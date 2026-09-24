@@ -15,6 +15,8 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   agents), settings, enabled plugins, and auto-memory location, injected as launch options.
   Nothing is written into any home; an account's own settings keep precedence; existing symlink
   layouts are detected so nothing loads twice. Opt an account out with `share = false`.
+  Authentication and provider settings are never shared, and shared settings travel to claude as
+  a private (0600) file rather than on the command line.
 - Relay (SPEC R19): `remuda relay <session> <account>` and `c` in the TUI continue a session under
   another account by copying its transcript and checkpoints into the target store and forking it
   there. The original session is never modified.
