@@ -8,6 +8,17 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ## [Unreleased]
 
+### Added
+
+- Shared configuration (SPEC R18): with `[share.claude] from = "<account>"`, every other Claude
+  account launches with the source account's instructions (`CLAUDE.md`, skills, commands,
+  agents), settings, enabled plugins, and auto-memory location, injected as launch options.
+  Nothing is written into any home; an account's own settings keep precedence; existing symlink
+  layouts are detected so nothing loads twice. Opt an account out with `share = false`.
+- Relay (SPEC R19): `remuda relay <session> <account>` and `c` in the TUI continue a session under
+  another account by copying its transcript and checkpoints into the target store and forking it
+  there. The original session is never modified.
+
 ## [0.1.0] - 2026-09-24
 
 Initial release.

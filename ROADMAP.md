@@ -1,6 +1,6 @@
 # remuda roadmap
 
-**Status:** v0.1.0. Milestones M0–M3 are complete.
+**Status:** v0.1.0. Milestones M0–M3 are complete; M2.5 is in progress.
 
 remuda is a multi-account and session manager for coding agents (Claude Code and Codex). Its
 behavior contract is [SPEC.md](SPEC.md); this document records the design principles, decisions,
@@ -31,6 +31,8 @@ and planned work.
 | 2026-09-23 | An account is a registered home path, not a conventional directory | The Keychain entry is bound to the home path string (SPEC R2), so existing homes can only be registered in place |
 | 2026-09-23 | Prefer the claude CLI's official output over parsing internal files | `agents --json`, `auth status --json`, and `-p /usage` are CLI interfaces, more stable than undocumented file formats |
 | 2026-09-23 | Pre-assign new session IDs with `--session-id` | The ID is known before launch, so attribution is exact and `run` can exec directly (R6, R9) |
+| 2026-09-24 | Sessions are not shared between accounts; configuration is | Exact attribution, no cross-account cleanup, work and personal sessions stay apart; switching accounts mid-session is covered by relay (R19) |
+| 2026-09-24 | Share configuration by launch-time injection, not symlinks | No writes into homes (R13), no drift, new accounts share automatically; plugin packaging rejected because it namespaces agent and skill names (R18) |
 
 ## Technology
 
@@ -72,29 +74,23 @@ stop for background sessions (via `claude attach|logs|stop`).
 **M3 · Codex provider** — **Done**
 Codex accounts (`CODEX_HOME`), the rollout session index, and launch / resume / fork (SPEC R4, R17).
 
-**M2.5 · Shared configuration** — **Planned**
-Accounts created with `remuda setup` need a way to share configuration and sessions with existing
-homes. The compatibility baseline is the existing symlink layout, in which parts of a home are
-symlinks pointing at `~/.claude`. Candidate directions:
-
-- a symmetric shared layer at `$REMUDA_HOME/shared/<provider>/`;
-- launch-time injection through options the claude CLI is confirmed to support: `--settings`,
-  `--setting-sources`, `--plugin-dir`, `--mcp-config`, `--agents`.
+**M2.5 · Shared configuration and relay** — **In progress**
+Sessions stay with the account that created them; configuration is shared by injection at launch
+(SPEC R18): instructions (`CLAUDE.md`, skills, commands, agents) through `--add-dir`, settings and
+the auto-memory location through one `--settings`, and enabled plugins through `--plugin-dir`.
+Nothing is written into any home, and existing symlink layouts are detected so nothing loads
+twice. A relay (SPEC R19) continues a session under another account by copying its transcript and
+checkpoints into the target store and forking it there.
 
 ## Later, as needed
 
 - Launch background sessions from the TUI (`claude --bg`) and manage them alongside foreground
   sessions.
-- Continue a session under a different account: `--resume <id> --fork-session`, leaving the
-  original session untouched (needs verification that the session can be found when `projects` is
-  not shared).
 - Rename sessions: `claude -p --resume <id> "/rename <new-name>"` (needs verification).
 - Cleanup: only via a `claude project purge --dry-run` preview followed by confirmed execution;
   remuda never deletes files itself. Note that with a shared `projects` directory, cleanup affects
   every account.
 - Show plugins in the accounts view: `claude plugin list --json`.
-- Shared configuration and session retention: existing symlink layouts keep working unchanged; a
-  design will follow when there is a concrete need (see M2.5 for the candidate directions).
 - Interact with running sessions through `messagingSocketPath`.
 - Relocate homes using `CLAUDE_SECURESTORAGE_CONFIG_DIR` (R2).
 
