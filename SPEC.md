@@ -535,8 +535,10 @@ by injecting launch options, so nothing is written into any home (R13), and home
   - in `env`, every name that starts with `ANTHROPIC_`, `AWS_`, `AZURE_`, `GOOGLE_`, `CLOUDSDK_`,
     `CLOUD_ML_`, `CLAUDE_CODE_USE_`, `CLAUDE_CODE_SKIP_`, or `_CLAUDE_CODE_`; every name that
     contains `TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `OAUTH`, `UUID`, or `BASE_URL`;
-    and `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Exception: the model-name variables
-    `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, and `ANTHROPIC_DEFAULT_*_MODEL*` are shared.
+    and `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Names are matched case-insensitively.
+    Exception: the model-name variables `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, and
+    `ANTHROPIC_DEFAULT_*_MODEL*` are shared, unless the name also contains one of the substrings
+    above.
   The rules follow claude's own groupings of provider, credential, and endpoint variables in the
   2.1.281 bundle, widened to prefixes so that new variables are withheld by default. The accounts
   view (R11) lists the settings withheld this way.
