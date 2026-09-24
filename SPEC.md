@@ -515,8 +515,12 @@ by injecting launch options, so nothing is written into any home (R13), and home
   - a key where both values are arrays: the source's elements that are not equal (as JSON) to any
     element of the other array are kept, so identical hook entries are not duplicated;
   - any other key the other side defines: dropped (the other side wins).
-  The project settings are read from `<project root>/.claude/` with the project root of the
-  auto-memory rule below; unreadable or invalid project files are treated as absent.
+  The project settings are those claude reads (2.1.281 bundle): `.claude/settings.json` and
+  `.claude/settings.local.json` of the start directory (the launch cwd, as in the auto-memory rule
+  below), not of the project root; and also `.claude/settings.local.json` of the project root when
+  that root differs from the start directory, is not the user's home directory, and it, its `.git`
+  and its `.claude` (if any) belong to the current user. Unreadable or invalid project files are
+  treated as absent.
   **[unverified]**: that claude concatenates arrays other than hook lists (for example
   `permissions.allow`) rather than replacing them.
 - **Never injected: authentication.** Keys that choose credentials, provider, or organization are
