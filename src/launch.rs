@@ -518,10 +518,15 @@ pub fn perform(program: &Path, plan: &Launch, cwd: Option<&Path>, log: &Path) ->
     let log_error = append_log(log, &plan.record)
         .err()
         .map(|e| format!("cannot write launch log {}: {e:#}", log.display()));
+    let status = run_plan(program, plan, cwd);
+    Ran { status, log_error }
+}
+
+/// Runs `plan` in the foreground like [`perform`], without logging it: the caller did.
+pub fn run_plan(program: &Path, plan: &Launch, cwd: Option<&Path>) -> io::Result<ExitStatus> {
     let mut cmd = command(program, &plan.args, &plan.env, cwd);
     cmd.envs(plan.extra_env.iter().map(|(k, v)| (k, v)));
-    let status = foreground(cmd);
-    Ran { status, log_error }
+    foreground(cmd)
 }
 
 /// Applies `change` on top of the environment `cmd` inherits.

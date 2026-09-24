@@ -434,6 +434,40 @@ fn tui_relay_copies_then_forks() {
     assert!(sb.invocations().is_empty());
 
     fs::remove_file(&dest).unwrap();
+    // R19: the terminal cannot be handed over: the copy just placed is removed.
+    let mut screen = FakeScreen {
+        fail_suspend: true,
+        ..FakeScreen::default()
+    };
+    let event = tui::relay_in_foreground(&mut screen, &deps, request.clone(), &source).unwrap();
+    let Err(e) = exit_of(&event) else {
+        panic!("{event:?}")
+    };
+    assert!(
+        e.contains("cannot hand the terminal over") && e.contains("the relay copy was removed"),
+        "{e}"
+    );
+    assert!(!dest.exists());
+    assert!(sb.invocations().is_empty());
+    // The launch cannot be logged: removed before the TUI steps aside.
+    let log_path = sb.launch_log();
+    let logged_before = fs::read_to_string(&log_path).unwrap();
+    fs::remove_file(&log_path).unwrap();
+    fs::create_dir(&log_path).unwrap();
+    let mut screen = FakeScreen::default();
+    let event = tui::relay_in_foreground(&mut screen, &deps, request.clone(), &source).unwrap();
+    assert!(screen.calls.is_empty());
+    let Err(e) = exit_of(&event) else {
+        panic!("{event:?}")
+    };
+    assert!(
+        e.contains("cannot write launch log") && e.contains("the relay copy was removed"),
+        "{e}"
+    );
+    assert!(!dest.exists());
+    fs::remove_dir(&log_path).unwrap();
+    fs::write(&log_path, logged_before).unwrap();
+
     let mut screen = FakeScreen::default();
     let event = tui::relay_in_foreground(&mut screen, &deps, request, &source).unwrap();
     assert_eq!(exit_of(&event), &Ok(Exit::Code(0)));
@@ -446,13 +480,17 @@ fn tui_relay_copies_then_forks() {
         inv.args[..4],
         ["--resume", ID, "--fork-session", "--session-id"]
     );
+    // The failed attempts left their log lines (the one that could not be handed over);
+    // the last line is this launch, logged once.
     let log = sb.launches();
-    assert_eq!(log[0]["fork_of"], json!(ID));
-    assert_eq!(log[0]["session_id"], json!(inv.args[4]));
+    let last = log.last().unwrap();
+    assert_eq!(last["fork_of"], json!(ID));
+    assert_eq!(last["session_id"], json!(inv.args[4]));
     assert_eq!(
-        log[0]["relay"]["transcript"],
+        last["relay"]["transcript"],
         json!(dest.canonicalize().unwrap())
     );
+    assert_eq!(log.len(), 2);
 }
 
 /// R18: a directory typed into the TUI's new-session form is made real before it names the
