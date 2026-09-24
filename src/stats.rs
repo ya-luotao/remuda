@@ -526,7 +526,7 @@ fn scan(job: &Job) -> Option<(FileStats, u64)> {
 }
 
 /// 64-bit FNV-1a of `parts`, concatenated.
-fn fnv1a(parts: &[&[u8]]) -> u64 {
+pub(crate) fn fnv1a(parts: &[&[u8]]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for part in parts {
         for &b in *part {

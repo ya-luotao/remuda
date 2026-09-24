@@ -8,8 +8,8 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 use super::app::{
-    App, Effect, Event, Exit, Form, FormKind, Key, LaunchRequest, Level, Mode, Overlay, View,
-    update,
+    App, Confirm, Effect, Event, Exit, Form, FormKind, Key, LaunchRequest, Level, Mode, Notice,
+    Overlay, Pick, PickFor, ResumeCodex, View, update,
 };
 use super::render;
 use crate::attribution::Attribution;
@@ -2866,6 +2866,10 @@ fn tiny_terminal_does_not_panic() {
         for view in ['1', '2', '3', '4', '?'] {
             keys(&mut app, &[Key::Char(view)]);
             screen(&app);
+            // Private mode draws a redacted copy (R21).
+            keys(&mut app, &[Key::Ctrl('p')]);
+            screen(&app);
+            keys(&mut app, &[Key::Ctrl('p')]);
         }
     }
 }
@@ -4292,4 +4296,782 @@ fn stats_scrolls() {
     );
     update(&mut app, Event::Resize(80, 40));
     assert_eq!(app.stats.scroll, 0);
+}
+
+// ---- Private mode (R21) --------------------------------------------------------------------
+
+const ZQ_A: &str = "aaaaaaaa-0000-4000-8000-00000000000a";
+const ZQ_B: &str = "bbbbbbbb-0000-4000-8000-00000000000b";
+const ZQ_C: &str = "019c1e08-e4f6-7d70-a129-38ec744a3f3c";
+/// Untitled: History shows its first message.
+const ZQ_D: &str = "dddddddd-0000-4000-8000-00000000000d";
+const ZQ_HOME: &str = "/Users/zquser";
+const ZQ_CWD: &str = "/Users/zquser/zq work/zqproj";
+const ZQ_STORE: &str = "/Users/zquser/.claude/projects";
+const ZQ_CODEX_STORE: &str = "/Users/zquser/.zqhomes/zqbeta/sessions";
+
+fn zq_account(provider: crate::provider::Provider, name: &str) -> Account {
+    Account {
+        provider,
+        name: name.into(),
+        home: Home::Path(format!("{ZQ_HOME}/.zqhomes/{name}")),
+    }
+}
+
+fn zq_entry(provider: crate::provider::Provider, id: &str, title: &str, minute: u32) -> Entry {
+    let (store, path) = match provider {
+        CODEX => (
+            ZQ_CODEX_STORE.to_string(),
+            format!("{ZQ_CODEX_STORE}/2026/09/24/rollout-2026-09-24T10-00-00-{id}.jsonl"),
+        ),
+        _ => (
+            ZQ_STORE.to_string(),
+            format!("{ZQ_STORE}/-Users-zquser-zq-work-zqproj/{id}.jsonl"),
+        ),
+    };
+    Entry {
+        provider,
+        path: PathBuf::from(path),
+        store: PathBuf::from(store),
+        title: Some(title.into()),
+        first_user_text: Some("zqfirst words".into()),
+        cwd_first: Some(ZQ_CWD.into()),
+        cwd_last: Some(ZQ_CWD.into()),
+        ..entry(id, title, minute)
+    }
+}
+
+/// Every place the screen can show something personal, filled with sentinels containing `zq`
+/// (which no UI text contains): names, homes, emails, organizations, the working directory,
+/// titles, first messages, session names, logs, previews, free text, the stats.
+fn secret_app() -> App {
+    let accounts = vec![
+        Account::default_for(CLAUDE),
+        zq_account(CLAUDE, "zqalpha"),
+        zq_account(CODEX, "zqbeta"),
+    ];
+    let mut app = App::new(accounts, TimeZone::UTC, Some(ZQ_HOME.into()), ts(NOW));
+    update(&mut app, Event::Resize(80, 24));
+    app.cwd = Some(PathBuf::from(ZQ_CWD));
+    app.start();
+    let identity =
+        |email: Option<&str>, org: Option<&str>, method: Option<&str>| Identity::LoggedIn {
+            email: email.map(str::to_string),
+            org: org.map(str::to_string),
+            plan: Some("max".into()),
+            method: method.map(str::to_string),
+            cached: false,
+        };
+    for (account, identity) in [
+        (
+            Account::default_for(CLAUDE),
+            identity(Some("zqdefault@zqmail.example"), Some("Zqorg Inc"), None),
+        ),
+        (
+            zq_account(CLAUDE, "zqalpha"),
+            identity(Some("zqme@zqmail.example"), Some("Zqorg Inc"), None),
+        ),
+        (
+            zq_account(CODEX, "zqbeta"),
+            identity(Some("zqb@zqmail.example"), None, Some("ChatGPT")),
+        ),
+    ] {
+        update(&mut app, Event::Identity { account, identity });
+    }
+    for account in [Account::default_for(CLAUDE), zq_account(CLAUDE, "zqalpha")] {
+        update(
+            &mut app,
+            Event::CachedUsage {
+                account,
+                result: cached(vec![
+                    row("Session", 34.0, None, Some("2026-09-24T14:00:00Z")),
+                    row(
+                        "Week (all models)",
+                        77.0,
+                        None,
+                        Some("2026-09-27T10:00:00Z"),
+                    ),
+                ]),
+            },
+        );
+    }
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: zq_account(CODEX, "zqbeta"),
+            result: Err(format!(
+                "cannot reach {ZQ_HOME}/.zqhomes/zqbeta: zqbeta timed out"
+            )),
+        },
+    );
+    update(
+        &mut app,
+        Event::Checks(vec![Check {
+            account: Some("claude:zqalpha".into()),
+            message: format!("home {ZQ_HOME}/.zqhomes/zqalpha is not readable"),
+        }]),
+    );
+    update(
+        &mut app,
+        Event::Stores(vec![
+            Store {
+                provider: CLAUDE,
+                path: PathBuf::from(ZQ_STORE),
+                accounts: vec!["claude:default".into(), "claude:zqalpha".into()],
+                thread_names: vec![],
+            },
+            Store {
+                provider: CODEX,
+                path: PathBuf::from(ZQ_CODEX_STORE),
+                accounts: vec!["codex:zqbeta".into()],
+                thread_names: vec![PathBuf::from(format!(
+                    "{ZQ_HOME}/.zqhomes/zqbeta/session_index.jsonl"
+                ))],
+            },
+        ]),
+    );
+    update(
+        &mut app,
+        Event::IndexDone {
+            entries: vec![
+                zq_entry(CLAUDE, ZQ_A, "zqtitle one", 3),
+                zq_entry(CLAUDE, ZQ_B, "zqtitle two", 2),
+                zq_entry(CODEX, ZQ_C, "zqcodex title", 1),
+                Entry {
+                    title: None,
+                    ..zq_entry(CLAUDE, ZQ_D, "unused", 0)
+                },
+            ],
+            error: Some(format!(
+                "zqalpha: cannot write {ZQ_HOME}/.remuda/state/index.json"
+            )),
+        },
+    );
+    let mut attribution = Attribution::default();
+    attribution.add(ZQ_A, "claude:zqalpha");
+    attribution.add(ZQ_B, "claude:zqalpha");
+    attribution.add(ZQ_B, "claude:default");
+    // An account no longer registered, named by the launch log.
+    attribution.add(ZQ_B, "claude:zqgone");
+    update(&mut app, Event::Attribution(attribution));
+    let mut interactive = live("claude:zqalpha", 7, Some(ZQ_A));
+    interactive.cwd = Some(ZQ_CWD.into());
+    interactive.name = Some("zqlivename".into());
+    let background = LiveSession {
+        pid: None,
+        short_id: Some("0a1b2c3d".into()),
+        kind: Some("background".into()),
+        name: Some("zqbgname".into()),
+        status: Some("running".into()),
+        ..live("claude:zqalpha", 0, Some(ZQ_B))
+    };
+    update(&mut app, Event::Live(vec![interactive, background]));
+    update(
+        &mut app,
+        Event::Stats {
+            report: Report {
+                tables: Period::ALL
+                    .map(|period| Table {
+                        period,
+                        since: None,
+                        sections: vec![
+                            stats_section(&["claude:default"], vec![]),
+                            stats_section(
+                                &["claude:zqalpha"],
+                                vec![model(CLAUDE, "claude-test", [8, 1_234_567, 160, 90, 0])],
+                            ),
+                            stats_section(
+                                &["codex:zqbeta"],
+                                vec![model(CODEX, "gpt-test", [1500, 200, 0, 30, 12])],
+                            ),
+                            stats_section(
+                                &["claude:default", "claude:zqalpha"],
+                                vec![model(CLAUDE, "claude-test", [5, 0, 0, 5, 0])],
+                            ),
+                            stats_section(
+                                &["claude:zqgone"],
+                                vec![model(CLAUDE, "claude-test", [9, 0, 0, 9, 0])],
+                            ),
+                        ],
+                        overall: vec![model(CLAUDE, "claude-test", [22, 1_234_567, 160, 104, 0])],
+                    })
+                    .to_vec(),
+                files: 3,
+            },
+            error: Some(format!("cannot write {ZQ_HOME}/.remuda/state/stats.json")),
+        },
+    );
+    app
+}
+
+/// The preview of the current selection, loaded.
+fn load_preview(app: &mut App) {
+    let target = app.preview.target.clone().expect("a preview target");
+    let messages = vec![
+        Message {
+            role: Role::User,
+            text: "zqpreview question".into(),
+        },
+        Message {
+            role: Role::Assistant,
+            text: "zqanswer\n[tool: Read]".into(),
+        },
+    ];
+    update(
+        app,
+        Event::Preview {
+            path: target,
+            result: Ok(messages),
+        },
+    );
+}
+
+fn zq_request(what: &str, args: &[&str], account: Account) -> LaunchRequest {
+    LaunchRequest {
+        account,
+        args: args.iter().map(|a| a.to_string()).collect(),
+        cwd: Some(PathBuf::from(ZQ_CWD)),
+        what: what.into(),
+    }
+}
+
+/// A state of the TUI and what it shows of the secrets when private mode is off.
+struct SecretState {
+    name: &'static str,
+    set: fn(&mut App),
+    /// Shown (in private mode off) at every size, except where `hidden_at_80` says the state
+    /// covers the whole 80×24 screen with text that has nothing personal (the help box).
+    shows: &'static str,
+    hidden_at_80: bool,
+}
+
+fn secret_states() -> Vec<SecretState> {
+    let state = |name, set: fn(&mut App), shows| SecretState {
+        name,
+        set,
+        shows,
+        hidden_at_80: false,
+    };
+    vec![
+        state("accounts", |app| drop(keys(app, &[Key::Char('1')])), "zqme"),
+        state(
+            "live",
+            |app| drop(keys(app, &[Key::Char('2')])),
+            "zqlivename",
+        ),
+        state(
+            "live preview expanded",
+            |app| {
+                keys(app, &[Key::Char('2')]);
+                load_preview(app);
+                keys(app, &[Key::Char('p')]);
+            },
+            "zqpreview",
+        ),
+        state(
+            "live preview collapsed",
+            |app| {
+                keys(app, &[Key::Char('2')]);
+                load_preview(app);
+            },
+            "zqanswer",
+        ),
+        state(
+            "live logs",
+            |app| {
+                let fx = keys(app, &[Key::Char('2'), Key::Char('j'), Key::Char('l')]);
+                assert!(
+                    fx.iter().any(|e| matches!(e, Effect::Logs { .. })),
+                    "{fx:?}"
+                );
+                update(
+                    app,
+                    Event::Logs {
+                        short_id: "0a1b2c3d".into(),
+                        result: Ok("zqlog line\n".into()),
+                    },
+                );
+            },
+            "zqlog line",
+        ),
+        state(
+            "history",
+            |app| drop(keys(app, &[Key::Char('3')])),
+            "zqtitle",
+        ),
+        state(
+            "history preview expanded",
+            |app| {
+                keys(app, &[Key::Char('3')]);
+                load_preview(app);
+                keys(app, &[Key::Char('p')]);
+            },
+            "zqpreview",
+        ),
+        state(
+            "history preview collapsed",
+            |app| {
+                keys(app, &[Key::Char('3')]);
+                load_preview(app);
+            },
+            "zqanswer",
+        ),
+        state("stats", |app| drop(keys(app, &[Key::Char('4')])), "zqalpha"),
+        state(
+            "search",
+            |app| {
+                keys(app, &[Key::Char('3'), Key::Char('/')]);
+                type_str(app, "zqquery");
+            },
+            "zqquery",
+        ),
+        state(
+            "search kept, no match",
+            |app| {
+                keys(app, &[Key::Char('3'), Key::Char('/')]);
+                type_str(app, "zqnomatch");
+                keys(app, &[Key::Enter]);
+            },
+            "zqnomatch",
+        ),
+        SecretState {
+            name: "help",
+            set: |app| drop(keys(app, &[Key::Char('?')])),
+            shows: "zqalpha",
+            hidden_at_80: true,
+        },
+        state("pick resume", |app| pick(app, PickFor::Resume), "zqalpha ●"),
+        state("pick fork", |app| pick(app, PickFor::Fork), "zqalpha ●"),
+        state("pick relay", |app| pick(app, PickFor::Relay), "zqalpha ●"),
+        state(
+            "new session form",
+            |app| {
+                keys(
+                    app,
+                    &[Key::Char('1'), Key::Char('j'), Key::Char('n'), Key::Tab],
+                );
+                type_str(app, "zqsess");
+            },
+            "zqsess",
+        ),
+        state(
+            "setup form",
+            |app| {
+                keys(app, &[Key::Char('1'), Key::Char('s')]);
+                type_str(app, "zqnew");
+                keys(app, &[Key::Tab]);
+                type_str(app, "zqnew@zqmail.example");
+                if let Some(Overlay::Form(form)) = &mut app.overlay {
+                    form.error = Some(format!(
+                        "zqnew: {ZQ_HOME}/.remuda/homes/claude/zqnew exists"
+                    ));
+                }
+            },
+            "zqnew",
+        ),
+        state(
+            "confirm",
+            |app| {
+                keys(app, &[Key::Char('2')]);
+                app.overlay = Some(Overlay::Confirm(Confirm {
+                    verb: Control::Stop,
+                    account: "claude:zqalpha".into(),
+                    short_id: "0a1b2c3d".into(),
+                }));
+            },
+            "(zqalpha)",
+        ),
+        state(
+            "remove account",
+            |app| drop(keys(app, &[Key::Char('1'), Key::Char('j'), Key::Char('D')])),
+            "Remove zqalpha",
+        ),
+        state(
+            "resume codex",
+            |app| {
+                keys(app, &[Key::Char('3')]);
+                app.overlay = Some(Overlay::ResumeCodex(ResumeCodex {
+                    path: PathBuf::from(format!(
+                        "{ZQ_CODEX_STORE}/2026/09/24/rollout-2026-09-24T10-00-00-{ZQ_C}.jsonl"
+                    )),
+                    written: Some(ts("2026-09-24T11:58:00Z")),
+                    request: zq_request(
+                        "resume 019c1e08 as codex:zqbeta",
+                        &["resume", ZQ_C, "-C", ZQ_CWD],
+                        zq_account(CODEX, "zqbeta"),
+                    ),
+                }));
+            },
+            "as codex:zqbeta?",
+        ),
+        state(
+            "pick for run",
+            |app| {
+                app.mode = Mode::PickForRun;
+                keys(app, &[Key::Char('1')]);
+            },
+            "zq work",
+        ),
+        state(
+            "notice",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                app.notice = Some(Notice {
+                    text: format!(
+                        "cannot use {ZQ_CWD} or /tmp/zqscratch/x: zqalpha, zqme@zqmail.example"
+                    ),
+                    level: Level::Error,
+                });
+            },
+            ": zqalpha,",
+        ),
+        state(
+            "pending check",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                app.pending = Some((
+                    1,
+                    zq_request(
+                        "new session “zqsess” as zqalpha",
+                        &["--name", "zqsess"],
+                        zq_account(CLAUDE, "zqalpha"),
+                    ),
+                ));
+            },
+            "“zqsess”",
+        ),
+        state(
+            "untitled session",
+            |app| drop(keys(app, &[Key::Char('3')])),
+            "zqfirst words",
+        ),
+        state(
+            "preview error",
+            |app| {
+                keys(app, &[Key::Char('3')]);
+                let target = app.preview.target.clone().expect("a preview target");
+                update(
+                    app,
+                    Event::Preview {
+                        path: target,
+                        result: Err(format!(
+                            "zqalpha has no access to {ZQ_STORE}/-Users-zquser/x.jsonl"
+                        )),
+                    },
+                );
+            },
+            "zqalpha has no access",
+        ),
+        state(
+            "logs error",
+            |app| {
+                keys(app, &[Key::Char('2'), Key::Char('j'), Key::Char('l')]);
+                update(
+                    app,
+                    Event::Logs {
+                        short_id: "0a1b2c3d".into(),
+                        result: Err(format!("zqalpha is logged out: exit 1 in {ZQ_CWD}")),
+                    },
+                );
+            },
+            "zqalpha is logged out",
+        ),
+        state(
+            "setup failed",
+            |app| {
+                keys(app, &[Key::Char('1'), Key::Char('s')]);
+                type_str(app, "zqnew");
+                let fx = keys(app, &[Key::Enter]);
+                assert!(
+                    fx.iter().any(|e| matches!(e, Effect::Setup { .. })),
+                    "{fx:?}"
+                );
+                update(
+                    app,
+                    Event::SetupDone {
+                        provider: CLAUDE,
+                        name: "zqnew".into(),
+                        result: Err(format!(
+                            "{ZQ_HOME}/.remuda/homes/claude/zqnew already exists"
+                        )),
+                    },
+                );
+            },
+            "set up zqnew",
+        ),
+        state(
+            "home with a trailing slash",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                app.home = Some(format!("{ZQ_HOME}/"));
+                app.notice = Some(Notice {
+                    text: format!("cannot use {ZQ_HOME}/zqother/x or home:{ZQ_HOME}/zqelse/y"),
+                    level: Level::Warn,
+                });
+            },
+            "zqother",
+        ),
+        state(
+            "home a prefix of another directory",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                app.home = Some("/Users/zq".into());
+                app.notice = Some(Notice {
+                    text: format!("cannot use {ZQ_HOME}/zqproj"),
+                    level: Level::Warn,
+                });
+            },
+            "zquser/zqproj",
+        ),
+        state(
+            "share source not registered",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                let accounts: Vec<Account> =
+                    app.accounts.iter().map(|a| a.account.clone()).collect();
+                let sharing = crate::registry::Sharing {
+                    source: Some(zq_account(CLAUDE, "zqshare")),
+                    opted_out: vec![],
+                };
+                let found = crate::checks::sharing(&accounts, &crate::Env::new(), &sharing);
+                update(app, Event::Checks(found));
+            },
+            "zqshare",
+        ),
+        state(
+            "index error",
+            |app| drop(keys(app, &[Key::Char('1')])),
+            "index cache: zqalpha",
+        ),
+    ]
+}
+
+/// A picker for the claude session A.
+fn pick(app: &mut App, action: PickFor) {
+    keys(app, &[Key::Char('3')]);
+    app.overlay = Some(Overlay::Pick(Pick {
+        path: PathBuf::from(format!(
+            "{ZQ_STORE}/-Users-zquser-zq-work-zqproj/{ZQ_A}.jsonl"
+        )),
+        session_id: ZQ_A.into(),
+        action,
+        options: vec!["claude:zqalpha".into(), "claude:default".into()],
+        attributed: vec!["claude:zqalpha".into()],
+        selected: 0,
+    }));
+}
+
+/// R21: in private mode nothing personal shows anywhere, while every one of these states shows
+/// something personal when it is off; numbers, model names and aliases still show.
+#[test]
+fn private_mode_leaks_nothing_anywhere() {
+    for state in secret_states() {
+        for (w, h) in [(80, 24), (160, 40)] {
+            let mut app = secret_app();
+            update(&mut app, Event::Resize(w, h));
+            (state.set)(&mut app);
+            let open = text(&app);
+            let at = format!("{} at {w}x{h}", state.name);
+            if state.hidden_at_80 && w == 80 {
+                assert!(
+                    !open.to_lowercase().contains("zq"),
+                    "{at}: expected a full-screen box:\n{open}"
+                );
+            } else {
+                assert!(
+                    open.contains(state.shows),
+                    "{at}: shows no {:?} when not private:\n{open}",
+                    state.shows
+                );
+            }
+            assert!(!open.contains("PRIVATE"), "{at}:\n{open}");
+
+            app.private = true;
+            let private = text(&app);
+            assert!(
+                !private.to_lowercase().contains("zq"),
+                "{at}: leaks in private mode:\n{private}"
+            );
+            assert!(private.contains("PRIVATE"), "{at}:\n{private}");
+        }
+    }
+}
+
+/// R21: what private mode leaves: numbers, model names, plans, aliases, `default`, masks.
+#[test]
+fn private_mode_keeps_numbers_models_and_aliases() {
+    let mut app = secret_app();
+    update(&mut app, Event::Resize(160, 40));
+    app.private = true;
+    let accounts = text(&app);
+    for shown in [
+        "PRIVATE",
+        "account-1",
+        "codex:account-1",
+        "default",
+        "34%",
+        "77%",
+        "•••@•••",
+        "max",
+    ] {
+        assert!(accounts.contains(shown), "{shown}:\n{accounts}");
+    }
+    keys(&mut app, &[Key::Char('4')]);
+    let stats = text(&app);
+    for shown in [
+        "1.2M",
+        "claude-test",
+        "gpt-test",
+        "account-1",
+        "account-2",
+        "codex:account-1",
+    ] {
+        assert!(stats.contains(shown), "{shown}:\n{stats}");
+    }
+    keys(&mut app, &[Key::Char('3')]);
+    let history = text(&app);
+    for shown in [
+        "09-24 10:03",
+        "~/•••/•••",
+        "account-1,ac",
+        "codex:accoun",
+        "•••",
+    ] {
+        assert!(history.contains(shown), "{shown}:\n{history}");
+    }
+    keys(&mut app, &[Key::Char('2')]);
+    let live = text(&app);
+    for shown in ["account-1", "0a1b2c3d", "7", "~/•••/•••"] {
+        assert!(live.contains(shown), "{shown}:\n{live}");
+    }
+}
+
+/// R21: Ctrl-P toggles private mode in every view and overlay, and is never anything else: it
+/// types nothing, closes nothing, cancels nothing, and a notice survives it.
+#[test]
+fn ctrl_p_toggles_everywhere() {
+    let toggles = |app: &mut App| {
+        let before = app.clone();
+        assert_eq!(keys(app, &[Key::Ctrl('p')]), []);
+        assert!(app.private);
+        assert_eq!(keys(app, &[Key::Ctrl('p')]), []);
+        assert_eq!(*app, before, "nothing else changed");
+    };
+    for view in ['1', '2', '3', '4'] {
+        let mut app = secret_app();
+        keys(&mut app, &[Key::Char(view)]);
+        toggles(&mut app);
+    }
+    for state in secret_states() {
+        let mut app = secret_app();
+        (state.set)(&mut app);
+        toggles(&mut app);
+        if app.help {
+            // The help box stays open; the next key closes it.
+            keys(&mut app, &[Key::Ctrl('p')]);
+            assert!(app.help && app.private);
+        }
+    }
+
+    // In a form and the search prompt, nothing is typed.
+    let mut app = secret_app();
+    keys(&mut app, &[Key::Char('1'), Key::Char('s')]);
+    type_str(&mut app, "zq");
+    keys(&mut app, &[Key::Ctrl('p')]);
+    type_str(&mut app, "Pp");
+    let Some(Overlay::Form(form)) = &app.overlay else {
+        panic!("form closed")
+    };
+    assert_eq!((form.fields[0].value.as_str(), form.focus), ("zqPp", 0));
+    // The cursor follows the masked value.
+    let all = text(&app);
+    assert!(all.contains("•••▏"), "{all}");
+    keys(&mut app, &[Key::Ctrl('p')]);
+    let all = text(&app);
+    assert!(all.contains("zqPp▏"), "{all}");
+
+    let mut app = secret_app();
+    keys(&mut app, &[Key::Char('3'), Key::Char('/')]);
+    type_str(&mut app, "zq");
+    keys(&mut app, &[Key::Ctrl('p')]);
+    type_str(&mut app, "x");
+    assert_eq!(app.history.query, "zqx");
+    assert!(app.history.searching);
+
+    // A notice survives the toggle; any other key clears it.
+    let mut app = secret_app();
+    app.notice = Some(Notice {
+        text: "hello".into(),
+        level: Level::Info,
+    });
+    keys(&mut app, &[Key::Ctrl('p')]);
+    assert!(app.notice.is_some());
+    keys(&mut app, &[Key::Char('j')]);
+    assert!(app.notice.is_none());
+
+    // Choosing an account for `remuda run`.
+    let mut app = secret_app();
+    app.mode = Mode::PickForRun;
+    toggles(&mut app);
+    // And Ctrl-C still quits in private mode.
+    keys(&mut app, &[Key::Ctrl('p')]);
+    assert_eq!(keys(&mut app, &[Key::Ctrl('c')]), [Effect::Quit]);
+}
+
+/// R21: an alias never changes while the TUI runs: removing an account keeps the others',
+/// and a new account gets the next number.
+#[test]
+fn aliases_stay_stable_when_accounts_change() {
+    let mut app = secret_app();
+    app.private = true;
+    let alias = |app: &App, q: &str| app.aliases.qualified(q);
+    assert_eq!(alias(&app, "claude:zqalpha"), "claude:account-1");
+    assert_eq!(alias(&app, "claude:zqgone"), "claude:account-2");
+    assert_eq!(alias(&app, "codex:zqbeta"), "codex:account-1");
+    update(
+        &mut app,
+        Event::Accounts(vec![
+            Account::default_for(CLAUDE),
+            zq_account(CODEX, "zqbeta"),
+            zq_account(CLAUDE, "zqnew"),
+        ]),
+    );
+    assert_eq!(alias(&app, "claude:zqalpha"), "claude:account-1");
+    assert_eq!(alias(&app, "codex:zqbeta"), "codex:account-1");
+    assert_eq!(alias(&app, "claude:zqnew"), "claude:account-3");
+    let all = text(&app);
+    assert!(all.contains("account-3"), "{all}");
+    assert!(!all.to_lowercase().contains("zq"), "{all}");
+}
+
+/// R21: the redacted copy kept between frames is made again whenever the app changes, and
+/// follows the clock without being made again.
+#[test]
+fn private_snapshot_follows_every_change() {
+    let mut app = secret_app();
+    app.private = true;
+    let mut snapshot = super::privacy::Snapshot::default();
+    let first = snapshot.of(&app).clone();
+    assert_eq!(first, super::privacy::redacted(&app));
+
+    app.now = ts("2026-09-24T12:00:05Z");
+    assert_eq!(*snapshot.of(&app), super::privacy::redacted(&app));
+
+    app.notice = Some(Notice {
+        text: "zqalpha exited".into(),
+        level: Level::Info,
+    });
+    let copy = snapshot.of(&app).clone();
+    assert_eq!(copy.notice.as_ref().unwrap().text, "account-1 exited");
+    keys(&mut app, &[Key::Char('3'), Key::Char('j')]);
+    assert_eq!(*snapshot.of(&app), super::privacy::redacted(&app));
+
+    // What the event loop draws is what `render` draws.
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| render::render_with(&app, &mut snapshot, f))
+        .unwrap();
+    let kept = terminal.backend().buffer().clone();
+    terminal.draw(|f| render::render(&app, f)).unwrap();
+    assert_eq!(*terminal.backend().buffer(), kept);
 }

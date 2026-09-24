@@ -49,6 +49,33 @@ impl Attribution {
         self.map.is_empty()
     }
 
+    /// Every account name any session is attributed to.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        let Attribution {
+            map,
+            relay_copies: _,
+        } = self;
+        map.values().flatten().map(String::as_str)
+    }
+
+    /// The same attribution with each account name through `name` and each relay copy's path
+    /// through `path` (private mode, R21). Every field is named: a new one does not compile
+    /// until it is decided what private mode does with it.
+    pub fn redacted(
+        &self,
+        name: impl Fn(&str) -> String,
+        path: impl Fn(&Path) -> PathBuf,
+    ) -> Attribution {
+        let Attribution { map, relay_copies } = self;
+        Attribution {
+            map: map
+                .iter()
+                .map(|(session, names)| (session.clone(), names.iter().map(|n| name(n)).collect()))
+                .collect(),
+            relay_copies: relay_copies.iter().map(|p| path(p)).collect(),
+        }
+    }
+
     /// Whether the transcript at `path` is a relay's copy (R19).
     pub fn is_relay_copy(&self, path: &Path) -> bool {
         self.relay_copies.contains(path)

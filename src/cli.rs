@@ -750,6 +750,7 @@ fn open_tui(config: &Path, ctx: &Context, mode: tui::app::Mode) -> Result<Option
         state_dir: state_dir(config),
         cwd: ctx.cwd.clone(),
         mode,
+        private: false,
     })
 }
 
