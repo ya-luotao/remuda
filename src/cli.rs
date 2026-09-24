@@ -349,13 +349,25 @@ fn exec_plan(
     }
     let log = state_dir(config).join("launches.jsonl");
     if let Err(e) = launch::append_log(&log, &plan.record) {
+        // A relay copy is only ever left with its record (R19).
+        if let Some(relay) = &plan.record.relay {
+            bail!(
+                "cannot write launch log {}: {e:#}; {}",
+                log.display(),
+                relay::discarded(relay)
+            );
+        }
         eprintln!(
             "remuda: warning: cannot write launch log {}: {e:#}",
             log.display()
         );
     }
     let err = launch::exec(program, plan, cwd);
-    Err(anyhow::Error::new(err).context(format!("cannot run {}", program.display())))
+    let mut err = anyhow::Error::new(err).context(format!("cannot run {}", program.display()));
+    if let Some(relay) = &plan.record.relay {
+        err = err.context(relay::discarded(relay));
+    }
+    Err(err)
 }
 
 /// `$REMUDA_HOME/state`, the sibling of `config.toml` (R3).

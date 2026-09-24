@@ -438,18 +438,44 @@ fn run_launch(
     };
     let mut warnings = launch::env_warnings(&deps.env);
     warnings.extend(plan.notices.iter().cloned());
+    // A relay copy is only ever left with its record, and only for a claude that starts (R19):
+    // its log line is written before the terminal is handed over, and anything that stops the
+    // launch from here on removes the copy.
+    let relayed = plan.record.relay.as_ref();
+    let undo = |e: String| match relayed {
+        Some(relay) => format!("{e}; {}", relay::discarded(relay)),
+        None => e,
+    };
+    if relayed.is_some()
+        && let Err(e) = launch::append_log(&log, &plan.record)
+    {
+        let e = format!("cannot write launch log {}: {e:#}", log.display());
+        return Ok((Err(undo(e)), warnings));
+    }
     if let Err(e) = screen.suspend() {
         let _ = screen.resume();
-        return Ok((Err(format!("cannot hand the terminal over: {e}")), warnings));
+        return Ok((
+            Err(undo(format!("cannot hand the terminal over: {e}"))),
+            warnings,
+        ));
     }
     let where_ = cwd.map_or(String::new(), |d| format!(" in {}", d.display()));
     println!("remuda: {}{where_}", request.what);
-    let ran = launch::perform(program, &plan, cwd, &log);
+    let ran = match relayed {
+        Some(_) => launch::Ran {
+            status: launch::run_plan(program, &plan, cwd),
+            log_error: None,
+        },
+        None => launch::perform(program, &plan, cwd, &log),
+    };
     screen
         .resume()
         .with_context(|| format!("cannot take the terminal back after {}", provider.program()))?;
     warnings.extend(ran.log_error);
-    Ok((ran.status.map(exit_of).map_err(|e| e.to_string()), warnings))
+    Ok((
+        ran.status.map(exit_of).map_err(|e| undo(e.to_string())),
+        warnings,
+    ))
 }
 
 /// `remuda setup --provider <p> <name>` from the TUI (R5, R16, R17): the same checks and steps

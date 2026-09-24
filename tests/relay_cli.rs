@@ -267,3 +267,64 @@ fn relay_copies_are_hidden_from_sessions() {
     let rows = parse_table(&String::from_utf8(out.get_output().stdout.clone()).unwrap());
     assert_eq!(rows.len(), 2, "{rows:?}");
 }
+
+/// R19: a relay copy is never left without its launch record: when the log cannot be
+/// written, the copy is removed and claude does not run.
+#[test]
+fn relay_removes_its_copy_when_the_launch_cannot_be_logged() {
+    let s = setup();
+    fs::create_dir_all(s.sb.launch_log()).unwrap();
+    s.relay("team")
+        .failure()
+        .stderr(predicate::str::contains("cannot write launch log"))
+        .stderr(predicate::str::contains("the relay copy was removed"));
+    assert!(!s.copy().exists());
+    assert!(s.sb.invocations().is_empty());
+    // Checkpoints stay: immutable, and copied again (or kept) by the next relay.
+    assert!(
+        s.team
+            .join("file-history")
+            .join(ID)
+            .join("abc@v1")
+            .is_file()
+    );
+}
+
+/// R19: when claude cannot be started, the copy just placed is removed too.
+#[test]
+fn relay_removes_its_copy_when_claude_cannot_start() {
+    let s = setup();
+    common::write_executable(&s.sb.bin().join("claude"), "#!/nonexistent/interpreter\n");
+    s.relay("team")
+        .failure()
+        .stderr(predicate::str::contains("the relay copy was removed"));
+    assert!(!s.copy().exists());
+}
+
+/// R19: a checkpoint that cannot be copied stops the relay before any transcript is placed.
+#[test]
+fn relay_stops_before_the_transcript_when_a_checkpoint_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = setup();
+    let locked = s.max.join("file-history").join(ID).join("locked@v1");
+    fs::write(&locked, "x").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    s.relay("team")
+        .failure()
+        .stderr(predicate::str::contains("locked@v1"));
+    assert!(!s.copy().exists());
+    assert!(s.sb.invocations().is_empty());
+    assert!(!s.sb.launch_log().exists());
+}
+
+/// R19: a transcript with no complete line is refused before anything is written.
+#[test]
+fn relay_refuses_a_transcript_without_a_complete_line() {
+    let s = setup();
+    fs::write(&s.transcript, "{\"type\":\"user\",").unwrap();
+    s.relay("team")
+        .failure()
+        .stderr(predicate::str::contains("has no complete record"));
+    assert!(!s.copy().exists());
+    assert!(!s.team.join("file-history").exists());
+}

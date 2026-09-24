@@ -91,6 +91,14 @@ pub fn check(source: &Source, target: &Account, env: &Env, launch_log: &Path) ->
     if store.as_ref() == Some(&source.store) {
         bail!("the projects store of {name} already holds session {id}: fork it there instead");
     }
+    let transcript = File::open(&source.transcript)
+        .with_context(|| format!("cannot read {}", source.transcript.display()))?;
+    if complete_len(&transcript)? == 0 {
+        bail!(
+            "{} has no complete record: nothing to continue",
+            source.transcript.display()
+        );
+    }
     match source.cwd_last.as_deref() {
         None => bail!("session {id} has no recorded directory to continue in"),
         Some(cwd) if !Path::new(cwd).is_dir() => bail!("{cwd} does not exist"),
@@ -153,11 +161,12 @@ pub fn prepare(
     Ok(plan)
 }
 
-/// Copies the transcript (up to its last complete line) into the target's store, then the
-/// checkpoints of every home whose `projects` resolves to the transcript's store, as a union,
-/// into the target's `file-history/<id>/` (R19). Everything is written under a temporary name
-/// and renamed into place; nothing but an unchanged earlier relay copy is replaced, and
-/// checkpoints already there are kept.
+/// Copies the checkpoints of every home whose `projects` resolves to the transcript's store, as
+/// a union, into the target's `file-history/<id>/`, then the transcript (up to its last
+/// complete line) into the target's store, placed last (R19). Everything is written under a
+/// temporary name and renamed into place; nothing but an unchanged earlier relay copy is
+/// replaced, and checkpoints already there are kept. If the launch cannot go ahead after this,
+/// [`discard`] removes the transcript copy.
 pub fn copy(source: &Source, target: &Target, accounts: &[Account], env: &Env) -> Result<Relay> {
     let projects = target.home.join("projects");
     fs::create_dir_all(projects.join(&target.dir))
@@ -170,11 +179,16 @@ pub fn copy(source: &Source, target: &Target, accounts: &[Account], env: &Env) -
     let dir = store.join(&target.dir);
     let dest = dir.join(&target.file);
 
+    // Checkpoints first: the transcript, placed last, is what makes a relay copy (R19).
+    let checkpoints = copy_checkpoints(source, &target.home, accounts, env)?;
     let tmp = temp_name(&dir, &target.file);
     let written = (|| -> Result<()> {
         let mut from = File::open(&source.transcript)
             .with_context(|| format!("cannot read {}", source.transcript.display()))?;
         let len = complete_len(&from)?;
+        if len == 0 {
+            bail!("{} has no complete record", source.transcript.display());
+        }
         let mut to = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -203,7 +217,6 @@ pub fn copy(source: &Source, target: &Target, accounts: &[Account], env: &Env) -
         return Err(e.context(format!("cannot copy the transcript to {}", dest.display())));
     }
     let (size, mtime_ns) = stat(&fs::metadata(&dest)?);
-    let checkpoints = copy_checkpoints(source, &target.home, accounts, env)?;
     Ok(Relay {
         source: source.transcript.display().to_string(),
         transcript: dest.display().to_string(),
@@ -214,6 +227,29 @@ pub fn copy(source: &Source, target: &Target, accounts: &[Account], env: &Env) -
         size,
         mtime_ns,
     })
+}
+
+/// Removes the transcript copy of `relay` when the launch it was made for cannot go ahead
+/// (R19): only while it is still the file remuda placed (same size and mtime). Checkpoints
+/// stay: they are immutable, and one a later relay would copy again.
+pub fn discard(relay: &Relay) -> Result<()> {
+    let path = Path::new(&relay.transcript);
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() && stat(&meta) == (relay.size, relay.mtime_ns) => {
+            fs::remove_file(path).with_context(|| format!("cannot remove {}", path.display()))
+        }
+        Ok(_) => bail!("{} changed meanwhile: not removed", path.display()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("cannot inspect {}", path.display())),
+    }
+}
+
+/// What to say after [`discard`]: the relay copy is gone, or where it was left.
+pub fn discarded(relay: &Relay) -> String {
+    match discard(relay) {
+        Ok(()) => "the relay copy was removed".to_string(),
+        Err(e) => format!("the relay copy could not be removed: {e:#}"),
+    }
 }
 
 /// The union of `file-history/<id>/` over every claude home whose `projects` resolves to the
@@ -621,5 +657,64 @@ mod tests {
         symlink(&source.transcript, dest_dir.join(format!("{ID}.jsonl"))).unwrap();
         assert!(err(&source, &named("team", &team)).contains("remuda does not overwrite it"));
         assert!(!team.join("file-history").exists());
+    }
+
+    /// R19: a transcript with no complete line has nothing to continue: refused.
+    #[test]
+    fn a_transcript_without_a_complete_line_is_refused() {
+        let f = fixture();
+        let (_, mut source) = home_with_session(&f, "max", "");
+        fs::write(&source.transcript, "{\"partial\":").unwrap();
+        source.transcript = fs::canonicalize(&source.transcript).unwrap();
+        let team = target(&f, "team");
+        let e = check(&source, &named("team", &team), &f.env, &f.log).unwrap_err();
+        assert!(e.to_string().contains("has no complete record"), "{e}");
+    }
+
+    /// R19: checkpoints go first; when one cannot be copied, no transcript is placed (and no
+    /// temporary file is left).
+    #[test]
+    fn a_failed_checkpoint_copy_places_no_transcript() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = fixture();
+        let (max, source) = home_with_session(&f, "max", "");
+        let checkpoints = max.join("file-history").join(ID);
+        fs::create_dir_all(&checkpoints).unwrap();
+        fs::write(checkpoints.join("locked@v1"), "x").unwrap();
+        fs::set_permissions(
+            checkpoints.join("locked@v1"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let team = target(&f, "team");
+        let accounts = [named("max", &max), named("team", &team)];
+        let dest = check(&source, &accounts[1], &f.env, &f.log).unwrap();
+        let e = copy(&source, &dest, &accounts, &f.env).unwrap_err();
+        assert!(format!("{e:#}").contains("locked@v1"), "{e:#}");
+        let project = team.join("projects/-w");
+        assert_eq!(fs::read_dir(&project).unwrap().count(), 0, "nothing placed");
+        let history = team.join("file-history").join(ID);
+        assert_eq!(fs::read_dir(&history).unwrap().count(), 0, "no temp files");
+    }
+
+    /// R19: `discard` removes the copy remuda placed, and nothing that changed since.
+    #[test]
+    fn discard_removes_only_the_placed_copy() {
+        let f = fixture();
+        let (max, source) = home_with_session(&f, "max", "");
+        let team = target(&f, "team");
+        let accounts = [named("max", &max), named("team", &team)];
+        let copy_of = || {
+            let dest = check(&source, &accounts[1], &f.env, &f.log).unwrap();
+            copy(&source, &dest, &accounts, &f.env).unwrap()
+        };
+        let relay = copy_of();
+        discard(&relay).unwrap();
+        assert!(!Path::new(&relay.transcript).exists());
+        discard(&relay).unwrap();
+        let relay = copy_of();
+        fs::write(&relay.transcript, "changed\n").unwrap();
+        assert!(discard(&relay).is_err());
+        assert_eq!(fs::read_to_string(&relay.transcript).unwrap(), "changed\n");
     }
 }
