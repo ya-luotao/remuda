@@ -11,7 +11,6 @@ pub mod rollouts;
 pub mod transcripts;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
@@ -196,6 +195,26 @@ pub struct Invocation {
     pub args: Vec<String>,
 }
 
+/// Writes an executable file through a `sh` child, so this process never holds a write
+/// descriptor on it: on Linux, a child forked by another test thread inherits such a
+/// descriptor until it execs, and running the file meanwhile fails with ETXTBSY.
+pub fn write_executable(path: &Path, contents: &str) {
+    use std::io::Write;
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn sh to write an executable");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(contents.as_bytes())
+        .expect("pipe the executable's contents");
+    assert!(child.wait().unwrap().success(), "write {}", path.display());
+}
+
 impl Sandbox {
     pub fn new() -> Self {
         let root = tempfile::Builder::new()
@@ -208,8 +227,7 @@ impl Sandbox {
         }
         // REMUDA_HOME is deliberately not created: remuda must cope with it missing.
         let claude = sb.bin().join("claude");
-        fs::write(&claude, FAKE_CLAUDE).expect("write fake claude");
-        fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("chmod fake claude");
+        write_executable(&claude, FAKE_CLAUDE);
         sb
     }
 
@@ -246,8 +264,7 @@ impl Sandbox {
     /// from now on (R17).
     pub fn install_codex(&self) {
         let codex = self.bin().join("codex");
-        fs::write(&codex, FAKE_CODEX).expect("write fake codex");
-        fs::set_permissions(&codex, fs::Permissions::from_mode(0o755)).expect("chmod fake codex");
+        write_executable(&codex, FAKE_CODEX);
     }
 
     /// Creates a directory that looks like a Codex home (has a `config.toml`).

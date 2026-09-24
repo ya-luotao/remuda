@@ -139,8 +139,7 @@ fn a_missing_directory_fails_before_anything_runs() {
 fn the_child_keeps_the_default_interrupt_action() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("self-interrupt");
-    fs::write(&script, "#!/bin/sh\nkill -INT $$\nsleep 5\nexit 0\n").unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&script, "#!/bin/sh\nkill -INT $$\nsleep 5\nexit 0\n");
     let keep = EnvChange::Set("REMUDA_TEST".into(), "1".into());
     let status = launch::run_foreground(&script, &[], &keep, Some(dir.path())).unwrap();
     assert_eq!(status.signal(), Some(2), "{status:?}");
@@ -150,8 +149,7 @@ fn the_child_keeps_the_default_interrupt_action() {
 fn exit_codes_come_back() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("fail");
-    fs::write(&script, "#!/bin/sh\nexit 3\n").unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&script, "#!/bin/sh\nexit 3\n");
     let keep = EnvChange::Set("REMUDA_TEST".into(), "1".into());
     let status = launch::run_foreground(&script, &[], &keep, None).unwrap();
     assert_eq!(status.code(), Some(3));
