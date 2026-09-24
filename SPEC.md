@@ -323,7 +323,8 @@ appeared in no `history.jsonl`.
 - Shared configuration (R18): the source account does not exist or its home is missing; a home
   shares some but not all of `CLAUDE.md`, `skills`, `commands`, `agents` with the source through
   symlinks (those items may load twice); an enabled plugin whose install path does not exist; an
-  `installed_plugins.json` whose format is not recognized.
+  `installed_plugins.json` whose format is not recognized; authentication keys in the source's
+  settings that are withheld from members.
 
 ## R12. Symlinks in homes
 
@@ -489,7 +490,7 @@ by injecting launch options, so nothing is written into any home (R13), and home
   | Component | Skipped when | Injection |
   | --- | --- | --- |
   | Instructions: `CLAUDE.md`, `skills/`, `commands/`, `agents/` | all four resolve to the source's | `--add-dir=$REMUDA_HOME/shared/claude` and `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` in the child environment |
-  | Settings | `settings.json` resolves to the source's | the part of the source's `settings.json` the home does not define, in the single `--settings` |
+  | Settings | `settings.json` resolves to the source's | the part of the source's `settings.json` that neither the home nor the project defines, in the single `--settings` |
   | Plugins | `plugins/` resolves to the source's | `--plugin-dir=<install path>` for each plugin enabled in the source's settings |
   | Auto-memory | `projects/` resolves to the source's | `autoMemoryDirectory`, in the single `--settings` |
 
@@ -502,22 +503,42 @@ by injecting launch options, so nothing is written into any home (R13), and home
   would rename every agent and skill. Side effects, documented rather than prevented: tools may
   access that directory like any `--add-dir`, and the variable also loads `CLAUDE.md` from other
   `--add-dir` directories the user passes.
-- **Settings.** claude loads the home's own `settings.json` and merges `--settings` over it:
-  injected keys win on conflict, and hook lists from both run (verified on 2.1.281). claude uses
-  only the last `--settings` option (verified on 2.1.281), so remuda passes exactly one, inline.
-  The home's own settings must keep precedence, and nothing may run twice, so remuda injects the
-  source's settings **minus what the home already defines**, computed recursively:
-  - a key the home does not define: the source's value is injected;
+- **Settings.** claude merges settings sources in the order user, project, local, flag, policy
+  (lowest to highest; read from the 2.1.281 bundle), and `--settings` is the flag source: injected
+  keys win over the home's own `settings.json` and over the project's `.claude/settings.json` and
+  `.claude/settings.local.json`, and hook lists from all of them run (verified on 2.1.281). The
+  shared settings must behave as if they were user settings, and nothing may run twice, so remuda
+  injects the source's settings **minus what the home, the project, and the local project settings
+  already define**, computed recursively against each of them in turn:
+  - a key the other side does not define: the source's value is kept;
   - a key where both values are objects: recurse;
   - a key where both values are arrays: the source's elements that are not equal (as JSON) to any
-    element of the home's array are injected, so identical hook entries are not duplicated;
-  - any other key the home defines: not injected (the home wins).
-  The result is the home's settings with the source's filling the gaps. **[unverified]**: that claude
-  concatenates arrays other than hook lists (for example `permissions.allow`) rather than replacing
-  them. `autoMemoryDirectory` is added when auto-memory is injected. If the user's arguments already
-  contain `--settings`, remuda injects no settings and no auto-memory and says so on stderr. A
-  settings file that is not a JSON object is an error for the launch.
-- **Plugins.** Enabled plugins are the keys set to `true` in the source settings' `enabledPlugins`.
+    element of the other array are kept, so identical hook entries are not duplicated;
+  - any other key the other side defines: dropped (the other side wins).
+  The project settings are read from `<project root>/.claude/` with the project root of the
+  auto-memory rule below; unreadable or invalid project files are treated as absent.
+  **[unverified]**: that claude concatenates arrays other than hook lists (for example
+  `permissions.allow`) rather than replacing them.
+- **Never injected: authentication.** Keys that choose credentials, provider, or organization are
+  removed from the injected settings, whatever the home defines, so a member never authenticates or
+  bills as the source: `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`,
+  `forceLoginMethod`, `forceLoginOrgUUID`, and in `env`: `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`,
+  `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`. The accounts view (R11) lists the keys
+  withheld this way.
+- **Passing settings.** claude uses only the last `--settings` option (verified on 2.1.281), so
+  remuda passes exactly one, as a file path, never inline: the injected JSON is written with mode
+  0600 to `$REMUDA_HOME/state/settings/<sha256 of the content>.json` (written atomically, reused
+  when the content is unchanged; files not used for 30 days are removed when a new one is written).
+  This keeps settings values out of the process list and away from per-argument size limits.
+  `autoMemoryDirectory` is added to the same JSON when auto-memory is injected. If the user's
+  arguments already contain `--settings`, remuda injects no settings and no auto-memory and says so
+  on stderr. A settings file of the source or home that is not a JSON object is an error for the
+  launch.
+- **Plugins.** Enabled plugins are the keys set to `true` in the source settings' `enabledPlugins`,
+  except those the home sets to `false` in its own `enabledPlugins` and those the home has installed
+  itself (listed in its own `plugins/installed_plugins.json`), which would otherwise load twice.
   Their install paths come from the source's `plugins/installed_plugins.json` (format version 2:
   `plugins.<name@marketplace>` is a list of installs; the first `user`-scoped install with an
   existing `installPath` is used). Basis (verified on 2.1.281): `enabledPlugins` alone does nothing
@@ -526,18 +547,28 @@ by injecting launch options, so nothing is written into any home (R13), and home
   and an R11 warning, never a failed launch.
 - **Auto-memory.** Memory belongs with configuration, not with sessions: its default location is
   `<home>/projects/<project>/memory/`. remuda points it at the source's copy:
-  `<source home>/projects/<project>/memory`. `<project>` is claude's encoding of the project root,
-  where every character that is not an ASCII letter or digit becomes `-`, and the project root is
-  the main repository's root for a git repository (a worktree maps to its main repository) or the
-  cwd otherwise. Basis (verified on 2.1.281, from the memory path claude reports in its system
-  prompt). If the source settings already set `autoMemoryDirectory`, remuda does not override it.
-  **[unverified]**: the encoding of names longer than 200 characters; for those, remuda does not
-  inject auto-memory.
+  `<source home>/projects/<project>/memory`, and must compute `<project>` exactly as claude does
+  (read from the 2.1.281 bundle and checked against the path claude reports):
+  - The start directory is the launch cwd (for a resume or relay, `cwd_last`), made absolute,
+    canonicalized (realpath), and NFC-normalized, as claude does with its own cwd.
+  - The project root comes from one `git -C <start> rev-parse --path-format=absolute --git-dir
+    --git-common-dir --show-toplevel`: if the git dir equals the common dir (a plain repository, a
+    submodule, or a separate git dir), the root is the top level; otherwise (a linked worktree) it
+    is the parent of the common dir when the common dir's name is `.git`, and the common dir itself
+    when it is not (a worktree of a bare repository). Outside any repository, including inside a
+    bare repository, the root is the start directory. If `git` cannot run or fails for another
+    reason, remuda does not inject auto-memory and says so, rather than guessing.
+  - The root is NFC-normalized. `<project>` replaces every UTF-16 code unit that is not an ASCII
+    letter or digit with `-` (so a character outside the Basic Multilingual Plane becomes `--`).
+  - If the root has more than 200 UTF-16 code units, claude truncates and hashes the name
+    (**[unverified]** details), so remuda does not inject auto-memory.
+  - remuda does not inject `autoMemoryDirectory` if the source, the home, or the project's local
+    settings already set it.
 - **Order.** Injected options come before the user's arguments, each in the `--option=value` form,
   so that a variadic option (such as `--add-dir`) cannot consume the user's arguments. The launch
   log (R6) records the injected option names and the byte size of each value, not the values.
-- `run` stays a fast path (R6): injection reads the source's `settings.json` and
-  `installed_plugins.json` and runs `git` once to find the project root; it scans no sessions.
+- `run` stays a fast path (R6): injection reads a handful of settings files and
+  `installed_plugins.json` and runs `git` at most once; it scans no sessions.
 
 ## R19. Relay: continuing a session under another account (M2.5)
 
@@ -555,13 +586,18 @@ every session still belongs to exactly one account.
   1. The selected transcript (R16: the row, not a lookup by ID) is copied to
      `<target home>/projects/<dir>/<id>.jsonl`, where `<dir>` is the name of the directory holding
      the transcript in its store. The copy ends at the last complete line, so a transcript being
-     written (a running session) never yields a partial record.
+     written (a running session) never yields a partial record; a transcript with no complete line
+     is refused.
   2. The checkpoints in `file-history/<id>/` are copied from every home whose `projects` resolves
      to the transcript's store (a session may have run under several homes sharing a store), as
      a union: checkpoint files are content-addressed and immutable, so a name found in two homes is
      the same file. Missing checkpoints are not an error.
   Basis (verified on 2.1.281): a fork copies the checkpoints of `file-history/<id>/` to the new ID;
   without them the fork works but `/rewind` cannot reach points before the fork.
+- **Order and failure.** Checkpoints are copied first and the transcript is placed last. If anything
+  after placing the transcript fails before claude starts (writing the launch log, handing over
+  the terminal), remuda removes the transcript copy it just placed (its own file) and reports the
+  error; the launch does not proceed without its log record.
 - **Overwrite rules.** Copies are written to a temporary name and renamed into place. An existing
   destination transcript is replaced only if the launch log records it as an earlier relay copy
   and its size and mtime still equal the recorded ones; otherwise the relay is refused.
