@@ -62,13 +62,18 @@ switching to a different, logged-out account.
   provider = "claude"
   name = "personal"
   home = "/Users/you/.claude-personal"
+  share = false             # optional: opt this account out of shared configuration (R18)
+
+  [share.claude]
+  from = "default"          # optional: the account whose configuration is shared (R18)
   ```
 - Homes created by `setup` live at `$REMUDA_HOME/homes/<provider>/<name>`; homes registered with
   `add` stay where they are.
 - Writes are atomic (temporary file + rename) and preserve the user's comments and unknown keys. If
   `config.toml` is a symlink, writes go through the symlink.
 - Loading validates strictly: an invalid name, a duplicate name, a claimed `default`, a named
-  account whose `home` is not an absolute path, and similar problems are all reported as errors
+  account whose `home` is not an absolute path, `share` on a codex account, a `[share.claude] from`
+  that names no claude account, and similar problems are all reported as errors
   naming the file; remuda neither guesses nor skips.
 - Runtime state (index cache, launch log) lives in `$REMUDA_HOME/state/` and may be deleted and
   rebuilt at any time.
@@ -108,6 +113,7 @@ remuda list                     accounts, login identity, home
 remuda sessions [--limit N]     print recent sessions as plain text: time, account attribution, title, cwd (R8, R9)
 remuda add <name> <path>        register an existing home directory (R14)
 remuda setup <name>             create a new home and run `claude auth login`
+remuda relay <session> <account>  continue a session under another account (R19)
 ```
 
 - There is no shell integration, global routing, or per-directory binding.
@@ -161,6 +167,9 @@ remuda setup <name>             create a new home and run `claude auth login`
   sent, so the launch log may contain IDs with no corresponding index row; this is expected. Also,
   a `--resume` that sends no message still appends several bookkeeping records to the original
   transcript (verified on 2.1.281), so "resuming just to look" is not a read-only operation.
+- Shared configuration (R18) is injected into session invocations only, using the classification
+  above: any subcommand name, `--help` / `-h`, or `--version` / `-v` means "not a session". New
+  sessions, resumes, continues, forks, and `-p` runs are sessions.
 - Launch log `state/launches.jsonl`: one line per launch, containing time, account, cwd, args, and
   session ID (or unknown).
 - **[unverified]**: whether variables inherited when launching from within a claude session, such
@@ -311,24 +320,34 @@ appeared in no `history.jsonl`.
   `cleanupPeriodDays`: warning (the default 30-day cleanup deletes everyone's sessions in the
   shared store).
 - A registered home does not exist, or appears not to be logged in.
+- Shared configuration (R18): the source account does not exist or its home is missing; a home
+  shares some but not all of `CLAUDE.md`, `skills`, `commands`, `agents` with the source through
+  symlinks (those items may load twice); an enabled plugin whose install path does not exist; an
+  `installed_plugins.json` whose format is not recognized.
 
-## R12. Shared configuration (v1 detects only)
+## R12. Symlinks in homes
 
 - v1 detects symlinks in a home that point elsewhere and displays them as `-> <target>`.
 - v1 does not create, delete, or modify any symlink. Any future write operation that encounters a
   symlink must either write through it or refuse; it must never replace the symlink with a private
   copy.
+- Configuration is shared without symlinks, by injection at launch (R18). Existing symlink layouts
+  keep working and are detected so that nothing is injected twice.
 
 ## R13. Write boundary
 
 The complete set of v1 write operations:
 
-- `$REMUDA_HOME/config.toml`, `$REMUDA_HOME/state/**`
+- `$REMUDA_HOME/config.toml`, `$REMUDA_HOME/state/**`, `$REMUDA_HOME/shared/**` (R18)
+- On an explicit relay (R19), and only then: a copy of one transcript into
+  `<target home>/projects/<dir>/` and of its checkpoint files into
+  `<target home>/file-history/<id>/`, creating those directories if needed. A relay never
+  overwrites or deletes anything that remuda did not create in an earlier relay.
 - `$REMUDA_HOME/homes/<provider>/<name>/` created by `setup` (an empty directory; login is performed
   by `claude auth login` itself, optionally with `--email` prefilled)
 
 remuda never writes credentials, `.claude.json`, the Keychain, transcripts, `history.jsonl`, or
-`*.key` files, never writes into any home directory, and never makes network requests of its own
+`*.key` files, never writes into any home directory except for the relay copies above, and never makes network requests of its own
 (live usage is queried by the agent itself; see R10).
 
 ## R14. `add <name> <path>`
@@ -375,6 +394,8 @@ defaults to paths inside the sandbox.
   - Refused when the selected account's `projects` store (realpath) differs from the store holding
     the transcript: that account cannot find the session.
   - The cwd is `cwd_last` (R6); an error is reported if the directory does not exist.
+  - `c`: continue under another account (relay, R19): a picker of the other claude accounts, then
+    the relay and a foreground launch.
   - `f`: fork (`--resume <id> --fork-session`, injecting a new ID per R6). A fork only reads the
     original session and writes under a new ID, so it is allowed even for a running session.
   - A background session that is no longer running is resumed from History as an ordinary
@@ -449,3 +470,107 @@ defaults to paths inside the sandbox.
   any other key cancels); if the rollout file was written within the last 10 minutes, the prompt
   adds that it is still being written. Forks need no confirmation.
 - Usage and running sessions: not supported for codex; shown as unavailable in the UI.
+## R18. Shared configuration (M2.5)
+
+Sessions stay with the account that created them; only configuration is shared. remuda shares it
+by injecting launch options, so nothing is written into any home (R13), and homes created by
+`setup` get the shared configuration without any setup of their own.
+
+- **Source.** `[share.claude] from = "<account>"` in `config.toml` names the account whose home is
+  the source of shared configuration (typically `default`, whose home is `~/.claude`). Without this
+  table nothing is shared. The source must be a claude account; loading fails otherwise (R3).
+- **Members.** Every other claude account, unless it sets `share = false`. The source account itself
+  gets no injection. Codex accounts are not affected; `share` on a codex account is a load error
+  (R3).
+- **When.** Only for session invocations (R6), from `run` and from the TUI alike.
+- **What is injected**, component by component. A component is skipped for a home that already
+  shares it with the source, detected by comparing realpaths (existing symlink layouts, R12):
+
+  | Component | Skipped when | Injection |
+  | --- | --- | --- |
+  | Instructions: `CLAUDE.md`, `skills/`, `commands/`, `agents/` | all four resolve to the source's | `--add-dir=$REMUDA_HOME/shared/claude` and `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` in the child environment |
+  | Settings | `settings.json` resolves to the source's | the part of the source's `settings.json` the home does not define, in the single `--settings` |
+  | Plugins | `plugins/` resolves to the source's | `--plugin-dir=<install path>` for each plugin enabled in the source's settings |
+  | Auto-memory | `projects/` resolves to the source's | `autoMemoryDirectory`, in the single `--settings` |
+
+- **Instructions.** `$REMUDA_HOME/shared/claude/` contains exactly one entry, a symlink `.claude`
+  pointing at the source home; remuda creates or corrects it before a launch that needs it. Basis
+  (verified on 2.1.281): with the environment variable set, `--add-dir=<dir>` loads
+  `<dir>/.claude/CLAUDE.md` and the skills, commands, and agents under `<dir>/.claude/` with their
+  plain names, also through a `.claude` symlink; it does not load `<dir>/.claude/settings.json`.
+  Plugins were rejected for this component because plugin items are namespaced (`name:item`), which
+  would rename every agent and skill. Side effects, documented rather than prevented: tools may
+  access that directory like any `--add-dir`, and the variable also loads `CLAUDE.md` from other
+  `--add-dir` directories the user passes.
+- **Settings.** claude loads the home's own `settings.json` and merges `--settings` over it:
+  injected keys win on conflict, and hook lists from both run (verified on 2.1.281). claude uses
+  only the last `--settings` option (verified on 2.1.281), so remuda passes exactly one, inline.
+  The home's own settings must keep precedence, and nothing may run twice, so remuda injects the
+  source's settings **minus what the home already defines**, computed recursively:
+  - a key the home does not define: the source's value is injected;
+  - a key where both values are objects: recurse;
+  - a key where both values are arrays: the source's elements that are not equal (as JSON) to any
+    element of the home's array are injected, so identical hook entries are not duplicated;
+  - any other key the home defines: not injected (the home wins).
+  The result is the home's settings with the source's filling the gaps. **[unverified]**: that claude
+  concatenates arrays other than hook lists (for example `permissions.allow`) rather than replacing
+  them. `autoMemoryDirectory` is added when auto-memory is injected. If the user's arguments already
+  contain `--settings`, remuda injects no settings and no auto-memory and says so on stderr. A
+  settings file that is not a JSON object is an error for the launch.
+- **Plugins.** Enabled plugins are the keys set to `true` in the source settings' `enabledPlugins`.
+  Their install paths come from the source's `plugins/installed_plugins.json` (format version 2:
+  `plugins.<name@marketplace>` is a list of installs; the first `user`-scoped install with an
+  existing `installPath` is used). Basis (verified on 2.1.281): `enabledPlugins` alone does nothing
+  in a home that has not installed the plugin, while `--plugin-dir=<install path>` loads it under
+  the same `name:item` names as an installed plugin, including the plugin's MCP servers. An unrecognized file means no plugin injection
+  and an R11 warning, never a failed launch.
+- **Auto-memory.** Memory belongs with configuration, not with sessions: its default location is
+  `<home>/projects/<project>/memory/`. remuda points it at the source's copy:
+  `<source home>/projects/<project>/memory`. `<project>` is claude's encoding of the project root,
+  where every character that is not an ASCII letter or digit becomes `-`, and the project root is
+  the main repository's root for a git repository (a worktree maps to its main repository) or the
+  cwd otherwise. Basis (verified on 2.1.281, from the memory path claude reports in its system
+  prompt). If the source settings already set `autoMemoryDirectory`, remuda does not override it.
+  **[unverified]**: the encoding of names longer than 200 characters; for those, remuda does not
+  inject auto-memory.
+- **Order.** Injected options come before the user's arguments, each in the `--option=value` form,
+  so that a variadic option (such as `--add-dir`) cannot consume the user's arguments. The launch
+  log (R6) records the injected option names and the byte size of each value, not the values.
+- `run` stays a fast path (R6): injection reads the source's `settings.json` and
+  `installed_plugins.json` and runs `git` once to find the project root; it scans no sessions.
+
+## R19. Relay: continuing a session under another account (M2.5)
+
+A relay continues a session under an account whose `projects` store does not contain it (verified
+on 2.1.281: `--resume <id>` in another home fails with "No conversation found"). The original
+session is never modified: the relay forks it, and the fork belongs to the target account, so
+every session still belongs to exactly one account.
+
+- **Entry points.** `remuda relay <session> <account>` (`<session>` is a full session ID from the
+  index) and `c` in History / Live (R16). Claude sessions only.
+- **Refused** when the target is not a claude account, when the target's `projects` store (realpath)
+  already holds the transcript (use a fork instead), when the transcript's `cwd_last` does not
+  exist (R6), or when the session or target account cannot be resolved.
+- **Copy.**
+  1. The selected transcript (R16: the row, not a lookup by ID) is copied to
+     `<target home>/projects/<dir>/<id>.jsonl`, where `<dir>` is the name of the directory holding
+     the transcript in its store. The copy ends at the last complete line, so a transcript being
+     written (a running session) never yields a partial record.
+  2. The checkpoints in `file-history/<id>/` are copied from every home whose `projects` resolves
+     to the transcript's store (a session may have run under several homes sharing a store), as
+     a union: checkpoint files are content-addressed and immutable, so a name found in two homes is
+     the same file. Missing checkpoints are not an error.
+  Basis (verified on 2.1.281): a fork copies the checkpoints of `file-history/<id>/` to the new ID;
+  without them the fork works but `/rewind` cannot reach points before the fork.
+- **Overwrite rules.** Copies are written to a temporary name and renamed into place. An existing
+  destination transcript is replaced only if the launch log records it as an earlier relay copy
+  and its size and mtime still equal the recorded ones; otherwise the relay is refused.
+  Checkpoint files are immutable (`<hash>@v<n>`): existing ones are kept, missing ones are copied.
+- **Launch.** Under the target account, in `cwd_last`, with R18 injection:
+  `claude --resume <id> --fork-session --session-id <new uuid>`. The launch log records `fork_of`
+  and a `relay` object: the source transcript path, the copied paths, and the copy's size and
+  mtime.
+- **Index.** A transcript recorded as a relay copy is hidden from History and is not attributed to
+  the target account; the original row keeps its attribution. If `state/` is deleted (R3), copies
+  reappear as the same ID in two stores, which R16 already handles.
+- A relay is allowed while the session is running, like a fork (R16).
