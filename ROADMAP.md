@@ -1,6 +1,7 @@
 # remuda roadmap
 
-**Status:** v0.1.0. Milestones M0–M3 are complete; M2.5 is in progress.
+**Status:** v0.1.0. Milestones M0–M3 are complete; M2.5 is implemented and awaits dogfooding
+before release.
 
 remuda is a multi-account and session manager for coding agents (Claude Code and Codex). Its
 behavior contract is [SPEC.md](SPEC.md); this document records the design principles, decisions,
@@ -74,13 +75,16 @@ stop for background sessions (via `claude attach|logs|stop`).
 **M3 · Codex provider** — **Done**
 Codex accounts (`CODEX_HOME`), the rollout session index, and launch / resume / fork (SPEC R4, R17).
 
-**M2.5 · Shared configuration and relay** — **In progress**
+**M2.5 · Shared configuration and relay** — **Implemented; dogfooding pending**
 Sessions stay with the account that created them; configuration is shared by injection at launch
 (SPEC R18): instructions (`CLAUDE.md`, skills, commands, agents) through `--add-dir`, settings and
 the auto-memory location through one `--settings`, and enabled plugins through `--plugin-dir`.
 Nothing is written into any home, and existing symlink layouts are detected so nothing loads
 twice. A relay (SPEC R19) continues a session under another account by copying its transcript and
 checkpoints into the target store and forking it there.
+It is released as 0.2.0 after it has run on a real multi-account setup. Homes that symlink every
+component, `projects` included, into the source home get nothing injected and refuse every relay,
+so such a setup first moves `projects` to per-account stores.
 
 ## Later, as needed
 
