@@ -2,6 +2,7 @@
 //! login's directory, the session store, launch arguments and login. Everything that differs
 //! between claude and codex is decided here or in a module this points to.
 
+pub mod app_server;
 pub mod codex;
 
 use std::fmt;
