@@ -170,3 +170,47 @@ fn write_rollout_in(dir: &Path, id: &str, contents: &str) -> PathBuf {
     fs::write(&path, contents).unwrap();
     path
 }
+
+/// A `turn_context` naming the model.
+pub fn model_turn(model: &str, ts: &str) -> String {
+    record(
+        "turn_context",
+        ts,
+        json!({"turn_id": "t1", "cwd": "/w/proj", "model": model,
+               "approval_policy": "on-request"}),
+    )
+}
+
+/// Codex usage `[input (cached included), cached, output, reasoning]`.
+pub fn usage(u: [u64; 4]) -> Value {
+    json!({"input_tokens": u[0], "cached_input_tokens": u[1], "cache_write_input_tokens": 0,
+           "output_tokens": u[2], "reasoning_output_tokens": u[3], "total_tokens": u[0] + u[2]})
+}
+
+/// A `token_count` event with `info`: the cumulative `total` and the latest request's `last`.
+pub fn tokens(total: [u64; 4], last: [u64; 4], ts: &str) -> String {
+    record(
+        "event_msg",
+        ts,
+        json!({"type": "token_count",
+               "info": {"total_token_usage": usage(total), "last_token_usage": usage(last),
+                        "model_context_window": 258400},
+               "rate_limits": null}),
+    )
+}
+
+/// A forked rollout's first record: `session_meta` with `forked_from_id`.
+pub fn fork_meta(id: &str, parent: &str, cwd: &str, ts: &str) -> String {
+    record(
+        "session_meta",
+        ts,
+        json!({"session_id": id, "id": id, "forked_from_id": parent, "timestamp": ts,
+               "cwd": cwd, "originator": "codex_vscode", "cli_version": "0.155.1",
+               "source": "vscode", "model_provider": "openai"}),
+    )
+}
+
+/// The `compacted` record codex writes after compacting.
+pub fn compacted(ts: &str) -> String {
+    record("compacted", ts, json!({"message": "summary"}))
+}

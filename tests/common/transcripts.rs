@@ -116,3 +116,82 @@ pub fn filler(bytes: usize, cwd: &str, ts: &str) -> String {
     );
     line(Value::Object(m))
 }
+
+/// `message.usage` as claude 2.1.281 writes it.
+pub fn usage(input: u64, output: u64, cache_write: u64, cache_read: u64) -> Value {
+    json!({"input_tokens": input, "output_tokens": output,
+           "cache_creation_input_tokens": cache_write, "cache_read_input_tokens": cache_read,
+           "cache_creation": {"ephemeral_1h_input_tokens": cache_write,
+                              "ephemeral_5m_input_tokens": 0},
+           "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+           "service_tier": "standard", "inference_geo": "not_available"})
+}
+
+/// One content block's record of assistant message `id` (claude writes one per block, each
+/// repeating the message's usage), with its `requestId`.
+pub fn assistant_usage(session: &str, id: &str, model: &str, usage: Value, ts: &str) -> String {
+    let mut m = base("assistant", "/w/proj", ts);
+    m.insert("sessionId".into(), json!(session));
+    m.insert("requestId".into(), json!(format!("req_{id}")));
+    m.insert(
+        "message".into(),
+        json!({"id": id, "type": "message", "role": "assistant", "model": model,
+               "content": [{"type": "text", "text": "ok"}], "stop_reason": null,
+               "usage": usage}),
+    );
+    line(Value::Object(m))
+}
+
+fn parse(record: &str) -> serde_json::Map<String, Value> {
+    match serde_json::from_str(record).unwrap() {
+        Value::Object(m) => m,
+        other => panic!("not a record: {other}"),
+    }
+}
+
+/// `record` as a fork copies it: with `forkedFrom` naming the parent session.
+pub fn forked(record: &str, parent: &str) -> String {
+    let mut m = parse(record);
+    m.insert(
+        "forkedFrom".into(),
+        json!({"sessionId": parent, "messageUuid": "00000000-0000-4000-8000-0000000000ff"}),
+    );
+    line(Value::Object(m))
+}
+
+/// A subagent's record: `isSidechain: true` and `agentId`.
+pub fn sidechain(record: &str, agent: &str) -> String {
+    let mut m = parse(record);
+    m.insert("isSidechain".into(), json!(true));
+    m.insert("agentId".into(), json!(agent));
+    line(Value::Object(m))
+}
+
+/// A `progress` record of claude 2.1.7x–2.1.8x repeating a subagent's assistant record `inner`.
+pub fn agent_progress(inner: &str, agent: &str, ts: &str) -> String {
+    let inner = parse(inner);
+    let mut m = base("progress", "/w/proj", ts);
+    m.insert(
+        "data".into(),
+        json!({"type": "agent_progress", "agentId": agent,
+               "message": {"type": "assistant", "timestamp": ts, "message": inner["message"],
+                           "requestId": inner["requestId"]}}),
+    );
+    line(Value::Object(m))
+}
+
+/// A user record whose tool result sums a subagent's usage (`toolUseResult.usage`).
+pub fn task_result(usage: Value, ts: &str) -> String {
+    let mut m = base("user", "/w/proj", ts);
+    m.insert(
+        "message".into(),
+        json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_01",
+                                            "content": [{"type": "text", "text": "done"}]}]}),
+    );
+    m.insert(
+        "toolUseResult".into(),
+        json!({"status": "completed", "agentId": "a1", "totalTokens": 1,
+               "totalToolUseCount": 1, "usage": usage}),
+    );
+    line(Value::Object(m))
+}

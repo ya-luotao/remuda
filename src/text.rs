@@ -37,6 +37,36 @@ pub fn pad(s: &str, w: usize) -> String {
     out
 }
 
+/// A token count for a narrow column: whole below 1,000, else in K, M, B or T rounded to one
+/// decimal below 100 (a trailing `.0` dropped) and to a whole number from 100 (`1.2M`, `93.3B`,
+/// `118K`). Rounding up moves to the next unit (`999_500` is `1M`).
+pub fn human_count(n: u64) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    let n = u128::from(n);
+    for (unit, suffix) in [
+        (1_000, "K"),
+        (1_000_000, "M"),
+        (1_000_000_000, "B"),
+        (1_000_000_000_000, "T"),
+    ] {
+        let tenths = (n * 10 + unit / 2) / unit;
+        if tenths < 1000 {
+            return match tenths % 10 {
+                0 => format!("{}{suffix}", tenths / 10),
+                d => format!("{}.{d}{suffix}", tenths / 10),
+            };
+        }
+        let whole = (n + unit / 2) / unit;
+        if whole < 1000 {
+            return format!("{whole}{suffix}");
+        }
+    }
+    let unit: u128 = 1_000_000_000_000;
+    format!("{}T", (n + unit / 2) / unit)
+}
+
 /// `s` wrapped to lines of at most `max` columns: at spaces where possible, inside a word
 /// when the word alone is too wide. Existing line breaks are kept; tabs count as spaces.
 pub fn wrap(s: &str, max: usize) -> Vec<String> {
@@ -329,6 +359,26 @@ mod tests {
         assert_eq!(terminal_text(""), "");
         // A cut-off sequence at the end is ignored.
         assert_eq!(terminal_text(&format!("end{esc}[3")), "end");
+    }
+
+    #[test]
+    fn human_count_rounds_to_units() {
+        for (n, shown) in [
+            (0, "0"),
+            (999, "999"),
+            (1000, "1K"),
+            (1049, "1K"),
+            (1050, "1.1K"),
+            (99_949, "99.9K"),
+            (99_950, "100K"),
+            (999_499, "999K"),
+            (999_500, "1M"),
+            (1_234_567, "1.2M"),
+            (93_328_770_717, "93.3B"),
+            (u64::MAX, "18446744T"),
+        ] {
+            assert_eq!(human_count(n), shown, "{n}");
+        }
     }
 
     #[test]
