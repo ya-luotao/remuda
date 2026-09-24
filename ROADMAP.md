@@ -34,6 +34,8 @@ and planned work.
 | 2026-09-23 | Pre-assign new session IDs with `--session-id` | The ID is known before launch, so attribution is exact and `run` can exec directly (R6, R9) |
 | 2026-09-24 | Sessions are not shared between accounts; configuration is | Exact attribution, no cross-account cleanup, work and personal sessions stay apart; switching accounts mid-session is covered by relay (R19) |
 | 2026-09-24 | Share configuration by launch-time injection, not symlinks | No writes into homes (R13), no drift, new accounts share automatically; plugin packaging rejected because it namespaces agent and skill names (R18) |
+| 2026-09-24 | Token statistics from transcripts, deduplicated by message id / cumulative total, own cache | The agents record exact usage per request; `message.id` and codex's cumulative total identify a request across repeated records, forks and relay copies. A row per request in `state/stats.json` keeps deduplication exact and needs no time zone; it stays out of `index.json`, which reads only head and tail windows (R20) |
+| 2026-09-24 | Private mode as a redacted snapshot of the TUI state | The screen is drawn from a copy of the state with names aliased and personal fields masked; every field is destructured, so a new one cannot reach the screen before it is decided how it is shown (R21) |
 | 2026-09-24 | Codex live usage and identity through `codex app-server`, only on explicit live queries; `list` keeps `codex login status` | `account/rateLimits/read` and `account/read` are machine-readable and codex reads its own credentials, so `auth.json` stays unread; but starting app-server is like launching Codex (it may refresh a token, uses the network, writes state into the home, takes about 1.5 s), so it runs only when live usage is asked for (R4, R10, R10a) |
 
 ## Technology
@@ -43,7 +45,8 @@ and planned work.
 - `serde` / `serde_json`: line-by-line JSONL parsing, skipping malformed lines
 - `toml_edit`: preserves comments when writing `config.toml` (R3)
 - `nucleo`: fuzzy search
-- The index cache is a single file under `state/`; move to SQLite only if data volume requires it
+- The index and statistics caches are single files under `state/`; move to SQLite only if data
+  volume requires it
 - A single crate (lib + bin), organized into modules:
   `registry`, `provider/{claude,codex}`, `usage`, `live`, `index`, `launch`, `tui`, `cli`
 
@@ -55,6 +58,9 @@ and planned work.
 - **History**: all sessions in chronological order, fuzzy-searchable by title / cwd / account, with
   attribution.
 - **Preview**: the last few messages of the selected session.
+- **Stats**: tokens per account and model for a period, computed in the background the first time
+  the view opens (R20).
+- **Private mode**: `Ctrl-P` hides names, emails, paths and session content for screenshots (R21).
 - Actions: start a new session in a directory with the selected account; resume the selected
   session (optionally under a different account); set up a new account; remove an account from the
   registry.
@@ -102,6 +108,9 @@ so such a setup first moves `projects` to per-account stores.
 - Show plugins in the accounts view: `claude plugin list --json`.
 - Interact with running sessions through `messagingSocketPath`.
 - Relocate homes using `CLAUDE_SECURESTORAGE_CONFIG_DIR` (R2).
+- `--private` for command-line output (R21 covers the TUI only).
+- Cost estimates for the token statistics.
+- A daily chart of token usage.
 
 ## Known issues
 

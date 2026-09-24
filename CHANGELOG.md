@@ -24,6 +24,16 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   place, and its path is printed so it can be registered again; `default` and the source of
   shared configuration cannot be removed. `D` in the TUI's Accounts view does the same after
   confirmation.
+- Token statistics (SPEC R20): `remuda stats [<account>] [--period today|7d|30d|all]` and the
+  TUI's Stats view (`4`; `t` cycles the period) show input, cache read, cache write, output and
+  reasoning tokens per account and model, counted from Claude transcripts (subagents and advisor
+  calls included) and Codex rollouts. Each request counts once across repeated records, forks,
+  relay copies and shared stores; a session attributed to several accounts is counted once, for
+  those accounts together. The counts are cached in `state/stats.json`; the first run reads every
+  transcript whole.
+- Private mode in the TUI (SPEC R21): `Ctrl-P`, anywhere, hides account names (shown as aliases),
+  emails, organizations, paths, session titles, previews, logs and typed text, for screenshots.
+  Numbers, model names and session IDs stay visible.
 - Codex usage limits (SPEC R10): `remuda usage` reads the newest rate limits Codex recorded in the
   account's rollouts; `--live` and `u` in the TUI query them through `codex app-server`. Five-hour
   and weekly windows show as Session and Week, per-model limits by name, on the same timeline as
