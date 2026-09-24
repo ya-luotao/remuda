@@ -35,7 +35,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::provider::Provider;
 use crate::registry::{Account, Registry};
-use crate::{Env, launch, paths, setup};
+use crate::{Env, launch, paths, setup, share};
 
 use app::{App, Effect, Event, Exit, Key, LaunchRequest, Mode};
 
@@ -382,14 +382,25 @@ fn run_launch(
         return Ok((Err(missing), Vec::new()));
     };
     let cwd = request.cwd.as_deref().or(deps.cwd.as_deref());
-    let plan = launch::prepare(
-        &request.account,
-        request.args.clone(),
-        cwd,
-        (deps.clock)().to_string(),
-        || uuid::Uuid::new_v4().to_string(),
-    );
+    // The registry as it is now, for its shared configuration (R18).
+    let planned = Registry::load(&deps.config).and_then(|registry| {
+        launch::plan(
+            &request.account,
+            request.args.clone(),
+            cwd,
+            (deps.clock)().to_string(),
+            || uuid::Uuid::new_v4().to_string(),
+            &registry.sharing,
+            &deps.env,
+            &share::dir(&deps.config),
+        )
+    });
+    let plan = match planned {
+        Ok(plan) => plan,
+        Err(e) => return Ok((Err(format!("{e:#}")), Vec::new())),
+    };
     let mut warnings = launch::env_warnings(&deps.env);
+    warnings.extend(plan.notices.iter().cloned());
     let log = deps.state_dir.join("launches.jsonl");
     if let Err(e) = screen.suspend() {
         let _ = screen.resume();

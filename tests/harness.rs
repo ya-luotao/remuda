@@ -36,6 +36,7 @@ fn fake_claude_records_argv_env_and_cwd_exactly() {
     );
     assert_eq!(inv.config_dir.as_deref(), Some("/x/with space/"));
     assert_eq!(inv.securestorage_dir, None);
+    assert_eq!(inv.add_dir_claude_md, None);
     assert_eq!(inv.cwd, sb.work().canonicalize().unwrap());
 }
 
@@ -47,6 +48,7 @@ fn fake_claude_distinguishes_empty_from_unset() {
             .env_clear()
             .env("FAKE_CLAUDE_OUT", sb.claude_out())
             .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+            .env("CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD", "1")
             .current_dir(sb.work())
             .status()
             .expect("run fake claude");
@@ -56,6 +58,7 @@ fn fake_claude_distinguishes_empty_from_unset() {
     for inv in all {
         assert_eq!(inv.config_dir, None);
         assert_eq!(inv.securestorage_dir.as_deref(), Some(""));
+        assert_eq!(inv.add_dir_claude_md.as_deref(), Some("1"));
         assert!(inv.args.is_empty());
     }
 }

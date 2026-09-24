@@ -14,7 +14,7 @@ use crate::index::{self, Index};
 use crate::provider::Provider;
 use crate::registry::{self, Account, Registry};
 use crate::{Env, paths};
-use crate::{attribution, launch, live, probe, setup, text, transcript, tui, usage};
+use crate::{attribution, launch, live, probe, setup, share, text, transcript, tui, usage};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -161,10 +161,11 @@ fn run_account(
     args: Vec<String>,
     ctx: &Context,
 ) -> Result<ExitCode> {
-    let account = match account {
+    let (account, registry) = match account {
         Some(reference) if reference.starts_with('-') => {
-            match Registry::load(config)?.resolve(&reference) {
-                Ok(account) => account,
+            let registry = Registry::load(config)?;
+            match registry.resolve(&reference) {
+                Ok(account) => (account, registry),
                 Err(_) => {
                     eprintln!(
                         "remuda: `remuda run` without an account takes no other arguments \
@@ -175,7 +176,10 @@ fn run_account(
                 }
             }
         }
-        Some(reference) => Registry::load(config)?.resolve(&reference)?,
+        Some(reference) => {
+            let registry = Registry::load(config)?;
+            (registry.resolve(&reference)?, registry)
+        }
         None => {
             if !(ctx.stdin_is_tty && ctx.stdout_is_tty) {
                 bail!(
@@ -184,30 +188,55 @@ fn run_account(
                 );
             }
             match open_tui(config, ctx, tui::app::Mode::PickForRun)? {
-                Some(account) => account,
+                // The registry as it is now: the picker may have been open a while.
+                Some(account) => (account, Registry::load(config)?),
                 // Cancelled: nothing was launched.
                 None => return Ok(ExitCode::FAILURE),
             }
         }
     };
-    exec_as(config, &account, args, ctx)
+    exec_as(config, &registry, &account, args, ctx)
 }
 
-/// Execs the account's agent exactly like `remuda run <account> [args...]` (R6, R17).
-fn exec_as(config: &Path, account: &Account, args: Vec<String>, ctx: &Context) -> Result<ExitCode> {
+/// Execs the account's agent exactly like `remuda run <account> [args...]` (R6, R17), with the
+/// shared configuration of `registry` (R18).
+fn exec_as(
+    config: &Path,
+    registry: &Registry,
+    account: &Account,
+    args: Vec<String>,
+    ctx: &Context,
+) -> Result<ExitCode> {
     let program = program(ctx, account.provider)?;
-    let plan = launch::prepare(
+    let plan = launch::plan(
         account,
         args,
         ctx.cwd.as_deref(),
         // After a pick, time has passed since `ctx.now`.
         (ctx.clock)().to_string(),
         || uuid::Uuid::new_v4().to_string(),
-    );
+        &registry.sharing,
+        &ctx.env,
+        &share::dir(config),
+    )?;
+    exec_plan(config, &program, &plan, None, ctx)
+}
+
+/// Warnings and notices, the launch log, then exec (R6): the ID is on disk before claude
+/// starts; a failed log write never blocks the launch.
+fn exec_plan(
+    config: &Path,
+    program: &Path,
+    plan: &launch::Launch,
+    cwd: Option<&Path>,
+    ctx: &Context,
+) -> Result<ExitCode> {
     for warning in launch::env_warnings(&ctx.env) {
         eprintln!("remuda: warning: {warning}");
     }
-    // The ID is on disk before claude starts (R6); a failed log write never blocks the launch.
+    for notice in &plan.notices {
+        eprintln!("remuda: {notice}");
+    }
     let log = state_dir(config).join("launches.jsonl");
     if let Err(e) = launch::append_log(&log, &plan.record) {
         eprintln!(
@@ -215,7 +244,7 @@ fn exec_as(config: &Path, account: &Account, args: Vec<String>, ctx: &Context) -
             log.display()
         );
     }
-    let err = launch::exec(&program, &plan.args, &plan.env);
+    let err = launch::exec(program, plan, cwd);
     Err(anyhow::Error::new(err).context(format!("cannot run {}", program.display())))
 }
 

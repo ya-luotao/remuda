@@ -15,6 +15,7 @@ pub mod probe;
 pub mod provider;
 pub mod registry;
 pub mod setup;
+pub mod share;
 pub mod text;
 pub mod transcript;
 pub mod tui;

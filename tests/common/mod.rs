@@ -24,7 +24,9 @@ use tempfile::TempDir;
 ///
 /// Record layout (every field terminated by NUL):
 /// `@@invocation`, `cwd=<physical cwd>`, `ccd=<unset|set:VALUE>` (CLAUDE_CONFIG_DIR),
-/// `css=<unset|set:VALUE>` (CLAUDE_SECURESTORAGE_CONFIG_DIR), then `arg=<argv[i]>` per argument.
+/// `css=<unset|set:VALUE>` (CLAUDE_SECURESTORAGE_CONFIG_DIR),
+/// `acm=<unset|set:VALUE>` (CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD, R18), then
+/// `arg=<argv[i]>` per argument.
 ///
 /// Fixtures live in `$CLAUDE_CONFIG_DIR/<name>`, or `$HOME/.<name>` when it is unset:
 /// - `fake-sleep`: if present, `exec sleep <its contents>` (simulates a hang);
@@ -63,6 +65,11 @@ if [ -n "${FAKE_CLAUDE_OUT+x}" ]; then
       printf 'css=set:%s\0' "$CLAUDE_SECURESTORAGE_CONFIG_DIR"
     else
       printf 'css=unset\0'
+    fi
+    if [ -n "${CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD+x}" ]; then
+      printf 'acm=set:%s\0' "$CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"
+    else
+      printf 'acm=unset\0'
     fi
     for a in "$@"; do
       printf 'arg=%s\0' "$a"
@@ -192,6 +199,8 @@ pub struct Invocation {
     pub config_dir: Option<String>,
     /// `None` when `CLAUDE_SECURESTORAGE_CONFIG_DIR` was unset.
     pub securestorage_dir: Option<String>,
+    /// `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` (R18); `None` when unset.
+    pub add_dir_claude_md: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -459,6 +468,7 @@ pub fn parse_invocations(bytes: &[u8]) -> Vec<Invocation> {
             .expect("cwd field");
         let config_dir = parse_var(iter.next().and_then(|f| f.strip_prefix("ccd=")));
         let securestorage_dir = parse_var(iter.next().and_then(|f| f.strip_prefix("css=")));
+        let add_dir_claude_md = parse_var(iter.next().and_then(|f| f.strip_prefix("acm=")));
         let mut args = Vec::new();
         while let Some(f) = iter.peek() {
             if *f == "@@invocation" {
@@ -472,6 +482,7 @@ pub fn parse_invocations(bytes: &[u8]) -> Vec<Invocation> {
             cwd: PathBuf::from(cwd),
             config_dir,
             securestorage_dir,
+            add_dir_claude_md,
             args,
         });
     }
