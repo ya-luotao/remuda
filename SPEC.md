@@ -515,34 +515,51 @@ by injecting launch options, so nothing is written into any home (R13), and home
   - a key where both values are arrays: the source's elements that are not equal (as JSON) to any
     element of the other array are kept, so identical hook entries are not duplicated;
   - any other key the other side defines: dropped (the other side wins).
-  The project settings are those claude reads (2.1.281 bundle): `.claude/settings.json` and
-  `.claude/settings.local.json` of the start directory (the launch cwd, as in the auto-memory rule
-  below), not of the project root; and also `.claude/settings.local.json` of the project root when
-  that root differs from the start directory, is not the user's home directory, and it, its `.git`
-  and its `.claude` (if any) belong to the current user. Unreadable or invalid project files are
-  treated as absent.
-  **[unverified]**: that claude concatenates arrays other than hook lists (for example
-  `permissions.allow`) rather than replacing them.
-- **Never injected: authentication.** Keys that choose credentials, provider, or organization are
-  removed from the injected settings, whatever the home defines, so a member never authenticates or
-  bills as the source: `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`, `gcpAuthRefresh`,
-  `forceLoginMethod`, `forceLoginOrgUUID`, and in `env`: `ANTHROPIC_API_KEY`,
-  `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_OAUTH_TOKEN`,
-  `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`,
-  `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`. The accounts view (R11) lists the keys
-  withheld this way.
+  claude's merge replaces rather than combines a few keys (read from the 2.1.281 bundle: every
+  array is concatenated and deduplicated except `fallbackModel`, which is replaced; `modelPicker` is
+  replaced; `extraKnownMarketplaces` and `managedMcpServers` are merged one level deep). These are
+  compared as whole values: `fallbackModel` and `modelPicker` are dropped if the other side defines
+  them at all, and each entry of `extraKnownMarketplaces` (and its alias `additionalMarketplaces`)
+  and `managedMcpServers` is dropped if the other side defines that entry.
+  Project settings are read as claude reads them (from the 2.1.281 bundle): `.claude/settings.json`
+  from the start directory; `.claude/settings.local.json` from the start directory and, when the
+  project root differs from it, is not the real home directory, and it, its `.git`, and its
+  `.claude` belong to the current user, also from the project root. Unreadable or invalid project
+  files are treated as absent. If the user's arguments contain `--setting-sources`, remuda injects
+  no settings and no auto-memory and says so on stderr, as for `--settings`.
+- **Never injected: authentication.** Settings that choose credentials, provider, endpoint, or
+  organization are removed from the injected settings, whatever the home defines, so a member never
+  authenticates or bills as the source, and no secret of the source reaches a member's tools:
+  - the keys `apiKeyHelper`, `proxyAuthHelper`, `awsAuthRefresh`, `awsCredentialExport`,
+    `gcpAuthRefresh`, `forceLoginMethod`, `forceLoginOrgUUID`;
+  - in `env`, every name that starts with `ANTHROPIC_`, `AWS_`, `AZURE_`, `GOOGLE_`, `CLOUDSDK_`,
+    `CLOUD_ML_`, `CLAUDE_CODE_USE_`, `CLAUDE_CODE_SKIP_`, or `_CLAUDE_CODE_`; every name that
+    contains `TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `OAUTH`, `UUID`, or `BASE_URL`;
+    and `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Exception: the model-name variables
+    `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, and `ANTHROPIC_DEFAULT_*_MODEL*` are shared.
+  The rules follow claude's own groupings of provider, credential, and endpoint variables in the
+  2.1.281 bundle, widened to prefixes so that new variables are withheld by default. The accounts
+  view (R11) lists the settings withheld this way.
 - **Passing settings.** claude uses only the last `--settings` option (verified on 2.1.281), so
   remuda passes exactly one, as a file path, never inline: the injected JSON is written with mode
   0600 to `$REMUDA_HOME/state/settings/<sha256 of the content>.json` (written atomically, reused
-  when the content is unchanged; files not used for 30 days are removed when a new one is written).
+  when the content is unchanged; files not used for 30 days are removed when a new one is written,
+  under an exclusive lock on the directory that reuse also takes, so a file is never removed
+  between being chosen and being passed). claude reads the file once at startup and keeps its
+  content (2.1.281 bundle).
   This keeps settings values out of the process list and away from per-argument size limits.
   `autoMemoryDirectory` is added to the same JSON when auto-memory is injected. If the user's
   arguments already contain `--settings`, remuda injects no settings and no auto-memory and says so
   on stderr. A settings file of the source or home that is not a JSON object is an error for the
   launch.
+  Note: claude treats a settings file passed with `--settings` like repository settings in one
+  check: a cloud or teleport git-bundle upload refuses if such a file sets `env.PATH`, `env.HOME`,
+  or similar variables (2.1.281 bundle). remuda shares them anyway; the case is rare.
 - **Plugins.** Enabled plugins are the keys set to `true` in the source settings' `enabledPlugins`,
-  except those the home sets to `false` in its own `enabledPlugins` and those the home has installed
-  itself (listed in its own `plugins/installed_plugins.json`), which would otherwise load twice.
+  except those set to `false` in the `enabledPlugins` of the home or of the project settings above,
+  and those the home has installed itself with `user` scope, or with `project` / `local` scope for
+  the start directory (listed in its own `plugins/installed_plugins.json`), which would otherwise
+  load twice.
   Their install paths come from the source's `plugins/installed_plugins.json` (format version 2:
   `plugins.<name@marketplace>` is a list of installs; the first `user`-scoped install with an
   existing `installPath` is used). Basis (verified on 2.1.281): `enabledPlugins` alone does nothing
@@ -555,13 +572,15 @@ by injecting launch options, so nothing is written into any home (R13), and home
   (read from the 2.1.281 bundle and checked against the path claude reports):
   - The start directory is the launch cwd (for a resume or relay, `cwd_last`), made absolute,
     canonicalized (realpath), and NFC-normalized, as claude does with its own cwd.
-  - The project root comes from one `git -C <start> rev-parse --path-format=absolute --git-dir
-    --git-common-dir --show-toplevel`: if the git dir equals the common dir (a plain repository, a
-    submodule, or a separate git dir), the root is the top level; otherwise (a linked worktree) it
-    is the parent of the common dir when the common dir's name is `.git`, and the common dir itself
-    when it is not (a worktree of a bare repository). Outside any repository, including inside a
-    bare repository, the root is the start directory. If `git` cannot run or fails for another
-    reason, remuda does not inject auto-memory and says so, rather than guessing.
+  - The project root is found as claude finds it, without running git (read from the 2.1.281
+    bundle): walk up from the start directory to the first directory containing a `.git` entry
+    (file or directory). If that `.git` is a file of the form `gitdir: <path>` whose git dir has a
+    `commondir`, and the git dir's `gitdir` file points back (by realpath) at that `.git` file, the
+    root is the parent of the common dir when the common dir is named `.git`, and the common dir
+    itself otherwise (a linked worktree, including a worktree of a bare repository); on any other
+    outcome the root is the directory containing `.git` (a plain repository, a submodule, a
+    separate git dir, a moved worktree). With no `.git` entry up to `/`, the root is the start
+    directory.
   - The root is NFC-normalized. `<project>` replaces every UTF-16 code unit that is not an ASCII
     letter or digit with `-` (so a character outside the Basic Multilingual Plane becomes `--`).
   - If the root has more than 200 UTF-16 code units, claude truncates and hashes the name
@@ -572,7 +591,7 @@ by injecting launch options, so nothing is written into any home (R13), and home
   so that a variadic option (such as `--add-dir`) cannot consume the user's arguments. The launch
   log (R6) records the injected option names and the byte size of each value, not the values.
 - `run` stays a fast path (R6): injection reads a handful of settings files and
-  `installed_plugins.json` and runs `git` at most once; it scans no sessions.
+  `installed_plugins.json`, runs no subprocess, and scans no sessions.
 
 ## R19. Relay: continuing a session under another account (M2.5)
 
