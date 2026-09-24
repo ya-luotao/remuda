@@ -1,0 +1,3514 @@
+//! `update` driven directly, and `render` into ratatui's `TestBackend`: no terminal.
+
+use std::path::{Path, PathBuf};
+
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+
+use super::app::{
+    App, Effect, Event, Exit, Form, FormKind, Key, LaunchRequest, Level, Mode, Overlay, View,
+    update,
+};
+use super::render;
+use crate::attribution::Attribution;
+use crate::checks::Check;
+use crate::identity::Identity;
+use crate::index::{Entry, Store};
+use crate::live::{Control, LiveSession, Source};
+use crate::registry::{Account, CLAUDE, CODEX, Home};
+use crate::transcript::{Message, Role};
+use crate::usage::{CachedUsage, LiveUsage, Resets, UsageRow};
+
+const NOW: &str = "2026-09-24T12:00:00Z";
+
+fn ts(s: &str) -> Timestamp {
+    s.parse().unwrap()
+}
+
+fn account(name: &str) -> Account {
+    if name == "default" {
+        return Account::default_for(CLAUDE);
+    }
+    Account {
+        provider: CLAUDE,
+        name: name.into(),
+        home: Home::Path(format!("/h/{name}")),
+    }
+}
+
+fn app() -> App {
+    let mut app = App::new(
+        vec![account("default"), account("max"), account("team")],
+        TimeZone::UTC,
+        Some("/Users/you".into()),
+        ts(NOW),
+    );
+    update(&mut app, Event::Resize(80, 24));
+    app.cwd = Some(PathBuf::from("/Users/you/space/remuda"));
+    app
+}
+
+/// An entry last active `minute` minutes past 10:00 on Sep 24.
+fn entry(id: &str, title: &str, minute: u32) -> Entry {
+    Entry {
+        provider: CLAUDE,
+        session_id: id.into(),
+        path: PathBuf::from(format!("/s/-w/{id}.jsonl")),
+        store: PathBuf::from("/s"),
+        size: 10,
+        mtime_ns: 0,
+        ino: 1,
+        scanned_offset: 10,
+        gap: false,
+        title: None,
+        first_user_text: Some(title.into()),
+        cwd_first: Some("/Users/you/space/remuda".into()),
+        cwd_last: Some("/Users/you/space/remuda".into()),
+        ts_first: None,
+        ts_last: Some(format!("2026-09-24T10:{minute:02}:00Z")),
+        entrypoint: Some("cli".into()),
+        source: None,
+        originator: None,
+    }
+}
+
+fn path(id: &str) -> PathBuf {
+    PathBuf::from(format!("/s/-w/{id}.jsonl"))
+}
+
+fn live(account: &str, pid: u32, session: Option<&str>) -> LiveSession {
+    LiveSession {
+        account: account.into(),
+        pid: Some(pid),
+        short_id: None,
+        cwd: Some("/Users/you/space/remuda".into()),
+        kind: Some("interactive".into()),
+        started_at: Some(ts("2026-09-24T11:57:00Z").as_millisecond()),
+        session_id: session.map(str::to_string),
+        name: Some("fix index".into()),
+        status: Some("busy".into()),
+        source: Source::Agents,
+    }
+}
+
+fn row(label: &str, percent: f64, severity: Option<&str>, resets: Option<&str>) -> UsageRow {
+    UsageRow {
+        label: label.into(),
+        percent,
+        severity: severity.map(str::to_string),
+        resets: resets.map(|r| Resets::At(ts(r))),
+    }
+}
+
+fn cached(rows: Vec<UsageRow>) -> Result<CachedUsage, String> {
+    Ok(CachedUsage {
+        fetched_at: Some(ts("2026-09-24T11:55:00Z")),
+        rows,
+    })
+}
+
+fn logged_in(email: &str) -> Identity {
+    Identity::LoggedIn {
+        email: Some(email.into()),
+        org: Some("Org".into()),
+        plan: Some("max".into()),
+        method: None,
+        cached: false,
+    }
+}
+
+fn keys(app: &mut App, keys: &[Key]) -> Vec<Effect> {
+    keys.iter()
+        .flat_map(|k| update(app, Event::Key(*k)))
+        .collect()
+}
+
+fn type_str(app: &mut App, s: &str) -> Vec<Effect> {
+    s.chars()
+        .flat_map(|c| update(app, Event::Key(Key::Char(c))))
+        .collect()
+}
+
+fn history_ids(app: &App) -> Vec<String> {
+    app.history
+        .rows
+        .iter()
+        .map(|p| p.file_stem().unwrap().to_str().unwrap().to_string())
+        .collect()
+}
+
+fn tick(app: &mut App, secs: i64) -> Vec<Effect> {
+    let now = app.now + jiff::SignedDuration::from_millis(secs * 1000);
+    update(app, Event::Tick(now))
+}
+
+// ---- update ------------------------------------------------------------------------
+
+#[test]
+fn start_requests_everything_in_the_background() {
+    let mut app = app();
+    assert_eq!(
+        app.start(),
+        [
+            Effect::RefreshIndex,
+            Effect::Identities,
+            Effect::CachedUsage,
+            Effect::Live,
+            Effect::Attribution,
+            Effect::Checks
+        ]
+    );
+    // `r` while everything is still running does not stack it.
+    assert_eq!(keys(&mut app, &[Key::Char('r')]), []);
+    update(
+        &mut app,
+        Event::IndexDone {
+            entries: vec![],
+            error: None,
+        },
+    );
+    update(&mut app, Event::Live(vec![]));
+    finish_accounts(&mut app);
+    update(&mut app, Event::Attribution(Attribution::default()));
+    update(&mut app, Event::Checks(vec![]));
+    assert_eq!(
+        keys(&mut app, &[Key::Char('r')]),
+        [
+            Effect::RefreshIndex,
+            Effect::Identities,
+            Effect::CachedUsage,
+            Effect::Live,
+            Effect::Attribution,
+            Effect::Checks
+        ]
+    );
+}
+
+/// Identity and cached usage for every account of [`app`].
+fn finish_accounts(app: &mut App) {
+    for account in 0..3 {
+        update(
+            app,
+            Event::Identity {
+                account,
+                identity: Identity::NotLoggedIn,
+            },
+        );
+        update(
+            app,
+            Event::CachedUsage {
+                account,
+                result: Err("no cache".into()),
+            },
+        );
+    }
+}
+
+#[test]
+fn refresh_starts_each_kind_of_work_once_until_it_finishes() {
+    let mut app = app();
+    app.start();
+    let r = [Key::Char('r'); 5];
+    assert_eq!(keys(&mut app, &r), []);
+
+    // Identities finish one account at a time: still running until the last one.
+    for account in 0..2 {
+        update(
+            &mut app,
+            Event::Identity {
+                account,
+                identity: Identity::NotLoggedIn,
+            },
+        );
+    }
+    assert_eq!(keys(&mut app, &r), []);
+    update(
+        &mut app,
+        Event::Identity {
+            account: 2,
+            identity: Identity::NotLoggedIn,
+        },
+    );
+    assert_eq!(keys(&mut app, &r), [Effect::Identities]);
+
+    for account in 0..3 {
+        update(
+            &mut app,
+            Event::CachedUsage {
+                account,
+                result: Err("no cache".into()),
+            },
+        );
+    }
+    assert_eq!(keys(&mut app, &r), [Effect::CachedUsage]);
+
+    update(&mut app, Event::Attribution(Attribution::default()));
+    assert_eq!(keys(&mut app, &r), [Effect::Attribution]);
+    update(&mut app, Event::Checks(vec![]));
+    assert_eq!(keys(&mut app, &r), [Effect::Checks]);
+}
+
+#[test]
+fn index_rows_arrive_before_the_refresh_ends() {
+    let mut app = app();
+    app.start();
+    update(&mut app, Event::IndexLoaded(vec![entry("a", "old", 1)]));
+    assert!(app.index_loaded);
+    assert_eq!(history_ids(&app), ["a"]);
+    update(
+        &mut app,
+        Event::IndexProgress {
+            done: 1,
+            total: 3,
+            entries: vec![entry("b", "newer", 5)],
+        },
+    );
+    assert_eq!(app.indexing, Some((1, 3)));
+    assert_eq!(history_ids(&app), ["b", "a"]);
+    // The final index replaces everything: `a` vanished, `c` is new.
+    update(
+        &mut app,
+        Event::IndexDone {
+            entries: vec![entry("b", "newer", 5), entry("c", "newest", 9)],
+            error: Some("disk full".into()),
+        },
+    );
+    assert_eq!(history_ids(&app), ["c", "b"]);
+    assert_eq!(app.indexing, None);
+    assert!(!app.index_in_flight);
+    assert_eq!(app.index_refreshed, Some(ts(NOW)));
+    assert_eq!(app.index_error.as_deref(), Some("disk full"));
+}
+
+#[test]
+fn selection_follows_its_session_when_rows_move() {
+    let mut app = app();
+    update(
+        &mut app,
+        Event::IndexLoaded(vec![entry("a", "a", 1), entry("b", "b", 2)]),
+    );
+    keys(&mut app, &[Key::Char('3'), Key::Char('j')]);
+    assert_eq!(app.selected_entry().unwrap().session_id, "a");
+    update(
+        &mut app,
+        Event::IndexProgress {
+            done: 1,
+            total: 1,
+            entries: vec![entry("c", "c", 9)],
+        },
+    );
+    assert_eq!(history_ids(&app), ["c", "b", "a"]);
+    assert_eq!(app.selected_entry().unwrap().session_id, "a");
+}
+
+fn noisy() -> Vec<Entry> {
+    let teammate = entry("tm", "<teammate-message teammate_id=\"x\">do it", 8);
+    let mut sdk = entry("sdk", "batch job", 7);
+    sdk.entrypoint = Some("sdk-cli".into());
+    vec![teammate, sdk, entry("real", "real work", 6)]
+}
+
+#[test]
+fn teammate_and_sdk_sessions_are_hidden_until_show_all() {
+    let mut app = app();
+    update(&mut app, Event::IndexLoaded(noisy()));
+    keys(&mut app, &[Key::Char('3')]);
+    assert_eq!(history_ids(&app), ["real"]);
+    assert_eq!(app.unfiltered_count(), 1);
+    keys(&mut app, &[Key::Char('a')]);
+    assert_eq!(history_ids(&app), ["tm", "sdk", "real"]);
+    keys(&mut app, &[Key::Char('a')]);
+    assert_eq!(history_ids(&app), ["real"]);
+    // `a` belongs to history only.
+    keys(&mut app, &[Key::Char('1'), Key::Char('a'), Key::Char('3')]);
+    assert!(!app.history.show_all);
+}
+
+#[test]
+fn search_prompt_takes_every_printable_key() {
+    let mut app = app();
+    update(
+        &mut app,
+        Event::IndexLoaded(vec![
+            entry("a", "fix the index scan", 1),
+            entry("b", "write docs", 2),
+            entry("c", "quick question about jaq", 3),
+        ]),
+    );
+    keys(&mut app, &[Key::Char('3'), Key::Char('/')]);
+    assert!(app.history.searching);
+    // q, j, a, u, r, ? and digits are text here, not commands.
+    assert_eq!(type_str(&mut app, "qjau r?1"), []);
+    assert_eq!(app.history.query, "qjau r?1");
+    assert_eq!(app.view, View::History);
+    assert!(!app.help);
+    for _ in 0..8 {
+        keys(&mut app, &[Key::Backspace]);
+    }
+    type_str(&mut app, "jaq");
+    assert_eq!(history_ids(&app), ["c"]);
+    // Enter keeps the filter; keys are commands again.
+    keys(&mut app, &[Key::Enter]);
+    assert!(!app.history.searching);
+    assert_eq!(history_ids(&app), ["c"]);
+    assert_eq!(keys(&mut app, &[Key::Char('q')]), [Effect::Quit]);
+    // Esc outside the prompt clears the filter.
+    keys(&mut app, &[Key::Esc]);
+    assert_eq!(history_ids(&app), ["c", "b", "a"]);
+    // Esc inside the prompt clears and closes it.
+    keys(&mut app, &[Key::Char('/')]);
+    type_str(&mut app, "docs");
+    assert_eq!(history_ids(&app), ["b"]);
+    keys(&mut app, &[Key::Esc]);
+    assert!(!app.history.searching);
+    assert_eq!(app.history.query, "");
+    assert_eq!(history_ids(&app), ["c", "b", "a"]);
+    // Ctrl-C quits even from the prompt.
+    keys(&mut app, &[Key::Char('/')]);
+    assert_eq!(keys(&mut app, &[Key::Ctrl('c')]), [Effect::Quit]);
+}
+
+#[test]
+fn search_matches_accounts_and_cwd() {
+    let mut app = app();
+    let mut other = entry("b", "unrelated", 2);
+    other.cwd_last = Some("/w/website".into());
+    update(
+        &mut app,
+        Event::IndexLoaded(vec![entry("a", "one", 1), other]),
+    );
+    let mut attribution = Attribution::default();
+    attribution.add("a", "claude:team");
+    update(&mut app, Event::Attribution(attribution));
+    keys(&mut app, &[Key::Char('3'), Key::Char('/')]);
+    type_str(&mut app, "team");
+    assert_eq!(history_ids(&app), ["a"]);
+    keys(&mut app, &[Key::Esc, Key::Char('/')]);
+    type_str(&mut app, "website");
+    assert_eq!(history_ids(&app), ["b"]);
+}
+
+#[test]
+fn preview_loads_after_the_selection_settles() {
+    let mut app = app();
+    app.start();
+    update(
+        &mut app,
+        Event::IndexLoaded(vec![entry("a", "a", 1), entry("b", "b", 2)]),
+    );
+    keys(&mut app, &[Key::Char('3')]);
+    assert_eq!(app.preview.target, Some(path("b")));
+    // One tick is not enough; moving starts the wait over.
+    assert_eq!(tick(&mut app, 0), []);
+    keys(&mut app, &[Key::Char('j')]);
+    assert_eq!(tick(&mut app, 0), []);
+    assert_eq!(tick(&mut app, 0), [Effect::Preview(path("a"), CLAUDE)]);
+    // Loading: no second request.
+    assert_eq!(tick(&mut app, 0), []);
+    // A result for a path that is no longer wanted is dropped.
+    keys(&mut app, &[Key::Char('k')]);
+    let msg = |t: &str| Message {
+        role: Role::User,
+        text: t.into(),
+    };
+    update(
+        &mut app,
+        Event::Preview {
+            path: path("a"),
+            result: Ok(vec![msg("from a")]),
+        },
+    );
+    assert_eq!(app.preview.loaded, None);
+    tick(&mut app, 0);
+    assert_eq!(tick(&mut app, 0), [Effect::Preview(path("b"), CLAUDE)]);
+    update(
+        &mut app,
+        Event::Preview {
+            path: path("b"),
+            result: Ok(vec![msg("from b")]),
+        },
+    );
+    assert_eq!(
+        app.preview.loaded,
+        Some((path("b"), Ok(vec![msg("from b")])))
+    );
+    // Loaded: nothing more to do.
+    assert_eq!(tick(&mut app, 0), []);
+}
+
+#[test]
+fn live_sessions_refresh_every_five_seconds() {
+    let mut app = app();
+    assert_eq!(
+        app.start().iter().filter(|e| **e == Effect::Live).count(),
+        1
+    );
+    // Still in flight: no second collection, however long it takes.
+    assert!(!tick(&mut app, 6).contains(&Effect::Live));
+    update(
+        &mut app,
+        Event::Live(vec![live("claude:max", 7, Some("a"))]),
+    );
+    // Five seconds after it finished.
+    assert!(!tick(&mut app, 4).contains(&Effect::Live));
+    assert!(tick(&mut app, 1).contains(&Effect::Live));
+    assert!(!tick(&mut app, 10).contains(&Effect::Live));
+}
+
+#[test]
+fn live_sessions_feed_attribution_and_find_their_transcript() {
+    let mut app = app();
+    update(
+        &mut app,
+        Event::IndexLoaded(vec![entry("a", "a", 1), entry("b", "b", 2)]),
+    );
+    let mut base = Attribution::default();
+    base.add("a", "claude:default");
+    update(&mut app, Event::Attribution(base));
+    update(
+        &mut app,
+        Event::Live(vec![
+            live("claude:max", 7, Some("a")),
+            live("claude:team", 8, Some("not-indexed")),
+        ]),
+    );
+    assert_eq!(
+        app.attribution.accounts("a"),
+        ["claude:default", "claude:max"]
+    );
+    keys(&mut app, &[Key::Char('2')]);
+    assert_eq!(app.preview.target, Some(path("a")));
+    keys(&mut app, &[Key::Char('j')]);
+    assert_eq!(app.preview.target, None);
+    // A later collection keeps the same session selected even if it moved.
+    update(
+        &mut app,
+        Event::Live(vec![
+            live("claude:team", 8, Some("not-indexed")),
+            live("claude:max", 7, Some("a")),
+        ]),
+    );
+    assert_eq!(app.selected_live().unwrap().pid, Some(8));
+    // Only the live part is replaced; the base attribution stays.
+    update(&mut app, Event::Live(vec![]));
+    assert_eq!(app.attribution.accounts("a"), ["claude:default"]);
+}
+
+#[test]
+fn live_usage_is_per_account_and_replaces_the_cache() {
+    let mut app = app();
+    update(
+        &mut app,
+        Event::CachedUsage {
+            account: 1,
+            result: cached(vec![row("Session", 10.0, None, None)]),
+        },
+    );
+    assert_eq!(
+        keys(&mut app, &[Key::Char('u')]),
+        [Effect::LiveUsage(vec![0, 1, 2])]
+    );
+    assert!(app.accounts.iter().all(|a| a.live_pending));
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: 1,
+            result: Ok(LiveUsage::Rows(vec![row("Session", 55.0, None, None)])),
+        },
+    );
+    // Only the accounts that finished can be asked again.
+    assert_eq!(
+        keys(&mut app, &[Key::Char('u')]),
+        [Effect::LiveUsage(vec![1])]
+    );
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: 1,
+            result: Ok(LiveUsage::Rows(vec![row("Session", 56.0, None, None)])),
+        },
+    );
+    assert_eq!(app.accounts[1].rows()[0].percent, 56.0);
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: 2,
+            result: Err("timed out after 90s".into()),
+        },
+    );
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: 0,
+            result: Ok(LiveUsage::Unrecognized("??".into())),
+        },
+    );
+    assert_eq!(
+        app.accounts[0].live,
+        Some(Err("output not recognized".into()))
+    );
+    assert!(!app.accounts[2].live_pending);
+    assert!(app.accounts[2].rows().is_empty());
+}
+
+#[test]
+fn quit_help_and_view_switching() {
+    let mut app = app();
+    assert_eq!(keys(&mut app, &[Key::Char('q')]), [Effect::Quit]);
+    assert_eq!(keys(&mut app, &[Key::Ctrl('c')]), [Effect::Quit]);
+    keys(&mut app, &[Key::Char('?')]);
+    assert!(app.help);
+    // Any key closes the help, and does nothing else.
+    assert_eq!(keys(&mut app, &[Key::Char('q')]), []);
+    assert!(!app.help);
+    let mut seen = vec![app.view];
+    for k in [Key::Tab, Key::Tab, Key::Tab, Key::BackTab] {
+        keys(&mut app, &[k]);
+        seen.push(app.view);
+    }
+    assert_eq!(
+        seen,
+        [
+            View::Accounts,
+            View::Live,
+            View::History,
+            View::Accounts,
+            View::History
+        ]
+    );
+    keys(&mut app, &[Key::Char('2')]);
+    assert_eq!(app.view, View::Live);
+    keys(&mut app, &[Key::Char('1')]);
+    assert_eq!(app.view, View::Accounts);
+}
+
+#[test]
+fn navigation_keys_move_and_scroll() {
+    let mut app = app();
+    let entries: Vec<Entry> = (0..40)
+        .map(|i| entry(&format!("s{i:02}"), "t", i))
+        .collect();
+    update(&mut app, Event::IndexLoaded(entries));
+    keys(&mut app, &[Key::Char('3')]);
+    let height = render::list_height(&app, View::History);
+    assert!(height > 3 && height < 40, "{height}");
+    let sel = |app: &App| app.history.list.selected;
+    keys(&mut app, &[Key::Char('j'), Key::Down]);
+    assert_eq!(sel(&app), 2);
+    keys(&mut app, &[Key::Char('k')]);
+    assert_eq!(sel(&app), 1);
+    keys(&mut app, &[Key::Char('G')]);
+    assert_eq!(sel(&app), 39);
+    assert_eq!(app.history.list.offset, 40 - height);
+    keys(&mut app, &[Key::Char('g')]);
+    assert_eq!((sel(&app), app.history.list.offset), (0, 0));
+    keys(&mut app, &[Key::PageDown]);
+    assert_eq!(sel(&app), height);
+    keys(&mut app, &[Key::PageUp, Key::PageUp]);
+    assert_eq!(sel(&app), 0);
+    keys(&mut app, &[Key::End]);
+    assert_eq!(sel(&app), 39);
+    keys(&mut app, &[Key::Home, Key::Up]);
+    assert_eq!(sel(&app), 0);
+}
+
+#[test]
+fn p_or_space_expands_the_preview_and_scrolls_it() {
+    let mut app = app();
+    update(&mut app, Event::IndexLoaded(vec![entry("a", "a", 1)]));
+    keys(&mut app, &[Key::Char('3')]);
+    tick(&mut app, 0);
+    tick(&mut app, 0);
+    let long: Vec<Message> = (0..20)
+        .map(|i| Message {
+            role: Role::Assistant,
+            text: format!("line {i}"),
+        })
+        .collect();
+    update(
+        &mut app,
+        Event::Preview {
+            path: path("a"),
+            result: Ok(long),
+        },
+    );
+    keys(&mut app, &[Key::Char(' ')]);
+    assert!(app.preview.expanded);
+    keys(&mut app, &[Key::Char('p')]);
+    assert!(!app.preview.expanded);
+    keys(&mut app, &[Key::Char('p')]);
+    assert!(app.preview.expanded);
+    keys(&mut app, &[Key::Char('k'), Key::Char('k'), Key::Char('j')]);
+    assert_eq!(app.preview.scroll, 1);
+    // Cannot scroll past the top.
+    keys(&mut app, &[Key::Char('g')]);
+    let top = app.preview.scroll;
+    keys(&mut app, &[Key::Char('k')]);
+    assert_eq!(app.preview.scroll, top);
+    keys(&mut app, &[Key::Esc]);
+    assert!(!app.preview.expanded);
+    assert_eq!(app.preview.scroll, 0);
+    // Moving still works after collapsing.
+    assert_eq!(app.history.list.selected, 0);
+}
+
+// ---- launching -------------------------------------------------------------------
+
+fn request(account_name: &str, args: &[&str], cwd: Option<&str>, what: &str) -> LaunchRequest {
+    LaunchRequest {
+        account: account(account_name),
+        args: args.iter().map(|a| a.to_string()).collect(),
+        cwd: cwd.map(PathBuf::from),
+        what: what.into(),
+    }
+}
+
+/// Everything [`App::start`] requested has finished.
+fn idle_app() -> App {
+    let mut app = app();
+    app.start();
+    update(
+        &mut app,
+        Event::IndexDone {
+            entries: vec![],
+            error: None,
+        },
+    );
+    update(&mut app, Event::Live(vec![]));
+    finish_accounts(&mut app);
+    update(&mut app, Event::Attribution(Attribution::default()));
+    update(&mut app, Event::Checks(vec![]));
+    app
+}
+
+/// [`Effect::CheckLaunch`] of `request` under the number of the last check issued.
+fn check_of(app: &App, request: LaunchRequest) -> Effect {
+    Effect::CheckLaunch {
+        check: app.launch_checks,
+        request,
+    }
+}
+
+/// The worker's answer to the last check issued.
+fn answer(app: &mut App, request: LaunchRequest, error: Option<String>) -> Vec<Effect> {
+    let check = app.launch_checks;
+    update(
+        app,
+        Event::LaunchChecked {
+            check,
+            request,
+            error,
+        },
+    )
+}
+
+fn notice(app: &App) -> Option<(&str, Level)> {
+    app.notice.as_ref().map(|n| (n.text.as_str(), n.level))
+}
+
+#[test]
+fn a_finished_launch_reports_its_exit_and_refreshes_sessions() {
+    let mut app = idle_app();
+    let resume = request("max", &["--resume", "a"], Some("/w"), "resume a as max");
+    let fx = update(
+        &mut app,
+        Event::Launched {
+            request: resume.clone(),
+            result: Ok(Exit::Code(0)),
+            warnings: vec![],
+        },
+    );
+    // The index, live sessions and attribution (launch log) are read again (R16).
+    assert_eq!(
+        fx,
+        [Effect::RefreshIndex, Effect::Live, Effect::Attribution]
+    );
+    assert_eq!(
+        notice(&app),
+        Some(("resume a as max: claude exited 0", Level::Info))
+    );
+
+    let mut app = idle_app();
+    update(
+        &mut app,
+        Event::Launched {
+            request: resume.clone(),
+            result: Ok(Exit::Code(3)),
+            warnings: vec!["cannot write launch log /x: denied".into()],
+        },
+    );
+    assert_eq!(
+        notice(&app),
+        Some((
+            "resume a as max: claude exited 3 · cannot write launch log /x: denied",
+            Level::Warn
+        ))
+    );
+    update(
+        &mut app,
+        Event::Launched {
+            request: resume.clone(),
+            result: Ok(Exit::Signal(9)),
+            warnings: vec![],
+        },
+    );
+    assert_eq!(
+        notice(&app),
+        Some((
+            "resume a as max: claude was killed by signal 9",
+            Level::Warn
+        ))
+    );
+    update(
+        &mut app,
+        Event::Launched {
+            request: resume,
+            result: Err("`claude` not found on PATH".into()),
+            warnings: vec![],
+        },
+    );
+    assert_eq!(
+        notice(&app),
+        Some((
+            "resume a as max: cannot run claude: `claude` not found on PATH",
+            Level::Error
+        ))
+    );
+    // The next key press clears the notice.
+    keys(&mut app, &[Key::Char('j')]);
+    assert_eq!(notice(&app), None);
+}
+
+#[test]
+fn a_refresh_already_running_when_a_launch_ends_runs_again() {
+    let mut app = app();
+    app.start();
+    let fx = update(
+        &mut app,
+        Event::Launched {
+            request: request("max", &[], Some("/w"), "new session as max"),
+            result: Ok(Exit::Code(0)),
+            warnings: vec![],
+        },
+    );
+    // Still running from the start: nothing stacks up...
+    assert_eq!(fx, []);
+    // ... but each runs once more when it finishes, to see the new transcript and log line.
+    let done = Event::IndexDone {
+        entries: vec![],
+        error: None,
+    };
+    assert_eq!(update(&mut app, done.clone()), [Effect::RefreshIndex]);
+    assert_eq!(update(&mut app, done), []);
+    assert_eq!(
+        update(&mut app, Event::Attribution(Attribution::default())),
+        [Effect::Attribution]
+    );
+    assert_eq!(
+        update(&mut app, Event::Attribution(Attribution::default())),
+        []
+    );
+    assert_eq!(update(&mut app, Event::Live(vec![])), [Effect::Live]);
+    assert_eq!(update(&mut app, Event::Live(vec![])), []);
+}
+
+// ---- resume and fork (R16) ---------------------------------------------------------
+
+/// Session ids are UUIDs (R16 refuses anything else); `short_id` shows `aaaaaaaa`.
+const A: &str = "aaaaaaaa-0000-4000-8000-000000000000";
+const B: &str = "bbbbbbbb-0000-4000-8000-000000000000";
+
+const CWD: &str = "/Users/you/space/remuda";
+
+fn background(account: &str, short: &str, session: &str, state: &str) -> LiveSession {
+    LiveSession {
+        account: account.into(),
+        pid: None,
+        short_id: Some(short.into()),
+        cwd: Some("/w/bg".into()),
+        kind: Some("background".into()),
+        started_at: Some(ts("2026-09-24T11:50:00Z").as_millisecond()),
+        session_id: Some(session.into()),
+        name: Some("bg task".into()),
+        status: Some(state.into()),
+        source: Source::Agents,
+    }
+}
+
+/// `default` and `max` share the store `/s` (where every [`entry`] lives); `team` has `/t`.
+fn stores() -> Vec<Store> {
+    vec![
+        Store {
+            provider: CLAUDE,
+            path: PathBuf::from("/s"),
+            accounts: vec!["claude:default".into(), "claude:max".into()],
+            thread_names: vec![],
+        },
+        Store {
+            provider: CLAUDE,
+            path: PathBuf::from("/t"),
+            accounts: vec!["claude:team".into()],
+            thread_names: vec![],
+        },
+    ]
+}
+
+/// History with sessions `a` (older) and `b` (newer), stores known, `a` selected, and `a`
+/// attributed to `owners`.
+fn history_with(owners: &[&str]) -> App {
+    let mut app = idle_app();
+    update(
+        &mut app,
+        Event::IndexLoaded(vec![entry(A, "a", 1), entry(B, "b", 2)]),
+    );
+    update(&mut app, Event::Stores(stores()));
+    let mut attribution = Attribution::default();
+    for owner in owners {
+        attribution.add(A, &format!("claude:{owner}"));
+    }
+    update(&mut app, Event::Attribution(attribution));
+    keys(&mut app, &[Key::Char('3'), Key::Char('j')]);
+    assert_eq!(app.selected_entry().unwrap().session_id, A);
+    app
+}
+
+fn resume_a(account_name: &str) -> LaunchRequest {
+    request(
+        account_name,
+        &["--resume", A],
+        Some(CWD),
+        &format!("resume aaaaaaaa as {account_name}"),
+    )
+}
+
+fn fork_a(account_name: &str) -> LaunchRequest {
+    request(
+        account_name,
+        &["--resume", A, "--fork-session"],
+        Some(CWD),
+        &format!("fork aaaaaaaa as {account_name}"),
+    )
+}
+
+#[test]
+fn enter_resumes_with_the_one_attributed_account_in_cwd_last() {
+    let mut app = history_with(&["max"]);
+    // The directory is checked first (the file system is the workers' business) ...
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, resume_a("max"))]
+    );
+    // ... and only then claude runs.
+    assert_eq!(
+        answer(&mut app, resume_a("max"), None),
+        [Effect::Launch(resume_a("max"))]
+    );
+    // A second answer for the same check does nothing.
+    assert_eq!(answer(&mut app, resume_a("max"), None), []);
+}
+
+#[test]
+fn f_forks_the_selected_session() {
+    let mut app = history_with(&["max"]);
+    assert_eq!(
+        keys(&mut app, &[Key::Char('f')]),
+        [check_of(&app, fork_a("max"))]
+    );
+}
+
+#[test]
+fn a_missing_directory_is_refused() {
+    let mut app = history_with(&["max"]);
+    keys(&mut app, &[Key::Enter]);
+    let fx = answer(
+        &mut app,
+        resume_a("max"),
+        Some(format!("{CWD} does not exist")),
+    );
+    assert_eq!(fx, []);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "resume aaaaaaaa as max: /Users/you/space/remuda does not exist",
+            Level::Error
+        ))
+    );
+
+    // No cwd recorded at all: refused before any check.
+    let mut app = idle_app();
+    let mut no_cwd = entry(A, "a", 1);
+    no_cwd.cwd_last = None;
+    update(&mut app, Event::IndexLoaded(vec![no_cwd]));
+    update(&mut app, Event::Stores(stores()));
+    let mut attribution = Attribution::default();
+    attribution.add(A, "claude:max");
+    update(&mut app, Event::Attribution(attribution));
+    keys(&mut app, &[Key::Char('3')]);
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "session aaaaaaaa has no recorded directory to resume in",
+            Level::Error
+        ))
+    );
+}
+
+#[test]
+fn several_or_no_accounts_open_the_account_picker() {
+    let mut app = history_with(&["team", "max"]);
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    let Some(Overlay::Pick(pick)) = &app.overlay else {
+        panic!("{:?}", app.overlay)
+    };
+    // C4: the accounts that can see the transcript's store first (attributed ones first
+    // among them), then those that cannot (attributed first).
+    assert_eq!(
+        pick.options,
+        ["claude:max", "claude:default", "claude:team"]
+    );
+    assert_eq!(pick.attributed, ["claude:max", "claude:team"]);
+    // Esc cancels without launching.
+    assert_eq!(keys(&mut app, &[Key::Esc]), []);
+    assert_eq!(app.overlay, None);
+
+    // `team`'s projects store is not the transcript's: it could not find the session.
+    keys(&mut app, &[Key::Enter, Key::Char('j'), Key::Char('j')]);
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(app.overlay, None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "team cannot find session aaaaaaaa: its projects store is /t, the transcript is in /s",
+            Level::Error
+        ))
+    );
+    // `default` shares max's store: fine, even though the session is not attributed to it.
+    keys(&mut app, &[Key::Enter, Key::Char('j')]);
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, resume_a("default"))]
+    );
+
+    // No attribution at all: every account, registry order.
+    let mut app = history_with(&[]);
+    keys(&mut app, &[Key::Char('f')]);
+    let Some(Overlay::Pick(pick)) = &app.overlay else {
+        panic!("{:?}", app.overlay)
+    };
+    assert_eq!(
+        pick.options,
+        ["claude:default", "claude:max", "claude:team"]
+    );
+    assert!(pick.attributed.is_empty());
+    assert_eq!(
+        keys(&mut app, &[Key::Char('j'), Key::Enter]),
+        [check_of(&app, fork_a("max"))]
+    );
+}
+
+#[test]
+fn an_account_without_a_store_cannot_resume() {
+    let mut app = history_with(&["max"]);
+    update(&mut app, Event::Stores(vec![stores().remove(1)]));
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "max cannot find session aaaaaaaa: it has no projects store",
+            Level::Error
+        ))
+    );
+}
+
+#[test]
+fn nothing_launches_before_the_stores_are_known() {
+    let mut app = idle_app();
+    update(&mut app, Event::IndexLoaded(vec![entry(A, "a", 1)]));
+    keys(&mut app, &[Key::Char('3')]);
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "still reading the transcript stores; try again in a moment",
+            Level::Warn
+        ))
+    );
+}
+
+#[test]
+fn a_running_interactive_session_is_not_resumed_but_can_be_forked() {
+    let mut app = history_with(&["max"]);
+    update(&mut app, Event::Live(vec![live("claude:max", 7, Some(A))]));
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "session aaaaaaaa is running in max (pid 7): switch to its terminal \
+             (two claudes writing one session overwrite each other)",
+            Level::Warn
+        ))
+    );
+    // A fork writes a new session: allowed.
+    assert_eq!(
+        keys(&mut app, &[Key::Char('f')]),
+        [check_of(&app, fork_a("max"))]
+    );
+}
+
+#[test]
+fn a_running_background_session_is_attached_instead() {
+    let mut app = history_with(&["max"]);
+    update(
+        &mut app,
+        Event::Live(vec![background("claude:max", "766560c5", A, "blocked")]),
+    );
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [Effect::Launch(request(
+            "max",
+            &["attach", "766560c5"],
+            None,
+            "attach 766560c5 as max"
+        ))]
+    );
+    // Once it has stopped, it is an ordinary transcript to resume.
+    update(
+        &mut app,
+        Event::Live(vec![background("claude:max", "766560c5", A, "stopped")]),
+    );
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, resume_a("max"))]
+    );
+}
+
+#[test]
+fn live_view_enter_and_fork() {
+    let mut app = history_with(&["max"]);
+    update(&mut app, Event::Live(vec![live("claude:max", 7, Some(A))]));
+    keys(&mut app, &[Key::Char('2')]);
+    // Interactive sessions can only be looked at here.
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "session aaaaaaaa is running in max (pid 7): switch to its terminal \
+             (two claudes writing one session overwrite each other)",
+            Level::Warn
+        ))
+    );
+    assert_eq!(
+        keys(&mut app, &[Key::Char('f')]),
+        [check_of(&app, fork_a("max"))]
+    );
+}
+
+/// Until the first live collection arrives, `self.live` is empty; a resume
+/// must not take that as "not running" (R16).
+#[test]
+fn resume_before_live_loaded() {
+    let mut app = app();
+    app.start();
+    update(&mut app, Event::IndexLoaded(vec![entry(A, "a", 1)]));
+    update(&mut app, Event::Stores(stores()));
+    let mut at = Attribution::default();
+    at.add(A, "claude:max");
+    update(&mut app, Event::Attribution(at));
+    keys(&mut app, &[Key::Char('3')]);
+    assert!(!app.live_loaded);
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "still reading the running sessions; try again in a moment",
+            Level::Warn
+        ))
+    );
+    // A fork only reads the session: allowed meanwhile.
+    assert_eq!(
+        keys(&mut app, &[Key::Char('f')]),
+        [check_of(&app, fork_a("max"))]
+    );
+    // Once they are known, the resume goes ahead.
+    update(&mut app, Event::Live(vec![]));
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, resume_a("max"))]
+    );
+}
+
+/// After a foreground launch the live list is from before it; a resume waits
+/// for a collection started after the launch.
+#[test]
+fn resume_waits_for_live_sessions_collected_after_a_launch() {
+    let mut app = history_with(&["max"]);
+    // A collection already running when the launch ends predates it ...
+    tick(&mut app, 6);
+    assert!(app.live_in_flight);
+    update(
+        &mut app,
+        Event::Launched {
+            request: resume_a("max"),
+            result: Ok(Exit::Code(0)),
+            warnings: vec![],
+        },
+    );
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "still reading the running sessions; try again in a moment",
+            Level::Warn
+        ))
+    );
+    // ... so its answer is not enough; the one it triggers is.
+    assert_eq!(update(&mut app, Event::Live(vec![])), [Effect::Live]);
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    update(&mut app, Event::Live(vec![]));
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, resume_a("max"))]
+    );
+}
+
+/// The session starts running while the account picker is open.
+#[test]
+fn picker_open_while_session_starts_running() {
+    let mut app = history_with(&["team", "max"]);
+    assert_eq!(keys(&mut app, &[Key::Enter]), []); // picker open
+    update(&mut app, Event::Live(vec![live("claude:max", 7, Some(A))])); // now running
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(app.overlay, None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "session aaaaaaaa is running in max (pid 7): switch to its terminal \
+             (two claudes writing one session overwrite each other)",
+            Level::Warn
+        ))
+    );
+}
+
+/// The session starts running between the pre-launch check and its answer.
+#[test]
+fn a_session_seen_running_before_the_check_answers_is_not_launched() {
+    let mut app = history_with(&["max"]);
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, resume_a("max"))]
+    );
+    update(&mut app, Event::Live(vec![live("claude:max", 7, Some(A))]));
+    let fx = answer(&mut app, resume_a("max"), None);
+    assert_eq!(fx, []);
+    assert_eq!(app.pending, None);
+    assert!(
+        notice(&app)
+            .unwrap()
+            .0
+            .contains("is running in max (pid 7)"),
+        "{:?}",
+        app.notice
+    );
+    // A fork is not affected.
+    assert_eq!(
+        keys(&mut app, &[Key::Char('f')]),
+        [check_of(&app, fork_a("max"))]
+    );
+    assert_eq!(
+        answer(&mut app, fork_a("max"), None),
+        [Effect::Launch(fork_a("max"))]
+    );
+}
+
+/// One session id in two stores (a copied profile). The selected row is what
+/// is resumed: its store decides which account can, its `cwd_last` where.
+#[test]
+fn duplicate_session_id_in_two_stores() {
+    let mut app = idle_app();
+    let in_s = entry(A, "copy in s", 2);
+    let mut in_t = entry(A, "copy in t", 1);
+    in_t.path = PathBuf::from(format!("/t/-w/{A}.jsonl"));
+    in_t.store = PathBuf::from("/t");
+    in_t.cwd_last = Some("/team/dir".into());
+    update(&mut app, Event::IndexLoaded(vec![in_s, in_t]));
+    update(&mut app, Event::Stores(stores()));
+    let mut at = Attribution::default();
+    at.add(A, "claude:max");
+    at.add(A, "claude:team");
+    update(&mut app, Event::Attribution(at));
+    keys(&mut app, &[Key::Char('3')]);
+    // The newer row is the copy in /s (max's store).
+    assert_eq!(
+        app.selected_entry().unwrap().path,
+        PathBuf::from(format!("/s/-w/{A}.jsonl"))
+    );
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    let Some(Overlay::Pick(_)) = &app.overlay else {
+        panic!("{:?}", app.overlay)
+    };
+    // The picker judges the stores against the selected row.
+    let lines = screen(&app);
+    let (_, max) = line_with(&lines, "│› max");
+    assert!(!max.contains("projects store"), "{max}");
+    let (_, team) = line_with(&lines, "│  team");
+    assert!(team.contains("other projects store"), "{team}");
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, resume_a("max"))]
+    );
+
+    // The older row is the copy in /t: team (the one account that sees it comes first, C4),
+    // in its own directory.
+    keys(&mut app, &[Key::Char('j')]);
+    assert_eq!(
+        app.selected_entry().unwrap().path,
+        PathBuf::from(format!("/t/-w/{A}.jsonl"))
+    );
+    keys(&mut app, &[Key::Enter]);
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(
+            &app,
+            request(
+                "team",
+                &["--resume", A],
+                Some("/team/dir"),
+                "resume aaaaaaaa as team"
+            )
+        )]
+    );
+}
+
+/// Ids from file names and `agents --json` are passed to claude as arguments only when
+/// they have the expected shape (R16).
+#[test]
+fn ids_that_are_not_uuids_are_not_passed_to_claude() {
+    let mut app = idle_app();
+    let evil = "--dangerously-skip-permissions";
+    update(&mut app, Event::IndexLoaded(vec![entry(evil, "evil", 1)]));
+    update(&mut app, Event::Stores(stores()));
+    let mut at = Attribution::default();
+    at.add(evil, "claude:max");
+    update(&mut app, Event::Attribution(at));
+    keys(&mut app, &[Key::Char('3')]);
+    for key in [Key::Enter, Key::Char('f')] {
+        assert_eq!(keys(&mut app, &[key]), [], "{key:?}");
+        assert_eq!(app.overlay, None);
+        assert_eq!(
+            notice(&app),
+            Some((
+                "session id \"--dangerously-skip-permissions\" is not a UUID; \
+                 remuda does not pass it to claude",
+                Level::Error
+            )),
+            "{key:?}"
+        );
+    }
+    // Not uppercase-only or unhyphenated variants either.
+    for id in [
+        "AAAAAAAA-0000-4000-8000-000000000000",
+        "aaaaaaaa000040008000000000000000",
+    ] {
+        let mut app = idle_app();
+        update(&mut app, Event::IndexLoaded(vec![entry(id, "x", 1)]));
+        update(&mut app, Event::Stores(stores()));
+        let mut at = Attribution::default();
+        at.add(id, "claude:max");
+        update(&mut app, Event::Attribution(at));
+        keys(&mut app, &[Key::Char('3')]);
+        assert_eq!(keys(&mut app, &[Key::Enter]), [], "{id}");
+    }
+}
+
+/// Background short ids must be 8 lowercase hex digits before attach/logs/stop/rm.
+#[test]
+fn background_ids_that_are_not_short_ids_are_refused() {
+    let mut app = history_with(&["max"]);
+    for bad in ["--force", "766560C5", "766560c", "766560c5x"] {
+        update(
+            &mut app,
+            Event::Live(vec![
+                background("claude:max", bad, A, "blocked"),
+                background("claude:max", bad, B, "stopped"),
+            ]),
+        );
+        keys(&mut app, &[Key::Char('2'), Key::Char('a'), Key::Char('g')]);
+        let refused = format!(
+            "background session id {bad:?} is not 8 hex digits; remuda does not pass it to claude"
+        );
+        for key in [Key::Enter, Key::Char('l'), Key::Char('x')] {
+            assert_eq!(keys(&mut app, &[key]), [], "{bad} {key:?}");
+            assert_eq!(app.overlay, None, "{bad} {key:?}");
+            assert_eq!(
+                notice(&app),
+                Some((refused.as_str(), Level::Error)),
+                "{key:?}"
+            );
+        }
+        keys(&mut app, &[Key::Char('G')]);
+        assert_eq!(keys(&mut app, &[Key::Char('D')]), [], "{bad}");
+        assert_eq!(app.overlay, None, "{bad}");
+        assert_eq!(notice(&app), Some((refused.as_str(), Level::Error)));
+        // History: a running background session is attached instead of resumed.
+        keys(&mut app, &[Key::Char('a'), Key::Char('3')]);
+        assert_eq!(keys(&mut app, &[Key::Enter]), [], "{bad}");
+        assert_eq!(notice(&app), Some((refused.as_str(), Level::Error)));
+    }
+}
+
+// ---- new session and setup forms (R16) ---------------------------------------------
+
+/// A check answered while a foreground child (here an attach) had the terminal predates
+/// whatever happened during it: the pending launch is cancelled when the child starts, and
+/// the answer (queued ahead of `Launched`) is ignored.
+#[test]
+fn check_answer_queued_during_an_attach_is_applied_after_it() {
+    let mut app = history_with(&["max"]);
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, resume_a("max"))]
+    );
+    update(
+        &mut app,
+        Event::Live(vec![background("claude:max", "0badf00d", B, "running")]),
+    );
+    let fx = keys(&mut app, &[Key::Char('2'), Key::Enter]);
+    assert!(
+        matches!(fx.as_slice(), [Effect::Launch(r)] if r.args[0] == "attach"),
+        "{fx:?}"
+    );
+    assert_eq!(app.pending, None);
+    // What the live list says predates the child too.
+    assert!(app.live_stale);
+    // Queue order after the attach: LaunchChecked (sent during it), then Launched.
+    assert_eq!(answer(&mut app, resume_a("max"), None), []);
+    assert_eq!(app.pending, None);
+    let attach = request(
+        "max",
+        &["attach", "0badf00d"],
+        None,
+        "attach 0badf00d as max",
+    );
+    update(
+        &mut app,
+        Event::Launched {
+            request: attach,
+            result: Ok(Exit::Code(0)),
+            warnings: vec![],
+        },
+    );
+    assert_eq!(
+        notice(&app),
+        Some((
+            "attach 0badf00d as max: claude exited 0 · resume aaaaaaaa as max was cancelled: \
+             start it again",
+            Level::Info
+        ))
+    );
+}
+
+/// The same, through a setup (`claude auth login` in the foreground).
+#[test]
+fn check_answer_queued_during_a_setup_is_applied_after_it() {
+    let mut app = history_with(&["max"]);
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, resume_a("max"))]
+    );
+    let mut fx = keys(&mut app, &[Key::Char('1'), Key::Char('s')]);
+    // Opening the form already cancelled the pending resume (C1).
+    assert_eq!(app.pending, None);
+    assert_eq!(
+        notice(&app),
+        Some(("resume aaaaaaaa as max cancelled", Level::Info))
+    );
+    fx.extend(type_str(&mut app, "newacct"));
+    fx.extend(keys(&mut app, &[Key::Enter]));
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::Setup { .. })),
+        "{fx:?}"
+    );
+    assert_eq!(app.pending, None);
+    assert!(app.live_stale);
+    assert_eq!(answer(&mut app, resume_a("max"), None), []);
+    assert_eq!(app.pending, None);
+    // The live list is collected again once the login ended (it may have run anything).
+    let fx = update(
+        &mut app,
+        Event::SetupDone {
+            provider: CLAUDE,
+            name: "newacct".into(),
+            result: Ok(Exit::Code(0)),
+        },
+    );
+    assert_eq!(fx, [Effect::Live]);
+    assert_eq!(
+        notice(&app),
+        Some(("set up newacct: claude auth login exited 0", Level::Info))
+    );
+}
+
+/// A live collection that was running when the child started does not count as
+/// current when it lands.
+#[test]
+fn a_live_collection_from_before_a_foreground_child_is_not_current() {
+    let mut app = history_with(&["max"]);
+    update(
+        &mut app,
+        Event::Live(vec![background("claude:max", "0badf00d", B, "running")]),
+    );
+    // A collection is running (the 5 s refresh) when the attach starts.
+    assert_eq!(tick(&mut app, 6), [Effect::Live]);
+    let fx = keys(&mut app, &[Key::Char('2'), Key::Enter]);
+    assert!(matches!(fx.as_slice(), [Effect::Launch(_)]), "{fx:?}");
+    // It lands after the child ran (queued ahead of `Launched`): collected again, still stale.
+    assert_eq!(update(&mut app, Event::Live(vec![])), [Effect::Live]);
+    assert!(app.live_stale);
+    keys(&mut app, &[Key::Char('3')]);
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "still reading the running sessions; try again in a moment",
+            Level::Warn
+        ))
+    );
+}
+
+/// While the pre-launch check runs the status line says so, and Esc cancels it. An answer
+/// to an earlier check of the very same launch is not taken for the current one.
+#[test]
+fn a_running_check_shows_in_the_status_line_and_esc_cancels_it() {
+    let mut app = history_with(&["max"]);
+    keys(&mut app, &[Key::Enter]);
+    let first = app.launch_checks;
+    let all = text(&app);
+    assert!(
+        all.contains("checking that aaaaaaaa is not running… (esc: cancel)"),
+        "{all}"
+    );
+    assert_eq!(keys(&mut app, &[Key::Esc]), []);
+    assert_eq!(app.pending, None);
+    assert_eq!(
+        notice(&app),
+        Some(("resume aaaaaaaa as max cancelled", Level::Info))
+    );
+    assert_eq!(answer(&mut app, resume_a("max"), None), []);
+    assert!(!text(&app).contains("checking that"));
+
+    // Again: only the answer to the new check counts.
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, resume_a("max"))]
+    );
+    assert_ne!(app.launch_checks, first);
+    let old = Event::LaunchChecked {
+        check: first,
+        request: resume_a("max"),
+        error: None,
+    };
+    assert_eq!(update(&mut app, old), []);
+    assert!(app.pending.is_some());
+    assert_eq!(
+        answer(&mut app, resume_a("max"), None),
+        [Effect::Launch(resume_a("max"))]
+    );
+
+    // A fork or a new session only has its directory checked.
+    let mut app = history_with(&["max"]);
+    keys(&mut app, &[Key::Char('f')]);
+    let all = text(&app);
+    assert!(
+        all.contains("checking fork aaaaaaaa as max… (esc: cancel)"),
+        "{all}"
+    );
+    // Esc still does what it did otherwise when nothing is pending.
+    keys(&mut app, &[Key::Esc]);
+    assert_eq!(app.pending, None);
+    keys(&mut app, &[Key::Char('/'), Key::Char('a'), Key::Enter]);
+    assert_eq!(app.history.query, "a");
+    keys(&mut app, &[Key::Esc]);
+    assert_eq!(app.history.query, "");
+}
+
+/// C1: opening an overlay cancels a pending launch (like Esc): its answer, when it comes,
+/// neither launches nor touches the overlay.
+#[test]
+fn opening_an_overlay_cancels_a_pending_launch() {
+    // A resume waiting for its check, then the new-session form.
+    let mut app = history_with(&["max"]);
+    keys(&mut app, &[Key::Enter]);
+    assert!(app.pending.is_some());
+    keys(&mut app, &[Key::Char('1'), Key::Char('n')]);
+    assert_eq!(app.pending, None);
+    assert_eq!(
+        notice(&app),
+        Some(("resume aaaaaaaa as max cancelled", Level::Info))
+    );
+    assert_eq!(answer(&mut app, resume_a("max"), None), []);
+    assert_eq!(
+        form(&app).kind,
+        FormKind::NewSession {
+            account: account("default")
+        }
+    );
+    assert_eq!(answer(&mut app, resume_a("max"), Some("gone".into())), []);
+    assert_eq!(form(&app).error, None);
+
+    // ... or the account picker of another session.
+    let mut app = history_with(&["max"]);
+    let mut at = Attribution::default();
+    at.add(A, "claude:max");
+    at.add(B, "claude:max");
+    at.add(B, "claude:team");
+    update(&mut app, Event::Attribution(at));
+    keys(&mut app, &[Key::Enter]);
+    keys(&mut app, &[Key::Char('k'), Key::Enter]);
+    assert!(
+        matches!(app.overlay, Some(Overlay::Pick(_))),
+        "{:?}",
+        app.overlay
+    );
+    assert_eq!(app.pending, None);
+    assert_eq!(answer(&mut app, resume_a("max"), None), []);
+    assert!(
+        matches!(app.overlay, Some(Overlay::Pick(_))),
+        "{:?}",
+        app.overlay
+    );
+}
+
+/// C1: a check's error goes into the form only when that form started the check.
+#[test]
+fn a_check_error_goes_only_into_the_form_that_started_it() {
+    let mut app = history_with(&["max"]);
+    keys(&mut app, &[Key::Enter]);
+    // A form that did not start the check (put there directly: the keys cannot get here).
+    let Some(Overlay::Form(unrelated)) = new_session_form().overlay else {
+        unreachable!()
+    };
+    app.overlay = Some(Overlay::Form(unrelated));
+    answer(&mut app, resume_a("max"), Some("/x does not exist".into()));
+    assert_eq!(form(&app).error, None);
+    assert_eq!(
+        notice(&app),
+        Some(("resume aaaaaaaa as max: /x does not exist", Level::Error))
+    );
+}
+
+/// A and its copy in `/t` (with its own directory), indexed together.
+fn history_with_two_copies(owners: &[&str]) -> App {
+    let mut app = idle_app();
+    let mut t = entry(A, "a-team", 3);
+    t.path = PathBuf::from(format!("/t/-w/{A}.jsonl"));
+    t.store = PathBuf::from("/t");
+    t.cwd_last = Some("/team/dir".into());
+    update(&mut app, Event::IndexLoaded(vec![entry(A, "a", 1), t]));
+    update(&mut app, Event::Stores(stores()));
+    let mut at = Attribution::default();
+    for owner in owners {
+        at.add(A, &format!("claude:{owner}"));
+    }
+    update(&mut app, Event::Attribution(at));
+    app
+}
+
+/// Live previews the copy that `f` forks: the one in the live session's store.
+#[test]
+fn the_live_preview_shows_the_copy_that_f_forks() {
+    let mut app = history_with_two_copies(&[]);
+    update(&mut app, Event::Live(vec![live("claude:max", 7, Some(A))]));
+    keys(&mut app, &[Key::Char('2')]);
+    assert_eq!(app.preview.target, Some(path(A)));
+    assert_eq!(
+        keys(&mut app, &[Key::Char('f')]),
+        [check_of(&app, fork_a("max"))]
+    );
+    keys(&mut app, &[Key::Esc]);
+    update(&mut app, Event::Live(vec![live("claude:team", 8, Some(A))]));
+    assert_eq!(
+        app.preview.target,
+        Some(PathBuf::from(format!("/t/-w/{A}.jsonl")))
+    );
+}
+
+/// The one attributed account cannot see the selected copy (another store): the picker
+/// opens with the accounts that can first, instead of a dead end.
+#[test]
+fn single_owner_in_the_other_store_leaves_no_way_to_resume_the_selected_copy() {
+    let mut app = history_with_two_copies(&["team"]);
+    keys(&mut app, &[Key::Char('3')]);
+    while app.selected_entry().unwrap().store != Path::new("/s") {
+        keys(&mut app, &[Key::Char('j')]);
+    }
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    let Some(Overlay::Pick(pick)) = &app.overlay else {
+        panic!("{:?} {:?}", app.overlay, app.notice)
+    };
+    assert_eq!(
+        pick.options,
+        ["claude:default", "claude:max", "claude:team"]
+    );
+    assert_eq!(pick.attributed, ["claude:team"]);
+    let lines = screen(&app);
+    let (_, team) = line_with(&lines, "│  team");
+    assert!(
+        team.contains("●") && team.contains("other projects store"),
+        "{team}"
+    );
+    let (_, default) = line_with(&lines, "│› default");
+    assert!(!default.contains("●"), "{default}");
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, resume_a("default"))]
+    );
+
+    // The owner's own copy still resumes with it directly.
+    keys(&mut app, &[Key::Esc]);
+    while app.selected_entry().unwrap().store != Path::new("/t") {
+        keys(&mut app, &[Key::Char('k')]);
+    }
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(
+            &app,
+            request(
+                "team",
+                &["--resume", A],
+                Some("/team/dir"),
+                "resume aaaaaaaa as team"
+            )
+        )]
+    );
+}
+
+fn form(app: &App) -> &Form {
+    match &app.overlay {
+        Some(Overlay::Form(form)) => form,
+        other => panic!("no form: {other:?}"),
+    }
+}
+
+fn values(app: &App) -> Vec<String> {
+    form(app).fields.iter().map(|f| f.value.clone()).collect()
+}
+
+/// `n` on `max` (the second account).
+fn new_session_form() -> App {
+    let mut app = idle_app();
+    keys(&mut app, &[Key::Char('j'), Key::Char('n')]);
+    assert_eq!(
+        form(&app).kind,
+        FormKind::NewSession {
+            account: account("max")
+        }
+    );
+    app
+}
+
+fn clear_field(app: &mut App) {
+    for _ in 0..200 {
+        keys(app, &[Key::Backspace]);
+    }
+}
+
+#[test]
+fn new_session_defaults_to_remudas_directory_and_checks_it() {
+    let mut app = new_session_form();
+    // Directory first (prefilled with where remuda started), then an optional name.
+    assert_eq!(values(&app), [CWD, ""]);
+    assert_eq!(form(&app).focus, 0);
+    let fx = keys(&mut app, &[Key::Enter]);
+    let want = request("max", &[], Some(CWD), "new session as max");
+    assert_eq!(fx, [check_of(&app, want.clone())]);
+    // The form stays up until the directory is known to exist.
+    assert!(app.overlay.is_some());
+    let fx = answer(&mut app, want.clone(), None);
+    assert_eq!(fx, [Effect::Launch(want)]);
+    assert_eq!(app.overlay, None);
+}
+
+#[test]
+fn new_session_form_editing_name_and_tilde() {
+    let mut app = new_session_form();
+    // Typing goes to the focused field: every key is text here.
+    clear_field(&mut app);
+    assert_eq!(type_str(&mut app, "~/w q1?"), []);
+    keys(&mut app, &[Key::Tab]);
+    assert_eq!(form(&app).focus, 1);
+    type_str(&mut app, "fix the index");
+    assert_eq!(values(&app), ["~/w q1?", "fix the index"]);
+    assert_eq!(app.view, View::Accounts);
+    let fx = keys(&mut app, &[Key::Enter]);
+    assert_eq!(
+        fx,
+        [check_of(
+            &app,
+            request(
+                "max",
+                &["-n", "fix the index"],
+                Some("/Users/you/w q1?"),
+                "new session “fix the index” as max"
+            )
+        )]
+    );
+    // BackTab goes back to the directory; a relative one is taken from remuda's directory.
+    keys(&mut app, &[Key::BackTab]);
+    clear_field(&mut app);
+    type_str(&mut app, "sub dir");
+    let fx = keys(&mut app, &[Key::Enter]);
+    let Some(Effect::CheckLaunch { request: req, .. }) = fx.first() else {
+        panic!("{fx:?}")
+    };
+    assert_eq!(req.cwd, Some(PathBuf::from(format!("{CWD}/sub dir"))));
+}
+
+#[test]
+fn new_session_form_errors_stay_inline() {
+    let mut app = new_session_form();
+    let want = request("max", &[], Some(CWD), "new session as max");
+    keys(&mut app, &[Key::Enter]);
+    let fx = answer(&mut app, want, Some(format!("{CWD} does not exist")));
+    assert_eq!(fx, []);
+    assert_eq!(
+        form(&app).error.as_deref(),
+        Some("/Users/you/space/remuda does not exist")
+    );
+    assert_eq!(app.notice, None);
+    // Typing clears the error.
+    type_str(&mut app, "x");
+    assert_eq!(form(&app).error, None);
+
+    clear_field(&mut app);
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(form(&app).error.as_deref(), Some("enter a directory"));
+
+    // A name that would stop remuda from seeing a new session (R6) is refused.
+    type_str(&mut app, "/w");
+    keys(&mut app, &[Key::Tab]);
+    type_str(&mut app, "update");
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert!(
+        form(&app)
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("choose another name"),
+        "{:?}",
+        form(&app).error
+    );
+}
+
+/// A name starting with `-` would be read by claude as an option; with `--`
+/// the injected id would even land after the terminator (R16).
+#[test]
+fn session_name_dash_dash() {
+    for name in ["--", "-x", "-p", "--verbose", "-", "update", "attach"] {
+        let mut app = new_session_form();
+        keys(&mut app, &[Key::Tab]);
+        type_str(&mut app, name);
+        assert_eq!(keys(&mut app, &[Key::Enter]), [], "{name}");
+        let error = form(&app).error.clone().unwrap_or_default();
+        assert!(error.contains("choose another name"), "{name}: {error}");
+    }
+    // Dashes inside a name are fine.
+    let mut app = new_session_form();
+    keys(&mut app, &[Key::Tab]);
+    type_str(&mut app, "fix-the-index --now");
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(
+            &app,
+            request(
+                "max",
+                &["-n", "fix-the-index --now"],
+                Some(CWD),
+                "new session “fix-the-index --now” as max"
+            )
+        )]
+    );
+}
+
+#[test]
+fn esc_cancels_a_form_and_its_pending_check() {
+    let mut app = new_session_form();
+    let want = request("max", &[], Some(CWD), "new session as max");
+    keys(&mut app, &[Key::Enter, Key::Esc]);
+    assert_eq!(app.overlay, None);
+    // The answer to the cancelled check launches nothing.
+    let fx = answer(&mut app, want, None);
+    assert_eq!(fx, []);
+    // `q` in a form is text, not quit.
+    keys(&mut app, &[Key::Char('n')]);
+    assert_eq!(keys(&mut app, &[Key::Char('q')]), []);
+    assert!(values(&app)[0].ends_with('q'));
+    // Ctrl-C still quits.
+    assert_eq!(keys(&mut app, &[Key::Ctrl('c')]), [Effect::Quit]);
+}
+
+#[test]
+fn n_and_s_belong_to_the_accounts_view() {
+    let mut app = idle_app();
+    keys(&mut app, &[Key::Char('3'), Key::Char('n'), Key::Char('s')]);
+    assert_eq!(app.overlay, None);
+}
+
+#[test]
+fn setup_form_validates_like_remuda_setup() {
+    let mut app = idle_app();
+    keys(&mut app, &[Key::Char('s')]);
+    assert_eq!(form(&app).kind, FormKind::Setup);
+    // Name, email, provider (R17).
+    assert_eq!(values(&app), ["", "", "claude"]);
+    for (name, error) in [
+        ("", "invalid account name"),
+        ("a.b", "invalid account name"),
+        ("default", "reserved"),
+        ("-x", "cannot start with `-`"),
+        ("max", "claude:max is already registered"),
+    ] {
+        clear_field(&mut app);
+        type_str(&mut app, name);
+        assert_eq!(keys(&mut app, &[Key::Enter]), [], "{name}");
+        let got = form(&app).error.clone().unwrap_or_default();
+        assert!(got.contains(error), "{name}: {got}");
+    }
+    clear_field(&mut app);
+    type_str(&mut app, "work");
+    keys(&mut app, &[Key::Down]);
+    type_str(&mut app, "me+work@example.com");
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [Effect::Setup {
+            provider: CLAUDE,
+            name: "work".into(),
+            email: Some("me+work@example.com".into())
+        }]
+    );
+    assert_eq!(app.overlay, None);
+
+    // Without an email.
+    keys(&mut app, &[Key::Char('s')]);
+    type_str(&mut app, "solo");
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [Effect::Setup {
+            provider: CLAUDE,
+            name: "solo".into(),
+            email: None
+        }]
+    );
+}
+
+#[test]
+fn a_finished_setup_reloads_accounts_and_identities() {
+    let mut app = idle_app();
+    let mut accounts: Vec<Account> = app.accounts.iter().map(|a| a.account.clone()).collect();
+    accounts.push(account("work"));
+    let fx = update(&mut app, Event::Accounts(accounts));
+    let names: Vec<&str> = app
+        .accounts
+        .iter()
+        .map(|a| a.account.name.as_str())
+        .collect();
+    assert_eq!(names, ["default", "max", "team", "work"]);
+    // Known accounts keep their state.
+    assert_eq!(app.accounts[1].identity, Some(Identity::NotLoggedIn));
+    assert_eq!(app.accounts[3].identity, None);
+    for effect in [
+        Effect::Identities,
+        Effect::CachedUsage,
+        Effect::Checks,
+        Effect::RefreshIndex,
+    ] {
+        assert!(fx.contains(&effect), "{effect:?} in {fx:?}");
+    }
+    update(
+        &mut app,
+        Event::SetupDone {
+            provider: CLAUDE,
+            name: "work".into(),
+            result: Ok(Exit::Code(0)),
+        },
+    );
+    assert_eq!(
+        notice(&app),
+        Some(("set up work: claude auth login exited 0", Level::Info))
+    );
+    update(
+        &mut app,
+        Event::SetupDone {
+            provider: CLAUDE,
+            name: "x".into(),
+            result: Err("/r/homes/claude/x already exists".into()),
+        },
+    );
+    assert_eq!(
+        notice(&app),
+        Some(("set up x: /r/homes/claude/x already exists", Level::Error))
+    );
+}
+
+// ---- background sessions in Live (R7, R16) -------------------------------------------
+
+/// Live with an interactive session (`a` under max), a running background one (`b` under
+/// team) and a stopped one (`c` under max), in that order; stores and index loaded.
+fn live_with_background() -> App {
+    let mut app = history_with(&["max"]);
+    update(
+        &mut app,
+        Event::Live(vec![
+            live("claude:max", 7, Some(A)),
+            background("claude:team", "bbbbbbbb", "b", "blocked"),
+            background("claude:max", "cccccccc", "c", "stopped"),
+        ]),
+    );
+    keys(&mut app, &[Key::Char('2')]);
+    app
+}
+
+fn live_names(app: &App) -> Vec<Option<String>> {
+    app.live_rows
+        .iter()
+        .map(|&i| app.live[i].short_id.clone())
+        .collect()
+}
+
+#[test]
+fn stopped_background_sessions_show_with_a() {
+    let mut app = live_with_background();
+    assert_eq!(live_names(&app), [None, Some("bbbbbbbb".into())]);
+    keys(&mut app, &[Key::Char('a')]);
+    assert_eq!(
+        live_names(&app),
+        [None, Some("bbbbbbbb".into()), Some("cccccccc".into())]
+    );
+    keys(&mut app, &[Key::Char('G')]);
+    assert_eq!(
+        app.selected_live().unwrap().short_id.as_deref(),
+        Some("cccccccc")
+    );
+    keys(&mut app, &[Key::Char('a')]);
+    // The selection moves to a row that is still shown.
+    assert_eq!(
+        app.selected_live().unwrap().short_id.as_deref(),
+        Some("bbbbbbbb")
+    );
+    // `a` in History is still its own toggle.
+    keys(&mut app, &[Key::Char('3'), Key::Char('a')]);
+    assert!(app.history.show_all);
+    keys(&mut app, &[Key::Char('2')]);
+    assert_eq!(live_names(&app).len(), 2);
+}
+
+#[test]
+fn enter_attaches_background_sessions_even_stopped_ones() {
+    let mut app = live_with_background();
+    keys(&mut app, &[Key::Char('j')]);
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [Effect::Launch(request(
+            "team",
+            &["attach", "bbbbbbbb"],
+            None,
+            "attach bbbbbbbb as team"
+        ))]
+    );
+    // claude: "resume it later with `claude attach <id>`".
+    keys(&mut app, &[Key::Char('a'), Key::Char('G')]);
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [Effect::Launch(request(
+            "max",
+            &["attach", "cccccccc"],
+            None,
+            "attach cccccccc as max"
+        ))]
+    );
+}
+
+#[test]
+fn logs_show_in_the_preview_until_the_selection_moves() {
+    let mut app = live_with_background();
+    // Interactive sessions have no logs.
+    assert_eq!(keys(&mut app, &[Key::Char('l')]), []);
+    assert!(
+        notice(&app).unwrap().0.contains("background"),
+        "{:?}",
+        app.notice
+    );
+    keys(&mut app, &[Key::Char('j')]);
+    assert_eq!(
+        keys(&mut app, &[Key::Char('l')]),
+        [Effect::Logs {
+            account: account("team"),
+            short_id: "bbbbbbbb".into()
+        }]
+    );
+    assert!(text(&app).contains("loading logs…"), "{}", text(&app));
+    update(
+        &mut app,
+        Event::Logs {
+            short_id: "bbbbbbbb".into(),
+            // Plain text already: `live::logs` interprets the terminal bytes (tests/live.rs).
+            result: Ok("Building the index\nstep 2 of 3".into()),
+        },
+    );
+    let all = text(&app);
+    assert!(all.contains("Logs · bbbbbbbb"), "{all}");
+    assert!(all.contains("Building the index"), "{all}");
+    assert!(all.contains("step 2 of 3"), "{all}");
+    // Esc goes back to the transcript preview; so does moving.
+    keys(&mut app, &[Key::Esc]);
+    assert_eq!(app.logs, None);
+    keys(&mut app, &[Key::Char('l')]);
+    update(
+        &mut app,
+        Event::Logs {
+            short_id: "bbbbbbbb".into(),
+            result: Err("exited with status 1: Couldn't read logs for bbbbbbbb".into()),
+        },
+    );
+    assert!(text(&app).contains("cannot read logs: exited with status 1"));
+    keys(&mut app, &[Key::Char('k')]);
+    assert_eq!(app.logs, None);
+    // A late answer for a session no longer selected is dropped.
+    update(
+        &mut app,
+        Event::Logs {
+            short_id: "bbbbbbbb".into(),
+            result: Ok("late".into()),
+        },
+    );
+    assert_eq!(app.logs, None);
+}
+
+#[test]
+fn x_stops_after_confirmation() {
+    let mut app = live_with_background();
+    keys(&mut app, &[Key::Char('j')]);
+    assert_eq!(keys(&mut app, &[Key::Char('x')]), []);
+    assert!(matches!(app.overlay, Some(Overlay::Confirm(_))));
+    assert!(
+        text(&app).contains("Stop background session bbbbbbbb (team)?"),
+        "{}",
+        text(&app)
+    );
+    // Anything but `y` cancels.
+    assert_eq!(keys(&mut app, &[Key::Char('n')]), []);
+    assert_eq!(app.overlay, None);
+    assert_eq!(notice(&app), Some(("cancelled", Level::Info)));
+    keys(&mut app, &[Key::Char('x')]);
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(app.overlay, None);
+    keys(&mut app, &[Key::Char('x')]);
+    assert_eq!(
+        keys(&mut app, &[Key::Char('y')]),
+        [Effect::Control {
+            account: account("team"),
+            verb: Control::Stop,
+            short_id: "bbbbbbbb".into()
+        }]
+    );
+    // When it is done, the live list is collected again.
+    let fx = update(
+        &mut app,
+        Event::ControlDone {
+            verb: Control::Stop,
+            short_id: "bbbbbbbb".into(),
+            result: Ok(String::new()),
+        },
+    );
+    assert_eq!(fx, [Effect::Live]);
+    assert_eq!(notice(&app), Some(("stopped bbbbbbbb", Level::Info)));
+    // A stopped session cannot be stopped again; interactive ones not at all.
+    keys(&mut app, &[Key::Char('a'), Key::Char('G'), Key::Char('x')]);
+    assert_eq!(app.overlay, None);
+    assert!(
+        notice(&app).unwrap().0.contains("already stopped"),
+        "{:?}",
+        app.notice
+    );
+    keys(&mut app, &[Key::Char('g'), Key::Char('x')]);
+    assert_eq!(app.overlay, None);
+    assert!(
+        notice(&app).unwrap().0.contains("only be viewed"),
+        "{:?}",
+        app.notice
+    );
+}
+
+#[test]
+fn capital_d_removes_stopped_sessions_after_confirmation() {
+    let mut app = live_with_background();
+    // A running one: stop it first.
+    keys(&mut app, &[Key::Char('j'), Key::Char('D')]);
+    assert_eq!(app.overlay, None);
+    assert!(
+        notice(&app).unwrap().0.contains("stop it first"),
+        "{:?}",
+        app.notice
+    );
+    keys(&mut app, &[Key::Char('a'), Key::Char('G'), Key::Char('D')]);
+    assert!(
+        text(&app).contains("Remove background session cccccccc (max)?"),
+        "{}",
+        text(&app)
+    );
+    assert_eq!(
+        keys(&mut app, &[Key::Char('y')]),
+        [Effect::Control {
+            account: account("max"),
+            verb: Control::Remove,
+            short_id: "cccccccc".into()
+        }]
+    );
+    update(&mut app, Event::Live(vec![]));
+    let fx = update(
+        &mut app,
+        Event::ControlDone {
+            verb: Control::Remove,
+            short_id: "cccccccc".into(),
+            result: Err("exited with status 1: has unpushed commits".into()),
+        },
+    );
+    assert_eq!(fx, [Effect::Live]);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "claude rm cccccccc exited with status 1: has unpushed commits",
+            Level::Error
+        ))
+    );
+}
+
+#[test]
+fn live_view_lists_both_kinds() {
+    let mut app = live_with_background();
+    update(&mut app, Event::Resize(120, 24));
+    let lines = screen(&app);
+    let all = lines.join("\n");
+    let (_, head) = line_with(&lines, "ACCOUNT");
+    assert!(head.contains("PID/ID"), "{head}");
+    let (_, bg) = line_with(&lines, "bbbbbbbb");
+    assert!(bg.contains("blocked") && bg.contains("background"), "{bg}");
+    let (_, fg) = line_with(&lines, "busy");
+    assert!(fg.contains(" 7 ") && fg.contains("interactive"), "{fg}");
+    assert!(!all.contains("cccccccc"), "stopped ones are hidden: {all}");
+    assert!(all.contains("2 running · 1 stopped (a: show)"), "{all}");
+    keys(&mut app, &[Key::Char('a')]);
+    let all = text(&app);
+    assert!(all.contains("cccccccc"), "{all}");
+    assert!(all.contains("2 running · 1 stopped (a: hide)"), "{all}");
+    assert!(all.contains("l: logs") && all.contains("x: stop"), "{all}");
+}
+
+// ---- `remuda run` without an account: pick one (R5, R16) --------------------------------
+
+fn pick_app() -> App {
+    let mut app = app();
+    app.mode = Mode::PickForRun;
+    app
+}
+
+#[test]
+fn pick_mode_loads_only_what_choosing_an_account_needs() {
+    let mut app = pick_app();
+    assert_eq!(
+        app.start(),
+        [Effect::Identities, Effect::CachedUsage, Effect::Checks]
+    );
+    finish_accounts(&mut app);
+    update(&mut app, Event::Checks(vec![]));
+    assert_eq!(
+        keys(&mut app, &[Key::Char('r')]),
+        [Effect::Identities, Effect::CachedUsage, Effect::Checks]
+    );
+    // Live usage helps to choose.
+    assert_eq!(
+        keys(&mut app, &[Key::Char('u')]),
+        [Effect::LiveUsage(vec![0, 1, 2])]
+    );
+}
+
+#[test]
+fn pick_mode_enter_chooses_and_esc_or_q_cancels() {
+    let mut app = pick_app();
+    assert_eq!(
+        keys(&mut app, &[Key::Char('j'), Key::Enter]),
+        [Effect::Pick(account("max"))]
+    );
+    assert_eq!(keys(&mut app, &[Key::Esc]), [Effect::Quit]);
+    assert_eq!(keys(&mut app, &[Key::Char('q')]), [Effect::Quit]);
+    // Nothing else to do here: no other views, no forms.
+    keys(
+        &mut app,
+        &[Key::Char('3'), Key::Tab, Key::Char('n'), Key::Char('s')],
+    );
+    assert_eq!(app.view, View::Accounts);
+    assert_eq!(app.overlay, None);
+}
+
+#[test]
+fn pick_mode_says_what_it_is_for() {
+    let mut app = pick_app();
+    let all = text(&app);
+    assert!(
+        all.contains("choose an account to launch claude in ~/space/remuda"),
+        "{all}"
+    );
+    assert!(
+        all.contains("enter: launch claude") && all.contains("esc/q: cancel"),
+        "{all}"
+    );
+    let lines = screen(&app);
+    let (_, max) = line_with(&lines, "max ");
+    assert!(max.starts_with("max"), "{max}");
+    keys(&mut app, &[Key::Char('?')]);
+    assert!(text(&app).contains("Keys"));
+}
+
+// ---- render ------------------------------------------------------------------------
+
+fn screen(app: &App) -> Vec<String> {
+    let (w, h) = app.size;
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal.draw(|f| render::render(app, f)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    (0..h)
+        .map(|y| {
+            let mut line = String::new();
+            let mut skip = 0;
+            for x in 0..w {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                let symbol = buffer[(x, y)].symbol();
+                skip = crate::text::width(symbol).saturating_sub(1);
+                line.push_str(symbol);
+            }
+            line.trim_end().to_string()
+        })
+        .collect()
+}
+
+fn text(app: &App) -> String {
+    screen(app).join("\n")
+}
+
+fn line_with<'a>(lines: &'a [String], needle: &str) -> (usize, &'a str) {
+    lines
+        .iter()
+        .enumerate()
+        .find(|(_, l)| l.contains(needle))
+        .map(|(i, l)| (i, l.as_str()))
+        .unwrap_or_else(|| panic!("no line with {needle:?}:\n{}", lines.join("\n")))
+}
+
+/// Accounts with identities, cached usage, a live result and checks.
+fn populated_accounts() -> App {
+    let mut app = app();
+    app.start();
+    update(
+        &mut app,
+        Event::Identity {
+            account: 0,
+            identity: logged_in("me@example.com"),
+        },
+    );
+    update(
+        &mut app,
+        Event::Identity {
+            account: 1,
+            identity: logged_in("max@example.com"),
+        },
+    );
+    update(
+        &mut app,
+        Event::Identity {
+            account: 2,
+            identity: Identity::NotLoggedIn,
+        },
+    );
+    update(
+        &mut app,
+        Event::CachedUsage {
+            account: 0,
+            result: cached(vec![
+                row(
+                    "Session",
+                    34.0,
+                    Some("normal"),
+                    Some("2026-09-24T14:00:00Z"),
+                ),
+                row(
+                    "Week (all models)",
+                    77.0,
+                    Some("warning"),
+                    Some("2026-09-27T12:00:00Z"),
+                ),
+                row(
+                    "Week (Fable)",
+                    100.0,
+                    Some("critical"),
+                    Some("2026-09-26T12:00:00Z"),
+                ),
+            ]),
+        },
+    );
+    update(
+        &mut app,
+        Event::CachedUsage {
+            account: 1,
+            result: cached(vec![row(
+                "Session",
+                5.0,
+                None,
+                Some("2026-09-24T12:30:00Z"),
+            )]),
+        },
+    );
+    update(
+        &mut app,
+        Event::CachedUsage {
+            account: 2,
+            result: Err("no /h/team/.claude.json".into()),
+        },
+    );
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: 1,
+            result: Ok(LiveUsage::Rows(vec![
+                UsageRow {
+                    label: "Session".into(),
+                    percent: 12.0,
+                    severity: None,
+                    resets: Some(Resets::Text("Sep 24 at 1pm (UTC)".into())),
+                },
+                UsageRow {
+                    label: "Week (all models)".into(),
+                    percent: 91.0,
+                    severity: None,
+                    resets: Some(Resets::Text("Sep 30 at 11:59am (UTC)".into())),
+                },
+            ])),
+        },
+    );
+    update(
+        &mut app,
+        Event::Checks(vec![Check {
+            account: None,
+            message: "ANTHROPIC_API_KEY is set: it overrides every account's /login".into(),
+        }]),
+    );
+    app
+}
+
+#[test]
+fn accounts_view_loading() {
+    let app = app();
+    let lines = screen(&app);
+    let (_, header) = line_with(&lines, "remuda");
+    assert!(
+        header.contains("1 Accounts") && header.contains("2 Live") && header.contains("3 History")
+    );
+    let (_, row) = line_with(&lines, "max ");
+    assert!(row.contains('…'), "{row}");
+    let all = text(&app);
+    assert!(all.contains("checking…"), "{all}");
+    assert!(all.contains("loading index…"), "{all}");
+    assert!(all.contains("u: live usage"), "{all}");
+}
+
+#[test]
+fn accounts_view_populated() {
+    let app = populated_accounts();
+    let lines = screen(&app);
+    let all = lines.join("\n");
+    let (_, head) = line_with(&lines, "ACCOUNT");
+    for col in ["EMAIL", "ORG", "PLAN", "SESSION", "WEEK", "Fable", "SOURCE"] {
+        assert!(head.contains(col), "{head}");
+    }
+    let (_, default) = line_with(&lines, "me@example.com");
+    for cell in ["34%", "77%", "100%", "cached 5m ago"] {
+        assert!(default.contains(cell), "{default}");
+    }
+    let (_, max) = line_with(&lines, "max@example.com");
+    for cell in ["12%", "91%", "live 0s ago"] {
+        assert!(max.contains(cell), "{max}");
+    }
+    assert!(
+        !max.contains(" 5%"),
+        "live replaced the cached number: {max}"
+    );
+    let (_, team) = line_with(&lines, "not logged in");
+    assert!(team.contains("no cache"), "{team}");
+
+    // Timeline: S and W where they reset, relative to now.
+    let (axis_y, axis) = line_with(&lines, "now");
+    assert!(axis.contains("+1d"), "{axis}");
+    let (track_y, track) = lines
+        .iter()
+        .enumerate()
+        .skip(axis_y + 1)
+        .find(|(_, l)| l.starts_with("default"))
+        .unwrap();
+    assert!(
+        track.contains("S 2h00m") && track.contains("W 3d00h"),
+        "{track}"
+    );
+    let axis_col = axis.find("now").unwrap();
+    // Columns on the axis (the account name comes first and may contain these letters).
+    let on_axis = |c: char| track.chars().skip(axis_col).position(|x| x == c).unwrap() + axis_col;
+    let s_col = on_axis('S');
+    assert!(
+        s_col - axis_col <= 1,
+        "S resets in 2h: at the start of the axis\n{all}"
+    );
+    let w_col = on_axis('W');
+    let f_col = on_axis('f');
+    assert!(s_col < f_col && f_col < w_col, "{track}");
+    // Live wording is placed too: max's week resets in ~6 days.
+    let max_track = &lines[track_y + 1];
+    assert!(max_track.starts_with("max"), "{all}");
+    assert!(max_track.contains("S 1h00m W 5d23h"), "{max_track}");
+    assert!(all.contains("f week (Fable)"), "{all}");
+
+    // Checks: the env check, the login state.
+    assert!(all.contains("! ANTHROPIC_API_KEY is set"), "{all}");
+    assert!(all.contains("! team: not logged in"), "{all}");
+}
+
+#[test]
+fn accounts_view_errors_and_pending_live_usage() {
+    let mut app = populated_accounts();
+    keys(&mut app, &[Key::Char('u')]);
+    let all = text(&app);
+    assert_eq!(all.matches("live…").count(), 3, "{all}");
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: 2,
+            result: Err("`claude -p /usage --no-session-persistence` timed out after 90s".into()),
+        },
+    );
+    update(&mut app, Event::Checks(vec![]));
+    let all = text(&app);
+    assert!(all.contains("live failed"), "{all}");
+    assert!(
+        all.contains("! team: live usage failed: `claude -p /usage"),
+        "{all}"
+    );
+    assert!(!all.contains("no problems found"), "{all}");
+}
+
+#[test]
+fn accounts_view_without_problems() {
+    let mut app = app();
+    update(&mut app, Event::Checks(vec![]));
+    assert!(text(&app).contains("✓ no problems found"));
+}
+
+fn populated_history() -> App {
+    let mut app = app();
+    app.start();
+    let mut titled = entry("a", "first words", 3);
+    titled.title = Some("修复索引的增量扫描".into());
+    let mut entries = noisy();
+    entries.push(titled);
+    entries.push(entry("b", "plain one", 1));
+    update(&mut app, Event::IndexLoaded(entries));
+    let mut attribution = Attribution::default();
+    attribution.add("a", "claude:max");
+    attribution.add("a", "claude:team");
+    update(&mut app, Event::Attribution(attribution));
+    keys(&mut app, &[Key::Char('3')]);
+    app
+}
+
+#[test]
+fn history_view_loading_and_empty() {
+    let mut app = app();
+    keys(&mut app, &[Key::Char('3')]);
+    assert!(text(&app).contains("loading sessions…"));
+    update(&mut app, Event::IndexLoaded(vec![]));
+    app.index_in_flight = true;
+    assert!(text(&app).contains("indexing…"));
+    update(
+        &mut app,
+        Event::IndexProgress {
+            done: 1234,
+            total: 6071,
+            entries: vec![],
+        },
+    );
+    assert!(text(&app).contains("indexing 1234/6071"));
+    update(
+        &mut app,
+        Event::IndexDone {
+            entries: vec![],
+            error: None,
+        },
+    );
+    let all = text(&app);
+    assert!(all.contains("no sessions found"), "{all}");
+    assert!(all.contains("showing 0 of 0 (a: show all)"), "{all}");
+    assert!(all.contains("refreshed 12:00:00"), "{all}");
+}
+
+#[test]
+fn history_view_populated_narrow() {
+    let mut app = populated_history();
+    // Preview arrives for the selected (newest visible) session.
+    tick(&mut app, 0);
+    tick(&mut app, 0);
+    update(
+        &mut app,
+        Event::Preview {
+            path: path("real"),
+            result: Ok(vec![
+                Message {
+                    role: Role::User,
+                    text: "please check the scan".into(),
+                },
+                Message {
+                    role: Role::Assistant,
+                    text: "Looking.\n[tool: Read]".into(),
+                },
+            ]),
+        },
+    );
+    let lines = screen(&app);
+    let all = lines.join("\n");
+    assert!(all.contains("showing 3 of 5 (a: show all)"), "{all}");
+    assert!(
+        all.contains("enter: resume") && all.contains("f: fork") && all.contains("p: preview"),
+        "{all}"
+    );
+    assert!(!all.contains("M2"), "{all}");
+    let (_, head) = line_with(&lines, "TIME");
+    assert!(head.contains("ACCOUNTS") && head.contains("TITLE") && head.contains("CWD"));
+    let (real_y, real) = line_with(&lines, "real work");
+    assert!(real.starts_with("09-24 10:06"), "{real}");
+    assert!(real.contains(" - "), "no accounts: {real}");
+    assert!(real.contains("~/space/remuda"), "{real}");
+    let (a_y, a) = line_with(&lines, "修复索引的增量扫描");
+    assert!(a.contains("max,team"), "{a}");
+    assert!(a_y > real_y, "newest first");
+    assert!(!all.contains("teammate-message"), "{all}");
+    // Narrow: the preview is below the list.
+    let (p_y, _) = line_with(&lines, "Preview · real work");
+    assert!(p_y > a_y, "{all}");
+    let (u_y, u) = line_with(&lines, "please check the scan");
+    assert!(u.starts_with("› "), "{u}");
+    let (_, tool) = line_with(&lines, "[tool: Read]");
+    assert!(u_y > p_y && tool.starts_with("  "), "{all}");
+}
+
+#[test]
+fn history_view_wide_has_preview_beside() {
+    let mut app = populated_history();
+    update(&mut app, Event::Resize(160, 30));
+    let lines = screen(&app);
+    let (y, line) = line_with(&lines, "Preview");
+    assert_eq!(y, 1, "preview starts at the top\n{}", lines.join("\n"));
+    assert!(line.contains("TIME"), "list and preview share rows: {line}");
+    let all = lines.join("\n");
+    assert!(all.contains("loading preview…"), "{all}");
+}
+
+#[test]
+fn history_search_prompt_and_no_matches() {
+    let mut app = populated_history();
+    keys(&mut app, &[Key::Char('/')]);
+    type_str(&mut app, "修复");
+    let lines = screen(&app);
+    let (y, prompt) = line_with(&lines, "/修复▏");
+    assert_eq!(y, 1, "{prompt}");
+    assert!(lines.join("\n").contains("showing 1 of 5"), "{lines:?}");
+    assert!(lines.join("\n").contains("type to filter"), "{lines:?}");
+    type_str(&mut app, "zzz");
+    keys(&mut app, &[Key::Enter]);
+    let all = text(&app);
+    assert!(all.contains("filter: 修复zzz"), "{all}");
+    assert!(all.contains("no matches for “修复zzz”"), "{all}");
+}
+
+#[test]
+fn history_preview_error() {
+    let mut app = populated_history();
+    tick(&mut app, 0);
+    tick(&mut app, 0);
+    update(
+        &mut app,
+        Event::Preview {
+            path: path("real"),
+            result: Err("No such file or directory (os error 2)".into()),
+        },
+    );
+    assert!(text(&app).contains("cannot read transcript: No such file"));
+}
+
+#[test]
+fn live_view_states() {
+    let mut app = app();
+    keys(&mut app, &[Key::Char('2')]);
+    assert!(text(&app).contains("collecting live sessions…"));
+    update(&mut app, Event::Live(vec![]));
+    let all = text(&app);
+    assert!(all.contains("no running sessions"), "{all}");
+    assert!(all.contains("0 running"), "{all}");
+
+    update(
+        &mut app,
+        Event::IndexLoaded(vec![entry("aaaaaaaa-1111", "indexed one", 1)]),
+    );
+    let mut idle = live("claude:team", 9, Some("bbbbbbbb-2222"));
+    idle.status = Some("idle".into());
+    idle.kind = Some("bg".into());
+    update(
+        &mut app,
+        Event::Live(vec![live("claude:max", 7, Some("aaaaaaaa-1111")), idle]),
+    );
+    let lines = screen(&app);
+    let all = lines.join("\n");
+    let (_, head) = line_with(&lines, "ACCOUNT");
+    for col in ["STATUS", "NAME", "KIND", "STARTED", "CWD", "SESSION"] {
+        assert!(head.contains(col), "{head}");
+    }
+    let (_, max) = line_with(&lines, "busy");
+    for cell in ["max", "fix index", "interactive", "3m ago", "aaaaaaaa"] {
+        assert!(max.contains(cell), "{cell}: {max}");
+    }
+    assert!(!max.contains("aaaaaaaa-"), "short id: {max}");
+    assert!(all.contains("Preview · fix index"), "{all}");
+    assert!(all.contains("loading preview…"), "{all}");
+    keys(&mut app, &[Key::Char('j')]);
+    let all = text(&app);
+    assert!(all.contains("transcript not indexed yet"), "{all}");
+}
+
+#[test]
+fn help_overlay_lists_every_key() {
+    let mut app = app();
+    keys(&mut app, &[Key::Char('?')]);
+    let all = text(&app);
+    assert!(all.contains("Keys"), "{all}");
+    for (key, _) in render::KEYS {
+        assert!(all.contains(key), "{key}\n{all}");
+    }
+}
+
+#[test]
+fn tiny_terminal_does_not_panic() {
+    for (w, h) in [(1, 1), (10, 3), (20, 5), (40, 10)] {
+        let mut app = populated_history();
+        update(&mut app, Event::Resize(w, h));
+        for view in ['1', '2', '3', '?'] {
+            keys(&mut app, &[Key::Char(view)]);
+            screen(&app);
+        }
+    }
+}
+
+#[test]
+fn accounts_table_stays_compact_on_a_wide_terminal() {
+    let mut app = populated_accounts();
+    update(
+        &mut app,
+        Event::CachedUsage {
+            account: 0,
+            result: Ok(CachedUsage {
+                fetched_at: Some(ts("2026-09-24T11:34:00Z")),
+                rows: vec![row("Session", 1.0, None, None)],
+            }),
+        },
+    );
+    update(&mut app, Event::Resize(300, 30));
+    let lines = screen(&app);
+    let (_, head) = line_with(&lines, "ACCOUNT");
+    // Usage sits next to the identity instead of across the screen.
+    assert!(head.find("SESSION").unwrap() < 100, "{head}");
+    let (_, default) = line_with(&lines, "me@example.com");
+    assert!(default.contains("cached 26m ago"), "not cut: {default}");
+}
+
+#[test]
+fn account_picker_and_notices_render() {
+    let mut app = history_with(&["team", "max"]);
+    keys(&mut app, &[Key::Enter]);
+    let lines = screen(&app);
+    let all = lines.join("\n");
+    assert!(all.contains("Resume aaaaaaaa as"), "{all}");
+    let (max_y, max) = line_with(&lines, "│› max");
+    assert!(max.contains("●"), "attributed: {max}");
+    let (team_y, team) = line_with(&lines, "│  team");
+    assert!(team.contains("●"), "{team}");
+    assert!(team.contains("other projects store"), "{team}");
+    let (default_y, default) = line_with(&lines, "│  default");
+    assert!(!default.contains("●"), "{default}");
+    // C4: the accounts that can see the transcript first.
+    assert!(max_y < default_y && default_y < team_y, "{all}");
+    assert!(all.contains("enter: choose · esc: cancel"), "{all}");
+
+    keys(&mut app, &[Key::Esc]);
+    update(&mut app, Event::Live(vec![live("claude:max", 7, Some(A))]));
+    keys(&mut app, &[Key::Char('f'), Key::Esc, Key::Enter]);
+    let lines = screen(&app);
+    let (_, status) = line_with(&lines, "is running in max (pid 7)");
+    assert!(status.starts_with(" session aaaaaaaa"), "{status}");
+}
+
+#[test]
+fn help_lists_the_launch_keys() {
+    let keys_text: Vec<&str> = render::KEYS.iter().map(|(k, _)| *k).collect();
+    for key in ["enter", "f", "p / space"] {
+        assert!(keys_text.contains(&key), "{key}: {keys_text:?}");
+    }
+    let enter = render::KEYS.iter().find(|(k, _)| *k == "enter").unwrap().1;
+    assert!(!enter.contains("M2"), "{enter}");
+}
+
+#[test]
+fn forms_render_with_their_fields_and_errors() {
+    let mut app = new_session_form();
+    let all = text(&app);
+    assert!(all.contains("New session as max"), "{all}");
+    let lines = screen(&app);
+    let (dir_y, dir) = line_with(&lines, "Directory");
+    assert!(
+        dir.contains("~/space/remuda") || dir.contains("remuda▏"),
+        "{dir}"
+    );
+    let (name_y, _) = line_with(&lines, "Name (optional)");
+    assert!(name_y == dir_y + 1, "{all}");
+    assert!(all.contains("enter: start claude · esc: cancel"), "{all}");
+    keys(&mut app, &[Key::Tab]);
+    type_str(&mut app, "update");
+    keys(&mut app, &[Key::Enter]);
+    assert!(
+        text(&app).contains("cannot tell this is a new session"),
+        "{}",
+        text(&app)
+    );
+
+    let mut app = idle_app();
+    keys(&mut app, &[Key::Char('s')]);
+    let all = text(&app);
+    assert!(all.contains("Set up a new account"), "{all}");
+    assert!(
+        all.contains("Account name") && all.contains("Email (optional)"),
+        "{all}"
+    );
+}
+
+// ---- codex (R17) ---------------------------------------------------------------------
+
+const C: &str = "019c1e08-e4f6-7d70-a129-38ec744a3f3c";
+const C_SUB: &str = "019c1e09-b0ff-7842-aca4-1397c3b7b047";
+const C_CWD: &str = "/w/proj";
+
+fn codex_account(name: &str) -> Account {
+    if name == "default" {
+        return Account::default_for(CODEX);
+    }
+    Account {
+        provider: CODEX,
+        name: name.into(),
+        home: Home::Path(format!("/c/{name}")),
+    }
+}
+
+fn codex_path(id: &str) -> PathBuf {
+    PathBuf::from(format!("/c/work/sessions/2026/09/24/rollout-x-{id}.jsonl"))
+}
+
+/// A rollout of `codex:work`, last written an hour before [`NOW`].
+fn codex_entry(id: &str, title: &str, minute: u32, source: &str) -> Entry {
+    Entry {
+        provider: CODEX,
+        path: codex_path(id),
+        store: PathBuf::from("/c/work/sessions"),
+        mtime_ns: (ts(NOW) - jiff::SignedDuration::from_hours(1)).as_nanosecond(),
+        cwd_first: Some(C_CWD.into()),
+        cwd_last: Some(C_CWD.into()),
+        entrypoint: None,
+        source: Some(source.into()),
+        originator: Some("codex-tui".into()),
+        ..entry(id, title, minute)
+    }
+}
+
+/// claude:default, max, codex:default, codex:work; everything loaded; history: claude `A`,
+/// codex `C` (cli) and `C_SUB` (a subagent's); `C` selected in History.
+fn codex_app() -> App {
+    let mut app = App::new(
+        vec![
+            account("default"),
+            account("max"),
+            codex_account("default"),
+            codex_account("work"),
+        ],
+        TimeZone::UTC,
+        Some("/Users/you".into()),
+        ts(NOW),
+    );
+    update(&mut app, Event::Resize(100, 30));
+    app.cwd = Some(PathBuf::from(CWD));
+    app.start();
+    update(
+        &mut app,
+        Event::IndexDone {
+            entries: vec![
+                entry(A, "claude work", 1),
+                codex_entry(C, "codex work", 2, "cli"),
+                codex_entry(C_SUB, "a subagent", 3, "subagent"),
+            ],
+            error: None,
+        },
+    );
+    update(&mut app, Event::Live(vec![]));
+    for account in 0..4 {
+        update(
+            &mut app,
+            Event::Identity {
+                account,
+                identity: Identity::NotLoggedIn,
+            },
+        );
+        update(
+            &mut app,
+            Event::CachedUsage {
+                account,
+                result: Err("no cache".into()),
+            },
+        );
+    }
+    update(&mut app, Event::Attribution(Attribution::default()));
+    update(&mut app, Event::Checks(vec![]));
+    update(
+        &mut app,
+        Event::Stores(vec![
+            stores().remove(0),
+            Store {
+                provider: CODEX,
+                path: PathBuf::from("/c/default/sessions"),
+                accounts: vec!["codex:default".into()],
+                thread_names: vec![PathBuf::from("/c/default/session_index.jsonl")],
+            },
+            Store {
+                provider: CODEX,
+                path: PathBuf::from("/c/work/sessions"),
+                accounts: vec!["codex:work".into()],
+                thread_names: vec![PathBuf::from("/c/work/session_index.jsonl")],
+            },
+        ]),
+    );
+    keys(&mut app, &[Key::Char('3')]);
+    assert_eq!(app.selected_entry().unwrap().session_id, C);
+    app
+}
+
+fn resume_c(verb: &str) -> LaunchRequest {
+    LaunchRequest {
+        account: codex_account("work"),
+        args: vec![verb.into(), C.into(), "-C".into(), C_CWD.into()],
+        cwd: Some(PathBuf::from(C_CWD)),
+        what: format!("{verb} 019c1e08 as codex:work"),
+    }
+}
+
+#[test]
+fn codex_accounts_show_their_login_method_and_no_usage() {
+    let mut app = codex_app();
+    keys(&mut app, &[Key::Char('1')]);
+    update(
+        &mut app,
+        Event::Identity {
+            account: 3,
+            identity: Identity::LoggedIn {
+                email: None,
+                org: None,
+                plan: None,
+                method: Some("ChatGPT".into()),
+                cached: false,
+            },
+        },
+    );
+    update(
+        &mut app,
+        Event::CachedUsage {
+            account: 3,
+            result: Err("usage is not available for codex".into()),
+        },
+    );
+    let lines = screen(&app);
+    let (_, work) = line_with(&lines, "codex:work ");
+    assert!(work.contains("logged in (ChatGPT)"), "{work}");
+    assert!(work.contains('—') && !work.contains("no cache"), "{work}");
+    let (_, native) = line_with(&lines, "codex:default ");
+    assert!(native.contains("not logged in"), "{native}");
+    // Live usage is claude's only.
+    assert_eq!(
+        keys(&mut app, &[Key::Char('u')]),
+        [Effect::LiveUsage(vec![0, 1])]
+    );
+    assert!(app.accounts[3].live.is_none() && !app.accounts[3].live_pending);
+}
+
+#[test]
+fn codex_sessions_are_in_history_with_their_account() {
+    let mut app = codex_app();
+    // The subagent's rollout is noise.
+    let all = text(&app);
+    assert!(all.contains("showing 2 of 3"), "{all}");
+    let lines = screen(&app);
+    let (_, c) = line_with(&lines, "codex work");
+    assert!(c.contains("codex:work"), "{c}");
+    assert!(!all.contains("a subagent"), "{all}");
+    keys(&mut app, &[Key::Char('a')]);
+    assert!(text(&app).contains("a subagent"));
+    // The account is searchable.
+    keys(&mut app, &[Key::Char('/')]);
+    type_str(&mut app, "codex:work");
+    keys(&mut app, &[Key::Enter]);
+    assert_eq!(history_ids(&app).len(), 2);
+    assert!(
+        history_ids(&app)
+            .iter()
+            .all(|id| id.ends_with(C) || id.ends_with(C_SUB))
+    );
+    // The preview reads the rollout as codex.
+    keys(&mut app, &[Key::Esc]);
+    while app.selected_entry().unwrap().session_id != C {
+        keys(&mut app, &[Key::Char('j')]);
+    }
+    tick(&mut app, 0);
+    assert_eq!(tick(&mut app, 0), [Effect::Preview(codex_path(C), CODEX)]);
+}
+
+/// R17: nothing tells whether a codex session runs elsewhere: an in-place resume always asks
+/// (`y` goes on, anything else cancels), under the rollout's own account, in its directory.
+#[test]
+fn resuming_a_codex_session_asks_first() {
+    let mut app = codex_app();
+    // Asking also reads the rollout's mtime: the prompt says whether it was just written.
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [Effect::RolloutWritten(codex_path(C))]
+    );
+    assert!(
+        matches!(app.overlay, Some(Overlay::ResumeCodex(_))),
+        "{:?}",
+        app.overlay
+    );
+    let all = text(&app);
+    assert!(all.contains("cannot confirm"), "{all}");
+    assert!(!all.contains("being written"), "{all}");
+    assert_eq!(keys(&mut app, &[Key::Char('n')]), []);
+    assert_eq!(app.overlay, None);
+    assert_eq!(notice(&app), Some(("cancelled", Level::Info)));
+
+    keys(&mut app, &[Key::Enter]);
+    assert_eq!(
+        keys(&mut app, &[Key::Char('y')]),
+        [check_of(&app, resume_c("resume"))]
+    );
+    assert_eq!(app.overlay, None);
+    // No live check for codex: only the directory counts.
+    assert_eq!(
+        answer(&mut app, resume_c("resume"), None),
+        [Effect::Launch(resume_c("resume"))]
+    );
+}
+
+#[test]
+fn the_prompt_says_when_the_rollout_was_just_written() {
+    let mut app = codex_app();
+    let mut fresh = codex_entry(C, "codex work", 2, "cli");
+    fresh.mtime_ns = (ts(NOW) - jiff::SignedDuration::from_mins(3)).as_nanosecond();
+    update(
+        &mut app,
+        Event::IndexProgress {
+            done: 1,
+            total: 1,
+            entries: vec![fresh],
+        },
+    );
+    keys(&mut app, &[Key::Enter]);
+    let all = text(&app);
+    assert!(all.contains("it is still being written"), "{all}");
+    assert!(all.contains("last written 3m ago"), "{all}");
+}
+
+/// The prompt takes the rollout's own mtime, read when it opens, not the index's (a refresh
+/// may queue behind a long scan).
+#[test]
+fn the_prompt_reads_the_rollouts_own_mtime() {
+    let mut app = codex_app();
+    keys(&mut app, &[Key::Enter]);
+    assert!(!text(&app).contains("being written"));
+    let written = |app: &mut App, path: PathBuf, mins: i64| {
+        let at = Some(ts(NOW) - jiff::SignedDuration::from_mins(mins));
+        update(app, Event::RolloutWritten { path, at })
+    };
+    // Another rollout's answer (from an earlier prompt) is not this one's.
+    written(&mut app, codex_path(C_SUB), 1);
+    assert!(!text(&app).contains("being written"));
+    written(&mut app, codex_path(C), 2);
+    let all = text(&app);
+    assert!(all.contains("it is still being written"), "{all}");
+    assert!(all.contains("last written 2m ago"), "{all}");
+    // An unreadable file keeps what was known.
+    update(
+        &mut app,
+        Event::RolloutWritten {
+            path: codex_path(C),
+            at: None,
+        },
+    );
+    assert!(text(&app).contains("last written 2m ago"));
+    // Without a prompt, nothing happens.
+    keys(&mut app, &[Key::Char('n')]);
+    assert_eq!(written(&mut app, codex_path(C), 1), []);
+    assert_eq!(app.overlay, None);
+}
+
+#[test]
+fn forking_a_codex_session_does_not_ask() {
+    let mut app = codex_app();
+    assert_eq!(
+        keys(&mut app, &[Key::Char('f')]),
+        [check_of(&app, resume_c("fork"))]
+    );
+    assert_eq!(app.overlay, None);
+}
+
+/// The rollout's home is its account: no picker, and no other account can resume it.
+#[test]
+fn a_codex_session_resumes_only_as_the_account_of_its_home() {
+    let mut app = codex_app();
+    // codex:work was unregistered meanwhile.
+    let accounts: Vec<Account> = app.accounts[..3]
+        .iter()
+        .map(|a| a.account.clone())
+        .collect();
+    update(&mut app, Event::Accounts(accounts));
+    keys(&mut app, &[Key::Char('f')]);
+    assert_eq!(app.overlay, None);
+    assert_eq!(app.pending, None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "session 019c1e08 is in /c/work/sessions, which no registered account has",
+            Level::Error
+        ))
+    );
+}
+
+#[test]
+fn a_new_codex_session_has_no_name_and_takes_its_directory_with_c() {
+    let mut app = codex_app();
+    keys(&mut app, &[Key::Char('1'), Key::Char('G'), Key::Char('n')]);
+    assert_eq!(
+        form(&app).kind,
+        FormKind::NewSession {
+            account: codex_account("work")
+        }
+    );
+    assert_eq!(values(&app), [CWD]);
+    let want = LaunchRequest {
+        account: codex_account("work"),
+        args: vec!["-C".into(), CWD.into()],
+        cwd: Some(PathBuf::from(CWD)),
+        what: "new session as codex:work".into(),
+    };
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, want.clone())]
+    );
+    assert_eq!(answer(&mut app, want.clone(), None), [Effect::Launch(want)]);
+}
+
+#[test]
+fn the_setup_form_chooses_the_provider() {
+    let mut app = codex_app();
+    keys(&mut app, &[Key::Char('1'), Key::Char('s')]);
+    assert_eq!(values(&app), ["", "", "claude"]);
+    // codex:work exists; claude:work does not.
+    type_str(&mut app, "work");
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [Effect::Setup {
+            provider: CLAUDE,
+            name: "work".into(),
+            email: None
+        }]
+    );
+    keys(&mut app, &[Key::Char('s')]);
+    type_str(&mut app, "work");
+    keys(&mut app, &[Key::Tab, Key::Tab]);
+    clear_field(&mut app);
+    type_str(&mut app, "codex");
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert!(
+        form(&app)
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("codex:work is already registered"),
+        "{:?}",
+        form(&app).error
+    );
+    keys(&mut app, &[Key::BackTab]);
+    type_str(&mut app, "me@example.com");
+    keys(&mut app, &[Key::BackTab]);
+    clear_field(&mut app);
+    type_str(&mut app, "solo");
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert!(
+        form(&app)
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("takes no email")
+    );
+    keys(&mut app, &[Key::Tab]);
+    clear_field(&mut app);
+    keys(&mut app, &[Key::Tab]);
+    clear_field(&mut app);
+    type_str(&mut app, "gemini");
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert!(
+        form(&app)
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("unknown provider")
+    );
+    clear_field(&mut app);
+    type_str(&mut app, "codex");
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [Effect::Setup {
+            provider: CODEX,
+            name: "solo".into(),
+            email: None
+        }]
+    );
+}
+
+#[test]
+fn a_finished_codex_setup_names_codex_login() {
+    let mut app = codex_app();
+    update(
+        &mut app,
+        Event::SetupDone {
+            provider: CODEX,
+            name: "solo".into(),
+            result: Ok(Exit::Code(1)),
+        },
+    );
+    assert_eq!(
+        notice(&app),
+        Some((
+            "set up solo: codex login exited 1; codex:solo stays registered, retry with: \
+             remuda run codex:solo login",
+            Level::Warn
+        ))
+    );
+}
+
+#[test]
+fn live_view_says_codex_sessions_cannot_be_listed() {
+    let mut app = codex_app();
+    keys(&mut app, &[Key::Char('2')]);
+    let all = text(&app);
+    assert!(
+        all.contains("codex sessions can't be listed as running"),
+        "{all}"
+    );
+    // Without codex accounts there is nothing to say.
+    let mut app = idle_app();
+    keys(&mut app, &[Key::Char('2')]);
+    assert!(!text(&app).contains("codex"));
+}
+
+/// A foreground child makes the answer to the confirmation stale, like a pending check.
+#[test]
+fn a_foreground_child_closes_a_codex_confirmation() {
+    let mut app = codex_app();
+    keys(&mut app, &[Key::Enter]);
+    assert!(matches!(app.overlay, Some(Overlay::ResumeCodex(_))));
+    // Not reachable by keys (the prompt takes them): put a pending launch there directly.
+    let attach = request(
+        "max",
+        &["attach", "0badf00d"],
+        None,
+        "attach 0badf00d as max",
+    );
+    let check = app.launch_checks + 1;
+    app.launch_checks = check;
+    app.pending = Some((check, attach.clone()));
+    answer(&mut app, attach, None);
+    assert_eq!(app.overlay, None);
+}
+
+// ---- accounts held by name; shared codex stores ----------------------------------
+
+/// The accounts of [`codex_app`] with `claude:team` added (a claude account added by
+/// another terminal lands before every codex account: the list is grouped by provider).
+fn with_team(app: &App) -> Vec<Account> {
+    let mut accounts: Vec<Account> = app.accounts.iter().map(|a| a.account.clone()).collect();
+    accounts.insert(2, account("team"));
+    accounts
+}
+
+/// The new-session form keeps its account, not its row: a registry change while it is
+/// open (a pre-launch check reads the registry again) moves the rows, not the account.
+#[test]
+fn form_index_shift() {
+    let mut app = codex_app();
+    keys(&mut app, &[Key::Char('1'), Key::Char('G'), Key::Char('n')]);
+    let accounts = with_team(&app);
+    update(&mut app, Event::Accounts(accounts));
+    let want = LaunchRequest {
+        account: codex_account("work"),
+        args: vec!["-C".into(), CWD.into()],
+        cwd: Some(PathBuf::from(CWD)),
+        what: "new session as codex:work".into(),
+    };
+    assert_eq!(keys(&mut app, &[Key::Enter]), [check_of(&app, want)]);
+
+    // The account went away meanwhile: refused, whatever row took its place.
+    let mut app = codex_app();
+    keys(&mut app, &[Key::Char('1'), Key::Char('G'), Key::Char('n')]);
+    let mut accounts = with_team(&app);
+    accounts.retain(|a| a.name != "work");
+    update(&mut app, Event::Accounts(accounts));
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(app.pending, None);
+    assert_eq!(
+        form(&app).error.as_deref(),
+        Some("codex:work is no longer registered")
+    );
+}
+
+/// The account picker keeps accounts, not rows: the chosen one is resolved by name, and
+/// refused once it is gone.
+#[test]
+fn pick_resolves_accounts_by_name() {
+    // Picker: max, default (both see /s), team.
+    let mut app = history_with(&["team", "max"]);
+    keys(&mut app, &[Key::Enter]);
+    assert!(matches!(app.overlay, Some(Overlay::Pick(_))));
+    // max is unregistered meanwhile: its row is now team's.
+    update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("team")]),
+    );
+    let lines = screen(&app);
+    let (_, max) = line_with(&lines, "│› max");
+    assert!(max.contains("no longer registered"), "{max}");
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(app.pending, None);
+    assert_eq!(
+        notice(&app),
+        Some(("max is no longer registered", Level::Error))
+    );
+
+    // An account added before the chosen one does not change what is chosen.
+    let mut app = history_with(&[]);
+    keys(&mut app, &[Key::Enter, Key::Char('j')]);
+    update(
+        &mut app,
+        Event::Accounts(vec![
+            account("default"),
+            account("alpha"),
+            account("max"),
+            account("team"),
+        ]),
+    );
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, resume_a("max"))]
+    );
+}
+
+/// Codex homes whose `sessions` resolve to one directory share every rollout: the
+/// rollout does not say which account it is, so the user picks among those accounts (and
+/// still confirms a resume in place).
+fn shared_codex_store(app: &mut App) {
+    update(
+        app,
+        Event::Stores(vec![
+            stores().remove(0),
+            Store {
+                provider: CODEX,
+                path: PathBuf::from("/c/work/sessions"),
+                accounts: vec!["codex:default".into(), "codex:work".into()],
+                thread_names: vec![PathBuf::from("/c/default/session_index.jsonl")],
+            },
+        ]),
+    );
+}
+
+#[test]
+fn a_shared_codex_store_asks_which_account() {
+    let mut app = codex_app();
+    shared_codex_store(&mut app);
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert!(
+        matches!(app.overlay, Some(Overlay::Pick(_))),
+        "{:?}",
+        app.overlay
+    );
+    let all = text(&app);
+    assert!(all.contains("Resume 019c1e08 as"), "{all}");
+    // codex:work, the second: the prompt follows the pick.
+    keys(&mut app, &[Key::Char('j'), Key::Enter]);
+    let Some(Overlay::ResumeCodex(confirm)) = &app.overlay else {
+        panic!("{:?}", app.overlay)
+    };
+    assert_eq!(confirm.request, resume_c("resume"));
+    assert_eq!(
+        keys(&mut app, &[Key::Char('y')]),
+        [check_of(&app, resume_c("resume"))]
+    );
+
+    // A fork picks too, and does not ask.
+    let mut app = codex_app();
+    shared_codex_store(&mut app);
+    assert_eq!(keys(&mut app, &[Key::Char('f')]), []);
+    assert!(matches!(app.overlay, Some(Overlay::Pick(_))));
+    assert_eq!(
+        keys(&mut app, &[Key::Char('j'), Key::Enter]),
+        [check_of(&app, resume_c("fork"))]
+    );
+    let mut default = resume_c("fork");
+    default.account = codex_account("default");
+    default.what = "fork 019c1e08 as codex:default".into();
+    keys(&mut app, &[Key::Esc]);
+    keys(&mut app, &[Key::Char('f')]);
+    assert_eq!(keys(&mut app, &[Key::Enter]), [check_of(&app, default)]);
+
+    // The stores were read again while the picker was open: codex:default no longer shares
+    // codex:work's; and a claude account never resumes a rollout.
+    let mut app = codex_app();
+    shared_codex_store(&mut app);
+    keys(&mut app, &[Key::Char('f')]);
+    let Some(Overlay::Pick(pick)) = &app.overlay else {
+        panic!("{:?}", app.overlay)
+    };
+    let pick = pick.clone();
+    update(
+        &mut app,
+        Event::Stores(vec![
+            stores().remove(0),
+            Store {
+                provider: CODEX,
+                path: PathBuf::from("/c/default/sessions"),
+                accounts: vec!["codex:default".into()],
+                thread_names: vec![],
+            },
+        ]),
+    );
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "codex:default cannot find session 019c1e08: the rollout is in /c/work/sessions, \
+             which is not codex:default's sessions store",
+            Level::Error
+        ))
+    );
+    let mut claude = pick;
+    claude.options = vec!["claude:max".into()];
+    app.overlay = Some(Overlay::Pick(claude));
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(app.pending, None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "max is not a codex account: it cannot resume codex session 019c1e08",
+            Level::Error
+        ))
+    );
+}
+
+/// A claude session's picker offers claude accounts only.
+#[test]
+fn pick_offers_only_the_sessions_provider() {
+    let mut app = codex_app();
+    while app.selected_entry().unwrap().session_id != A {
+        keys(&mut app, &[Key::Char('j')]);
+    }
+    keys(&mut app, &[Key::Enter]);
+    let Some(Overlay::Pick(pick)) = &app.overlay else {
+        panic!("{:?}", app.overlay)
+    };
+    assert_eq!(pick.options, ["claude:default", "claude:max"]);
+    // Defensively, a codex account cannot resume a claude session even if offered.
+    let mut pick = pick.clone();
+    pick.options = vec!["codex:work".into()];
+    app.overlay = Some(Overlay::Pick(pick));
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(app.pending, None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "codex:work is not a claude account: it cannot resume claude session aaaaaaaa",
+            Level::Error
+        ))
+    );
+}
+
+/// A codex prompt keeps its account too: gone by the time of `y`, it is refused.
+#[test]
+fn codex_prompt_account_gone_before_yes() {
+    let mut app = codex_app();
+    keys(&mut app, &[Key::Enter]);
+    assert!(matches!(app.overlay, Some(Overlay::ResumeCodex(_))));
+    let accounts: Vec<Account> = app.accounts[..3]
+        .iter()
+        .map(|a| a.account.clone())
+        .collect();
+    update(&mut app, Event::Accounts(accounts));
+    assert_eq!(keys(&mut app, &[Key::Char('y')]), []);
+    assert_eq!(app.pending, None);
+    assert_eq!(
+        notice(&app),
+        Some(("codex:work is no longer registered", Level::Error))
+    );
+}
+
+/// With `codex:work` registered, a bare `work` is ambiguous: the retry names
+/// `claude:work`.
+#[test]
+fn setup_retry_is_unambiguous() {
+    let mut app = codex_app();
+    let mut accounts: Vec<Account> = app.accounts.iter().map(|a| a.account.clone()).collect();
+    accounts.insert(2, account("work"));
+    update(&mut app, Event::Accounts(accounts));
+    update(
+        &mut app,
+        Event::SetupDone {
+            provider: CLAUDE,
+            name: "work".into(),
+            result: Ok(Exit::Code(1)),
+        },
+    );
+    assert_eq!(
+        notice(&app),
+        Some((
+            "set up work: claude auth login exited 1; claude:work stays registered, retry \
+             with: remuda run claude:work auth login",
+            Level::Warn
+        ))
+    );
+}

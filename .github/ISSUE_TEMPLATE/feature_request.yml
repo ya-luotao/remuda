@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose new behavior or a change to existing behavior.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Behavior is specified in SPEC.md before it is implemented. Describing the problem first
+        makes it easier to find the right place for a change in the specification.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what makes it hard today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: How should remuda behave? Cite affected SPEC.md entries if you know them.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches or workarounds you have considered.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Agent versions, relevant agent features or options, or anything else that helps.
