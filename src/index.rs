@@ -205,9 +205,9 @@ pub fn stores(accounts: &[Account], env: &Env) -> Vec<Store> {
 
 /// Size, mtime and inode of a transcript as listed.
 #[derive(Debug, Clone, Copy)]
-struct Stat {
+pub(crate) struct Stat {
     size: u64,
-    mtime_ns: i128,
+    pub(crate) mtime_ns: i128,
     ino: u64,
 }
 
@@ -381,7 +381,7 @@ fn list_store(store: &Store) -> Vec<(PathBuf, String, Stat)> {
 /// `<sessions>/**/rollout-*.jsonl` (R17): `sessions/YYYY/MM/DD/` in practice. Symlinked
 /// directories below the store are not followed; unreadable entries and non-UTF-8 names are
 /// skipped.
-fn list_rollouts(dir: &Path, out: &mut Vec<(PathBuf, String, Stat)>) {
+pub(crate) fn list_rollouts(dir: &Path, out: &mut Vec<(PathBuf, String, Stat)>) {
     let Ok(listing) = fs::read_dir(dir) else {
         return;
     };

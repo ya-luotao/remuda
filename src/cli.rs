@@ -46,14 +46,14 @@ enum Command {
         /// Existing home directory; stored exactly as given (a leading `~` is expanded once)
         path: String,
     },
-    /// Show usage limits: cached in each account's .claude.json, or queried live
+    /// Show usage limits: cached by the agent (claude: .claude.json; codex: its rollouts), or queried live
     Usage {
         /// Only this account (`name` or `provider:name`)
         account: Option<String>,
-        /// Ask claude now (`claude -p /usage`) instead of reading the cache
+        /// Ask each agent now (`claude -p /usage`, `codex app-server`) instead of reading the cache
         #[arg(long)]
         live: bool,
-        /// Seconds to wait for each account's live query (claude scans local session history: 2-20 s)
+        /// Seconds to wait for each account's live query (claude scans local session history: 2-20 s; codex: about 1-2 s)
         #[arg(long, value_name = "SECONDS", default_value = "90", value_parser = parse_timeout)]
         timeout: Duration,
     },
@@ -443,13 +443,18 @@ fn usage(
         None => registry.all(&ctx.env),
     };
     let reports: Vec<(String, bool)> = if live {
-        // Only claude has usage to query (R4).
-        let program = match accounts.iter().any(|a| a.provider.has_usage()) {
+        // A missing claude fails the whole command; a missing codex, each codex account (R10).
+        let claude = match accounts.iter().any(|a| a.provider == Provider::Claude) {
             true => Some(claude_program(ctx)?),
             false => None,
         };
+        let codex = program(ctx, Provider::Codex).ok();
         probe::parallel(&accounts, |account| {
-            usage::live_report(account, program.as_deref(), &ctx.tz, timeout)
+            let program = match account.provider {
+                Provider::Claude => claude.as_deref(),
+                Provider::Codex => codex.as_deref(),
+            };
+            usage::live_report(account, program, &ctx.tz, timeout)
         })
     } else {
         accounts

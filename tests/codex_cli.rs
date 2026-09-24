@@ -1,9 +1,11 @@
-//! R4, R17: codex accounts on the command line: `add`, `setup`, `list`, `run`, `usage`.
+//! R4, R10, R17: codex accounts on the command line: `add`, `setup`, `list`, `run`, `usage`.
 
 mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use common::{Sandbox, parse_table};
 use predicates::prelude::*;
@@ -126,8 +128,9 @@ fn add_refuses_a_home_registered_under_the_other_provider() {
 
 // --- list -----------------------------------------------------------------------------------
 
-/// R4, R17: identity is `codex login status` under the account's `CODEX_HOME` (it prints to
-/// stderr and exits 1 when not logged in); only the login method, no email.
+/// R4, R10a, R17: identity is `codex login status` under the account's `CODEX_HOME` (it prints
+/// to stderr and exits 1 when not logged in); only the login method, no email. `codex
+/// app-server` is not run: it is for explicit live queries only.
 #[test]
 fn list_shows_the_codex_login_method() {
     let sb = Sandbox::new();
@@ -171,6 +174,7 @@ fn list_shows_the_codex_login_method() {
             Some(work.to_str().unwrap().to_string())
         ]
     );
+    assert!(sb.codex_rpc().is_empty());
 }
 
 /// Output remuda does not recognize: unknown, with a warning; never a crash.
@@ -321,35 +325,344 @@ fn run_codex_without_codex_on_path() {
 
 // --- usage ----------------------------------------------------------------------------------
 
-/// R4: codex has no usage; it says so and is not a failure.
-#[test]
-fn usage_shows_codex_as_unsupported() {
-    let sb = Sandbox::new();
-    sb.install_codex();
-    register(&sb, &[("codex", "work", WORK_HOME)]);
-    for args in [
-        &["usage"][..],
-        &["usage", "--live"],
-        &["usage", "codex:work", "--live"],
-    ] {
-        let out = sb.remuda().args(args).output().unwrap();
-        let stdout = String::from_utf8(out.stdout).unwrap();
-        assert!(
-            stdout.contains("codex:work  usage is not available for codex"),
-            "{args:?}: {stdout}"
-        );
-        if args.len() == 3 {
-            // Only the account asked for; nothing failed.
-            assert!(!stdout.contains("codex:default"), "{stdout}");
-            assert!(out.status.success(), "{args:?}");
+/// `remuda usage` output blocks: the header (whitespace-normalized), then its rows.
+fn blocks(stdout: &str) -> Vec<(String, Vec<String>)> {
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let norm = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.starts_with(' ') {
+            out.last_mut().expect("row before header").1.push(norm);
         } else {
-            assert!(
-                stdout.contains("codex:default  usage is not available for codex"),
-                "{args:?}: {stdout}"
-            );
+            out.push((norm, Vec::new()));
         }
     }
+    out
+}
+
+/// `remuda <args>`: stdout and the exit code.
+fn usage(sb: &Sandbox, args: &[&str]) -> (String, Option<i32>) {
+    let out = sb.remuda().args(args).output().unwrap();
+    (String::from_utf8(out.stdout).unwrap(), out.status.code())
+}
+
+/// The block of `account` (its header starts with the name).
+fn block<'a>(blocks: &'a [(String, Vec<String>)], account: &str) -> &'a (String, Vec<String>) {
+    let prefix = format!("{account} ");
+    blocks
+        .iter()
+        .find(|(header, _)| header.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no block for {account}: {blocks:?}"))
+}
+
+fn path(home: &Path) -> &str {
+    home.to_str().unwrap()
+}
+
+/// A rollout `rate_limits` record, snake_case like codex writes it.
+fn rollout_limits(limit_id: serde_json::Value, windows: &[(f64, i64, i64)]) -> serde_json::Value {
+    let window = |i: usize| {
+        windows.get(i).map_or(serde_json::Value::Null, |(pct, minutes, resets)| {
+            json!({"used_percent": pct, "window_minutes": minutes, "resets_at": resets})
+        })
+    };
+    json!({"limit_id": limit_id, "limit_name": null, "primary": window(0),
+           "secondary": window(1), "credits": {"has_credits": false, "unlimited": false,
+           "balance": "0"}, "individual_limit": null, "spend_control_reached": null,
+           "plan_type": "pro", "rate_limit_reached_type": null})
+}
+
+/// R10: cached codex usage is the newest general rate limits recorded in the home's rollouts
+/// (`sessions/**` and `archived_sessions/`); codex is not run.
+#[test]
+fn usage_reads_codex_rate_limits_from_rollouts() {
+    use common::rollouts::{token_count, ts, write_archived_rollout, write_rollout};
+    let sb = Sandbox::new();
+    let work = sb.make_codex_home("c/work");
+    let empty = sb.make_codex_home("c/empty");
+    register(
+        &sb,
+        &[
+            ("codex", "work", path(&work)),
+            ("codex", "empty", path(&empty)),
+        ],
+    );
+    // A Pro plan: one weekly window. Older records and a per-model one after it do not count.
+    let pro = rollout_limits(json!("codex"), &[(99.0, 10080, 1790414559)]);
+    let older = rollout_limits(json!("codex"), &[(50.0, 10080, 1790414559)]);
+    let spark = json!({"limit_id": "codex_bengalfox", "limit_name": "GPT-5.3-Codex-Spark",
+                       "primary": {"used_percent": 5.0, "window_minutes": 300, "resets_at": 1}});
+    write_rollout(
+        &work,
+        "019c1e08-e4f6-7d70-a129-38ec744a3f3c",
+        &[
+            token_count(older, &ts(1)),
+            token_count(pro, &ts(2)),
+            token_count(spark, &ts(3)),
+            token_count(serde_json::Value::Null, &ts(4)),
+        ]
+        .concat(),
+    );
+    // codex:default (`~/.codex`) has only an archived rollout, from 2025: a null `limit_id`,
+    // windows of 299 and 10079 minutes.
+    let plus = rollout_limits(
+        serde_json::Value::Null,
+        &[(10.0, 299, 1790100000), (20.0, 10079, 1790500000)],
+    );
+    write_archived_rollout(
+        &sb.home().join(".codex"),
+        "019c1e09-b0ff-7842-aca4-1397c3b7b047",
+        &token_count(plus, &ts(5)),
+    );
+    let (out, code) = usage(&sb, &["usage"]);
+    assert_eq!(code, Some(0), "{out}");
+    let b = blocks(&out);
+    let (header, rows) = block(&b, "codex:work");
+    assert!(
+        header.starts_with("codex:work cached ") && header.ends_with("(Sep 20 10:02)"),
+        "{out}"
+    );
+    assert_eq!(rows, &["Week (all models) 99% !! resets Sep 26 09:22"]);
+    let (header, rows) = block(&b, "codex:default");
+    assert!(header.ends_with("(Sep 20 10:05)"), "{out}");
+    assert_eq!(
+        rows,
+        &[
+            "Session 10% resets Sep 22 18:00",
+            "Week (all models) 20% resets Sep 27 09:06"
+        ]
+    );
+    let (header, rows) = block(&b, "codex:empty");
+    assert_eq!(
+        header,
+        &format!(
+            "codex:empty no cached usage (no rate limits in the rollouts under {})",
+            path(&empty)
+        )
+    );
+    assert!(rows.is_empty());
     assert!(sb.codex_invocations().is_empty());
+}
+
+/// An `account/rateLimits/read` result: Pro's weekly general limit, and a per-model limit.
+const RATE_LIMITS: &str = r#"{
+  "rateLimits": {"limitId": "codex", "limitName": null,
+    "primary": {"usedPercent": 99, "windowDurationMins": 10080, "resetsAt": 1790414559},
+    "secondary": null, "credits": {"hasCredits": false, "unlimited": false, "balance": "0"},
+    "planType": "pro"},
+  "rateLimitsByLimitId": {
+    "codex": {"limitId": "codex", "limitName": null,
+      "primary": {"usedPercent": 99, "windowDurationMins": 10080, "resetsAt": 1790414559},
+      "secondary": null, "planType": "pro"},
+    "codex_bengalfox": {"limitId": "codex_bengalfox", "limitName": "GPT-5.3-Codex-Spark",
+      "primary": {"usedPercent": 5, "windowDurationMins": 300, "resetsAt": 1790300000},
+      "secondary": {"usedPercent": 7, "windowDurationMins": 10080, "resetsAt": 1790700000},
+      "planType": "pro"}},
+  "rateLimitResetCredits": null
+}"#;
+
+const CX_ACCOUNT: &str = r#"{"account":{"type":"chatgpt","email":"cx@example.com","planType":"pro"},"requiresOpenaiAuth":true}"#;
+
+const LIVE_ROWS: [&str; 3] = [
+    "Week (all models) 99% !! resets Sep 26 09:22",
+    "Session (GPT-5.3-Codex-Spark) 5% resets Sep 25 01:33",
+    "Week (GPT-5.3-Codex-Spark) 7% resets Sep 29 16:40",
+];
+
+/// R4, R10: `usage --live` runs one `codex app-server` per codex account, in its `CODEX_HOME`,
+/// asking the rate limits and the account in the same session; the header shows the email and
+/// plan, the rows include per-model limits.
+#[test]
+fn live_usage_asks_codex_app_server() {
+    let sb = Sandbox::new();
+    sb.install_codex();
+    let work = sb.make_codex_home("c/work");
+    register(&sb, &[("codex", "work", path(&work))]);
+    for home in [None, Some(work.as_path())] {
+        sb.set_codex_rate_limits(home, RATE_LIMITS);
+    }
+    sb.set_codex_account(Some(&work), CX_ACCOUNT);
+    sb.set_codex_account(
+        None,
+        r#"{"account":{"type":"apiKey"},"requiresOpenaiAuth":true}"#,
+    );
+    sb.set_live_usage(None, "Current session: 3% used\n");
+    let (out, code) = usage(&sb, &["usage", "--live"]);
+    assert_eq!(code, Some(0), "{out}");
+    let b = blocks(&out);
+    let headers: Vec<&str> = b.iter().map(|(h, _)| h.as_str()).collect();
+    assert_eq!(
+        headers,
+        [
+            "claude:default live",
+            "codex:default live logged in (API key)",
+            "codex:work live cx@example.com (pro)",
+        ]
+    );
+    assert_eq!(b[1].1, LIVE_ROWS);
+    assert_eq!(b[2].1, LIVE_ROWS);
+
+    // One app-server per codex home, each with the handshake, then both requests.
+    let homes = [None, Some(path(&work).to_string())];
+    let invocations = sb.codex_invocations();
+    assert_eq!(invocations.len(), 2, "{invocations:?}");
+    let rpc = sb.codex_rpc();
+    for home in &homes {
+        let runs: Vec<_> = invocations
+            .iter()
+            .filter(|i| &i.codex_home == home)
+            .collect();
+        assert_eq!(runs.len(), 1, "{home:?}: {invocations:?}");
+        assert_eq!(runs[0].args, ["app-server"]);
+        let messages: Vec<&serde_json::Value> = rpc
+            .iter()
+            .filter(|r| &r.codex_home == home)
+            .map(|r| &r.message)
+            .collect();
+        let version = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            messages,
+            [
+                &json!({"id": 1, "method": "initialize",
+                        "params": {"clientInfo": {"name": "remuda", "version": version}}}),
+                &json!({"method": "initialized"}),
+                &json!({"id": 2, "method": "account/rateLimits/read",
+                        "params": {"excludeResetCreditDetails": true}}),
+                &json!({"id": 3, "method": "account/read", "params": {"refreshToken": false}}),
+            ],
+            "{home:?}"
+        );
+    }
+    assert_eq!(
+        sb.invocations().len(),
+        1,
+        "claude asked once, for its own account"
+    );
+    assert!(!sb.remuda_home().join("state").exists());
+}
+
+/// R10: `account/read` failing does not fail the query: the usage is shown, without an identity.
+#[test]
+fn live_usage_codex_account_read_error_keeps_the_usage() {
+    let sb = Sandbox::new();
+    sb.install_codex();
+    let work = sb.make_codex_home("c/work");
+    register(&sb, &[("codex", "work", path(&work))]);
+    sb.set_codex_rate_limits(Some(&work), RATE_LIMITS);
+    sb.set_codex_account_error(Some(&work), r#"{"code":-32603,"message":"backend down"}"#);
+    let (out, code) = usage(&sb, &["usage", "codex:work", "--live"]);
+    assert_eq!(code, Some(0), "{out}");
+    let b = blocks(&out);
+    assert_eq!(b.len(), 1, "{out}");
+    assert_eq!(b[0].0, "codex:work live");
+    assert_eq!(b[0].1, LIVE_ROWS);
+    // An `account/read` result remuda does not recognize: the same.
+    fs::remove_file(work.join("fake-account-error.json")).unwrap();
+    sb.set_codex_account(Some(&work), r#"{"account":"x"}"#);
+    let (out, code) = usage(&sb, &["usage", "codex:work", "--live"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(blocks(&out)[0].0, "codex:work live");
+}
+
+/// R10: a logged-out home's rate limits are an error: that account fails (exit 1), the others
+/// still print.
+#[test]
+fn live_usage_codex_logged_out_fails() {
+    let sb = Sandbox::new();
+    sb.install_codex();
+    let work = sb.make_codex_home("c/work");
+    register(&sb, &[("codex", "work", path(&work))]);
+    sb.set_codex_rate_limits(None, RATE_LIMITS);
+    sb.set_live_usage(None, "Current session: 3% used\n");
+    let (out, code) = usage(&sb, &["usage", "--live"]);
+    assert_eq!(code, Some(1), "{out}");
+    let b = blocks(&out);
+    assert_eq!(b.len(), 3, "{out}");
+    assert_eq!(block(&b, "claude:default").1, ["Session 3%"]);
+    assert_eq!(block(&b, "codex:default").1, LIVE_ROWS);
+    assert_eq!(
+        block(&b, "codex:work").0,
+        "codex:work error: `codex app-server` account/rateLimits/read: codex account \
+         authentication required to read rate limits"
+    );
+}
+
+/// A hanging codex is stopped at the timeout.
+#[test]
+fn live_usage_codex_timeout() {
+    let sb = Sandbox::new();
+    sb.install_codex();
+    let work = sb.make_codex_home("c/work");
+    register(&sb, &[("codex", "work", path(&work))]);
+    sb.set_codex_hang(Some(&work), 30);
+    let start = Instant::now();
+    let (out, code) = usage(&sb, &["usage", "codex:work", "--live", "--timeout", "3"]);
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        blocks(&out)[0].0,
+        "codex:work error: `codex app-server` timed out after 3s"
+    );
+}
+
+/// A codex without `app-server`: that account's error.
+#[test]
+fn live_usage_codex_without_app_server() {
+    let sb = Sandbox::new();
+    sb.install_codex();
+    let work = sb.make_codex_home("c/work");
+    register(&sb, &[("codex", "work", path(&work))]);
+    sb.set_codex_without_app_server(Some(&work));
+    let (out, code) = usage(&sb, &["usage", "codex:work", "--live"]);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(
+        blocks(&out)[0].0,
+        "codex:work error: `codex app-server` exited with status 2: error: unrecognized \
+         subcommand 'app-server'"
+    );
+}
+
+/// R10: without codex on PATH, each codex account fails on its own; claude's still print.
+#[test]
+fn live_usage_without_codex_on_path() {
+    let sb = Sandbox::new();
+    register(&sb, &[("codex", "work", WORK_HOME)]);
+    sb.set_live_usage(None, "Current session: 3% used\n");
+    let (out, code) = usage(&sb, &["usage", "codex:work", "--live"]);
+    assert_eq!(code, Some(1), "{out}");
+    assert_eq!(out, "codex:work  error: `codex` not found on PATH\n");
+    let (out, code) = usage(&sb, &["usage", "--live"]);
+    assert_eq!(code, Some(1), "{out}");
+    let b = blocks(&out);
+    assert_eq!(b[0].0, "claude:default live");
+    assert_eq!(b[1].0, "codex:work error: `codex` not found on PATH");
+}
+
+/// R10: a result without a usable window is shown as is (indented JSON), and is not a failure.
+#[test]
+fn live_usage_codex_unrecognized() {
+    let sb = Sandbox::new();
+    sb.install_codex();
+    let work = sb.make_codex_home("c/work");
+    register(&sb, &[("codex", "work", path(&work))]);
+    sb.set_codex_rate_limits(
+        Some(&work),
+        r#"{"rateLimits":{"limitId":"codex","primary":null,"secondary":null}}"#,
+    );
+    let (out, code) = usage(&sb, &["usage", "codex:work", "--live"]);
+    assert_eq!(code, Some(0), "{out}");
+    // No account fixture: `account/read` says not logged in, which is not shown.
+    assert_eq!(
+        out,
+        "codex:work  live (output not recognized; shown as is)\n    {\n      \"rateLimits\": {\n        \
+         \"limitId\": \"codex\",\n        \"primary\": null,\n        \"secondary\": null\n      }\n    }\n"
+    );
 }
 
 // --- sessions -------------------------------------------------------------------------------

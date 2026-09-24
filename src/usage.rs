@@ -1,5 +1,6 @@
-//! Usage limits per account (SPEC R10): the cache claude writes into `.claude.json`, or a
-//! live `claude -p /usage` query.
+//! Usage limits per account (SPEC R10): the cache claude writes into `.claude.json` or a live
+//! `claude -p /usage` query; the rate limits codex records in its rollouts or a live
+//! `codex app-server` query.
 
 use std::fs;
 use std::io;
@@ -8,8 +9,11 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use crate::identity::{self, Identity};
+use crate::provider::app_server::{self, ACCOUNT_READ, RATE_LIMITS_READ};
+use crate::provider::{Provider, codex};
 use crate::registry::Account;
 use crate::{Env, launch, probe, text};
 
@@ -105,6 +109,99 @@ fn limit_row(limit: &Value) -> Option<UsageRow> {
 fn resets_at(v: &Value) -> Option<Resets> {
     let text = v.get("resets_at")?.as_str()?;
     text.parse().ok().map(Resets::At)
+}
+
+/// The label of a codex window (R10), by its duration rather than its position (a Pro plan's
+/// `primary` window is weekly): minutes rounded to whole hours; 5 hours is `Session`, 168 hours
+/// `Week (all models)`, anything else `<N>h window` (`<N>d window` for whole days). A per-model
+/// limit's `name` replaces `all models` in the week and is appended to the others.
+pub fn codex_label(minutes: i64, name: Option<&str>) -> String {
+    let hours = (minutes + 30) / 60;
+    match (hours, name) {
+        (5, None) => "Session".to_string(),
+        (5, Some(name)) => format!("Session ({name})"),
+        (168, None) => "Week (all models)".to_string(),
+        (168, Some(name)) => format!("Week ({name})"),
+        _ => {
+            let duration = if hours >= 24 && hours % 24 == 0 {
+                format!("{}d", hours / 24)
+            } else if hours > 0 {
+                format!("{hours}h")
+            } else {
+                format!("{minutes}m")
+            };
+            match name {
+                None => format!("{duration} window"),
+                Some(name) => format!("{duration} window ({name})"),
+            }
+        }
+    }
+}
+
+/// Rows of one codex rate-limit snapshot (R10): a rollout's `rate_limits` (snake_case) or an
+/// app-server snapshot (camelCase), `name` `None` for the general limit. A window without a
+/// numeric percentage and a positive duration is dropped; rows go by window length.
+pub fn codex_rows(snapshot: &Value, name: Option<&str>) -> Vec<UsageRow> {
+    let mut windows: Vec<(i64, UsageRow)> = ["primary", "secondary"]
+        .into_iter()
+        .filter_map(|key| {
+            let window = snapshot.get(key)?;
+            let percent = field(window, "used_percent", "usedPercent")?.as_f64()?;
+            let minutes = field(window, "window_minutes", "windowDurationMins")?
+                .as_i64()
+                .filter(|m| *m > 0)?;
+            let resets = field(window, "resets_at", "resetsAt")
+                .and_then(Value::as_i64)
+                .and_then(|s| Timestamp::from_second(s).ok())
+                .map(Resets::At);
+            let row = UsageRow {
+                label: codex_label(minutes, name),
+                percent,
+                severity: None,
+                resets,
+            };
+            Some((minutes, row))
+        })
+        .collect();
+    windows.sort_by_key(|(minutes, _)| *minutes);
+    windows.into_iter().map(|(_, row)| row).collect()
+}
+
+/// `v[snake]`, else `v[camel]`: rollouts spell codex's fields one way, app-server the other.
+fn field<'a>(v: &'a Value, snake: &str, camel: &str) -> Option<&'a Value> {
+    v.get(snake).or_else(|| v.get(camel))
+}
+
+/// Rows of an `account/rateLimits/read` result (R10): the general limit
+/// (`rateLimitsByLimitId.codex`, else `rateLimits`), then every other limit of
+/// `rateLimitsByLimitId` by its ID, named by its `limitName` (else its ID).
+pub fn codex_live_rows(result: &Value) -> Vec<UsageRow> {
+    let by_id = result.get("rateLimitsByLimitId").and_then(Value::as_object);
+    let general = by_id
+        .and_then(|map| map.get("codex"))
+        .filter(|snapshot| snapshot.is_object())
+        .or_else(|| result.get("rateLimits"));
+    let mut rows = general.map_or_else(Vec::new, |g| codex_rows(g, None));
+    let general_id = general
+        .and_then(|g| g.get("limitId"))
+        .and_then(Value::as_str);
+    if let Some(map) = by_id {
+        let mut ids: Vec<&String> = map
+            .keys()
+            .filter(|id| id.as_str() != "codex" && Some(id.as_str()) != general_id)
+            .collect();
+        ids.sort();
+        for id in ids {
+            let snapshot = &map[id];
+            let name = snapshot
+                .get("limitName")
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())
+                .unwrap_or(id);
+            rows.extend(codex_rows(snapshot, Some(name)));
+        }
+    }
+    rows
 }
 
 /// Parses the `Current session` / `Current week (...)` lines of `claude -p /usage`.
@@ -207,17 +304,30 @@ pub fn format_percent(p: f64) -> String {
     }
 }
 
-/// Why an account has no usage at all: its provider has none (codex, R4).
-pub fn unsupported(account: &Account) -> Option<String> {
-    (!account.provider.has_usage())
-        .then(|| format!("usage is not available for {}", account.provider))
+/// An account's cached usage (R10): claude's cache in `.claude.json`, or the newest general rate
+/// limits codex recorded in the home's rollouts. `Err` is a short notice for the user.
+pub fn cached_usage(account: &Account, env: &Env) -> Result<CachedUsage, String> {
+    match account.provider {
+        Provider::Claude => cached_claude(account, env),
+        Provider::Codex => {
+            let Some(home) = account.home_dir(env) else {
+                return Err("HOME is not set".to_string());
+            };
+            match codex::cached_rate_limits(&home) {
+                Some((at, limits)) => Ok(CachedUsage {
+                    fetched_at: Some(at),
+                    rows: codex_rows(&limits, None),
+                }),
+                None => Err(format!(
+                    "no rate limits in the rollouts under {}",
+                    home.display()
+                )),
+            }
+        }
+    }
 }
 
-/// The usage cache in an account's `.claude.json` (R10). `Err` is a short notice for the user.
-pub fn cached_usage(account: &Account, env: &Env) -> Result<CachedUsage, String> {
-    if let Some(why) = unsupported(account) {
-        return Err(why);
-    }
+fn cached_claude(account: &Account, env: &Env) -> Result<CachedUsage, String> {
     let Some(path) = account.claude_json(env) else {
         return Err("HOME is not set".to_string());
     };
@@ -231,12 +341,9 @@ pub fn cached_usage(account: &Account, env: &Env) -> Result<CachedUsage, String>
     parse_cached(&text)
 }
 
-/// `remuda usage` block for one account from its cached `.claude.json` (R10).
+/// `remuda usage` block for one account from its cached usage (R10).
 pub fn cached_report(account: &Account, env: &Env, tz: &TimeZone, now: Timestamp) -> String {
     let name = account.qualified();
-    if let Some(why) = unsupported(account) {
-        return format!("{name}  {why}\n");
-    }
     match cached_usage(account, env) {
         Err(notice) => format!("{name}  no cached usage ({notice})\n"),
         Ok(cached) => {
@@ -251,22 +358,47 @@ pub fn cached_report(account: &Account, env: &Env, tz: &TimeZone, now: Timestamp
 
 pub const LIVE_USAGE_ARGS: &[&str] = &["-p", "/usage", "--no-session-persistence"];
 
-/// What a live `claude -p /usage` query printed.
+/// What a live query answered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveUsage {
     Rows(Vec<UsageRow>),
-    /// Output with no recognizable limit lines, kept verbatim.
+    /// Output with no recognizable limits, kept verbatim (codex: the result as indented JSON).
     Unrecognized(String),
 }
 
-/// Runs `claude -p /usage --no-session-persistence` for `account` (R10): never through
-/// `launch::prepare`, so no `--session-id` is injected and nothing is logged. `Err` says why
-/// the query failed.
+/// A live query's usage, and the identity the same query told (R10): codex's `account/read`,
+/// only when it names a logged-in account; always `None` for claude.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveResult {
+    pub usage: LiveUsage,
+    pub identity: Option<Identity>,
+}
+
+impl From<LiveUsage> for LiveResult {
+    fn from(usage: LiveUsage) -> Self {
+        LiveResult {
+            usage,
+            identity: None,
+        }
+    }
+}
+
+/// Queries `account`'s usage live with its agent `program` (R10): `claude -p /usage`, or
+/// `codex app-server`. `Err` says why the query failed.
 pub fn live_usage(
     account: &Account,
     program: &Path,
     timeout: Duration,
-) -> Result<LiveUsage, String> {
+) -> Result<LiveResult, String> {
+    match account.provider {
+        Provider::Claude => live_claude(account, program, timeout).map(LiveResult::from),
+        Provider::Codex => live_codex(account, program, timeout),
+    }
+}
+
+/// Runs `claude -p /usage --no-session-persistence` for `account` (R10): never through
+/// `launch::prepare`, so no `--session-id` is injected and nothing is logged.
+fn live_claude(account: &Account, program: &Path, timeout: Duration) -> Result<LiveUsage, String> {
     let change = launch::env_change(account);
     let outcome = probe::run_captured(program, LIVE_USAGE_ARGS, &change, timeout);
     let Some(stdout) = outcome.success_stdout() else {
@@ -284,8 +416,44 @@ pub fn live_usage(
     })
 }
 
-/// `remuda usage --live` block for one account; `false` when the query failed (R10). An
-/// account without usage (codex) says so and has not failed. `program` is claude.
+/// One `codex app-server` run in `account`'s environment (R4, R10), asking
+/// `account/rateLimits/read` (without the reset-credit lookup) and `account/read` (without a
+/// token refresh). The rate limits are the query: their error is its failure. The identity is
+/// extra: it is dropped when `account/read` fails, is not recognized, or names no logged-in
+/// account.
+fn live_codex(account: &Account, program: &Path, timeout: Duration) -> Result<LiveResult, String> {
+    let answers = app_server::call(
+        program,
+        account,
+        &[
+            (RATE_LIMITS_READ, json!({"excludeResetCreditDetails": true})),
+            (ACCOUNT_READ, json!({"refreshToken": false})),
+        ],
+        timeout,
+    )?;
+    let [limits, read]: [Result<Value, String>; 2] = answers
+        .try_into()
+        .map_err(|_| "`codex app-server` did not answer each request".to_string())?;
+    let limits = limits?;
+    let identity = read
+        .ok()
+        .as_ref()
+        .and_then(identity::parse_account_read)
+        .filter(|identity| matches!(identity, Identity::LoggedIn { .. }));
+    let rows = codex_live_rows(&limits);
+    let usage = if rows.is_empty() {
+        LiveUsage::Unrecognized(
+            serde_json::to_string_pretty(&limits).unwrap_or_else(|_| limits.to_string()),
+        )
+    } else {
+        LiveUsage::Rows(rows)
+    };
+    Ok(LiveResult { usage, identity })
+}
+
+/// `remuda usage --live` block for one account; `false` when the query failed (R10). `program`
+/// is the account's agent, `None` when it is not on PATH. The header names the identity the
+/// query told (codex: email and plan).
 pub fn live_report(
     account: &Account,
     program: Option<&Path>,
@@ -293,28 +461,46 @@ pub fn live_report(
     timeout: Duration,
 ) -> (String, bool) {
     let name = account.qualified();
-    if let Some(why) = unsupported(account) {
-        return (format!("{name}  {why}\n"), true);
-    }
     let Some(program) = program else {
         return (
-            format!("{name}  error: `claude` not found on PATH\n"),
+            format!(
+                "{name}  error: `{}` not found on PATH\n",
+                account.provider.program()
+            ),
             false,
         );
     };
     match live_usage(account, program, timeout) {
         Err(e) => (format!("{name}  error: {e}\n"), false),
-        Ok(LiveUsage::Unrecognized(stdout)) => {
-            let raw: String = stdout
-                .lines()
-                .map(|l| format!("    {}\n", l.trim_end()))
-                .collect();
-            (
-                format!("{name}  live (output not recognized; shown as is)\n{raw}"),
-                true,
-            )
+        Ok(LiveResult { usage, identity }) => {
+            let who = identity.as_ref().map(who_and_plan).unwrap_or_default();
+            match usage {
+                LiveUsage::Unrecognized(stdout) => {
+                    let raw: String = stdout
+                        .lines()
+                        .map(|l| format!("    {}\n", l.trim_end()))
+                        .collect();
+                    (
+                        format!("{name}  live (output not recognized; shown as is){who}\n{raw}"),
+                        true,
+                    )
+                }
+                LiveUsage::Rows(rows) => (
+                    format!("{name}  live{who}\n{}", format_rows(&rows, tz)),
+                    true,
+                ),
+            }
         }
-        Ok(LiveUsage::Rows(rows)) => (format!("{name}  live\n{}", format_rows(&rows, tz)), true),
+    }
+}
+
+/// `  cx@example.com (pro)`: the identity after a live header.
+fn who_and_plan(identity: &Identity) -> String {
+    match identity {
+        Identity::LoggedIn {
+            plan: Some(plan), ..
+        } => format!("  {} ({plan})", identity.who()),
+        _ => format!("  {}", identity.who()),
     }
 }
 
@@ -525,6 +711,158 @@ mod tests {
         }
         let no_time = r#"{"cachedUsageUtilization": {"utilization": {"limits": [{"kind": "session", "percent": 1}]}}}"#;
         assert_eq!(parse_cached(no_time).unwrap().fetched_at, None);
+    }
+
+    fn at_second(s: i64) -> Option<Resets> {
+        Some(Resets::At(Timestamp::from_second(s).unwrap()))
+    }
+
+    /// R10: codex windows are labeled by their duration, never by their position.
+    #[test]
+    fn codex_windows_are_labeled_by_duration() {
+        let rows = |v: Value| codex_rows(&v, None);
+        let window = |pct: f64, minutes: i64, resets: Value| json!({"used_percent": pct, "window_minutes": minutes, "resets_at": resets});
+        // A Pro plan: one weekly window, as `primary`.
+        let pro = json!({"limit_id": "codex", "limit_name": null,
+            "primary": window(99.0, 10080, json!(1790414559)), "secondary": null,
+            "credits": {"has_credits": false}, "plan_type": "pro"});
+        assert_eq!(
+            rows(pro),
+            [row("Week (all models)", 99.0, None, at_second(1790414559))]
+        );
+        // A Plus plan: five hours and a week, in either position; shortest first.
+        let plus = json!({"primary": window(10.0, 300, json!(1)),
+                          "secondary": window(20.0, 10080, json!(2))});
+        let expected = [
+            row("Session", 10.0, None, at_second(1)),
+            row("Week (all models)", 20.0, None, at_second(2)),
+        ];
+        assert_eq!(rows(plus), expected);
+        let swapped = json!({"primary": window(20.0, 10080, json!(2)),
+                             "secondary": window(10.0, 300, json!(1))});
+        assert_eq!(rows(swapped), expected);
+        // 2025 rollouts: 299 and 10079 minutes, no reset time.
+        let legacy = json!({"limit_id": null, "primary": window(1.5, 299, Value::Null),
+                            "secondary": window(2.0, 10079, Value::Null)});
+        assert_eq!(
+            rows(legacy),
+            [
+                row("Session", 1.5, None, None),
+                row("Week (all models)", 2.0, None, None)
+            ]
+        );
+        // app-server spells the same in camelCase.
+        let camel = json!({"primary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": 1},
+                           "secondary": {"usedPercent": 20, "windowDurationMins": 10080,
+                                         "resetsAt": 2}});
+        assert_eq!(rows(camel), expected);
+        // A per-model limit is named.
+        let spark = json!({"primary": window(5.0, 300, json!(1)),
+                           "secondary": window(7.0, 10080, json!(2))});
+        assert_eq!(
+            codex_rows(&spark, Some("GPT-5.3-Codex-Spark")),
+            [
+                row("Session (GPT-5.3-Codex-Spark)", 5.0, None, at_second(1)),
+                row("Week (GPT-5.3-Codex-Spark)", 7.0, None, at_second(2)),
+            ]
+        );
+        // Other durations.
+        for (minutes, name, label) in [
+            (60, None, "1h window"),
+            (1440, None, "1d window"),
+            (43200, None, "30d window"),
+            (2160, None, "36h window"),
+            (20, None, "20m window"),
+            (1440, Some("X"), "1d window (X)"),
+            (10080, Some("X"), "Week (X)"),
+        ] {
+            assert_eq!(codex_label(minutes, name), label, "{minutes} {name:?}");
+        }
+        // Windows without a numeric percentage and a positive duration are dropped.
+        for junk in [
+            json!({"primary": {"used_percent": 5}}),
+            json!({"primary": {"used_percent": "x", "window_minutes": 300}}),
+            json!({"primary": {"used_percent": 5, "window_minutes": 0}}),
+            json!({"primary": {"used_percent": 5, "window_minutes": "300"}}),
+            json!({"primary": null, "secondary": null}),
+            json!({"primary": 3}),
+            json!("rate limits"),
+            Value::Null,
+        ] {
+            assert!(rows(junk.clone()).is_empty(), "{junk}");
+        }
+    }
+
+    /// R10: an `account/rateLimits/read` result: the general limit, then per-model limits.
+    #[test]
+    fn codex_live_rows_general_then_per_model() {
+        let snapshot = |id: &str, name: Value, primary: Value, secondary: Value| {
+            json!({"limitId": id, "limitName": name, "primary": primary, "secondary": secondary,
+                   "credits": null, "planType": "pro"})
+        };
+        let window = |pct: i64, minutes: i64| json!({"usedPercent": pct, "windowDurationMins": minutes, "resetsAt": 1790414559});
+        let general = snapshot("codex", Value::Null, window(99, 10080), Value::Null);
+        let result = json!({
+            "rateLimits": general,
+            "rateLimitsByLimitId": {
+                "premium": snapshot("premium", Value::Null, Value::Null, Value::Null),
+                "codex_bengalfox": snapshot("codex_bengalfox", json!("GPT-5.3-Codex-Spark"),
+                                            window(5, 300), window(7, 10080)),
+                "codex": general,
+                "codex_other": snapshot("codex_other", Value::Null, window(1, 60), Value::Null),
+            },
+            "rateLimitResetCredits": null,
+        });
+        let labels = |v: &Value| -> Vec<(String, f64)> {
+            codex_live_rows(v)
+                .into_iter()
+                .map(|r| (r.label, r.percent))
+                .collect()
+        };
+        let owned = |rows: &[(&str, f64)]| -> Vec<(String, f64)> {
+            rows.iter().map(|(l, p)| (l.to_string(), *p)).collect()
+        };
+        assert_eq!(
+            labels(&result),
+            owned(&[
+                ("Week (all models)", 99.0),
+                ("Session (GPT-5.3-Codex-Spark)", 5.0),
+                ("Week (GPT-5.3-Codex-Spark)", 7.0),
+                ("1h window (codex_other)", 1.0),
+            ])
+        );
+        assert_eq!(codex_live_rows(&result)[0].resets, at_second(1790414559));
+        // Without the map, `rateLimits` alone.
+        assert_eq!(
+            labels(&json!({"rateLimits": general})),
+            owned(&[("Week (all models)", 99.0)])
+        );
+        // The map's `codex` wins over `rateLimits`.
+        let other = snapshot("codex", Value::Null, window(10, 300), Value::Null);
+        assert_eq!(
+            labels(&json!({"rateLimits": other, "rateLimitsByLimitId": {"codex": general}})),
+            owned(&[("Week (all models)", 99.0)])
+        );
+        // `rateLimits` naming another limit is not repeated as a per-model limit.
+        let spark = snapshot(
+            "codex_bengalfox",
+            json!("Spark"),
+            window(5, 300),
+            Value::Null,
+        );
+        assert_eq!(
+            labels(&json!({"rateLimits": spark,
+                           "rateLimitsByLimitId": {"codex_bengalfox": spark}})),
+            owned(&[("Session", 5.0)])
+        );
+        for empty in [
+            json!({}),
+            json!({"rateLimits": null}),
+            json!({"rateLimits": {"limitId": "codex", "primary": null, "secondary": null}}),
+            json!([]),
+        ] {
+            assert!(codex_live_rows(&empty).is_empty(), "{empty}");
+        }
     }
 
     #[test]

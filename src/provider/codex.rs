@@ -20,6 +20,12 @@ use crate::transcript::{
     FIRST_USER_TEXT_CAP, Head, Message, PREVIEW_CAP, Role, Tail, WINDOW, complete_lines, one_line,
     read_at,
 };
+use crate::{index, usage};
+
+/// At most this many rollouts, newest first, are read for the cached rate limits (R10).
+pub const RATE_LIMIT_FILES: usize = 16;
+/// Each rollout is read from its end for the rate limits, in a window growing up to this size.
+pub const RATE_LIMIT_TAIL_CAP: u64 = 1024 * 1024;
 
 /// The fields of a record the index and the preview look at; the rest is skipped.
 #[derive(Deserialize)]
@@ -368,6 +374,81 @@ fn messages(lines: &[&[u8]]) -> Vec<Message> {
     out
 }
 
+/// The newest general rate limits codex recorded in `home`'s rollouts (R10): the `rate_limits`
+/// of a `token_count` event whose `limit_id` is `codex` or null (2025) and which has a usable
+/// window, from `sessions/**` and `archived_sessions/`, newest by the record's `timestamp`.
+/// Bounded: at most [`RATE_LIMIT_FILES`] rollouts, newest mtime first, stopping at the first one
+/// last written before the best record found (none of its records can be newer). `None` when
+/// there is none.
+pub fn cached_rate_limits(home: &Path) -> Option<(Timestamp, Value)> {
+    let mut files = Vec::new();
+    index::list_rollouts(&home.join("sessions"), &mut files);
+    index::list_rollouts(&home.join("archived_sessions"), &mut files);
+    files.sort_by_key(|(_, _, stat)| std::cmp::Reverse(stat.mtime_ns));
+    let mut best: Option<(Timestamp, Value)> = None;
+    for (path, _, stat) in files.into_iter().take(RATE_LIMIT_FILES) {
+        if let Some((at, _)) = &best
+            && stat.mtime_ns < at.as_nanosecond()
+        {
+            break;
+        }
+        if let Some(found) = last_rate_limits(&path)
+            && best.as_ref().is_none_or(|(at, _)| found.0 > *at)
+        {
+            best = Some(found);
+        }
+    }
+    best
+}
+
+/// The last general rate limits in one rollout, read from its end in a window that grows ×4
+/// from 64 KB up to [`RATE_LIMIT_TAIL_CAP`] (like [`preview`]).
+fn last_rate_limits(path: &Path) -> Option<(Timestamp, Value)> {
+    const NEEDLE: &[u8] = b"\"token_count\"";
+    let file = File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    let mut window = WINDOW;
+    loop {
+        let start = size.saturating_sub(window);
+        let read_from = start.saturating_sub(1);
+        let buf = read_at(&file, read_from, size - read_from).ok()?;
+        let found = complete_lines(&buf, start > 0)
+            .lines
+            .iter()
+            .rev()
+            .filter(|line| line.windows(NEEDLE.len()).any(|w| w == NEEDLE))
+            .find_map(|line| rate_limits_of(line));
+        if found.is_some() || start == 0 || window >= RATE_LIMIT_TAIL_CAP {
+            return found;
+        }
+        window *= 4;
+    }
+}
+
+/// A `token_count` event's general rate limits and its timestamp: `limit_id` absent, null or
+/// `codex` (per-model limits are shown live only), with at least one usable window.
+fn rate_limits_of(line: &[u8]) -> Option<(Timestamp, Value)> {
+    let r: Value = serde_json::from_slice(line).ok()?;
+    if r.get("type")?.as_str()? != "event_msg" {
+        return None;
+    }
+    let payload = r.get("payload")?;
+    if payload.get("type")?.as_str()? != "token_count" {
+        return None;
+    }
+    let limits = payload.get("rate_limits").filter(|l| l.is_object())?;
+    match limits.get("limit_id") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(id)) if id == "codex" => {}
+        Some(_) => return None,
+    }
+    let at: Timestamp = r.get("timestamp")?.as_str()?.parse().ok()?;
+    if usage::codex_rows(limits, None).is_empty() {
+        return None;
+    }
+    Some((at, limits.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,6 +491,196 @@ mod tests {
         assert_eq!(rollout_id(&format!("rollout-2025-04-18-{id}.json")), None);
         assert_eq!(rollout_id("rollout-short.jsonl"), None);
         assert_eq!(rollout_id(&format!("other-{id}.jsonl")), None);
+    }
+
+    // --- cached rate limits (R10) ---
+
+    const T: i64 = 1_790_000_000;
+
+    fn iso(second: i64) -> String {
+        Timestamp::from_second(second).unwrap().to_string()
+    }
+
+    /// A `token_count` event at `second` with a weekly window at `pct`.
+    fn token_count(second: i64, limit_id: Value, pct: f64) -> String {
+        let limits = serde_json::json!({"limit_id": limit_id, "limit_name": null,
+            "primary": {"used_percent": pct, "window_minutes": 10080, "resets_at": 1790414559},
+            "secondary": null, "credits": null, "plan_type": "pro"});
+        event(second, limits)
+    }
+
+    fn event(second: i64, rate_limits: Value) -> String {
+        let record = serde_json::json!({"timestamp": iso(second), "type": "event_msg",
+            "payload": {"type": "token_count", "info": null, "rate_limits": rate_limits}});
+        format!("{record}\n")
+    }
+
+    /// A rollout `n` under `home/<dir>`, last modified at `mtime` (whole seconds).
+    fn rollout(home: &Path, dir: &str, n: u32, contents: &str, mtime: i64) {
+        let dir = home.join(dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!(
+            "rollout-2026-09-20T10-00-00-00000000-0000-0000-0000-{n:012}.jsonl"
+        ));
+        fs::write(&path, contents).unwrap();
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime as u64);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    fn percent_of(found: Option<(Timestamp, Value)>) -> Option<(i64, f64)> {
+        found.map(|(at, v)| {
+            (
+                at.as_second(),
+                v["primary"]["used_percent"].as_f64().unwrap(),
+            )
+        })
+    }
+
+    const DAY: &str = "sessions/2026/09/20";
+
+    /// R10: the newest general record wins; a per-model or null `rate_limits` after it does not
+    /// hide it.
+    #[test]
+    fn cached_rate_limits_take_the_newest_general_record() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        assert_eq!(cached_rate_limits(home), None);
+        let newer = [
+            token_count(T + 1, serde_json::json!("codex"), 50.0),
+            token_count(T + 2, serde_json::json!("codex_bengalfox"), 7.0),
+            event(T + 3, Value::Null),
+            format!(
+                "{}\n",
+                serde_json::json!({"timestamp": iso(T + 4), "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": []}})
+            ),
+        ]
+        .concat();
+        rollout(home, DAY, 1, &newer, T + 10);
+        rollout(
+            home,
+            DAY,
+            2,
+            &token_count(T, serde_json::json!("codex"), 10.0),
+            T,
+        );
+        assert_eq!(percent_of(cached_rate_limits(home)), Some((T + 1, 50.0)));
+    }
+
+    /// R10: files are read newest mtime first, but the newest record decides; reading stops at
+    /// a file last written before the best record.
+    #[test]
+    fn a_record_in_an_older_file_can_be_newer() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        rollout(home, DAY, 1, &token_count(T + 1, Value::Null, 50.0), T + 10);
+        rollout(
+            home,
+            DAY,
+            2,
+            &token_count(T + 5, serde_json::json!("codex"), 60.0),
+            T + 5,
+        );
+        // Last written before T + 5: not read (its record could not really be newer).
+        rollout(
+            home,
+            DAY,
+            3,
+            &token_count(T + 9, serde_json::json!("codex"), 70.0),
+            T + 2,
+        );
+        assert_eq!(percent_of(cached_rate_limits(home)), Some((T + 5, 60.0)));
+    }
+
+    #[test]
+    fn archived_sessions_count() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        rollout(
+            home,
+            "archived_sessions",
+            1,
+            &token_count(T, serde_json::json!("codex"), 30.0),
+            T,
+        );
+        assert_eq!(percent_of(cached_rate_limits(home)), Some((T, 30.0)));
+        rollout(
+            home,
+            DAY,
+            2,
+            &token_count(T + 1, serde_json::json!("codex"), 40.0),
+            T + 1,
+        );
+        assert_eq!(percent_of(cached_rate_limits(home)), Some((T + 1, 40.0)));
+    }
+
+    /// R10: the tail window grows ×4 from 64 KB up to 1 MB.
+    #[test]
+    fn the_tail_window_grows() {
+        let filler = |bytes: usize| -> String {
+            let line = format!(
+                "{}\n",
+                serde_json::json!({"timestamp": iso(T), "type": "response_item",
+                    "payload": {"type": "reasoning", "text": "x".repeat(1000)}})
+            );
+            line.repeat(bytes / line.len() + 1)
+        };
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let record = token_count(T, serde_json::json!("codex"), 30.0);
+        rollout(home, DAY, 1, &(record.clone() + &filler(300 * 1024)), T);
+        assert_eq!(percent_of(cached_rate_limits(home)), Some((T, 30.0)));
+        let far = tempfile::tempdir().unwrap();
+        rollout(far.path(), DAY, 1, &(record + &filler(1100 * 1024)), T);
+        assert_eq!(cached_rate_limits(far.path()), None);
+    }
+
+    /// R10: at most 16 rollouts are read, newest first.
+    #[test]
+    fn only_the_newest_16_files_are_read() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        rollout(home, DAY, 0, &token_count(T, Value::Null, 30.0), T);
+        for n in 1..RATE_LIMIT_FILES as u32 {
+            rollout(home, DAY, n, "{}\n", T + i64::from(n));
+        }
+        assert_eq!(RATE_LIMIT_FILES, 16);
+        assert_eq!(percent_of(cached_rate_limits(home)), Some((T, 30.0)));
+        rollout(home, DAY, 99, "{}\n", T + 100);
+        assert_eq!(cached_rate_limits(home), None);
+    }
+
+    /// R10: malformed lines, records without a timestamp or a usable window, and other limits
+    /// are skipped; a null `limit_id` (2025) counts.
+    #[test]
+    fn malformed_lines_and_records_without_a_timestamp_are_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let no_time = token_count(T + 2, Value::Null, 90.0).replace("\"timestamp\"", "\"time\"");
+        let bad_time = token_count(T + 2, Value::Null, 90.0).replace(&iso(T + 2), "yesterday");
+        let junk_window = event(
+            T + 3,
+            serde_json::json!({"limit_id": "codex", "primary": {"used_percent": "x"}}),
+        );
+        let contents = [
+            token_count(T + 1, Value::Null, 30.0),
+            no_time,
+            bad_time,
+            junk_window,
+            event(T + 4, serde_json::json!("limits")),
+            token_count(T + 5, serde_json::json!(7), 80.0),
+            "{\"type\": \"event_msg\", \"payload\": {\"type\": \"token_count\", trunc\n"
+                .to_string(),
+            "not json but \"token_count\"\n".to_string(),
+        ]
+        .concat();
+        rollout(home, DAY, 1, &contents, T + 10);
+        assert_eq!(percent_of(cached_rate_limits(home)), Some((T + 1, 30.0)));
     }
 
     #[test]

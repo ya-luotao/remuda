@@ -432,11 +432,11 @@ fn usage_columns(app: &App) -> Vec<(String, String)> {
             let header = match label.as_str() {
                 "Session" => "SESSION".to_string(),
                 "Week (all models)" => "WEEK".to_string(),
-                other => other
-                    .strip_prefix("Week (")
-                    .and_then(|s| s.strip_suffix(')'))
-                    .unwrap_or(other)
-                    .to_string(),
+                other => match scope(other) {
+                    Some(("Week", model)) => model.to_string(),
+                    Some((_, model)) => format!("{model} 5h"),
+                    None => other.to_string(),
+                },
             };
             (header, label)
         })
@@ -466,9 +466,6 @@ fn identity_cells(a: &AccountState) -> [(String, Style); 3] {
 }
 
 fn source_cell(a: &AccountState, now: Timestamp) -> (String, Style) {
-    if !a.account.provider.has_usage() {
-        return dim("—");
-    }
     if a.live_pending {
         return ("live…".to_string(), WARN);
     }
@@ -562,13 +559,10 @@ fn accounts_view(app: &App, f: &mut Frame, mut area: Rect) {
             cells.extend(identity_cells(a));
             let rows = a.rows();
             let loading = a.cached.is_none() && a.live.is_none();
-            let usage = a.account.provider.has_usage();
             for (k, (_, label)) in columns.iter().enumerate() {
                 // Right-aligned in its column.
                 let w = widths[4 + k];
                 cells.push(match rows.iter().find(|r| &r.label == label) {
-                    // No usage at all (codex, R4).
-                    _ if !usage => dim(format!("{:>w$}", "—")),
                     Some(r) => (
                         format!("{:>w$}", usage::format_percent(r.percent)),
                         severity_style(r),
@@ -587,16 +581,36 @@ fn accounts_view(app: &App, f: &mut Frame, mut area: Rect) {
     checks_view(app, f, checks_area);
 }
 
+/// A model-scoped limit's label, `Week (<model>)` or `Session (<model>)` (codex, R10):
+/// `("Week" | "Session", model)`.
+fn scope(label: &str) -> Option<(&'static str, &str)> {
+    ["Week", "Session"].into_iter().find_map(|kind| {
+        let model = label
+            .strip_prefix(kind)?
+            .strip_prefix(" (")?
+            .strip_suffix(')')?;
+        Some((kind, model))
+    })
+}
+
 /// Marker for a usage row on the timeline: `S` session, `W` all-models week, the lowercase
-/// initial of the model for a model-scoped week.
+/// initial of the model for a model-scoped week or session.
 fn marker(label: &str) -> char {
     match label {
         "Session" => 'S',
         "Week (all models)" => 'W',
-        other => other
-            .strip_prefix("Week (")
-            .and_then(|s| s.chars().next())
+        other => scope(other)
+            .and_then(|(_, model)| model.chars().next())
             .map_or('?', |c| c.to_ascii_lowercase()),
+    }
+}
+
+/// How the timeline's legend names a row other than `S` and `W`: `week (<model>)`,
+/// `session (<model>)`, else its label.
+fn legend_text(label: &str) -> String {
+    match scope(label) {
+        Some((kind, model)) => format!("{} ({model})", kind.to_ascii_lowercase()),
+        None => label.to_string(),
     }
 }
 
@@ -644,9 +658,9 @@ fn timeline_view(app: &App, f: &mut Frame, area: Rect, name_w: usize) {
             };
             let m = marker(&r.label);
             if m != 'S' && m != 'W' {
-                let name = r.label.trim_start_matches("Week (").trim_end_matches(')');
-                if !scoped.iter().any(|(c, _)| *c == m) {
-                    scoped.push((m, name.to_string()));
+                let entry = (m, legend_text(&r.label));
+                if !scoped.contains(&entry) {
+                    scoped.push(entry);
                 }
             } else {
                 next.push(format!("{m} {}", timeline::until(app.now, t)));
@@ -671,8 +685,8 @@ fn timeline_view(app: &App, f: &mut Frame, area: Rect, name_w: usize) {
         lines.push(Line::from(spans));
     }
     let mut legend = String::from("S session · W week (all models)");
-    for (c, name) in &scoped {
-        legend.push_str(&format!(" · {c} week ({name})"));
+    for (c, text) in &scoped {
+        legend.push_str(&format!(" · {c} {text}"));
     }
     lines.push(Line::styled(
         format!("{} {legend}", text::pad("", name_w)),
@@ -1055,7 +1069,7 @@ pub const KEYS: &[(&str, &str)] = &[
         "a",
         "history: show teammate, SDK and codex subagent sessions · live: show stopped ones",
     ),
-    ("u", "query live usage for every claude account"),
+    ("u", "query live usage for every account"),
     ("r", "refresh index, identities, live sessions, checks"),
     ("?", "this help"),
     ("q / ctrl-c", "quit"),

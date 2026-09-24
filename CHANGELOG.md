@@ -24,6 +24,10 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   place, and its path is printed so it can be registered again; `default` and the source of
   shared configuration cannot be removed. `D` in the TUI's Accounts view does the same after
   confirmation.
+- Codex usage limits (SPEC R10): `remuda usage` reads the newest rate limits Codex recorded in the
+  account's rollouts; `--live` and `u` in the TUI query them through `codex app-server`. Five-hour
+  and weekly windows show as Session and Week, per-model limits by name, on the same timeline as
+  Claude's. The live query also shows a Codex account's email and plan.
 
 ### Fixed
 

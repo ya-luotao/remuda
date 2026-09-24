@@ -136,7 +136,16 @@ exit "${FAKE_CLAUDE_EXIT:-0}"
 /// Fixtures live in `$CODEX_HOME/<name>`, or `$HOME/.codex/<name>` when it is unset:
 /// - `fake-sleep`: if present, `exec sleep <its contents>`;
 /// - `login status` prints `fake-login.txt` **to stderr** and exits 0, like codex 0.155.1
-///   (`Logged in using ChatGPT`); without it, `Not logged in` to stderr and exit 1.
+///   (`Logged in using ChatGPT`); without it, `Not logged in` to stderr and exit 1;
+/// - `app-server` fails like a codex without it (`unrecognized subcommand`, exit 2) if
+///   `fake-no-app-server` exists. Otherwise it speaks JSON-RPC over stdio like codex 0.155.1
+///   (R4): every line it reads is appended to `$FAKE_CODEX_OUT.rpc` as `cxh<TAB>line` (`cxh` as
+///   in the record); `initialize` is answered; `account/read` gets a notification, then
+///   `fake-account-error.json` as its error if it exists, else `fake-account.json` as its
+///   result (without either, a logged-out home's `{"account":null,"requiresOpenaiAuth":true}`);
+///   `account/rateLimits/read` gets a
+///   notification, then `fake-rate-limits.json` (without it, codex's -32600 authentication
+///   error); any other request gets -32601. It exits 0 when stdin closes.
 ///
 /// Anything else exits `${FAKE_CODEX_EXIT:-0}`.
 const FAKE_CODEX: &str = r#"#!/bin/sh
@@ -175,8 +184,48 @@ if [ "$1" = login ] && [ "$2" = status ]; then
   echo "Not logged in" >&2
   exit 1
 fi
+if [ "$1" = app-server ]; then
+  if [ -f "${fixtures}fake-no-app-server" ]; then
+    echo "error: unrecognized subcommand 'app-server'" >&2; exit 2
+  fi
+  if [ -n "${CODEX_HOME+x}" ]; then cxh="set:$CODEX_HOME"; else cxh=unset; fi
+  echo "fake codex app-server starting" >&2
+  while IFS= read -r line; do
+    printf '%s\t%s\n' "$cxh" "$line" >> "$FAKE_CODEX_OUT.rpc"
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    case "$line" in
+      *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fake"}}\n' "$id" ;;
+      *'"method":"account/read"'*)
+        printf '{"method":"remoteControl/status/changed","params":{"status":"disabled"}}\n'
+        if [ -f "${fixtures}fake-account-error.json" ]; then
+          printf '{"id":%s,"error":%s}\n' "$id" "$(tr -d '\n' < "${fixtures}fake-account-error.json")"
+        elif [ -f "${fixtures}fake-account.json" ]; then
+          printf '{"id":%s,"result":%s}\n' "$id" "$(tr -d '\n' < "${fixtures}fake-account.json")"
+        else
+          printf '{"id":%s,"result":{"account":null,"requiresOpenaiAuth":true}}\n' "$id"
+        fi ;;
+      *'"method":"account/rateLimits/read"'*)
+        printf '{"method":"account/rateLimits/updated","params":{}}\n'
+        if [ -f "${fixtures}fake-rate-limits.json" ]; then
+          printf '{"id":%s,"result":%s}\n' "$id" "$(tr -d '\n' < "${fixtures}fake-rate-limits.json")"
+        else
+          printf '{"error":{"code":-32600,"message":"codex account authentication required to read rate limits"},"id":%s}\n' "$id"
+        fi ;;
+      *'"id":'*) printf '{"error":{"code":-32601,"message":"method not found"},"id":%s}\n' "$id" ;;
+    esac
+  done
+  exit 0
+fi
 exit "${FAKE_CODEX_EXIT:-0}"
 "#;
+
+/// One JSON-RPC line the fake `codex app-server` read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexRpc {
+    /// `None` when `CODEX_HOME` was unset in codex's environment.
+    pub codex_home: Option<String>,
+    pub message: serde_json::Value,
+}
 
 /// One recorded run of the fake `codex`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,14 +333,71 @@ impl Sandbox {
         dir
     }
 
-    /// `codex login status` output (stderr) for a codex home (`None`: `$HOME/.codex`).
-    pub fn set_codex_login(&self, home: Option<&Path>, text: &str) {
+    /// Where the fake codex looks for fixtures: the home, or `$HOME/.codex` for `None`
+    /// (created).
+    pub fn codex_fixture_dir(&self, home: Option<&Path>) -> PathBuf {
         let dir = match home {
             Some(dir) => dir.to_path_buf(),
             None => self.home().join(".codex"),
         };
         fs::create_dir_all(&dir).expect("create codex home");
+        dir
+    }
+
+    /// `codex login status` output (stderr) for a codex home (`None`: `$HOME/.codex`).
+    pub fn set_codex_login(&self, home: Option<&Path>, text: &str) {
+        let dir = self.codex_fixture_dir(home);
         fs::write(dir.join("fake-login.txt"), text).expect("write login fixture");
+    }
+
+    /// The result of `codex app-server`'s `account/read` for a codex home.
+    pub fn set_codex_account(&self, home: Option<&Path>, json: &str) {
+        let dir = self.codex_fixture_dir(home);
+        fs::write(dir.join("fake-account.json"), json).expect("write account fixture");
+    }
+
+    /// The error `codex app-server` answers `account/read` with for a codex home.
+    pub fn set_codex_account_error(&self, home: Option<&Path>, json: &str) {
+        let dir = self.codex_fixture_dir(home);
+        fs::write(dir.join("fake-account-error.json"), json).expect("write account fixture");
+    }
+
+    /// The result of `codex app-server`'s `account/rateLimits/read` for a codex home.
+    pub fn set_codex_rate_limits(&self, home: Option<&Path>, json: &str) {
+        let dir = self.codex_fixture_dir(home);
+        fs::write(dir.join("fake-rate-limits.json"), json).expect("write rate limits fixture");
+    }
+
+    /// Makes `codex app-server` fail for a codex home like a codex without it.
+    pub fn set_codex_without_app_server(&self, home: Option<&Path>) {
+        let dir = self.codex_fixture_dir(home);
+        fs::write(dir.join("fake-no-app-server"), "").expect("write app-server fixture");
+    }
+
+    /// Makes every codex invocation for this home hang for `secs` seconds.
+    pub fn set_codex_hang(&self, home: Option<&Path>, secs: u32) {
+        let dir = self.codex_fixture_dir(home);
+        fs::write(dir.join("fake-sleep"), secs.to_string()).expect("write sleep fixture");
+    }
+
+    /// Every JSON-RPC line the fake `codex app-server` read so far, in order (empty if it
+    /// never ran).
+    pub fn codex_rpc(&self) -> Vec<CodexRpc> {
+        let path = self.root().join("codex-out.rpc");
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => panic!("read fake codex rpc record: {e}"),
+        };
+        text.lines()
+            .map(|line| {
+                let (cxh, message) = line.split_once('\t').expect("cxh<TAB>message");
+                CodexRpc {
+                    codex_home: parse_var(Some(cxh)),
+                    message: serde_json::from_str(message).expect("rpc line is JSON"),
+                }
+            })
+            .collect()
     }
 
     /// All invocations of the fake codex so far (empty if it never ran).

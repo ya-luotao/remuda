@@ -18,7 +18,8 @@ use super::app::{self, Effect, Event, LaunchRequest, PREVIEW_MESSAGES};
 
 /// `claude auth status` / `codex login status` per account; the same default as `remuda list`.
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(15);
-/// `claude -p /usage` per account; the same default as `remuda usage --live` (R10).
+/// `claude -p /usage` / `codex app-server` per account; the same default as
+/// `remuda usage --live` (R10).
 const LIVE_USAGE_TIMEOUT: Duration = Duration::from_secs(90);
 /// `claude stop|rm <id>`.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -69,9 +70,12 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
             for account in which {
                 let (deps, tx) = (Arc::clone(&deps), tx.clone());
                 thread::spawn(move || {
-                    let result = match &deps.claude {
-                        Some(claude) => usage::live_usage(&account, claude, LIVE_USAGE_TIMEOUT),
-                        None => Err("`claude` not found on PATH".to_string()),
+                    let result = match deps.program(account.provider) {
+                        Some(program) => usage::live_usage(&account, program, LIVE_USAGE_TIMEOUT),
+                        None => Err(format!(
+                            "`{}` not found on PATH",
+                            account.provider.program()
+                        )),
                     };
                     let _ = tx.send(Event::LiveUsage { account, result });
                 });
@@ -540,6 +544,67 @@ mod tests {
             [Event::LiveUsage {
                 account: max,
                 result: Err("`claude` not found on PATH".into())
+            }]
+        );
+    }
+
+    /// R10: a codex account's live usage goes to `codex app-server`, and brings its identity;
+    /// without codex it fails on its own.
+    #[test]
+    fn live_usage_asks_each_accounts_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = Account {
+            provider: Provider::Codex,
+            name: "work".into(),
+            home: Home::Path(dir.path().join("work").display().to_string()),
+        };
+        let without = collect(
+            Effect::LiveUsage(vec![work.clone()]),
+            &deps(dir.path()),
+            |_| true,
+        );
+        assert_eq!(
+            without,
+            [Event::LiveUsage {
+                account: work.clone(),
+                result: Err("`codex` not found on PATH".into())
+            }]
+        );
+        let codex = crate::probe::script(
+            dir.path(),
+            "codex",
+            "read a; read b; read c; read d; \
+             echo '{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":4,\
+             \"windowDurationMins\":300}}}}'; \
+             echo '{\"id\":3,\"result\":{\"account\":{\"type\":\"chatgpt\",\
+             \"email\":\"c@example.com\",\"planType\":\"plus\"}}}'; cat >/dev/null",
+        );
+        let deps = Arc::new(Deps {
+            accounts: vec![work.clone()],
+            codex: Some(codex),
+            ..Deps::clone(&deps(dir.path()))
+        });
+        let events = collect(Effect::LiveUsage(vec![work.clone()]), &deps, |_| true);
+        let identity = crate::identity::Identity::LoggedIn {
+            email: Some("c@example.com".into()),
+            org: None,
+            plan: Some("plus".into()),
+            method: Some("ChatGPT".into()),
+            cached: false,
+        };
+        assert_eq!(
+            events,
+            [Event::LiveUsage {
+                account: work,
+                result: Ok(usage::LiveResult {
+                    usage: usage::LiveUsage::Rows(vec![usage::UsageRow {
+                        label: "Session".into(),
+                        percent: 4.0,
+                        severity: None,
+                        resets: None,
+                    }]),
+                    identity: Some(identity),
+                })
             }]
         );
     }
