@@ -98,7 +98,15 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
         Effect::Checks => {
             thread::spawn(move || {
                 let stores = index::stores(&deps.accounts, &deps.env);
-                let found = checks::run(&deps.accounts, &deps.env, &stores);
+                let mut found = checks::run(&deps.accounts, &deps.env, &stores);
+                // A registry that cannot be read shares nothing (the launch says why).
+                if let Ok(registry) = Registry::load(&deps.config) {
+                    found.extend(checks::sharing(
+                        &deps.accounts,
+                        &deps.env,
+                        &registry.sharing,
+                    ));
+                }
                 let _ = tx.send(Event::Checks(found));
             });
         }

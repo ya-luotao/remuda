@@ -9,7 +9,8 @@ use serde_json::Value;
 
 use crate::Env;
 use crate::index::Store;
-use crate::registry::{Account, CLAUDE, Home};
+use crate::registry::{Account, CLAUDE, Home, Sharing};
+use crate::share::{self, Installs};
 
 /// One problem worth a warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +88,82 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
     checks
 }
 
+/// Shared configuration (R11, R18): a source account that is not listed or whose home is
+/// missing; members whose home shares some but not all instruction items with the source
+/// through symlinks (those load twice); enabled plugins without an install path that exists,
+/// and an `installed_plugins.json` whose format is not recognized.
+pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let Some(source) = &sharing.source else {
+        return checks;
+    };
+    let name = source.qualified();
+    if !accounts.iter().any(|a| a.qualified() == name) {
+        checks.push(Check {
+            account: None,
+            message: format!("[share.claude] from = {name}: no such account"),
+        });
+        return checks;
+    }
+    let Some(from) = source.home_dir(env).filter(|d| d.is_dir()) else {
+        let home = source
+            .home_dir(env)
+            .map_or(source.home.to_string(), |d| d.display().to_string());
+        checks.push(Check {
+            account: Some(name),
+            message: format!(
+                "home {home} of the shared configuration source does not exist: nothing is shared"
+            ),
+        });
+        return checks;
+    };
+    for account in accounts {
+        if sharing.source_for(account).is_none() {
+            continue;
+        }
+        let Some(home) = account.home_dir(env).filter(|d| d.is_dir()) else {
+            continue;
+        };
+        let items = share::instructions(&from, &home);
+        if items.partial() {
+            checks.push(Check {
+                account: Some(account.qualified()),
+                message: format!(
+                    "shares {} with {name} through symlinks but not {}: the shared ones load \
+                     twice (with the injected --add-dir)",
+                    items.shared.join(", "),
+                    items.missing.join(", ")
+                ),
+            });
+        }
+    }
+    let settings = share::read_settings(&from.join("settings.json")).unwrap_or_default();
+    let plugins = share::enabled_plugins(&settings);
+    match share::installed_plugins(&from) {
+        Installs::Unrecognized(path) => checks.push(Check {
+            account: Some(name),
+            message: format!(
+                "{} is not in a recognized format: plugins are not shared",
+                path.display()
+            ),
+        }),
+        installs => {
+            for plugin in plugins {
+                if installs.install_path(&plugin).is_none() {
+                    checks.push(Check {
+                        account: Some(name.clone()),
+                        message: format!(
+                            "enabled plugin {plugin} has no user install whose path exists: \
+                             it is not shared"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    checks
+}
+
 /// Top-level entries of `dir` that are symlinks to nothing, with their targets.
 fn dangling_symlinks(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     let Ok(listing) = fs::read_dir(dir) else {
@@ -122,6 +199,7 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::symlink;
 
+    use super::sharing as sharing_checks;
     use super::*;
     use crate::index;
     use crate::registry::CODEX;
@@ -328,6 +406,144 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the checks opened auth.json");
         assert_eq!(got, []);
+    }
+
+    fn sharing_from(source: Account) -> Sharing {
+        Sharing {
+            source: Some(source),
+            opted_out: vec!["claude:solo".into()],
+        }
+    }
+
+    /// R11, R18: nothing to say about a clean shared setup.
+    #[test]
+    fn a_clean_shared_setup_has_no_problems() {
+        let f = fixture();
+        let native = f.root.join("home/.claude");
+        fs::write(native.join("CLAUDE.md"), "x").unwrap();
+        let max = f.root.join("max");
+        fs::create_dir_all(&max).unwrap();
+        let accounts = vec![Account::default_for(CLAUDE), named("max", &max)];
+        let sharing = sharing_from(Account::default_for(CLAUDE));
+        assert_eq!(sharing_checks(&accounts, &f.env, &sharing), []);
+        assert_eq!(sharing_checks(&accounts, &f.env, &Sharing::default()), []);
+    }
+
+    /// R11: the source's home is missing, or the source is not an account.
+    #[test]
+    fn a_missing_source() {
+        let f = fixture();
+        let gone = f.root.join("gone");
+        let accounts = vec![Account::default_for(CLAUDE), named("gone", &gone)];
+        let got = sharing_checks(&accounts, &f.env, &sharing_from(named("gone", &gone)));
+        assert_eq!(
+            messages(&got),
+            [(
+                Some("claude:gone"),
+                format!(
+                    "home {} of the shared configuration source does not exist: nothing is shared",
+                    gone.display()
+                )
+                .as_str()
+            )]
+        );
+        let got = sharing_checks(&accounts[..1], &f.env, &sharing_from(named("gone", &gone)));
+        assert_eq!(
+            messages(&got),
+            [(None, "[share.claude] from = claude:gone: no such account")]
+        );
+    }
+
+    /// R11: a member sharing some instruction items through symlinks but not all; opted-out
+    /// accounts and the source are not members.
+    #[test]
+    fn partly_symlinked_instructions() {
+        let f = fixture();
+        let native = f.root.join("home/.claude");
+        fs::write(native.join("CLAUDE.md"), "x").unwrap();
+        fs::create_dir_all(native.join("skills")).unwrap();
+        fs::create_dir_all(native.join("agents")).unwrap();
+        let (max, solo) = (f.root.join("max"), f.root.join("solo"));
+        for home in [&max, &solo] {
+            fs::create_dir_all(home).unwrap();
+            symlink(native.join("CLAUDE.md"), home.join("CLAUDE.md")).unwrap();
+            symlink(native.join("skills"), home.join("skills")).unwrap();
+        }
+        let accounts = vec![
+            Account::default_for(CLAUDE),
+            named("max", &max),
+            named("solo", &solo),
+        ];
+        let got = sharing_checks(
+            &accounts,
+            &f.env,
+            &sharing_from(Account::default_for(CLAUDE)),
+        );
+        assert_eq!(
+            messages(&got),
+            [(
+                Some("claude:max"),
+                "shares CLAUDE.md, skills with claude:default through symlinks but not agents: \
+                 the shared ones load twice (with the injected --add-dir)"
+            )]
+        );
+        symlink(native.join("agents"), max.join("agents")).unwrap();
+        assert_eq!(
+            sharing_checks(
+                &accounts,
+                &f.env,
+                &sharing_from(Account::default_for(CLAUDE))
+            ),
+            []
+        );
+    }
+
+    /// R11: enabled plugins without an existing user install, and an unrecognized
+    /// `installed_plugins.json`.
+    #[test]
+    fn plugin_problems() {
+        let f = fixture();
+        let native = f.root.join("home/.claude");
+        fs::create_dir_all(native.join("plugins/cache/ok")).unwrap();
+        fs::write(
+            native.join("settings.json"),
+            r#"{"enabledPlugins": {"ok@m": true, "gone@m": true, "off@m": false}}"#,
+        )
+        .unwrap();
+        let file = native.join("plugins/installed_plugins.json");
+        fs::write(
+            &file,
+            serde_json::json!({
+                "version": 2,
+                "plugins": {
+                    "ok@m": [{"scope": "user", "installPath": native.join("plugins/cache/ok")}],
+                    "gone@m": [{"scope": "user", "installPath": native.join("plugins/cache/gone")}],
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let accounts = vec![Account::default_for(CLAUDE)];
+        let sharing = sharing_from(Account::default_for(CLAUDE));
+        assert_eq!(
+            messages(&sharing_checks(&accounts, &f.env, &sharing)),
+            [(
+                Some("claude:default"),
+                "enabled plugin gone@m has no user install whose path exists: it is not shared"
+            )]
+        );
+        fs::write(&file, r#"{"version": 1}"#).unwrap();
+        assert_eq!(
+            messages(&sharing_checks(&accounts, &f.env, &sharing)),
+            [(
+                Some("claude:default"),
+                format!(
+                    "{} is not in a recognized format: plugins are not shared",
+                    file.display()
+                )
+                .as_str()
+            )]
+        );
     }
 
     #[test]
