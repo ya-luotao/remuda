@@ -76,8 +76,8 @@ switching to a different, logged-out account.
   account whose `home` is not an absolute path, `share` on a codex account, a `[share.claude] from`
   that names no claude account, and similar problems are all reported as errors
   naming the file; remuda neither guesses nor skips.
-- Runtime state (index cache, launch log) lives in `$REMUDA_HOME/state/` and may be deleted and
-  rebuilt at any time.
+- Runtime state (index cache, statistics cache, launch log) lives in `$REMUDA_HOME/state/` and may
+  be deleted and rebuilt at any time.
 
 ## R4. Provider contract
 
@@ -736,3 +736,77 @@ every session still belongs to exactly one account.
   the target account; the original row keeps its attribution. If `state/` is deleted (R3), copies
   reappear as the same ID in two stores, which R16 already handles.
 - A relay is allowed while the session is running, like a fork (R16).
+
+## R20. Token statistics
+
+Token counts per account and model, read from the agents' own transcripts, for a period. No cost is
+estimated, and computing them runs no agent command.
+
+- **Counts.** Input, cache read, cache write, output, and reasoning. The total is input + cache
+  read + cache write + output (reasoning is part of output). A count a provider does not record is
+  shown as `-`: claude records no reasoning apart from output, codex no cache write.
+- **Claude** (verified on 2.1.71–2.1.281 against 1,064,472 records in 19,431 transcripts): an
+  assistant record (`"type": "assistant"`) carries `message.id`, `message.model`, and
+  `message.usage` with `input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`
+  (cache write), and `output_tokens`. Claude writes one record per content block, each repeating
+  the message's usage, with `output_tokens` growing while the message streams. So a message is
+  counted once, by its `message.id` (in the corpus no id was shared by two requests), with the
+  largest value of each count among its records and the timestamp of its first. Not counted:
+  other record types (a `progress` record repeats a subagent's message, which is counted from the
+  subagent's transcript; a tool result's `usage` sums a subagent's), records without
+  `message.id`, and the model `<synthetic>` (claude's placeholder messages, whose usage is zero).
+- **Advisor calls.** `usage.iterations` lists the requests behind a message, and the top-level
+  usage is the sum of its `message` entries (12,735 of 12,741 records). An `advisor_message`
+  entry is a separate request to its own `model`, not included in the top-level usage; each is
+  counted under that model.
+- **Claude transcripts**: in each `projects` store (a store shared by several homes is read once,
+  R8), every top-level `<project>/*.jsonl`, and every `*.jsonl` at any depth below a directory
+  `<project>/<session id>/` (subagent transcripts, such as `subagents/agent-*.jsonl` and
+  `subagents/workflows/<id>/agent-*.jsonl`), which belongs to that session. Sessions hidden from
+  History (R8) count too.
+- **Codex** (verified on 0.155.1 against 106,795 `token_count` events in 1,464 rollouts): an
+  `event_msg` of type `token_count` with an `info` carries `total_token_usage`, the session's
+  cumulative usage, and `last_token_usage`, the latest request's; each has `input_tokens` (cached
+  included), `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens` (part of output),
+  and `total_tokens`. An event whose `total_token_usage` equals the previous one's in the same
+  rollout is skipped: codex repeats events (16,750 in the corpus), and after compacting it records
+  the new context size with an unchanged total (673). Every other event counts its
+  `last_token_usage`: input without cached, cached as cache read, output, reasoning. An event
+  belongs to the model of the last `turn_context` before it (`payload.model`); events before the
+  first `turn_context` take the model of the first one after them, else `unknown`. Rollouts:
+  `sessions/**/rollout-*.jsonl` and `archived_sessions/rollout-*.jsonl` of every codex home,
+  including those hidden from History (R17).
+- **Copies count once.** A fork holds its parent's history: claude copies the parent's records
+  with their `message.id` and timestamp and marks them `forkedFrom`; a codex fork may replay the
+  parent's `token_count` events with the fork's timestamps and the parent's cumulative totals; a
+  relay (R19) copies a transcript whole. So each claude message is counted once across all stores
+  by its `message.id`, and each codex request once across all rollouts by its
+  `total_token_usage`. In the corpus, 2,360 of the 2,362 totals found in more than one rollout
+  came from forks; the other two were the first requests of unrelated `codex exec` runs with
+  identical usage, which are counted once (a known limitation). The copy that counts is, in
+  order: one not known to be a copy (a `forkedFrom` record, or a transcript the launch log records
+  as a relay copy, R19), the one with the earliest timestamp, the one whose path sorts first.
+- **Accounts.** A message counts for the session of the transcript whose copy counts. A claude
+  session's accounts are those of R9 without running sessions (the launch log and
+  `history.jsonl`); a codex rollout's are the accounts of its home (R17). A session attributed to
+  several accounts is counted once, for those accounts together (`max + team`); a claude session
+  attributed to none is counted as unattributed. The sections therefore add up to the overall
+  total.
+- **Periods**: today, the last 7 days, the last 30 days, all. A period starts at local midnight
+  (the system time zone) of today, of 6 days before, or of 29 days before; a message is in it when
+  its timestamp is not earlier than the start. All also includes messages without a timestamp.
+- **Shown**, for a period: every account in registry order (including those with nothing in the
+  period), then each group of accounts, then unattributed. Each lists the tokens per model (the
+  model id as recorded), most first, and their total. Then the tokens per model over everything.
+  Counts below 1,000 are shown whole, others in K, M, B, or T, with one decimal below 100
+  (`1.2M`, `93.3B`, `118K`).
+- **Only transcripts that exist count**: tokens of transcripts deleted since (claude deletes those
+  older than `cleanupPeriodDays`) are no longer counted.
+- **Cache**: `$REMUDA_HOME/state/stats.json`, with a schema version, rebuilt on a mismatch,
+  written atomically, deletable at any time (R3). For each transcript it holds what was counted
+  from it (a 64-bit FNV-1a hash of each request's key, its timestamp, model, and counts), how far
+  the transcript was read, and, for codex, the last total and model. Transcripts are read like the
+  index (R8): an unchanged file is not read again, a grown one only from its last complete line,
+  any other one whole; only complete lines are parsed. Records of one message read in two
+  refreshes merge by their key. The first computation reads every transcript whole (measured:
+  20,895 files, 17.2 GB).

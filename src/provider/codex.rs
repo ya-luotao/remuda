@@ -17,8 +17,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::transcript::{
-    FIRST_USER_TEXT_CAP, Head, Message, PREVIEW_CAP, Role, Tail, WINDOW, complete_lines, one_line,
-    read_at,
+    FIRST_USER_TEXT_CAP, Head, Message, PREVIEW_CAP, Role, Tail, WINDOW, complete_lines, contains,
+    one_line, read_at,
 };
 use crate::{index, usage};
 
@@ -416,7 +416,7 @@ fn last_rate_limits(path: &Path) -> Option<(Timestamp, Value)> {
             .lines
             .iter()
             .rev()
-            .filter(|line| line.windows(NEEDLE.len()).any(|w| w == NEEDLE))
+            .filter(|line| contains(line, NEEDLE))
             .find_map(|line| rate_limits_of(line));
         if found.is_some() || start == 0 || window >= RATE_LIMIT_TAIL_CAP {
             return found;

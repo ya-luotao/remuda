@@ -156,6 +156,11 @@ pub(crate) fn read_at(file: &File, offset: u64, len: u64) -> io::Result<Vec<u8>>
     Ok(buf)
 }
 
+/// Whether `needle` occurs in `line`: a cheap filter before parsing a line as JSON.
+pub(crate) fn contains(line: &[u8], needle: &[u8]) -> bool {
+    line.windows(needle.len()).any(|w| w == needle)
+}
+
 /// The complete lines of a buffer read from a transcript.
 pub(crate) struct Lines<'a> {
     /// Non-empty lines, without their `\n`, in file order.

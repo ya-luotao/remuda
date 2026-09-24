@@ -206,13 +206,13 @@ pub fn stores(accounts: &[Account], env: &Env) -> Vec<Store> {
 /// Size, mtime and inode of a transcript as listed.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Stat {
-    size: u64,
+    pub(crate) size: u64,
     pub(crate) mtime_ns: i128,
-    ino: u64,
+    pub(crate) ino: u64,
 }
 
 impl Stat {
-    fn of(meta: &fs::Metadata) -> Stat {
+    pub(crate) fn of(meta: &fs::Metadata) -> Stat {
         Stat {
             size: meta.len(),
             mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),

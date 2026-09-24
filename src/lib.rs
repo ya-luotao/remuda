@@ -17,6 +17,7 @@ pub mod registry;
 pub mod relay;
 pub mod setup;
 pub mod share;
+pub mod stats;
 pub mod text;
 pub mod transcript;
 pub mod tui;
