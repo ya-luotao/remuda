@@ -78,6 +78,30 @@ impl Account {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Registry {
     pub accounts: Vec<Account>,
+    /// `[share.claude]` and the accounts that opt out of it (R3, R18).
+    pub sharing: Sharing,
+}
+
+/// Shared configuration (R18): whose configuration other claude accounts get.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sharing {
+    /// The account named by `[share.claude] from`; `None`: nothing is shared.
+    pub source: Option<Account>,
+    /// `provider:name` of every account with `share = false`.
+    pub opted_out: Vec<String>,
+}
+
+impl Sharing {
+    /// The source whose configuration `account` gets: every claude account other than the
+    /// source itself, unless it sets `share = false` (R18).
+    pub fn source_for(&self, account: &Account) -> Option<&Account> {
+        let source = self.source.as_ref()?;
+        let qualified = account.qualified();
+        let member = account.provider == CLAUDE
+            && qualified != source.qualified()
+            && !self.opted_out.contains(&qualified);
+        member.then_some(source)
+    }
 }
 
 impl Registry {
@@ -89,13 +113,19 @@ impl Registry {
 
     /// Parses and validates a config document.
     pub fn from_document(doc: &DocumentMut) -> Result<Self> {
-        let Some(item) = doc.get("account") else {
-            return Ok(Registry::default());
-        };
-        let Some(tables) = item.as_array_of_tables() else {
-            bail!("`account` must be an array of tables ([[account]])");
-        };
-        let mut accounts: Vec<Account> = Vec::new();
+        let mut registry = Registry::default();
+        if let Some(item) = doc.get("account") {
+            let Some(tables) = item.as_array_of_tables() else {
+                bail!("`account` must be an array of tables ([[account]])");
+            };
+            registry.parse_accounts(tables)?;
+        }
+        registry.sharing.source = registry.share_source(doc)?;
+        Ok(registry)
+    }
+
+    fn parse_accounts(&mut self, tables: &ArrayOfTables) -> Result<()> {
+        let accounts = &mut self.accounts;
         for (i, table) in tables.iter().enumerate() {
             let field = |key: &str| {
                 table
@@ -128,13 +158,66 @@ impl Registry {
             {
                 bail!("duplicate account {provider}:{name}");
             }
+            // `share = false` opts a claude account out of shared configuration (R18).
+            if let Some(share) = table.get("share") {
+                let Some(share) = share.as_bool() else {
+                    bail!("account {provider}:{name}: `share` must be true or false");
+                };
+                if provider != CLAUDE {
+                    bail!(
+                        "account {provider}:{name}: `share` applies to claude accounts only \
+                         (shared configuration is claude's)"
+                    );
+                }
+                if !share {
+                    self.sharing.opted_out.push(format!("{provider}:{name}"));
+                }
+            }
             accounts.push(Account {
                 provider,
                 name: name.to_string(),
                 home: Home::Path(home.to_string()),
             });
         }
-        Ok(Registry { accounts })
+        Ok(())
+    }
+
+    /// `[share.claude] from`: `name` or `claude:name` of a claude account, registered or the
+    /// implicit `default` (R3, R18).
+    fn share_source(&self, doc: &DocumentMut) -> Result<Option<Account>> {
+        let Some(share) = doc.get("share") else {
+            return Ok(None);
+        };
+        let Some(share) = share.as_table_like() else {
+            bail!("`share` must be a table ([share.claude])");
+        };
+        let Some(claude) = share.get(CLAUDE.name()) else {
+            return Ok(None);
+        };
+        let Some(claude) = claude.as_table_like() else {
+            bail!("`share.claude` must be a table ([share.claude])");
+        };
+        let Some(from) = claude.get("from").and_then(|v| v.as_str()) else {
+            bail!("[share.claude]: missing or non-string `from`");
+        };
+        let name = from.strip_prefix("claude:").unwrap_or(from);
+        match self
+            .with_defaults(|_| true)
+            .into_iter()
+            .find(|a| a.provider == CLAUDE && a.name == name)
+        {
+            Some(source) => Ok(Some(source)),
+            None => bail!(
+                "[share.claude]: from = {from:?} names no claude account (known: {})",
+                qualified_list(
+                    &self
+                        .with_defaults(|p| p == CLAUDE)
+                        .into_iter()
+                        .filter(|a| a.provider == CLAUDE)
+                        .collect::<Vec<_>>()
+                )
+            ),
+        }
     }
 
     /// Every account to list, grouped by provider (claude first): the provider's implicit
@@ -522,6 +605,7 @@ mod tests {
     fn all_lists_default_first() {
         let reg = Registry {
             accounts: vec![acc("claude", "max", "/m")],
+            ..Registry::default()
         };
         let all = reg.all(&Env::new());
         assert_eq!(all[0], Account::default_for(CLAUDE));
@@ -534,6 +618,7 @@ mod tests {
     fn resolves_references() {
         let reg = Registry {
             accounts: vec![acc("claude", "max", "/m"), acc("claude", "team", "/t")],
+            ..Registry::default()
         };
         assert_eq!(reg.resolve("max").unwrap(), acc("claude", "max", "/m"));
         assert_eq!(
@@ -554,6 +639,7 @@ mod tests {
     fn unknown_reference_lists_known_accounts() {
         let reg = Registry {
             accounts: vec![acc("claude", "max", "/m")],
+            ..Registry::default()
         };
         for bad in ["nope", "claude:nope", "codex:max", ""] {
             let msg = reg.resolve(bad).unwrap_err().to_string();
@@ -568,6 +654,7 @@ mod tests {
     fn bare_name_in_several_providers_is_ambiguous() {
         let reg = Registry {
             accounts: vec![acc("claude", "x", "/a"), acc("codex", "x", "/b")],
+            ..Registry::default()
         };
         let msg = reg.resolve("x").unwrap_err().to_string();
         assert!(msg.contains("claude:x") && msg.contains("codex:x"), "{msg}");
@@ -580,6 +667,7 @@ mod tests {
     fn bare_default_is_claude_and_codex_default_resolves() {
         let reg = Registry {
             accounts: vec![acc("claude", "max", "/m"), acc("codex", "max", "/c")],
+            ..Registry::default()
         };
         assert_eq!(
             reg.resolve("default").unwrap(),
@@ -611,6 +699,7 @@ mod tests {
                 acc("claude", "max", "/m"),
                 acc("claude", "team", "/t"),
             ],
+            ..Registry::default()
         };
         let names = |accounts: Vec<Account>| -> Vec<String> {
             accounts.iter().map(Account::qualified).collect()
@@ -670,6 +759,159 @@ mod tests {
             let reparsed = parse(&out).unwrap();
             assert_eq!(reparsed.accounts.last(), Some(&acc("claude", "team", "/t")));
         }
+    }
+
+    /// R3, R18: `[share.claude] from` names a claude account (registered, or the implicit
+    /// `default`), bare or as `claude:name`; `share = false` opts an account out.
+    #[test]
+    fn parses_shared_configuration() {
+        let reg = parse(
+            r#"
+            [[account]]
+            provider = "claude"
+            name = "max"
+            home = "/m"
+
+            [[account]]
+            provider = "claude"
+            name = "solo"
+            home = "/s"
+            share = false
+
+            [[account]]
+            provider = "claude"
+            name = "team"
+            home = "/t"
+            share = true
+
+            [share.claude]
+            from = "default"
+            "#,
+        )
+        .unwrap();
+        let sharing = &reg.sharing;
+        assert_eq!(sharing.source, Some(Account::default_for(CLAUDE)));
+        assert_eq!(sharing.opted_out, ["claude:solo"]);
+        let default = Account::default_for(CLAUDE);
+        assert_eq!(
+            sharing.source_for(&default),
+            None,
+            "the source gets nothing"
+        );
+        assert_eq!(sharing.source_for(&reg.accounts[0]), Some(&default));
+        assert_eq!(sharing.source_for(&reg.accounts[1]), None, "share = false");
+        assert_eq!(sharing.source_for(&reg.accounts[2]), Some(&default));
+        assert_eq!(
+            sharing.source_for(&Account::default_for(CODEX)),
+            None,
+            "codex accounts are not affected"
+        );
+
+        for from in ["max", "claude:max"] {
+            let reg = parse(&format!(
+                "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n\
+                 [share.claude]\nfrom = \"{from}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                reg.sharing.source,
+                Some(acc("claude", "max", "/m")),
+                "{from}"
+            );
+            assert_eq!(reg.sharing.source_for(&reg.accounts[0]), None);
+            assert_eq!(
+                reg.sharing.source_for(&Account::default_for(CLAUDE)),
+                Some(&acc("claude", "max", "/m"))
+            );
+        }
+        // Without the table nothing is shared; `share = false` alone is harmless.
+        let reg = parse(
+            "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\nshare = false\n",
+        )
+        .unwrap();
+        assert_eq!(reg.sharing.source, None);
+        assert_eq!(reg.sharing.source_for(&reg.accounts[0]), None);
+        assert_eq!(parse("[share]\n").unwrap().sharing.source, None);
+    }
+
+    /// R3: `share` on a codex account and a `from` that names no claude account are load
+    /// errors, as are malformed values.
+    #[test]
+    fn rejects_invalid_shared_configuration() {
+        let codex = "[[account]]\nprovider = \"codex\"\nname = \"cx\"\nhome = \"/c\"\n";
+        let cases = [
+            (
+                format!("{codex}share = false\n"),
+                "`share` applies to claude accounts only",
+            ),
+            (
+                format!("{codex}share = true\n"),
+                "`share` applies to claude accounts only",
+            ),
+            (
+                "[[account]]\nprovider = \"claude\"\nname = \"x\"\nhome = \"/x\"\nshare = \"no\"\n"
+                    .to_string(),
+                "`share` must be true or false",
+            ),
+            (
+                "[share.claude]\nfrom = \"nobody\"\n".to_string(),
+                "from = \"nobody\" names no claude account (known: claude:default)",
+            ),
+            (
+                format!("{codex}[share.claude]\nfrom = \"cx\"\n"),
+                "names no claude account",
+            ),
+            (
+                format!("{codex}[share.claude]\nfrom = \"codex:cx\"\n"),
+                "names no claude account",
+            ),
+            (
+                "[share.claude]\nfrom = \"codex:default\"\n".to_string(),
+                "names no claude account",
+            ),
+            (
+                "[share.claude]\nfrom = 1\n".to_string(),
+                "missing or non-string `from`",
+            ),
+            (
+                "[share.claude]\n".to_string(),
+                "missing or non-string `from`",
+            ),
+            ("share = 1\n".to_string(), "`share` must be a table"),
+            (
+                "[share]\nclaude = \"default\"\n".to_string(),
+                "`share.claude` must be a table",
+            ),
+        ];
+        for (text, want) in cases {
+            let err = format!("{:#}", parse(&text).unwrap_err());
+            assert!(err.contains(want), "{text}\n=> {err}");
+        }
+    }
+
+    /// Adding an account keeps `[share.claude]`, `share = false` and their comments (R3).
+    #[test]
+    fn append_preserves_shared_configuration() {
+        let original = "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n\
+                        share = false # not this one\n\n# shared from the native login\n\
+                        [share.claude]\nfrom = \"default\" # the source\n";
+        let mut doc: DocumentMut = original.parse().unwrap();
+        append_account(&mut doc, &acc("claude", "team", "/t")).unwrap();
+        let out = doc.to_string();
+        for kept in [
+            "share = false # not this one",
+            "# shared from the native login",
+            "from = \"default\" # the source",
+        ] {
+            assert!(out.contains(kept), "{kept:?} lost:\n{out}");
+        }
+        let reg = parse(&out).unwrap();
+        assert_eq!(
+            reg.accounts,
+            [acc("claude", "max", "/m"), acc("claude", "team", "/t")]
+        );
+        assert_eq!(reg.sharing.source, Some(Account::default_for(CLAUDE)));
+        assert_eq!(reg.sharing.opted_out, ["claude:max"]);
     }
 
     #[test]
