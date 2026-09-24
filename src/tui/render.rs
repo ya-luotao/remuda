@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::identity::Identity;
 use crate::index::Entry;
+use crate::stats::{self, ModelRow, Table};
 use crate::transcript::{Role, one_line};
 use crate::usage::{self, Resets, UsageRow};
 use crate::{text, usage::format_age};
@@ -111,6 +112,7 @@ pub fn list_height(app: &App, view: View) -> usize {
             let area = split(app, body).list.unwrap_or_default();
             area.height.saturating_sub(list_chrome(app, view)) as usize
         }
+        View::Stats => stats_height(app),
     }
 }
 
@@ -157,6 +159,7 @@ pub fn render(app: &App, f: &mut Frame) {
             }
             preview(app, f, s.preview);
         }
+        View::Stats => stats_view(app, f, areas.body),
     }
     f.render_widget(Paragraph::new(status_line(app)), areas.status);
     f.render_widget(Paragraph::new(Line::styled(hints(app), DIM)), areas.hints);
@@ -256,6 +259,14 @@ fn status_line(app: &App) -> Line<'static> {
             }
         }
         View::Accounts => {}
+        View::Stats => {
+            spans.push(stats_status(app));
+            if let Some(e) = &app.stats.error {
+                spans.push(sep());
+                spans.push(Span::styled(format!("stats cache: {e}"), CRIT));
+            }
+            return Line::from(spans);
+        }
     }
     if app.mode == Mode::PickForRun {
         return Line::from(spans);
@@ -304,6 +315,7 @@ fn hints(app: &App) -> String {
             View::History => {
                 "enter: resume · f: fork · c: continue as… · p: preview · /: search · a: show all"
             }
+            View::Stats => "t: period · j/k: scroll · r: refresh",
         }
     };
     format!(" {text}")
@@ -1029,12 +1041,11 @@ fn preview(app: &App, f: &mut Frame, area: Rect) {
 
 pub const KEYS: &[(&str, &str)] = &[
     (
-        "1 2 3 / tab / shift-tab",
-        "switch view: Accounts, Live, History",
+        "1 2 3 4 / tab / shift-tab",
+        "switch view: Accounts, Live, History, Stats",
     ),
     ("j k / ↑ ↓", "move"),
-    ("g G / home end", "first / last"),
-    ("pgup pgdn", "page"),
+    ("g G / home end / pgup pgdn", "first / last / page"),
     (
         "enter",
         "history: resume the session (codex: asks first) · live: attach a background session",
@@ -1069,11 +1080,200 @@ pub const KEYS: &[(&str, &str)] = &[
         "a",
         "history: show teammate, SDK and codex subagent sessions · live: show stopped ones",
     ),
+    ("t", "stats: next period (all, today, 7 days, 30 days)"),
     ("u", "query live usage for every account"),
     ("r", "refresh index, identities, live sessions, checks"),
     ("?", "this help"),
     ("q / ctrl-c", "quit"),
 ];
+
+// ---- Stats ---------------------------------------------------------------------------
+
+/// The Stats view's numeric columns: header and width. The name column takes the rest.
+const STATS_COLUMNS: [(&str, usize); 6] = [
+    ("INPUT", 7),
+    ("CACHE READ", 10),
+    ("CACHE WRITE", 11),
+    ("OUTPUT", 7),
+    ("REASONING", 9),
+    ("TOTAL", 7),
+];
+/// When the name column would be narrower, REASONING is dropped, then CACHE WRITE.
+const STATS_MIN_NAME: usize = 16;
+const STATS_NAME: &str = "ACCOUNT / MODEL";
+/// The title and the column header stay put above the scrolled lines.
+const STATS_CHROME: u16 = 2;
+
+/// Lines of the Stats body below its title and column header.
+pub fn stats_height(app: &App) -> usize {
+    frame_areas(screen(app))
+        .body
+        .height
+        .saturating_sub(STATS_CHROME) as usize
+}
+
+/// Lines the Stats view scrolls over at the current width.
+pub fn stats_line_count(app: &App) -> usize {
+    stats_lines(app, frame_areas(screen(app)).body.width).len()
+}
+
+fn stats_table(app: &App) -> Option<&Table> {
+    Some(app.stats.report.as_ref()?.table(app.stats.period))
+}
+
+/// A section's accounts, short (`default + max`), or `unattributed`.
+fn stats_label(accounts: &[String]) -> String {
+    match accounts.is_empty() {
+        true => "unattributed".to_string(),
+        false => accounts
+            .iter()
+            .map(|a| short(a))
+            .collect::<Vec<_>>()
+            .join(" + "),
+    }
+}
+
+/// The width of the name column and the numeric columns shown (indexes into
+/// [`STATS_COLUMNS`]) at `width`: the name column is as wide as its widest name (so a wide
+/// terminal keeps the numbers next to the names), at most what the numbers leave; narrower
+/// than [`STATS_MIN_NAME`], it takes REASONING's place, then CACHE WRITE's.
+fn stats_columns(app: &App, width: u16) -> (usize, Vec<usize>) {
+    let mut widest = text::width(STATS_NAME);
+    if let Some(table) = stats_table(app) {
+        for s in &table.sections {
+            widest = widest.max(text::width(&stats_label(&s.accounts)));
+        }
+        for m in table.sections.iter().flat_map(|s| &s.models) {
+            widest = widest.max(2 + text::width(&m.model));
+        }
+    }
+    let mut shown: Vec<usize> = (0..STATS_COLUMNS.len()).collect();
+    let room = |shown: &[usize]| {
+        let numbers: usize = shown.iter().map(|&i| STATS_COLUMNS[i].1 + 1).sum();
+        (width as usize).saturating_sub(numbers)
+    };
+    for dropped in [4, 2] {
+        if room(&shown) >= STATS_MIN_NAME {
+            break;
+        }
+        shown.retain(|&i| i != dropped);
+    }
+    (room(&shown).min(widest), shown)
+}
+
+/// A Stats line: the name truncated and padded to its column, then the counts right-aligned.
+fn stats_row(
+    name: &str,
+    counts: &[String; 6],
+    style: Style,
+    columns: &(usize, Vec<usize>),
+) -> Line<'static> {
+    let (name_w, shown) = columns;
+    let mut spans = vec![Span::styled(
+        text::pad(&text::truncate(name, *name_w), *name_w),
+        style,
+    )];
+    for &i in shown {
+        let pad = STATS_COLUMNS[i].1.saturating_sub(text::width(&counts[i]));
+        spans.push(Span::styled(
+            format!(" {}{}", " ".repeat(pad), counts[i]),
+            style,
+        ));
+    }
+    Line::from(spans)
+}
+
+/// A bold row with the models' total, then a row per model (codex's in its color); an empty
+/// section is one row saying so.
+fn stats_block(
+    label: &str,
+    models: &[ModelRow],
+    columns: &(usize, Vec<usize>),
+    lines: &mut Vec<Line<'static>>,
+) {
+    if models.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                text::pad(&text::truncate(label, columns.0), columns.0),
+                BOLD,
+            ),
+            Span::styled(" no tokens", DIM),
+        ]));
+        return;
+    }
+    let (total, providers) = stats::sum(models);
+    lines.push(stats_row(
+        label,
+        &stats::counts(&total, &providers),
+        BOLD,
+        columns,
+    ));
+    for m in models {
+        let style = match m.provider {
+            Provider::Codex => CODEX_STYLE,
+            Provider::Claude => Style::new(),
+        };
+        let counts = stats::counts(&m.tokens, &[m.provider]);
+        lines.push(stats_row(
+            &format!("  {}", m.model),
+            &counts,
+            style,
+            columns,
+        ));
+    }
+}
+
+/// The scrolled part of the Stats view: every section of the period, then Overall; while the
+/// first report is computed, what is being done. Reads only `app.stats` (R20).
+pub fn stats_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let Some(table) = stats_table(app) else {
+        let doing = match app.stats.progress {
+            Some((done, total)) if done < total => format!("reading transcripts {done}/{total}…"),
+            _ => "computing…".to_string(),
+        };
+        return vec![Line::styled(doing, DIM)];
+    };
+    let columns = stats_columns(app, width);
+    let mut lines = Vec::new();
+    for s in &table.sections {
+        stats_block(&stats_label(&s.accounts), &s.models, &columns, &mut lines);
+    }
+    lines.push(Line::raw(""));
+    stats_block("Overall", &table.overall, &columns, &mut lines);
+    lines
+}
+
+fn stats_view(app: &App, f: &mut Frame, area: Rect) {
+    let title = format!("Tokens · {} (t: period)", app.stats.period.label());
+    let columns = stats_columns(app, area.width);
+    let header = STATS_COLUMNS.map(|(h, _)| h.to_string());
+    let mut lines = vec![
+        section(&title, area.width),
+        stats_row(STATS_NAME, &header, DIM, &columns),
+    ];
+    let body = stats_lines(app, area.width);
+    let height = area.height.saturating_sub(STATS_CHROME) as usize;
+    let scroll = app.stats.scroll.min(body.len().saturating_sub(height));
+    lines.extend(body.into_iter().skip(scroll).take(height));
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// The Stats status: the computation's progress, else when the report was computed.
+fn stats_status(app: &App) -> Span<'static> {
+    let s = &app.stats;
+    match (s.in_flight, s.progress, s.computed) {
+        (true, Some((done, total)), _) if done < total => {
+            Span::styled(format!("reading transcripts {done}/{total}…"), WARN)
+        }
+        (true, _, _) => Span::styled("computing statistics…", WARN),
+        (false, _, Some(at)) => Span::raw(format!(
+            "computed {} · {} transcripts",
+            at.to_zoned(app.tz.clone()).strftime("%H:%M:%S"),
+            s.report.as_ref().map_or(0, |r| r.files)
+        )),
+        (false, _, None) => Span::raw(""),
+    }
+}
 
 /// A centered box with a border and a title; `lines` are clipped to it.
 fn boxed(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {

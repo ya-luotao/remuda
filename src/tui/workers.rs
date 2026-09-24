@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::index::{self, Index};
 use crate::provider::{Provider, codex};
 use crate::registry::{self, Account, Registry};
-use crate::{attribution, checks, identity, live, transcript, usage};
+use crate::{attribution, checks, identity, live, stats, transcript, usage};
 
 use super::Deps;
 use super::app::{self, Effect, Event, LaunchRequest, PREVIEW_MESSAGES};
@@ -23,7 +23,8 @@ const IDENTITY_TIMEOUT: Duration = Duration::from_secs(15);
 const LIVE_USAGE_TIMEOUT: Duration = Duration::from_secs(90);
 /// `claude stop|rm <id>`.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Index progress is sent at most this often (entries are batched in between).
+/// Index and statistics progress is sent at most this often (index entries are batched in
+/// between).
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
 /// Starts `effect` in the background. Leaving the TUI ([`Effect::Quit`], [`Effect::Pick`])
@@ -99,6 +100,9 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                 let base = attribution::collect(&deps.accounts, &deps.env, &log, &[]);
                 let _ = tx.send(Event::Attribution(base));
             });
+        }
+        Effect::Stats => {
+            thread::spawn(move || compute_stats(&deps, &tx));
         }
         Effect::Checks => {
             thread::spawn(move || {
@@ -298,6 +302,38 @@ fn refresh_index(deps: &Deps, tx: &Sender<Event>) {
     });
 }
 
+/// Token statistics (R20): the cache brought up to date with progress (the first and last
+/// report, and at most every [`PROGRESS_EVERY`] in between), saved if that changed it, then
+/// the report with attribution from the launch log and `history.jsonl`. Leaving the TUI does
+/// not wait for it: the thread ends with the process, the cache unsaved.
+fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
+    let path = deps.state_dir.join("stats.json");
+    let mut cache = stats::Cache::load(&path);
+    let sources = stats::sources(&deps.accounts, &deps.env);
+    let mut last = Instant::now();
+    let refreshed = stats::refresh(&mut cache, &sources, |done, total| {
+        if done == 0 || done == total || last.elapsed() >= PROGRESS_EVERY {
+            last = Instant::now();
+            let _ = tx.send(Event::StatsProgress { done, total });
+        }
+    });
+    let error = cache
+        .save_if_changed(&path, &refreshed)
+        .err()
+        .map(|e| format!("{e:#}"));
+    let log = deps.state_dir.join("launches.jsonl");
+    let attribution = attribution::collect(&deps.accounts, &deps.env, &log, &[]);
+    let report = stats::report(
+        &cache,
+        &sources,
+        &attribution,
+        &deps.accounts,
+        (deps.clock)(),
+        &deps.tz,
+    );
+    let _ = tx.send(Event::Stats { report, error });
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -389,6 +425,50 @@ mod tests {
             matches!(&second[0], Event::IndexLoaded(v) if v.len() == 2),
             "{second:?}"
         );
+    }
+
+    /// R20: progress first and last, then the report; the cache is written, and not rewritten
+    /// when nothing changed.
+    #[test]
+    fn stats_report_progress_then_the_report_and_cache_the_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let transcript = dir.path().join("max/projects/-w/s1.jsonl");
+        let mut text = fs::read_to_string(&transcript).unwrap();
+        text.push_str(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-09-24T10:03:00Z\",\
+             \"message\":{\"id\":\"msg_1\",\"model\":\"claude-test\",\"role\":\"assistant\",\
+             \"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":40,\
+             \"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":300}}}\n",
+        );
+        fs::write(&transcript, text).unwrap();
+        let done = |e: &Event| matches!(e, Event::Stats { .. });
+        let events = collect(Effect::Stats, &deps, done);
+        assert_eq!(
+            events.first(),
+            Some(&Event::StatsProgress { done: 0, total: 2 })
+        );
+        assert!(
+            events.contains(&Event::StatsProgress { done: 2, total: 2 }),
+            "{events:?}"
+        );
+        let Some(Event::Stats { report, error }) = events.last() else {
+            panic!("{events:?}")
+        };
+        assert_eq!(error, &None);
+        assert_eq!(report.files, 2);
+        let all = report.table(stats::Period::All);
+        assert_eq!(all.sections[0].accounts, ["claude:max"]);
+        let unattributed = all.sections.last().unwrap();
+        assert!(unattributed.accounts.is_empty());
+        assert_eq!(unattributed.models[0].model, "claude-test");
+        assert_eq!(unattributed.models[0].tokens.total(), 443);
+        let cache = deps.state_dir.join("stats.json");
+        let written = fs::metadata(&cache).unwrap().modified().unwrap();
+
+        let again = collect(Effect::Stats, &deps, done);
+        assert_eq!(again.last(), events.last());
+        assert_eq!(fs::metadata(&cache).unwrap().modified().unwrap(), written);
     }
 
     #[test]
