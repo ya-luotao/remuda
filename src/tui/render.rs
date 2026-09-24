@@ -21,6 +21,7 @@ use super::app::{
 use super::timeline;
 use crate::live::Control;
 use crate::provider::Provider;
+use crate::registry::Account;
 
 /// From this width on, the preview sits beside the list instead of below it.
 pub const WIDE: u16 = 120;
@@ -164,6 +165,7 @@ pub fn render(app: &App, f: &mut Frame) {
         Some(Overlay::Form(form)) => form_box(form, f, f.area()),
         Some(Overlay::Confirm(confirm)) => confirm_box(confirm, f, f.area()),
         Some(Overlay::ResumeCodex(confirm)) => resume_codex_box(app, confirm, f, f.area()),
+        Some(Overlay::RemoveAccount(account)) => remove_account_box(app, account, f, f.area()),
         None => {}
     }
     if app.help {
@@ -270,7 +272,9 @@ fn hints(app: &App) -> String {
     let text = if let Some(overlay) = &app.overlay {
         match overlay {
             Overlay::Pick(_) => "j/k: move · enter: choose · esc: cancel",
-            Overlay::Confirm(_) | Overlay::ResumeCodex(_) => "y: yes · any other key: cancel",
+            Overlay::Confirm(_) | Overlay::ResumeCodex(_) | Overlay::RemoveAccount(_) => {
+                "y: yes · any other key: cancel"
+            }
             Overlay::Form(form) => match &form.kind {
                 FormKind::NewSession { account } => {
                     let agent = account.provider.program();
@@ -290,7 +294,9 @@ fn hints(app: &App) -> String {
         "j/k/pgup/pgdn: scroll · esc/p: back · enter: resume · f: fork · c: continue as…"
     } else {
         match app.view {
-            View::Accounts => "n: new session · s: set up an account · u: live usage · r: refresh",
+            View::Accounts => {
+                "n: new session · s: set up an account · D: remove · u: live usage · r: refresh"
+            }
             View::Live => {
                 "enter: attach · f: fork · c: continue as… · p: preview · l: logs · x: stop · \
                  D: rm · a: stopped"
@@ -1037,7 +1043,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ("x", "live: stop a background session (asks first)"),
     (
         "D",
-        "live: remove a stopped background session (asks first)",
+        "accounts: remove the account (asks first; its home stays) · live: remove a stopped \
+         background session (asks first)",
     ),
     (
         "esc",
@@ -1216,6 +1223,28 @@ fn confirm_box(confirm: &Confirm, f: &mut Frame, area: Rect) {
         ]),
     ];
     boxed(f, area, title, lines);
+}
+
+/// R14a, R16: unregistering keeps the home; the prompt says which.
+fn remove_account_box(app: &App, account: &Account, f: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::styled(
+            format!("Remove {} from the registry?", short(&account.qualified())),
+            BOLD,
+        ),
+        Line::styled(
+            format!(
+                "its home {} is kept; `remuda add` can register it again",
+                tilde(app, &account.home.to_string())
+            ),
+            DIM,
+        ),
+        Line::from(vec![
+            Span::styled("y", BOLD),
+            Span::raw(": yes · any other key: cancel"),
+        ]),
+    ];
+    boxed(f, area, "Remove account", lines);
 }
 
 /// R17: nothing says whether a codex session runs elsewhere; the user decides.
