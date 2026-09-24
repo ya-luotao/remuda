@@ -6,6 +6,7 @@
 //! [`workers`] run the slow parts in the background.
 
 pub mod app;
+pub mod privacy;
 pub mod render;
 pub mod search;
 pub mod timeline;
@@ -58,6 +59,9 @@ pub struct Deps {
     /// The directory remuda was started in: the default for new sessions.
     pub cwd: Option<PathBuf>,
     pub mode: Mode,
+    /// Private mode is on (R21): what remuda prints before handing the terminal to a child
+    /// shows no path, name or email. Follows the app.
+    pub private: bool,
 }
 
 impl Deps {
@@ -267,7 +271,8 @@ fn event_loop(
     for effect in app.start() {
         workers::spawn(effect, &deps, &tx);
     }
-    terminal.draw(|f| render::render(&app, f))?;
+    let mut snapshot = privacy::Snapshot::default();
+    terminal.draw(|f| render::render_with(&app, &mut snapshot, f))?;
 
     let mut next_tick = Instant::now() + TICK;
     loop {
@@ -293,19 +298,30 @@ fn event_loop(
                     ..Deps::clone(&deps)
                 });
             }
-            for effect in app::update(&mut app, event) {
+            let effects = app::update(&mut app, event);
+            if app.private != deps.private {
+                deps = Arc::new(Deps {
+                    private: app.private,
+                    ..Deps::clone(&deps)
+                });
+            }
+            for effect in effects {
                 match effect {
                     Effect::Quit => return Ok(None),
                     Effect::Pick(account) => return Ok(Some(account)),
                     Effect::Launch(request) => {
-                        let event = launch_in_foreground(terminal, &deps, request)?;
+                        let (request, what) = for_screen(&app, request);
+                        let mut event = launch_in_foreground(terminal, &deps, request)?;
+                        restore_what(&mut event, what);
                         // Results come back through the queue, after this batch.
                         let _ = tx.send(event);
                         let size = terminal.size()?;
                         let _ = tx.send(Event::Resize(size.width, size.height));
                     }
                     Effect::Relay { request, source } => {
-                        let event = relay_in_foreground(terminal, &deps, request, &source)?;
+                        let (request, what) = for_screen(&app, request);
+                        let mut event = relay_in_foreground(terminal, &deps, request, &source)?;
+                        restore_what(&mut event, what);
                         // Results come back through the queue, after this batch.
                         let _ = tx.send(event);
                         let size = terminal.size()?;
@@ -339,7 +355,33 @@ fn event_loop(
         if idle {
             continue;
         }
-        terminal.draw(|f| render::render(&app, f))?;
+        terminal.draw(|f| render::render_with(&app, &mut snapshot, f))?;
+    }
+}
+
+/// `request` with the description remuda prints before the child scrubbed in private mode
+/// (R21), and the description itself, which [`restore_what`] puts back.
+fn for_screen(app: &App, mut request: LaunchRequest) -> (LaunchRequest, String) {
+    let what = request.what.clone();
+    if app.private {
+        request.what = privacy::Scrubber::of(app).text(&what);
+    }
+    (request, what)
+}
+
+/// The launch's own description again, for the app.
+fn restore_what(event: &mut Event, what: String) {
+    if let Event::Launched { request, .. } = event {
+        request.what = what;
+    }
+}
+
+/// What remuda prints before handing the terminal to a child: what runs, and where, except in
+/// private mode (R21).
+fn launch_line(what: &str, cwd: Option<&Path>, private: bool) -> String {
+    match cwd {
+        Some(dir) if !private => format!("remuda: {what} in {}", dir.display()),
+        _ => format!("remuda: {what}"),
     }
 }
 
@@ -459,8 +501,7 @@ fn run_launch(
             warnings,
         ));
     }
-    let where_ = cwd.map_or(String::new(), |d| format!(" in {}", d.display()));
-    println!("remuda: {}{where_}", request.what);
+    println!("{}", launch_line(&request.what, cwd, deps.private));
     let ran = match relayed {
         Some(_) => launch::Ran {
             status: launch::run_plan(program, &plan, cwd),
@@ -527,11 +568,15 @@ fn run_setup(
     let status = match setup::create_and_register(&deps.config, &account) {
         Err(e) => Err(format!("{e:#}")),
         Ok(()) => {
-            println!(
-                "remuda: registered {} at {}; running `{login}`",
-                account.qualified(),
-                account.home
-            );
+            if deps.private {
+                println!("remuda: registered a new account; running `{login}`");
+            } else {
+                println!(
+                    "remuda: registered {} at {}; running `{login}`",
+                    account.qualified(),
+                    account.home
+                );
+            }
             launch::run_foreground(program, &args, &change, None)
                 .map(exit_of)
                 .map_err(|e| e.to_string())
@@ -602,6 +647,36 @@ mod decode_tests {
         let mut release = k(KeyCode::Char('q'), KeyModifiers::NONE);
         release.kind = KeyEventKind::Release;
         assert_eq!(decode(release), None);
+        // Private mode's key (R21), with or without shift; `P` alone is typed.
+        for mods in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(decode(k(KeyCode::Char('p'), mods)), Some(Key::Ctrl('p')));
+            assert_eq!(decode(k(KeyCode::Char('P'), mods)), Some(Key::Ctrl('p')));
+        }
+        assert_eq!(
+            decode(k(KeyCode::Char('P'), KeyModifiers::SHIFT)),
+            Some(Key::Char('P'))
+        );
+    }
+
+    /// R16, R21: the line before a child names the directory, except in private mode.
+    #[test]
+    fn launch_line_hides_the_directory_in_private_mode() {
+        let dir = Path::new("/Users/you/space/remuda");
+        assert_eq!(
+            launch_line("resume 766560c5 as max", Some(dir), false),
+            "remuda: resume 766560c5 as max in /Users/you/space/remuda"
+        );
+        assert_eq!(
+            launch_line("resume 766560c5 as account-1", Some(dir), true),
+            "remuda: resume 766560c5 as account-1"
+        );
+        assert_eq!(
+            launch_line("new session as max", None, false),
+            "remuda: new session as max"
+        );
     }
 }
 

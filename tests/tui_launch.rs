@@ -199,6 +199,7 @@ fn deps(sb: &Sandbox) -> Deps {
         state_dir: sb.remuda_home().join("state"),
         cwd: Some(sb.work()),
         mode: remuda::tui::app::Mode::Browse,
+        private: false,
     }
 }
 

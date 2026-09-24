@@ -23,6 +23,7 @@ use crate::stats::{self, Period};
 use crate::transcript::Message;
 use crate::usage::{CachedUsage, LiveResult, LiveUsage, UsageRow};
 
+use super::privacy::Aliases;
 use super::{render, search};
 
 /// Live sessions are re-collected this long after the last collection finished (R7).
@@ -407,17 +408,32 @@ pub enum FormKind {
 pub struct Field {
     pub label: &'static str,
     pub value: String,
+    /// How private mode shows the value (R21).
+    pub mask: Mask,
+}
+
+/// What a form value is, for private mode (R21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mask {
+    /// Shown with each component masked.
+    Path,
+    /// Masked whole.
+    Text,
+    Email,
+    /// Shown as it is (a provider).
+    Plain,
 }
 
 impl Form {
-    fn new(kind: FormKind, fields: &[(&'static str, String)]) -> Self {
+    fn new(kind: FormKind, fields: &[(&'static str, String, Mask)]) -> Self {
         Form {
             kind,
             fields: fields
                 .iter()
-                .map(|(label, value)| Field {
+                .map(|(label, value, mask)| Field {
                     label,
                     value: value.clone(),
+                    mask: *mask,
                 })
                 .collect(),
             focus: 0,
@@ -564,10 +580,10 @@ pub struct App {
     pub index_loaded: bool,
     pub index_refreshed: Option<Timestamp>,
     pub index_error: Option<String>,
-    by_session: HashMap<String, PathBuf>,
+    pub(super) by_session: HashMap<String, PathBuf>,
 
     /// Launch log + `history.jsonl`; `attribution` adds live sessions to it.
-    attribution_base: Attribution,
+    pub(super) attribution_base: Attribution,
     pub attribution: Attribution,
     pub attribution_in_flight: bool,
 
@@ -598,17 +614,26 @@ pub struct App {
     /// Pre-launch checks issued so far (the last one's number).
     pub launch_checks: u64,
     /// The pending launch a foreground child cancelled, told when the child ends.
-    cancelled: Option<String>,
+    pub(super) cancelled: Option<String>,
     /// The check the open form started: only its answer belongs in the form (C1).
-    form_check: Option<u64>,
+    pub(super) form_check: Option<u64>,
     /// Work to run once more when its current run finishes: a launch ended meanwhile.
-    index_again: bool,
-    attribution_again: bool,
-    live_again: bool,
+    pub(super) index_again: bool,
+    pub(super) attribution_again: bool,
+    pub(super) live_again: bool,
+    /// `Ctrl-P`: the screen is drawn from [`super::privacy::redacted`] (R21).
+    pub private: bool,
+    /// Every account name seen, with its private-mode alias.
+    pub aliases: Aliases,
 }
 
 impl App {
     pub fn new(accounts: Vec<Account>, tz: TimeZone, home: Option<String>, now: Timestamp) -> Self {
+        // Aliases are numbered in registry order first (R21).
+        let mut aliases = Aliases::default();
+        for account in &accounts {
+            aliases.note(&account.qualified());
+        }
         App {
             mode: Mode::Browse,
             now,
@@ -654,6 +679,8 @@ impl App {
             index_again: false,
             attribution_again: false,
             live_again: false,
+            private: false,
+            aliases,
         }
     }
 
@@ -978,6 +1005,12 @@ impl App {
     }
 
     fn on_key(&mut self, key: Key, fx: &mut Vec<Effect>) {
+        // Anywhere, before anything else: it types nothing, closes nothing, and keeps the
+        // notice (R21).
+        if key == Key::Ctrl('p') {
+            self.private = !self.private;
+            return;
+        }
         self.notice = None;
         if key == Key::Ctrl('c') {
             fx.push(Effect::Quit);
@@ -1064,9 +1097,13 @@ impl App {
                 self.open(Overlay::Form(Form::new(
                     FormKind::Setup,
                     &[
-                        ("Account name", String::new()),
-                        ("Email (optional)", String::new()),
-                        ("Provider (claude/codex)", CLAUDE.name().to_string()),
+                        ("Account name", String::new(), Mask::Text),
+                        ("Email (optional)", String::new(), Mask::Email),
+                        (
+                            "Provider (claude/codex)",
+                            CLAUDE.name().to_string(),
+                            Mask::Plain,
+                        ),
                     ],
                 )));
             }
@@ -1241,9 +1278,9 @@ impl App {
             .cwd
             .as_ref()
             .map_or(String::new(), |d| d.display().to_string());
-        let mut fields = vec![("Directory", dir)];
+        let mut fields = vec![("Directory", dir, Mask::Path)];
         if state.account.provider.names_sessions() {
-            fields.push(("Name (optional)", String::new()));
+            fields.push(("Name (optional)", String::new(), Mask::Text));
         }
         let account = state.account.clone();
         self.open(Overlay::Form(Form::new(
@@ -1267,6 +1304,10 @@ impl App {
         };
         match outcome {
             Ok(effect @ Effect::Setup { .. }) => {
+                // The name is told when the setup ends, registered or not (R21).
+                if let Effect::Setup { provider, name, .. } = &effect {
+                    self.aliases.note(&format!("{provider}:{name}"));
+                }
                 self.overlay = None;
                 self.foreground(effect, fx);
             }
@@ -1391,6 +1432,9 @@ impl App {
     fn set_accounts(&mut self, accounts: Vec<Account>, fx: &mut Vec<Effect>) {
         if self.accounts.iter().map(|a| &a.account).eq(accounts.iter()) {
             return;
+        }
+        for account in &accounts {
+            self.aliases.note(&account.qualified());
         }
         let old = std::mem::take(&mut self.accounts);
         self.accounts = accounts
@@ -2368,6 +2412,9 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             }
         }
         Event::Live(sessions) => {
+            for s in &sessions {
+                app.aliases.note(&s.account);
+            }
             let selected = app.selected_live().map(LiveSession::key);
             app.live = sessions;
             app.live_loaded = true;
@@ -2383,6 +2430,11 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             }
         }
         Event::Attribution(base) => {
+            // Names first seen here are numbered by name (R21).
+            let names: std::collections::BTreeSet<&str> = base.names().collect();
+            for name in names {
+                app.aliases.note(name);
+            }
             app.attribution_base = base;
             app.attribution_in_flight = false;
             app.merge_attribution();
@@ -2394,6 +2446,10 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             }
         }
         Event::Checks(checks) => {
+            // A check may name an account that is not registered (`[share.claude] from`).
+            for name in checks.iter().filter_map(|c| c.account.as_deref()) {
+                app.aliases.note(name);
+            }
             app.checks = Some(checks);
             app.checks_in_flight = false;
         }
@@ -2406,6 +2462,9 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             }
         }
         Event::Stores(stores) => {
+            for name in stores.iter().flat_map(|s| &s.accounts) {
+                app.aliases.note(name);
+            }
             app.stores = Some(stores);
             // Codex rows' accounts come from the stores, and are searched.
             if !app.history.query.is_empty() {
@@ -2481,6 +2540,11 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
         }
         Event::StatsProgress { done, total } => app.stats.progress = Some((done, total)),
         Event::Stats { report, error } => {
+            for table in &report.tables {
+                for name in table.sections.iter().flat_map(|s| &s.accounts) {
+                    app.aliases.note(name);
+                }
+            }
             app.stats.report = Some(report);
             app.stats.error = error;
             app.stats.in_flight = false;

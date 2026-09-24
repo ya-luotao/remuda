@@ -378,6 +378,7 @@ mod tests {
             state_dir: root.join("state"),
             cwd: None,
             mode: crate::tui::app::Mode::Browse,
+            private: false,
         })
     }
 

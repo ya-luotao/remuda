@@ -493,12 +493,12 @@ or sessions. Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jso
   and the `auth login` in setup do not.
 - **New account** (`s` in Accounts): equivalent to `remuda setup` (R5).
 - **Remove account** (`D` in Accounts): equivalent to `remuda remove` (R14a) after confirmation
-  (`y` confirms; any other key cancels); the prompt names the home that is kept. Refused on a
-  `default` row. The account list is read again afterwards.
+  (`y` confirms; `Ctrl-P` toggles private mode, R21; any other key cancels); the prompt names the
+  home that is kept. Refused on a `default` row. The account list is read again afterwards.
 - **Background sessions** (in Live): `Enter` attaches (`claude attach <id>`, likewise suspending the
   TUI); `l` shows `claude logs <id>` in the preview pane; `x` stops and `D` removes a stopped
-  session, both after confirmation (`y` confirms; any other key cancels). Interactive sessions in
-  Live are view-only.
+  session, both after confirmation (`y` confirms; `Ctrl-P` toggles private mode, R21; any other key
+  cancels). Interactive sessions in Live are view-only.
 - Session IDs and background short IDs passed to claude are validated first (session IDs must be
   UUIDs; short IDs must be 8 lowercase hex digits) and rejected if malformed, so that a file name
   or JSON field starting with `-` cannot be interpreted as an option.
@@ -553,8 +553,9 @@ or sessions. Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jso
 - **Running check**: codex has no source for running sessions, so remuda cannot confirm that a
   session is not running elsewhere. An in-place codex resume therefore **requires confirmation
   first** ("remuda cannot confirm that this session is not running elsewhere"; `y` resumes anyway,
-  any other key cancels); if the rollout file was written within the last 10 minutes, the prompt
-  adds that it is still being written. Forks need no confirmation.
+  `Ctrl-P` toggles private mode (R21), any other key cancels); if the rollout file was written
+  within the last 10 minutes, the prompt adds that it is still being written. Forks need no
+  confirmation.
 - Running sessions: not supported for codex; shown as unavailable in the UI. Identity and usage:
   R4, R10, R10a.
 
@@ -817,3 +818,36 @@ estimated, and computing them runs no agent command.
 - **TUI**: view `4`, Stats. The statistics are computed in the background the first time the
   view opens, and again on each `r` after that, with reading progress shown. `t` in the view cycles
   the period (all, today, 7 days, 30 days).
+
+## R21. Private mode (TUI)
+
+For screenshots, `Ctrl-P` toggles private mode anywhere in the TUI: in every view, in forms and
+the search prompt (nothing is typed), in the account picker, and in the help box and
+confirmation prompts, which stay open (`Ctrl-P` is not a key that cancels, R16, R17). Private mode
+is off when the TUI starts and is not saved. The command line has no private mode.
+
+While it is on, the header shows `PRIVATE`, and nothing on screen (views, overlays, forms, the
+status and hint lines, notices, the help box) shows:
+
+- **Account names** other than `default`, including names that are not registered (a launch log
+  entry, `[share.claude] from`, a name typed in a setup): each is replaced by an alias
+  `account-<n>`, numbered per provider in registry order when the TUI starts, then in the order the
+  names appear (names that appear together, by name). Codex aliases keep their prefix
+  (`codex:account-1`). An alias does not change while the TUI runs, even when accounts are added
+  or removed.
+- **Emails and organization names**: shown as `•••@•••` and `•••`.
+- **Paths** (homes, working directories, stores, the directory remuda started in, form values):
+  each component is shown as `•••`, and a leading `$HOME` as `~` (`~/•••/•••`).
+- **Session content**: titles, first messages, session names, preview messages, background
+  session logs, and search text are shown as `•••`.
+- **Free text** (notices, errors, check messages, the description of a pending launch): account
+  names are replaced by their aliases, as whole words; emails, organization names, live session
+  names, the search text, and the values typed in the open form are masked; text in `“…”` is
+  masked; each path is masked, from a `/` or `~/` that begins a word, or from wherever a path the
+  TUI knows (`$HOME`, a home, a store, the directory remuda started in, a typed directory) occurs
+  as whole components, to the next `: `, `, `, `; `, quote, or bracket, or to the end; and each
+  word with an `@` is masked.
+
+Numbers (usage percentages, reset times, token counts), model names, plans, login methods,
+providers, session IDs, pids, and times stay visible. The line remuda prints before handing the
+terminal to a child (R16) shows no path and follows the same rules.

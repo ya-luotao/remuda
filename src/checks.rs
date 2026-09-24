@@ -101,8 +101,8 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
     let name = source.qualified();
     if !accounts.iter().any(|a| a.qualified() == name) {
         checks.push(Check {
-            account: None,
-            message: format!("[share.claude] from = {name}: no such account"),
+            account: Some(name),
+            message: "[share.claude] from names this account, which is not registered".into(),
         });
         return checks;
     }
@@ -474,7 +474,10 @@ mod tests {
         let got = sharing_checks(&accounts[..1], &f.env, &sharing_from(named("gone", &gone)));
         assert_eq!(
             messages(&got),
-            [(None, "[share.claude] from = claude:gone: no such account")]
+            [(
+                Some("claude:gone"),
+                "[share.claude] from names this account, which is not registered"
+            )]
         );
     }
 

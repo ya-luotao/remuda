@@ -19,7 +19,7 @@ use super::app::{
     AccountState, App, Confirm, Form, FormKind, Level, ListState, Mode, Overlay, PREVIEW_MESSAGES,
     Pick, PickFor, ResumeCodex, View, short_id,
 };
-use super::timeline;
+use super::{privacy, timeline};
 use crate::live::Control;
 use crate::provider::Provider;
 use crate::registry::Account;
@@ -136,13 +136,33 @@ pub fn preview_line_count(app: &App) -> usize {
     preview_lines(app, preview_text_area(app).width as usize).len()
 }
 
+/// Draws `app`; in private mode, only its redacted copy is drawn (R21).
 pub fn render(app: &App, f: &mut Frame) {
+    render_with(app, &mut privacy::Snapshot::default(), f);
+}
+
+/// [`render`], with the redacted copy kept in `snapshot` from frame to frame.
+pub fn render_with(app: &App, snapshot: &mut privacy::Snapshot, f: &mut Frame) {
+    if app.private {
+        draw(snapshot.of(app), f);
+    } else {
+        draw(app, f);
+    }
+}
+
+fn draw(app: &App, f: &mut Frame) {
     let areas = frame_areas(f.area());
-    f.render_widget(header(app), areas.header);
-    f.render_widget(
-        Paragraph::new(Line::styled("?: help · q: quit ", DIM)).alignment(Alignment::Right),
-        areas.header,
-    );
+    let header = header(app);
+    let keys = Line::styled("?: help · q: quit ", DIM);
+    // The views come first where both do not fit (private mode's mark takes room).
+    let room = header.width() + keys.width() <= areas.header.width as usize;
+    f.render_widget(header, areas.header);
+    if room {
+        f.render_widget(
+            Paragraph::new(keys).alignment(Alignment::Right),
+            areas.header,
+        );
+    }
     match app.view {
         View::Accounts => accounts_view(app, f, areas.body),
         View::Live => {
@@ -176,8 +196,18 @@ pub fn render(app: &App, f: &mut Frame) {
     }
 }
 
+/// Private mode's mark in the header (R21).
+const PRIVATE: Style = Style::new()
+    .fg(Color::Black)
+    .bg(Color::Yellow)
+    .add_modifier(Modifier::BOLD);
+
 fn header(app: &App) -> Line<'static> {
     let mut spans = vec![Span::styled(" remuda ", BOLD)];
+    if app.private {
+        spans.push(Span::styled(" PRIVATE ", PRIVATE));
+        spans.push(Span::raw(" "));
+    }
     if app.mode == Mode::PickForRun {
         spans.push(Span::raw(" run: pick an account "));
         return Line::from(spans);
@@ -1083,8 +1113,11 @@ pub const KEYS: &[(&str, &str)] = &[
     ("t", "stats: next period (all, today, 7 days, 30 days)"),
     ("u", "query live usage for every account"),
     ("r", "refresh index, identities, live sessions, checks"),
-    ("?", "this help"),
-    ("q / ctrl-c", "quit"),
+    (
+        "ctrl-p",
+        "private mode: hide account names, emails, paths, titles and previews (for screenshots)",
+    ),
+    ("? · q / ctrl-c", "this help · quit"),
 ];
 
 // ---- Stats ---------------------------------------------------------------------------
@@ -1524,7 +1557,7 @@ fn help(f: &mut Frame, area: Rect) {
         Paragraph::new(lines).block(
             Block::new()
                 .borders(Borders::ALL)
-                .title(" Keys · any key closes "),
+                .title(" Keys · any key but ctrl-p closes "),
         ),
         rect,
     );
