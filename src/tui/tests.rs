@@ -18,6 +18,7 @@ use crate::identity::Identity;
 use crate::index::{Entry, Store};
 use crate::live::{Control, LiveSession, Source};
 use crate::registry::{Account, CLAUDE, CODEX, Home};
+use crate::stats::{ModelRow, Period, Report, Section, Table, Tokens};
 use crate::transcript::{Message, Role};
 use crate::usage::{CachedUsage, LiveResult, LiveUsage, Resets, UsageRow};
 
@@ -617,7 +618,7 @@ fn quit_help_and_view_switching() {
     assert_eq!(keys(&mut app, &[Key::Char('q')]), []);
     assert!(!app.help);
     let mut seen = vec![app.view];
-    for k in [Key::Tab, Key::Tab, Key::Tab, Key::BackTab] {
+    for k in [Key::Tab, Key::Tab, Key::Tab, Key::Tab, Key::BackTab] {
         keys(&mut app, &[k]);
         seen.push(app.view);
     }
@@ -627,12 +628,15 @@ fn quit_help_and_view_switching() {
             View::Accounts,
             View::Live,
             View::History,
+            View::Stats,
             View::Accounts,
-            View::History
+            View::Stats
         ]
     );
     keys(&mut app, &[Key::Char('2')]);
     assert_eq!(app.view, View::Live);
+    keys(&mut app, &[Key::Char('4')]);
+    assert_eq!(app.view, View::Stats);
     keys(&mut app, &[Key::Char('1')]);
     assert_eq!(app.view, View::Accounts);
 }
@@ -2852,7 +2856,14 @@ fn tiny_terminal_does_not_panic() {
     for (w, h) in [(1, 1), (10, 3), (20, 5), (40, 10)] {
         let mut app = populated_history();
         update(&mut app, Event::Resize(w, h));
-        for view in ['1', '2', '3', '?'] {
+        update(
+            &mut app,
+            Event::Stats {
+                report: stats_report(),
+                error: Some("disk full".into()),
+            },
+        );
+        for view in ['1', '2', '3', '4', '?'] {
             keys(&mut app, &[Key::Char(view)]);
             screen(&app);
         }
@@ -3879,4 +3890,406 @@ fn relay_copies_are_hidden_from_history() {
         app.entry_accounts(app.selected_entry().unwrap()),
         ["claude:max"]
     );
+}
+
+// ---- Stats (R20) ------------------------------------------------------------------
+
+fn model(provider: crate::provider::Provider, name: &str, t: [u64; 5]) -> ModelRow {
+    let [input, cache_read, cache_write, output, reasoning] = t;
+    ModelRow {
+        provider,
+        model: name.into(),
+        tokens: Tokens {
+            input,
+            cache_read,
+            cache_write,
+            output,
+            reasoning,
+        },
+    }
+}
+
+fn stats_section(accounts: &[&str], models: Vec<ModelRow>) -> Section {
+    Section {
+        accounts: accounts.iter().map(|a| a.to_string()).collect(),
+        models,
+    }
+}
+
+/// The same sections in every period, but today's has only `default`.
+fn stats_report() -> Report {
+    let test = model(CLAUDE, "claude-test", [8, 1_234_567, 160, 90, 0]);
+    let haiku = model(CLAUDE, "claude-haiku-4-5-20251001", [30, 0, 0, 5, 0]);
+    let gpt = model(CODEX, "gpt-test", [1500, 200, 0, 30, 12]);
+    let sections = vec![
+        stats_section(&["claude:default"], vec![test.clone(), haiku.clone()]),
+        stats_section(&["claude:max"], vec![]),
+        stats_section(&["claude:team"], vec![]),
+        stats_section(&["codex:work"], vec![gpt.clone()]),
+        stats_section(
+            &["claude:default", "claude:max"],
+            vec![model(CLAUDE, "claude-test", [5, 0, 0, 5, 0])],
+        ),
+        stats_section(&[], vec![model(CLAUDE, "claude-test", [9, 0, 0, 9, 0])]),
+    ];
+    let overall = vec![
+        model(CLAUDE, "claude-test", [22, 1_234_567, 160, 104, 0]),
+        gpt,
+        haiku,
+    ];
+    Report {
+        tables: Period::ALL
+            .map(|period| Table {
+                period,
+                since: None,
+                sections: match period {
+                    Period::Today => sections[..1].to_vec(),
+                    _ => sections.clone(),
+                },
+                overall: overall.clone(),
+            })
+            .to_vec(),
+        files: 42,
+    }
+}
+
+/// The app in Stats with the report computed.
+fn stats_app() -> App {
+    let mut app = app();
+    keys(&mut app, &[Key::Char('4')]);
+    update(
+        &mut app,
+        Event::Stats {
+            report: stats_report(),
+            error: None,
+        },
+    );
+    app
+}
+
+fn squeezed(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// R20: the statistics are computed the first time Stats opens (never at start), then on each
+/// `r`; never twice at once, whatever is pressed meanwhile.
+#[test]
+fn stats_view_computes_on_first_visit_then_on_r() {
+    let mut app = app();
+    assert!(!app.start().contains(&Effect::Stats));
+    assert!(!keys(&mut app, &[Key::Char('r')]).contains(&Effect::Stats));
+    assert_eq!(keys(&mut app, &[Key::Char('4')]), [Effect::Stats]);
+    assert!(app.stats.in_flight);
+    let all = text(&app);
+    assert!(all.contains("computing…"), "{all}");
+    let again = keys(
+        &mut app,
+        &[
+            Key::Char('4'),
+            Key::Char('1'),
+            Key::Char('4'),
+            Key::Tab,
+            Key::BackTab,
+            Key::Char('r'),
+            Key::Char('r'),
+        ],
+    );
+    assert!(!again.contains(&Effect::Stats), "{again:?}");
+
+    update(&mut app, Event::StatsProgress { done: 3, total: 10 });
+    let lines = screen(&app);
+    line_with(&lines, "Tokens · all time (t: period)");
+    let (body, _) = line_with(&lines, "reading transcripts 3/10…");
+    let (status, _) = line_with(&lines[body + 1..], "reading transcripts 3/10…");
+    assert_eq!(body + 1 + status, 22, "and in the status line");
+
+    update(
+        &mut app,
+        Event::Stats {
+            report: stats_report(),
+            error: None,
+        },
+    );
+    assert!(!app.stats.in_flight);
+    let all = text(&app);
+    assert!(all.contains("computed 12:00:00 · 42 transcripts"), "{all}");
+    assert!(!keys(&mut app, &[Key::Char('1'), Key::Char('4')]).contains(&Effect::Stats));
+    // `r` computes again, once, from any view; the last report stays shown meanwhile.
+    keys(&mut app, &[Key::Char('1')]);
+    let fx = keys(&mut app, &[Key::Char('r'), Key::Char('r')]);
+    assert_eq!(
+        fx.iter().filter(|e| **e == Effect::Stats).count(),
+        1,
+        "{fx:?}"
+    );
+    keys(&mut app, &[Key::Char('4')]);
+    update(&mut app, Event::StatsProgress { done: 0, total: 5 });
+    let all = text(&app);
+    assert!(all.contains("claude-test"), "{all}");
+    assert!(all.contains("reading transcripts 0/5…"), "{all}");
+
+    // A cache that cannot be written is told, the report still shown.
+    update(
+        &mut app,
+        Event::Stats {
+            report: stats_report(),
+            error: Some("disk full".into()),
+        },
+    );
+    let all = text(&app);
+    assert!(all.contains("stats cache: disk full"), "{all}");
+    assert!(all.contains("claude-test"), "{all}");
+}
+
+/// R20: every section, bold totals, models with `…` when too long, `-` for counts a provider
+/// does not record, `no tokens` for an empty account, then Overall.
+#[test]
+fn stats_view_shows_sections_models_and_totals() {
+    let app = stats_app();
+    let lines = screen(&app);
+    let rows: Vec<String> = lines[2..].iter().map(|l| squeezed(l)).collect();
+    let expected = [
+        "ACCOUNT / MODEL INPUT CACHE READ CACHE WRITE OUTPUT REASONING TOTAL",
+        "default 38 1.2M 160 95 - 1.2M",
+        "claude-test 8 1.2M 160 90 - 1.2M",
+        "claude-haiku-4-5-202… 30 0 0 5 - 35",
+        "max no tokens",
+        "team no tokens",
+        "codex:work 1.5K 200 - 30 12 1.7K",
+        "gpt-test 1.5K 200 - 30 12 1.7K",
+        "default + max 5 0 0 5 - 10",
+        "claude-test 5 0 0 5 - 10",
+        "unattributed 9 0 0 9 - 18",
+        "claude-test 9 0 0 9 - 18",
+        "",
+        "Overall 1.6K 1.2M 160 139 12 1.2M",
+        "claude-test 22 1.2M 160 104 - 1.2M",
+        "gpt-test 1.5K 200 - 30 12 1.7K",
+        "claude-haiku-4-5-202… 30 0 0 5 - 35",
+    ];
+    assert_eq!(rows[..expected.len()], expected, "{}", lines.join("\n"));
+    // The numbers line up under their headers.
+    let header = &lines[2];
+    let (_, gpt) = line_with(&lines, "gpt-test");
+    assert_eq!(
+        gpt.find("1.7K").unwrap() + 4,
+        header.find("TOTAL").unwrap() + 5
+    );
+    let (_, name) = line_with(&lines, "claude-haiku");
+    assert!(name.starts_with("  claude-haiku-4-5-202… "), "{name}");
+}
+
+/// Where each run of non-blank characters ends, in columns (every character here is one
+/// column wide).
+fn token_ends(line: &str) -> Vec<usize> {
+    let chars: Vec<char> = line.chars().collect();
+    (0..chars.len())
+        .filter(|&i| chars[i] != ' ' && chars.get(i + 1).is_none_or(|c| *c == ' '))
+        .map(|i| i + 1)
+        .collect()
+}
+
+/// R20: every count ends in the column its header ends in, in every row, whatever its width
+/// (`-`, `0`, `512K`, `1.2M`), with long names cut, at every width.
+#[test]
+fn stats_columns_align_in_every_row() {
+    let mut app = stats_app();
+    let mut report = stats_report();
+    for table in &mut report.tables {
+        table.sections.push(stats_section(
+            &["codex:other"],
+            vec![
+                model(
+                    CODEX,
+                    "gpt-5.3-codex",
+                    [8_300_000, 161_000_000, 0, 808_000, 512_000],
+                ),
+                model(
+                    CODEX,
+                    "gpt-5.2",
+                    [5_700_000, 225_000_000, 0, 1_600_000, 1_200_000],
+                ),
+            ],
+        ));
+    }
+    update(
+        &mut app,
+        Event::Stats {
+            report,
+            error: None,
+        },
+    );
+    for (width, columns) in [(80, 6), (70, 5), (60, 4), (160, 6)] {
+        update(&mut app, Event::Resize(width, 40));
+        let lines = screen(&app);
+        let header = &lines[2];
+        let ends: Vec<usize> = [
+            "INPUT",
+            "CACHE READ",
+            "CACHE WRITE",
+            "OUTPUT",
+            "REASONING",
+            "TOTAL",
+        ]
+        .iter()
+        .filter_map(|h| {
+            header
+                .find(h)
+                .map(|at| header[..at].chars().count() + h.len())
+        })
+        .collect();
+        assert_eq!(ends.len(), columns, "{width}: {header}");
+        let rows: Vec<&String> = lines[3..]
+            .iter()
+            .filter(|l| !l.trim().is_empty() && !l.contains("no tokens"))
+            .take_while(|l| !l.starts_with(" computed"))
+            .collect();
+        assert_eq!(rows.len(), 16, "{width}: {rows:?}");
+        for row in rows {
+            let cells = token_ends(row);
+            assert_eq!(
+                cells[cells.len() - columns..],
+                ends[..],
+                "{width}: {row:?}\n{}",
+                lines.join("\n")
+            );
+        }
+    }
+}
+
+/// R20: narrow terminals give up REASONING, then CACHE WRITE, before model names are cut
+/// short; a wide one keeps the numbers next to the names.
+#[test]
+fn stats_view_degrades_on_narrow_terminals() {
+    let mut app = stats_app();
+    for (width, dropped) in [
+        (80, &[][..]),
+        (70, &["REASONING"][..]),
+        (60, &["REASONING", "CACHE WRITE"][..]),
+    ] {
+        update(&mut app, Event::Resize(width, 24));
+        let lines = screen(&app);
+        let header = &lines[2];
+        for column in [
+            "INPUT",
+            "CACHE READ",
+            "CACHE WRITE",
+            "OUTPUT",
+            "REASONING",
+            "TOTAL",
+        ] {
+            assert_eq!(
+                header.contains(column),
+                !dropped.contains(&column),
+                "{width}: {header}"
+            );
+        }
+        let (_, test) = line_with(&lines, "  claude-test");
+        assert!(test.contains("1.2M"), "{test}");
+    }
+    update(&mut app, Event::Resize(160, 40));
+    let lines = screen(&app);
+    assert!(lines[2].trim_end().len() < 100, "{}", lines[2]);
+    let (_, haiku) = line_with(&lines, "claude-haiku-4-5-20251001 ");
+    assert!(haiku.contains("35"), "not cut: {haiku}");
+}
+
+/// R20: `t` cycles the period (all, today, 7 days, 30 days) in Stats only; the preview keys do
+/// nothing there, and neither do the session keys.
+#[test]
+fn t_cycles_the_period_and_p_is_inert_in_stats() {
+    let mut app = stats_app();
+    let mut titles = Vec::new();
+    for _ in 0..5 {
+        let lines = screen(&app);
+        let (_, title) = line_with(&lines, "Tokens · ");
+        titles.push(
+            title
+                .split(" (t: period)")
+                .next()
+                .unwrap()
+                .trim()
+                .to_string(),
+        );
+        keys(&mut app, &[Key::Char('t')]);
+    }
+    assert_eq!(
+        titles,
+        [
+            "Tokens · all time",
+            "Tokens · today",
+            "Tokens · last 7 days",
+            "Tokens · last 30 days",
+            "Tokens · all time"
+        ]
+    );
+    assert_eq!(app.stats.period, Period::Today);
+    let all = text(&app);
+    assert!(!all.contains("codex:work"), "today has only default: {all}");
+    keys(&mut app, &[Key::Char('t'), Key::Char('t'), Key::Char('t')]);
+    assert_eq!(app.stats.period, Period::All);
+
+    let before = text(&app);
+    for k in [
+        Key::Char('p'),
+        Key::Char(' '),
+        Key::Enter,
+        Key::Char('f'),
+        Key::Char('c'),
+    ] {
+        assert_eq!(keys(&mut app, &[k]), [], "{k:?}");
+    }
+    assert!(!app.preview.expanded);
+    assert_eq!(text(&app), before);
+    assert!(
+        before.contains("t: period · j/k: scroll · r: refresh"),
+        "{before}"
+    );
+
+    // Elsewhere `t` is not the period key.
+    keys(&mut app, &[Key::Char('1'), Key::Char('t')]);
+    assert_eq!(app.stats.period, Period::All);
+}
+
+/// R20: movement keys scroll the Stats view within its lines; the title and the column header
+/// stay.
+#[test]
+fn stats_scrolls() {
+    let mut app = stats_app();
+    update(&mut app, Event::Resize(80, 12));
+    let height = render::stats_height(&app);
+    let count = render::stats_line_count(&app);
+    assert_eq!((height, count), (7, 16));
+    let first_row = |app: &App| squeezed(&screen(app)[3]);
+    assert_eq!(first_row(&app), "default 38 1.2M 160 95 - 1.2M");
+    keys(&mut app, &[Key::Char('j'), Key::Down]);
+    assert_eq!(app.stats.scroll, 2);
+    assert_eq!(first_row(&app), "claude-haiku-4-5-202… 30 0 0 5 - 35");
+    let lines = screen(&app);
+    line_with(&lines, "Tokens · all time");
+    line_with(&lines, "ACCOUNT / MODEL");
+    keys(&mut app, &[Key::Char('G')]);
+    assert_eq!(app.stats.scroll, count - height);
+    let lines = screen(&app);
+    line_with(&lines, "Overall");
+    keys(&mut app, &[Key::Char('j'), Key::PageDown]);
+    assert_eq!(app.stats.scroll, count - height, "bounded");
+    keys(&mut app, &[Key::PageUp]);
+    assert_eq!(app.stats.scroll, count - 2 * height);
+    keys(&mut app, &[Key::Char('g')]);
+    assert_eq!(app.stats.scroll, 0);
+    keys(&mut app, &[Key::Char('G'), Key::Char('t')]);
+    assert_eq!(app.stats.scroll, 0, "a new period starts at the top");
+    // A taller terminal needs less scrolling.
+    keys(
+        &mut app,
+        &[
+            Key::Char('t'),
+            Key::Char('t'),
+            Key::Char('t'),
+            Key::Char('G'),
+        ],
+    );
+    update(&mut app, Event::Resize(80, 40));
+    assert_eq!(app.stats.scroll, 0);
 }

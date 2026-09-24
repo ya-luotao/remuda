@@ -638,11 +638,7 @@ fn stats(
         progress.report(done, total, &mut stderr)
     });
     progress.finish(cache.files.len(), &mut stderr);
-    // An unchanged cache is not rewritten (it is tens of MB on a large corpus).
-    let changed = refreshed.reused != refreshed.files || refreshed.removed > 0;
-    if (changed || !path.exists())
-        && let Err(e) = cache.save(&path)
-    {
+    if let Err(e) = cache.save_if_changed(&path, &refreshed) {
         eprintln!(
             "remuda: warning: cannot write statistics cache {}: {e:#}",
             path.display()

@@ -19,6 +19,7 @@ use crate::provider::Provider;
 use crate::registry::{self, Account, CLAUDE, CODEX, Home};
 use crate::relay;
 use crate::setup;
+use crate::stats::{self, Period};
 use crate::transcript::Message;
 use crate::usage::{CachedUsage, LiveResult, LiveUsage, UsageRow};
 
@@ -36,16 +37,19 @@ pub enum View {
     Accounts,
     Live,
     History,
+    /// Token statistics (R20).
+    Stats,
 }
 
 impl View {
-    pub const ALL: [View; 3] = [View::Accounts, View::Live, View::History];
+    pub const ALL: [View; 4] = [View::Accounts, View::Live, View::History, View::Stats];
 
     pub fn title(self) -> &'static str {
         match self {
             View::Accounts => "Accounts",
             View::Live => "Live",
             View::History => "History",
+            View::Stats => "Stats",
         }
     }
 
@@ -143,6 +147,16 @@ pub enum Event {
         short_id: String,
         result: Result<String, String>,
     },
+    /// Transcripts read so far by [`Effect::Stats`] / transcripts that need reading.
+    StatsProgress {
+        done: usize,
+        total: usize,
+    },
+    /// [`Effect::Stats`] finished; `error` says why the cache could not be written.
+    Stats {
+        report: stats::Report,
+        error: Option<String>,
+    },
     /// The registry was read again (after a setup or a removal, or by a pre-launch check).
     Accounts(Vec<Account>),
     /// [`Effect::RemoveAccount`] finished: done, or why not.
@@ -235,6 +249,8 @@ pub enum Effect {
     Live,
     Attribution,
     Checks,
+    /// Token statistics (R20): the statistics cache brought up to date, then a report.
+    Stats,
     /// The last messages of a transcript or rollout of this provider.
     Preview(PathBuf, Provider),
     /// Checks right before a launch, answered by [`Event::LaunchChecked`]: the request's
@@ -487,6 +503,40 @@ pub struct Preview {
     pub scroll: usize,
 }
 
+/// The Stats view (R20): computed the first time it opens, then on each `r`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatsState {
+    /// The last report; kept while the next one is computed.
+    pub report: Option<stats::Report>,
+    /// Why the last computation could not write the cache.
+    pub error: Option<String>,
+    pub in_flight: bool,
+    /// The view has been opened: `r` computes again.
+    pub requested: bool,
+    /// `(done, total)` transcripts read by the computation running.
+    pub progress: Option<(usize, usize)>,
+    /// When the last report arrived.
+    pub computed: Option<Timestamp>,
+    pub period: Period,
+    /// Lines scrolled down.
+    pub scroll: usize,
+}
+
+impl Default for StatsState {
+    fn default() -> Self {
+        StatsState {
+            report: None,
+            error: None,
+            in_flight: false,
+            requested: false,
+            progress: None,
+            computed: None,
+            period: Period::All,
+            scroll: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct App {
     pub mode: Mode,
@@ -537,6 +587,7 @@ pub struct App {
 
     pub history: History,
     pub preview: Preview,
+    pub stats: StatsState,
 
     pub notice: Option<Notice>,
     pub overlay: Option<Overlay>,
@@ -592,6 +643,7 @@ impl App {
             live_updated: None,
             history: History::default(),
             preview: Preview::default(),
+            stats: StatsState::default(),
             notice: None,
             overlay: None,
             stores: None,
@@ -699,9 +751,22 @@ impl App {
             self.checks_in_flight = true;
             fx.push(Effect::Checks);
         }
+        if self.stats.requested {
+            self.request_stats(fx);
+        }
         // Transcripts may have grown: load the preview again.
         self.preview.loaded = None;
         self.preview.settled = 0;
+    }
+
+    /// Computes the statistics, unless a computation is running: they are never computed twice
+    /// at once (a cold one reads every transcript whole, R20).
+    fn request_stats(&mut self, fx: &mut Vec<Effect>) {
+        self.stats.requested = true;
+        if !self.stats.in_flight {
+            self.stats.in_flight = true;
+            fx.push(Effect::Stats);
+        }
     }
 
     fn start_live(&mut self, fx: &mut Vec<Effect>) {
@@ -815,6 +880,7 @@ impl App {
             View::Accounts => self.accounts.len(),
             View::Live => self.live_rows.len(),
             View::History => self.history.rows.len(),
+            View::Stats => 0,
         }
     }
 
@@ -823,6 +889,8 @@ impl App {
             View::Accounts => &mut self.accounts_list,
             View::Live => &mut self.live_list,
             View::History => &mut self.history.list,
+            // Stats has no list: `navigate` scrolls it instead and never gets here.
+            View::Stats => &mut self.accounts_list,
         }
     }
 
@@ -836,9 +904,35 @@ impl App {
         self.accounts_list.clamp(self.accounts.len(), heights[0]);
         self.live_list.clamp(self.live_rows.len(), heights[1]);
         self.history.list.clamp(self.history.rows.len(), heights[2]);
+        self.stats.scroll = self.stats.scroll.min(self.stats_max_scroll());
+    }
+
+    fn stats_max_scroll(&self) -> usize {
+        render::stats_line_count(self).saturating_sub(render::stats_height(self))
+    }
+
+    /// Movement keys in Stats scroll it.
+    fn scroll_stats(&mut self, key: Key) -> bool {
+        let page = render::stats_height(self).max(1);
+        let max = self.stats_max_scroll();
+        let scroll = self.stats.scroll.min(max);
+        self.stats.scroll = match key {
+            Key::Char('j') | Key::Down => scroll + 1,
+            Key::Char('k') | Key::Up => scroll.saturating_sub(1),
+            Key::Char('g') | Key::Home => 0,
+            Key::Char('G') | Key::End => max,
+            Key::PageDown => scroll + page,
+            Key::PageUp => scroll.saturating_sub(page),
+            _ => return false,
+        }
+        .min(max);
+        true
     }
 
     fn navigate(&mut self, key: Key) -> bool {
+        if self.view == View::Stats {
+            return self.scroll_stats(key);
+        }
         let len = self.list_len();
         let page = self.list_height().max(1);
         let list = self.list_mut();
@@ -873,10 +967,14 @@ impl App {
         true
     }
 
-    fn switch(&mut self, view: View) {
+    fn switch(&mut self, view: View, fx: &mut Vec<Effect>) {
         self.view = view;
         self.preview.expanded = false;
         self.preview.scroll = 0;
+        // Computed the first time the view opens, then on `r` (R20).
+        if view == View::Stats && !self.stats.requested {
+            self.request_stats(fx);
+        }
     }
 
     fn on_key(&mut self, key: Key, fx: &mut Vec<Effect>) {
@@ -904,9 +1002,15 @@ impl App {
         match key {
             Key::Char('q') => fx.push(Effect::Quit),
             Key::Char('?') => self.help = true,
-            Key::Char(c @ '1'..='3') => self.switch(View::ALL[c as usize - '1' as usize]),
-            Key::Tab => self.switch(View::ALL[(self.view.position() + 1) % 3]),
-            Key::BackTab => self.switch(View::ALL[(self.view.position() + 2) % 3]),
+            Key::Char(c @ '1'..='4') => self.switch(View::ALL[c as usize - '1' as usize], fx),
+            Key::Tab => {
+                let next = (self.view.position() + 1) % View::ALL.len();
+                self.switch(View::ALL[next], fx);
+            }
+            Key::BackTab => {
+                let len = View::ALL.len();
+                self.switch(View::ALL[(self.view.position() + len - 1) % len], fx);
+            }
             Key::Char('r') => self.refresh(fx),
             Key::Char('u') => self.live_usage(fx),
             Key::Esc if self.pending.is_some() => {
@@ -937,7 +1041,11 @@ impl App {
             {
                 self.logs = None;
             }
-            Key::Char('p' | ' ') if self.view != View::Accounts => {
+            Key::Char('t') if self.view == View::Stats => {
+                self.stats.period = self.stats.period.next();
+                self.stats.scroll = 0;
+            }
+            Key::Char('p' | ' ') if matches!(self.view, View::Live | View::History) => {
                 self.preview.expanded = !self.preview.expanded;
                 self.preview.scroll = 0;
             }
@@ -2096,7 +2204,7 @@ impl App {
             View::Live => self
                 .selected_live()
                 .and_then(|s| self.transcript_for_live(s)),
-            View::Accounts => return,
+            View::Accounts | View::Stats => return,
         };
         if target != self.preview.target {
             self.preview.target = target;
@@ -2370,6 +2478,15 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             } else {
                 app.start_live(&mut fx);
             }
+        }
+        Event::StatsProgress { done, total } => app.stats.progress = Some((done, total)),
+        Event::Stats { report, error } => {
+            app.stats.report = Some(report);
+            app.stats.error = error;
+            app.stats.in_flight = false;
+            app.stats.progress = None;
+            app.stats.computed = Some(app.now);
+            app.clamp_lists();
         }
         Event::Accounts(accounts) => app.set_accounts(accounts, &mut fx),
         Event::AccountRemoved { account, result } => {

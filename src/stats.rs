@@ -203,6 +203,18 @@ impl Cache {
     pub fn save(&self, path: &Path) -> Result<()> {
         registry::write_atomic(path, &serde_json::to_vec(self)?)
     }
+
+    /// After [`refresh`] reported `refreshed`: writes the cache unless the refresh changed
+    /// nothing and the file exists (it is tens of MB on a large corpus). Returns whether it
+    /// was written.
+    pub fn save_if_changed(&self, path: &Path, refreshed: &RefreshStats) -> Result<bool> {
+        let changed = refreshed.reused != refreshed.files || refreshed.removed > 0;
+        if !changed && path.exists() {
+            return Ok(false);
+        }
+        self.save(path)?;
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1192,39 +1204,48 @@ fn format_rows(models: &[ModelRow]) -> Vec<[String; 7]> {
     if models.is_empty() {
         return Vec::new();
     }
-    let cells = |name: String, t: &Tokens, claude: bool, codex: bool| {
-        let count = |n: u64, recorded: bool| match recorded {
-            true => human_count(n),
-            false => "-".to_string(),
-        };
-        [
-            name,
-            human_count(t.input),
-            human_count(t.cache_read),
-            count(t.cache_write, claude),
-            human_count(t.output),
-            count(t.reasoning, codex),
-            human_count(t.total()),
-        ]
+    let row = |name: String, counts: [String; 6]| {
+        let [a, b, c, d, e, f] = counts;
+        [name, a, b, c, d, e, f]
     };
-    let has = |p: Provider| models.iter().any(|m| m.provider == p);
+    let mut rows: Vec<[String; 7]> = models
+        .iter()
+        .map(|m| row(format!("  {}", m.model), counts(&m.tokens, &[m.provider])))
+        .collect();
+    let (total, providers) = sum(models);
+    rows.push(row("  total".to_string(), counts(&total, &providers)));
+    rows
+}
+
+/// The counts of `tokens` as shown, in column order (input, cache read, cache write, output,
+/// reasoning, total), as [`human_count`]s. A count none of `providers` records is `-`: cache
+/// write is claude's, reasoning codex's.
+pub fn counts(tokens: &Tokens, providers: &[Provider]) -> [String; 6] {
+    let count = |n: u64, recorded_by: Provider| match providers.contains(&recorded_by) {
+        true => human_count(n),
+        false => "-".to_string(),
+    };
+    [
+        human_count(tokens.input),
+        human_count(tokens.cache_read),
+        count(tokens.cache_write, Provider::Claude),
+        human_count(tokens.output),
+        count(tokens.reasoning, Provider::Codex),
+        human_count(tokens.total()),
+    ]
+}
+
+/// The tokens of `models` together, and the providers they come from.
+pub fn sum(models: &[ModelRow]) -> (Tokens, Vec<Provider>) {
     let mut total = Tokens::default();
-    let mut rows = Vec::new();
+    let mut providers = Vec::new();
     for m in models {
         total.add(&m.tokens);
-        let (claude, codex) = (
-            m.provider == Provider::Claude,
-            m.provider == Provider::Codex,
-        );
-        rows.push(cells(format!("  {}", m.model), &m.tokens, claude, codex));
+        if !providers.contains(&m.provider) {
+            providers.push(m.provider);
+        }
     }
-    rows.push(cells(
-        "  total".to_string(),
-        &total,
-        has(Provider::Claude),
-        has(Provider::Codex),
-    ));
-    rows
+    (total, providers)
 }
 
 /// Most tokens first, then by provider and model.

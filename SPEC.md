@@ -814,3 +814,6 @@ estimated, and computing them runs no agent command.
 - **Command**: `remuda stats [<account>] [--period today|7d|30d|all]` prints one period
   (default `all`). With an account, it prints only the sections that include that account, and no
   overall section. Reading progress goes to stderr, as for `sessions`.
+- **TUI**: view `4`, Stats. The statistics are computed in the background the first time the
+  view opens, and again on each `r` after that, with reading progress shown. `t` in the view cycles
+  the period (all, today, 7 days, 30 days).
