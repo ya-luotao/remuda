@@ -326,6 +326,65 @@ fn tui_launch_without_claude_does_not_suspend() {
     );
 }
 
+/// R16, R18: the TUI launches through the same path as `run`: shared configuration from the
+/// registry as it is at launch goes before the arguments, and its notices come back as
+/// warnings.
+#[test]
+fn tui_launches_get_shared_configuration() {
+    let sb = Sandbox::new();
+    let source = sb.home().join(".claude");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("CLAUDE.md"), "be brief").unwrap();
+    let max = sb.make_claude_home("max");
+    sb.write_config(&format!(
+        "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{}\"\n\
+         [share.claude]\nfrom = \"default\"\n",
+        max.display()
+    ));
+    let dir = project(&sb);
+    let account = named("max", max.to_str().unwrap());
+    let event = tui_launch(&sb, &account, &["--settings", "/x.json"], Some(&dir));
+    let Event::Launched { warnings, .. } = &event else {
+        panic!("{event:?}")
+    };
+    assert_eq!(
+        warnings,
+        &[
+            "--settings given: settings and auto-memory from claude:default are not injected \
+           (claude uses only the last --settings)"
+        ]
+    );
+    let inv = sb.only_invocation();
+    let shared = sb.remuda_home().join("shared/claude");
+    assert_eq!(
+        inv.args[..3],
+        [
+            format!("--add-dir={}", shared.display()),
+            "--settings".to_string(),
+            "/x.json".to_string()
+        ]
+    );
+    assert_eq!(inv.add_dir_claude_md.as_deref(), Some("1"));
+    assert_eq!(sb.launches()[0]["shared"][0]["option"], json!("--add-dir"));
+
+    // A registry that cannot be read now: the launch does not happen.
+    sb.write_config("[share.claude]\nfrom = \"nobody\"\n");
+    let mut screen = FakeScreen::default();
+    let request = LaunchRequest {
+        account,
+        args: vec![],
+        cwd: Some(dir),
+        what: "test".into(),
+    };
+    let event = tui::launch_in_foreground(&mut screen, &deps(&sb), request).unwrap();
+    assert!(screen.calls.is_empty());
+    let Err(e) = exit_of(&event) else {
+        panic!("{event:?}")
+    };
+    assert!(e.contains("names no claude account"), "{e}");
+    assert_eq!(sb.invocations().len(), 1);
+}
+
 // --- codex from the TUI (R17) ---------------------------------------------------------------
 
 const CODEX_ID: &str = "019c1e08-e4f6-7d70-a129-38ec744a3f3c";
