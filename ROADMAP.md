@@ -100,10 +100,8 @@ so such a setup first moves `projects` to per-account stores.
 
 ## Known issues
 
-Both affect only display or very narrow timing windows:
+It affects only a very narrow timing window:
 
-- `Identity` / `CachedUsage` / `LiveUsage` events are delivered by account index, so if the account
-  registry changes while the TUI is running, data can be shown on the wrong row.
 - A launch request whose running check is already in progress still launches after the check
   passes, even if its account was removed in the meantime (`pending` holds an `Account`).
 

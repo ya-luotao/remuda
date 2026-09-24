@@ -41,7 +41,7 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
             thread::spawn(move || refresh_index(&deps, &tx));
         }
         Effect::Identities => {
-            for (i, account) in deps.accounts.iter().enumerate() {
+            for account in &deps.accounts {
                 let (deps, tx, account) = (Arc::clone(&deps), tx.clone(), account.clone());
                 thread::spawn(move || {
                     let (identity, _warning) = identity::identify(
@@ -50,33 +50,30 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                         &deps.env,
                         IDENTITY_TIMEOUT,
                     );
-                    let _ = tx.send(Event::Identity {
-                        account: i,
-                        identity,
-                    });
+                    let _ = tx.send(Event::Identity { account, identity });
                 });
             }
         }
         Effect::CachedUsage => {
             thread::spawn(move || {
-                for (i, account) in deps.accounts.iter().enumerate() {
+                for account in &deps.accounts {
                     let result = usage::cached_usage(account, &deps.env);
-                    let _ = tx.send(Event::CachedUsage { account: i, result });
+                    let _ = tx.send(Event::CachedUsage {
+                        account: account.clone(),
+                        result,
+                    });
                 }
             });
         }
         Effect::LiveUsage(which) => {
-            for i in which {
+            for account in which {
                 let (deps, tx) = (Arc::clone(&deps), tx.clone());
                 thread::spawn(move || {
-                    let result = match (&deps.claude, deps.accounts.get(i)) {
-                        (Some(claude), Some(account)) => {
-                            usage::live_usage(account, claude, LIVE_USAGE_TIMEOUT)
-                        }
-                        (None, _) => Err("`claude` not found on PATH".to_string()),
-                        (_, None) => return,
+                    let result = match &deps.claude {
+                        Some(claude) => usage::live_usage(&account, claude, LIVE_USAGE_TIMEOUT),
+                        None => Err("`claude` not found on PATH".to_string()),
                     };
-                    let _ = tx.send(Event::LiveUsage { account: i, result });
+                    let _ = tx.send(Event::LiveUsage { account, result });
                 });
             }
         }
@@ -521,11 +518,12 @@ mod tests {
         };
         assert_eq!(p, &path);
         assert_eq!(messages[0].text, "first");
-        let events = collect(Effect::LiveUsage(vec![0]), &deps, |_| true);
+        let max = deps.accounts[0].clone();
+        let events = collect(Effect::LiveUsage(vec![max.clone()]), &deps, |_| true);
         assert_eq!(
             events,
             [Event::LiveUsage {
-                account: 0,
+                account: max,
                 result: Err("`claude` not found on PATH".into())
             }]
         );

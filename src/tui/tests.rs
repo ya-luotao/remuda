@@ -188,11 +188,12 @@ fn start_requests_everything_in_the_background() {
 
 /// Identity and cached usage for every account of [`app`].
 fn finish_accounts(app: &mut App) {
-    for account in 0..3 {
+    let accounts: Vec<Account> = app.accounts.iter().map(|a| a.account.clone()).collect();
+    for account in accounts {
         update(
             app,
             Event::Identity {
-                account,
+                account: account.clone(),
                 identity: Identity::NotLoggedIn,
             },
         );
@@ -214,11 +215,11 @@ fn refresh_starts_each_kind_of_work_once_until_it_finishes() {
     assert_eq!(keys(&mut app, &r), []);
 
     // Identities finish one account at a time: still running until the last one.
-    for account in 0..2 {
+    for name in ["default", "max"] {
         update(
             &mut app,
             Event::Identity {
-                account,
+                account: account(name),
                 identity: Identity::NotLoggedIn,
             },
         );
@@ -227,17 +228,17 @@ fn refresh_starts_each_kind_of_work_once_until_it_finishes() {
     update(
         &mut app,
         Event::Identity {
-            account: 2,
+            account: account("team"),
             identity: Identity::NotLoggedIn,
         },
     );
     assert_eq!(keys(&mut app, &r), [Effect::Identities]);
 
-    for account in 0..3 {
+    for name in ["default", "max", "team"] {
         update(
             &mut app,
             Event::CachedUsage {
-                account,
+                account: account(name),
                 result: Err("no cache".into()),
             },
         );
@@ -502,31 +503,35 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
     update(
         &mut app,
         Event::CachedUsage {
-            account: 1,
+            account: account("max"),
             result: cached(vec![row("Session", 10.0, None, None)]),
         },
     );
     assert_eq!(
         keys(&mut app, &[Key::Char('u')]),
-        [Effect::LiveUsage(vec![0, 1, 2])]
+        [Effect::LiveUsage(vec![
+            account("default"),
+            account("max"),
+            account("team")
+        ])]
     );
     assert!(app.accounts.iter().all(|a| a.live_pending));
     update(
         &mut app,
         Event::LiveUsage {
-            account: 1,
+            account: account("max"),
             result: Ok(LiveUsage::Rows(vec![row("Session", 55.0, None, None)])),
         },
     );
     // Only the accounts that finished can be asked again.
     assert_eq!(
         keys(&mut app, &[Key::Char('u')]),
-        [Effect::LiveUsage(vec![1])]
+        [Effect::LiveUsage(vec![account("max")])]
     );
     update(
         &mut app,
         Event::LiveUsage {
-            account: 1,
+            account: account("max"),
             result: Ok(LiveUsage::Rows(vec![row("Session", 56.0, None, None)])),
         },
     );
@@ -534,14 +539,14 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
     update(
         &mut app,
         Event::LiveUsage {
-            account: 2,
+            account: account("team"),
             result: Err("timed out after 90s".into()),
         },
     );
     update(
         &mut app,
         Event::LiveUsage {
-            account: 0,
+            account: account("default"),
             result: Ok(LiveUsage::Unrecognized("??".into())),
         },
     );
@@ -551,6 +556,54 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
     );
     assert!(!app.accounts[2].live_pending);
     assert!(app.accounts[2].rows().is_empty());
+}
+
+/// Results name their account: when the list changes during a query, a late result lands on
+/// its account's new row, and one for an account no longer listed is dropped.
+#[test]
+fn late_results_follow_their_account_when_rows_move() {
+    let mut app = app();
+    keys(&mut app, &[Key::Char('u')]);
+    // max is removed: team moves up to row 1.
+    update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("team")]),
+    );
+    assert_eq!(app.accounts[1].account, account("team"));
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: account("team"),
+            result: Ok(LiveUsage::Rows(vec![row("Session", 42.0, None, None)])),
+        },
+    );
+    assert_eq!(app.accounts[1].rows()[0].percent, 42.0);
+    assert!(!app.accounts[1].live_pending);
+    assert!(app.accounts[0].live.is_none() && app.accounts[0].live_pending);
+
+    let before = app.accounts.clone();
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: account("max"),
+            result: Ok(LiveUsage::Rows(vec![row("Session", 99.0, None, None)])),
+        },
+    );
+    update(
+        &mut app,
+        Event::Identity {
+            account: account("max"),
+            identity: logged_in("max@example.com"),
+        },
+    );
+    update(
+        &mut app,
+        Event::CachedUsage {
+            account: account("max"),
+            result: cached(vec![row("Session", 99.0, None, None)]),
+        },
+    );
+    assert_eq!(app.accounts, before);
 }
 
 #[test]
@@ -2230,7 +2283,11 @@ fn pick_mode_loads_only_what_choosing_an_account_needs() {
     // Live usage helps to choose.
     assert_eq!(
         keys(&mut app, &[Key::Char('u')]),
-        [Effect::LiveUsage(vec![0, 1, 2])]
+        [Effect::LiveUsage(vec![
+            account("default"),
+            account("max"),
+            account("team")
+        ])]
     );
 }
 
@@ -2316,28 +2373,28 @@ fn populated_accounts() -> App {
     update(
         &mut app,
         Event::Identity {
-            account: 0,
+            account: account("default"),
             identity: logged_in("me@example.com"),
         },
     );
     update(
         &mut app,
         Event::Identity {
-            account: 1,
+            account: account("max"),
             identity: logged_in("max@example.com"),
         },
     );
     update(
         &mut app,
         Event::Identity {
-            account: 2,
+            account: account("team"),
             identity: Identity::NotLoggedIn,
         },
     );
     update(
         &mut app,
         Event::CachedUsage {
-            account: 0,
+            account: account("default"),
             result: cached(vec![
                 row(
                     "Session",
@@ -2363,7 +2420,7 @@ fn populated_accounts() -> App {
     update(
         &mut app,
         Event::CachedUsage {
-            account: 1,
+            account: account("max"),
             result: cached(vec![row(
                 "Session",
                 5.0,
@@ -2375,14 +2432,14 @@ fn populated_accounts() -> App {
     update(
         &mut app,
         Event::CachedUsage {
-            account: 2,
+            account: account("team"),
             result: Err("no /h/team/.claude.json".into()),
         },
     );
     update(
         &mut app,
         Event::LiveUsage {
-            account: 1,
+            account: account("max"),
             result: Ok(LiveUsage::Rows(vec![
                 UsageRow {
                     label: "Session".into(),
@@ -2493,7 +2550,7 @@ fn accounts_view_errors_and_pending_live_usage() {
     update(
         &mut app,
         Event::LiveUsage {
-            account: 2,
+            account: account("team"),
             result: Err("`claude -p /usage --no-session-persistence` timed out after 90s".into()),
         },
     );
@@ -2722,7 +2779,7 @@ fn accounts_table_stays_compact_on_a_wide_terminal() {
     update(
         &mut app,
         Event::CachedUsage {
-            account: 0,
+            account: account("default"),
             result: Ok(CachedUsage {
                 fetched_at: Some(ts("2026-09-24T11:34:00Z")),
                 rows: vec![row("Session", 1.0, None, None)],
@@ -2873,11 +2930,12 @@ fn codex_app() -> App {
         },
     );
     update(&mut app, Event::Live(vec![]));
-    for account in 0..4 {
+    let accounts: Vec<Account> = app.accounts.iter().map(|a| a.account.clone()).collect();
+    for account in accounts {
         update(
             &mut app,
             Event::Identity {
-                account,
+                account: account.clone(),
                 identity: Identity::NotLoggedIn,
             },
         );
@@ -2930,7 +2988,7 @@ fn codex_accounts_show_their_login_method_and_no_usage() {
     update(
         &mut app,
         Event::Identity {
-            account: 3,
+            account: codex_account("work"),
             identity: Identity::LoggedIn {
                 email: None,
                 org: None,
@@ -2943,7 +3001,7 @@ fn codex_accounts_show_their_login_method_and_no_usage() {
     update(
         &mut app,
         Event::CachedUsage {
-            account: 3,
+            account: codex_account("work"),
             result: Err("usage is not available for codex".into()),
         },
     );
@@ -2956,7 +3014,7 @@ fn codex_accounts_show_their_login_method_and_no_usage() {
     // Live usage is claude's only.
     assert_eq!(
         keys(&mut app, &[Key::Char('u')]),
-        [Effect::LiveUsage(vec![0, 1])]
+        [Effect::LiveUsage(vec![account("default"), account("max")])]
     );
     assert!(app.accounts[3].live.is_none() && !app.accounts[3].live_pending);
 }
