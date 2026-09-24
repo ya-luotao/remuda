@@ -74,6 +74,11 @@ enum Command {
         #[arg(long)]
         email: Option<String>,
     },
+    /// Unregister an account (remove it from config.toml); its home directory is left in place
+    Remove {
+        /// Account: `name` or `provider:name`
+        account: String,
+    },
     /// Continue a claude session under another account: copy it into that account's
     /// projects store and fork it there (the original is not modified)
     Relay {
@@ -155,6 +160,7 @@ fn dispatch(cli: Cli, ctx: &Context) -> Result<ExitCode> {
             name,
             email,
         }) => setup(&config, parse_provider(&provider)?, &name, email, ctx),
+        Some(Command::Remove { account }) => remove(&config, &account),
         Some(Command::Run { account, args }) => run_account(&config, account, args, ctx),
         Some(Command::Relay { session, account }) => relay(&config, &session, &account, ctx),
     }
@@ -638,6 +644,25 @@ fn setup(
             Ok(ExitCode::FAILURE)
         }
     }
+}
+
+/// `remuda remove <account>` (R14a): unregisters the account and says how to register its
+/// home, which is left in place, again. Stdout stays empty.
+fn remove(config: &Path, reference: &str) -> Result<ExitCode> {
+    let account = Registry::load(config)?.resolve(reference)?;
+    registry::unregister(config, &account)?;
+    let provider_flag = match account.provider {
+        Provider::Claude => "",
+        Provider::Codex => "--provider codex ",
+    };
+    eprintln!(
+        "remuda: removed {}; its home {home} was left in place (to register it again: remuda \
+         add {provider_flag}{} {home})",
+        account.qualified(),
+        account.name,
+        home = account.home,
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Bare `remuda`: the TUI.

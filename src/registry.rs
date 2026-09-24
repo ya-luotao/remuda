@@ -382,6 +382,46 @@ pub fn register(config: &Path, account: &Account) -> Result<()> {
         .with_context(|| format!("cannot write {}", config.display()))
 }
 
+/// `remuda remove` (R14a): deletes `account`'s `[[account]]` table from `config`, atomically
+/// and keeping every other comment and unknown key (R3). The home is not touched (R2).
+/// `default` is implicit, and the source of shared configuration cannot go while
+/// `[share.claude] from` names it: the registry would no longer load.
+pub fn unregister(config: &Path, account: &Account) -> Result<()> {
+    let q = account.qualified();
+    if account.home == Home::Default {
+        bail!("{q} is the native login: it is implicit and cannot be removed");
+    }
+    let mut doc = read_document(config)?;
+    let registry =
+        Registry::from_document(&doc).with_context(|| format!("invalid {}", config.display()))?;
+    if registry.sharing.source.as_ref() == Some(account) {
+        bail!(
+            "{q} is the source of shared configuration ([share.claude] from in {}); change or \
+             remove `from` first",
+            config.display()
+        );
+    }
+    // The tables are in `accounts` order (`parse_accounts`).
+    let Some(index) = registry.accounts.iter().position(|a| a == account) else {
+        if let Some(other) = registry
+            .accounts
+            .iter()
+            .find(|a| a.provider == account.provider && a.name == account.name)
+        {
+            bail!(
+                "{q} is now registered with home {}; not removed",
+                other.home
+            );
+        }
+        bail!("{q} is not registered");
+    };
+    remove_account_table(&mut doc, index);
+    Registry::from_document(&doc)
+        .with_context(|| format!("removing {q} would leave {} invalid", config.display()))?;
+    write_atomic(config, doc.to_string().as_bytes())
+        .with_context(|| format!("cannot write {}", config.display()))
+}
+
 impl Registry {
     /// Refuses a taken name, or a home already registered under this or another spelling
     /// (R14). Different spellings of one directory would share its files under two Keychain
@@ -441,6 +481,118 @@ pub fn append_account(doc: &mut DocumentMut, account: &Account) -> Result<()> {
     tables.push(table);
     doc.set_trailing("");
     Ok(())
+}
+
+/// Removes the `index`th `[[account]]` table (R3, R14a); the caller guarantees it exists. Its
+/// own comments go with it: those inside it and the comment lines directly above its header.
+/// A comment block separated from the header by a blank line is kept, moved in front of the
+/// next table in the file, or to the end of the file when none follows.
+pub fn remove_account_table(doc: &mut DocumentMut, index: usize) {
+    let Some(tables) = doc
+        .get_mut("account")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return;
+    };
+    let removed = tables.remove(index);
+    if tables.is_empty() {
+        doc.remove("account");
+    }
+    let prefix = removed
+        .decor()
+        .prefix()
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+    let kept = after_last_blank_line(prefix).map_or("", |end| &prefix[..end]);
+    if kept.trim().is_empty() {
+        return;
+    }
+    let kept = kept.to_string();
+    if let Some(p) = removed
+        .position()
+        .and_then(|p| next_position(doc.as_table(), p))
+        && prepend_at(doc.as_table_mut(), p, &kept)
+    {
+        return;
+    }
+    let old = doc.trailing().as_str().unwrap_or("").to_string();
+    doc.set_trailing(join(&kept, &old));
+}
+
+/// The smallest position after `after` of an explicit table anywhere in `t`.
+fn next_position(t: &Table, after: isize) -> Option<isize> {
+    let mut best: Option<isize> = None;
+    let mut consider = |sub: &Table| {
+        let own = sub.position().filter(|&p| !sub.is_implicit() && p > after);
+        for p in own.into_iter().chain(next_position(sub, after)) {
+            if best.is_none_or(|b| p < b) {
+                best = Some(p);
+            }
+        }
+    };
+    for (_, item) in t.iter() {
+        match item {
+            Item::Table(sub) => consider(sub),
+            Item::ArrayOfTables(tables) => tables.iter().for_each(&mut consider),
+            _ => {}
+        }
+    }
+    best
+}
+
+/// Prepends `text` to the decor prefix of the explicit table at `pos` in `t`; whether it was
+/// found.
+fn prepend_at(t: &mut Table, pos: isize, text: &str) -> bool {
+    for (_, item) in t.iter_mut() {
+        let subs: Vec<&mut Table> = match item {
+            Item::Table(sub) => vec![sub],
+            Item::ArrayOfTables(tables) => tables.iter_mut().collect(),
+            _ => vec![],
+        };
+        for sub in subs {
+            if !sub.is_implicit() && sub.position() == Some(pos) {
+                let old = sub.decor().prefix().and_then(|p| p.as_str()).unwrap_or("");
+                let new = join(text, old);
+                sub.decor_mut().set_prefix(new);
+                return true;
+            }
+            if prepend_at(sub, pos, text) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `kept` (ending in a blank line) followed by `old` without doubling that blank line.
+fn join(kept: &str, old: &str) -> String {
+    let old = match old.split_inclusive('\n').next() {
+        Some(first) if after_last_blank_line(kept) == Some(kept.len()) && is_blank_line(first) => {
+            &old[first.len()..]
+        }
+        _ => old,
+    };
+    format!("{kept}{old}")
+}
+
+/// Where the last blank line of `text` ends (after its `\n`).
+fn after_last_blank_line(text: &str) -> Option<usize> {
+    let mut end = None;
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        at += line.len();
+        if is_blank_line(line) {
+            end = Some(at);
+        }
+    }
+    end
+}
+
+/// A complete line (`\n` or `\r\n`) of nothing but spaces and tabs.
+fn is_blank_line(line: &str) -> bool {
+    line.strip_suffix('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .is_some_and(|l| l.bytes().all(|b| b == b' ' || b == b'\t'))
 }
 
 fn read_document(config: &Path) -> Result<DocumentMut> {
@@ -912,6 +1064,126 @@ mod tests {
         );
         assert_eq!(reg.sharing.source, Some(Account::default_for(CLAUDE)));
         assert_eq!(reg.sharing.opted_out, ["claude:max"]);
+    }
+
+    fn removed(text: &str, index: usize) -> String {
+        let mut doc: DocumentMut = text.parse().unwrap();
+        remove_account_table(&mut doc, index);
+        doc.to_string()
+    }
+
+    /// R3, R14a: removing an account keeps every other comment, table and unknown key; its own
+    /// comments (inside it, and directly above its header) go with it.
+    #[test]
+    fn remove_keeps_other_comments_and_unknown_keys() {
+        let original = "# my accounts\nunknown_top = \"keep\"\n\n# about max\n[[account]]\n\
+                        provider = \"claude\"\nname = \"max\"\nhome = \"/m\"\nextra = 42 # note\n\n\
+                        # ---- codex ----\n\n# about work\n[[account]]\n# inside work\n\
+                        provider = \"codex\"\nname = \"work\"\nhome = \"/c\"\n\n\
+                        # shared from the native login\n[share.claude]\n\
+                        from = \"default\" # the source\n# end of file\n";
+        assert_eq!(
+            removed(original, 0),
+            "# my accounts\nunknown_top = \"keep\"\n\n# ---- codex ----\n\n# about work\n\
+             [[account]]\n# inside work\nprovider = \"codex\"\nname = \"work\"\nhome = \"/c\"\n\n\
+             # shared from the native login\n[share.claude]\nfrom = \"default\" # the source\n\
+             # end of file\n"
+        );
+        assert_eq!(
+            removed(original, 1),
+            "# my accounts\nunknown_top = \"keep\"\n\n# about max\n[[account]]\n\
+             provider = \"claude\"\nname = \"max\"\nhome = \"/m\"\nextra = 42 # note\n\n\
+             # ---- codex ----\n\n# shared from the native login\n[share.claude]\n\
+             from = \"default\" # the source\n# end of file\n"
+        );
+        let reg = parse(&removed(original, 0)).unwrap();
+        assert_eq!(reg.accounts, [acc("codex", "work", "/c")]);
+        assert_eq!(reg.sharing.source, Some(Account::default_for(CLAUDE)));
+    }
+
+    /// R3, R14a: a file header above the first account stays, also when it was the only one.
+    #[test]
+    fn remove_keeps_a_file_header() {
+        assert_eq!(
+            removed(
+                "# header\n\n# about max\n[[account]]\nprovider = \"claude\"\nname = \"max\"\n\
+                 home = \"/m\"\n\n[[account]]\nprovider = \"claude\"\nname = \"team\"\n\
+                 home = \"/t\"\n",
+                0
+            ),
+            "# header\n\n[[account]]\nprovider = \"claude\"\nname = \"team\"\nhome = \"/t\"\n"
+        );
+        let out = removed(
+            "# header\n\n[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n\
+             # end\n",
+            0,
+        );
+        assert_eq!(out, "# header\n\n# end\n");
+        let doc: DocumentMut = out.parse().unwrap();
+        assert!(doc.get("account").is_none());
+        assert_eq!(Registry::from_document(&doc).unwrap(), Registry::default());
+
+        // A blank line with CRLF endings, or with only spaces and tabs, separates as well
+        // (CRLF comes out as LF, as with `add`).
+        let team = "[[account]]\nprovider = \"claude\"\nname = \"team\"\nhome = \"/t\"\n";
+        for (text, want) in [
+            (
+                "# header\r\n\r\n# about max\r\n[[account]]\r\nprovider = \"claude\"\r\n\
+                 name = \"max\"\r\nhome = \"/m\"\r\n\r\n[[account]]\r\nprovider = \"claude\"\r\n\
+                 name = \"team\"\r\nhome = \"/t\"\r\n",
+                format!("# header\n\n{team}"),
+            ),
+            (
+                "# header\n \t\n# about max\n[[account]]\nprovider = \"claude\"\nname = \"max\"\n\
+                 home = \"/m\"\n\n[[account]]\nprovider = \"claude\"\nname = \"team\"\n\
+                 home = \"/t\"\n",
+                format!("# header\n \t\n{team}"),
+            ),
+        ] {
+            let out = removed(text, 0);
+            assert_eq!(out, want);
+            assert_eq!(parse(&out).unwrap().accounts, [acc("claude", "team", "/t")]);
+        }
+        let out = removed(
+            "# header\n  \n[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n",
+            0,
+        );
+        assert!(out.starts_with("# header\n"), "{out:?}");
+        assert_eq!(parse(&out).unwrap(), Registry::default());
+    }
+
+    /// R14a: `default`, the share source, an unregistered account and a stale home are refused;
+    /// the file is left as it was.
+    #[test]
+    fn unregister_refusals() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let accounts = "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n";
+        let refused = |text: &str, account: &Account| {
+            fs::write(&config, text).unwrap();
+            let e = format!("{:#}", unregister(&config, account).unwrap_err());
+            assert_eq!(fs::read_to_string(&config).unwrap(), text, "{e}");
+            e
+        };
+        for provider in [CLAUDE, CODEX] {
+            let e = refused(accounts, &Account::default_for(provider));
+            assert!(e.contains("implicit"), "{e}");
+        }
+        for from in ["max", "claude:max"] {
+            let text = format!("{accounts}\n[share.claude]\nfrom = \"{from}\"\n");
+            let e = refused(&text, &acc("claude", "max", "/m"));
+            assert!(e.contains("[share.claude]"), "{e}");
+        }
+        let e = refused(accounts, &acc("claude", "team", "/t"));
+        assert_eq!(e, "claude:team is not registered");
+        let e = refused(accounts, &acc("codex", "max", "/m"));
+        assert_eq!(e, "codex:max is not registered");
+        let e = refused(accounts, &acc("claude", "max", "/elsewhere"));
+        assert!(e.contains("now registered with home /m"), "{e}");
+
+        fs::write(&config, accounts).unwrap();
+        unregister(&config, &acc("claude", "max", "/m")).unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), "");
     }
 
     #[test]

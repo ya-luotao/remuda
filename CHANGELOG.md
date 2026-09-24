@@ -20,6 +20,9 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 - Relay (SPEC R19): `remuda relay <session> <account>` and `c` in the TUI continue a session under
   another account by copying its transcript and checkpoints into the target store and forking it
   there. The original session is never modified.
+- `remuda remove <account>` unregisters an account (SPEC R14a). The home directory is left in
+  place, and its path is printed so it can be registered again; `default` and the source of
+  shared configuration cannot be removed.
 
 ### Fixed
 

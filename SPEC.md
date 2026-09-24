@@ -69,8 +69,9 @@ switching to a different, logged-out account.
   ```
 - Homes created by `setup` live at `$REMUDA_HOME/homes/<provider>/<name>`; homes registered with
   `add` stay where they are.
-- Writes are atomic (temporary file + rename) and preserve the user's comments and unknown keys. If
-  `config.toml` is a symlink, writes go through the symlink.
+- Writes are atomic (temporary file + rename) and preserve the user's comments and unknown keys
+  (the comments of an account that `remove` deletes go with it, R14a). If `config.toml` is a
+  symlink, writes go through the symlink.
 - Loading validates strictly: an invalid name, a duplicate name, a claimed `default`, a named
   account whose `home` is not an absolute path, `share` on a codex account, a `[share.claude] from`
   that names no claude account, and similar problems are all reported as errors
@@ -113,6 +114,7 @@ remuda list                     accounts, login identity, home
 remuda sessions [--limit N]     print recent sessions as plain text: time, account attribution, title, cwd (R8, R9)
 remuda add <name> <path>        register an existing home directory (R14)
 remuda setup <name>             create a new home and run `claude auth login`
+remuda remove <account>         unregister an account; its home is left in place (R14a)
 remuda relay <session> <account>  continue a session under another account (R19)
 ```
 
@@ -364,6 +366,24 @@ remuda never writes credentials, `.claude.json`, the Keychain, transcripts, `his
   refused: that directory is `default`, and giving it another name would create a separate Keychain
   entry and read `.claude.json` from inside the directory, making it appear logged out.
 - Registration only records a name; nothing is moved, copied, or created.
+
+## R14a. `remove <account>`
+
+- Unregisters an account: its `[[account]]` table is deleted from `config.toml`, atomically (R3).
+  The home directory and everything in it are left untouched (R2); remuda prints the home's path
+  and how to register it again (`remuda add`).
+- The account is named as in R1 (`name` or `provider:name`; a bare name that exists under more than
+  one provider is an error listing the candidates).
+- `default` (`claude:default`, `codex:default`) is implicit and cannot be removed: error.
+- Refused while `[share.claude] from` names the account: the registry would no longer load (R3).
+  `from` must be changed or removed first; remuda does not edit it.
+- The removed table's comments go with it: those inside it and the comment lines directly above
+  its header. A comment block separated from the header by a blank line is kept (moved before
+  the next table, or to the end of the file). Every other line is kept.
+- State is not touched: the launch log keeps the account's lines (R3). Sessions in a store that no
+  remaining account has drop out of the index at its next refresh; in a store shared with a
+  remaining account they stay, and their launch-log attribution may still name the removed
+  account, which can no longer be chosen to resume them.
 
 ## R15. Testing
 
