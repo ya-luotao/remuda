@@ -554,7 +554,7 @@ mod tests {
 
     /// The server's process group goes with it: a process it started is terminated on a
     /// timeout, and one that ignores SIGTERM is killed after the grace. (The timeout leaves the
-    /// script time to write both pids.)
+    /// script time to write both pids, even on a loaded machine running the suite in parallel.)
     #[test]
     fn json_rpc_kills_the_process_group() {
         let dir = tempfile::tempdir().unwrap();
@@ -566,9 +566,9 @@ mod tests {
         );
         let d = dir.path().to_str().unwrap();
         let start = Instant::now();
-        let result = run_json_rpc(&p, &[d], &keep(), &[], &[1], Duration::from_secs(2));
-        assert_eq!(result, Err("timed out after 2s".to_string()));
-        assert!(start.elapsed() < Duration::from_secs(6));
+        let result = run_json_rpc(&p, &[d], &keep(), &[], &[1], Duration::from_secs(5));
+        assert_eq!(result, Err("timed out after 5s".to_string()));
+        assert!(start.elapsed() < Duration::from_secs(10));
         for name in ["plain", "stubborn"] {
             assert!(gone(pid_in(&dir.path().join(name))), "{name} survived");
         }
