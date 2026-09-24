@@ -35,7 +35,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::provider::Provider;
 use crate::registry::{Account, Registry};
-use crate::{Env, launch, paths, relay, setup, share};
+use crate::{Env, launch, paths, relay, setup};
 
 use app::{App, Effect, Event, Exit, Key, LaunchRequest, Mode};
 
@@ -419,7 +419,7 @@ fn run_launch(
             || uuid::Uuid::new_v4().to_string(),
             &registry.sharing,
             &deps.env,
-            &share::dir(&deps.config),
+            &deps.config,
         ),
         Some(source) => relay::prepare(
             source,
@@ -428,7 +428,7 @@ fn run_launch(
             &registry.sharing,
             &deps.env,
             &log,
-            &share::dir(&deps.config),
+            &deps.config,
             ts,
         ),
     });

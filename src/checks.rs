@@ -90,8 +90,9 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
 
 /// Shared configuration (R11, R18): a source account that is not listed or whose home is
 /// missing; members whose home shares some but not all instruction items with the source
-/// through symlinks (those load twice); enabled plugins without an install path that exists,
-/// and an `installed_plugins.json` whose format is not recognized.
+/// through symlinks (those load twice); authentication keys of the source's settings, which
+/// are withheld; enabled plugins without an install path that exists, and an
+/// `installed_plugins.json` whose format is not recognized.
 pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check> {
     let mut checks = Vec::new();
     let Some(source) = &sharing.source else {
@@ -138,6 +139,17 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
         }
     }
     let settings = share::read_settings(&from.join("settings.json")).unwrap_or_default();
+    let withheld = share::withheld(&settings);
+    if !withheld.is_empty() {
+        checks.push(Check {
+            account: Some(name.clone()),
+            message: format!(
+                "settings keys withheld from shared configuration (authentication is never \
+                 shared): {}",
+                withheld.join(", ")
+            ),
+        });
+    }
     let plugins = share::enabled_plugins(&settings);
     match share::installed_plugins(&from) {
         Installs::Unrecognized(path) => checks.push(Check {
@@ -495,6 +507,32 @@ mod tests {
                 &sharing_from(Account::default_for(CLAUDE))
             ),
             []
+        );
+    }
+
+    /// R11, R18: authentication keys in the source's settings are listed as withheld.
+    #[test]
+    fn withheld_authentication_keys() {
+        let f = fixture();
+        let native = f.root.join("home/.claude");
+        fs::write(
+            native.join("settings.json"),
+            r#"{"apiKeyHelper": "/k", "model": "x", "env": {"ANTHROPIC_AUTH_TOKEN": "t"}}"#,
+        )
+        .unwrap();
+        let accounts = vec![Account::default_for(CLAUDE)];
+        let got = sharing_checks(
+            &accounts,
+            &f.env,
+            &sharing_from(Account::default_for(CLAUDE)),
+        );
+        assert_eq!(
+            messages(&got),
+            [(
+                Some("claude:default"),
+                "settings keys withheld from shared configuration (authentication is never \
+                 shared): apiKeyHelper, env.ANTHROPIC_AUTH_TOKEN"
+            )]
         );
     }
 

@@ -3,13 +3,14 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use common::{Invocation, Sandbox};
 use predicates::prelude::*;
 use serde_json::{Value, json};
+use unicode_normalization::UnicodeNormalization;
 
 const HOOK: &str = r#"{"matcher": "Bash", "hooks": [{"type": "command", "command": "lint"}]}"#;
 
@@ -86,24 +87,37 @@ impl Shared {
     }
 }
 
-/// `--settings=<json>` among `args`, parsed.
+/// The settings file passed as `--settings=<path>` among `args`, parsed (R18: never inline).
 fn settings_of(args: &[String]) -> Option<Value> {
     let found: Vec<&String> = args
         .iter()
         .filter(|a| a.starts_with("--settings"))
         .collect();
     assert!(found.len() <= 1, "one --settings at most: {args:?}");
-    found
-        .first()
-        .map(|a| serde_json::from_str(a.strip_prefix("--settings=").unwrap()).unwrap())
+    found.first().map(|a| {
+        let path = Path::new(a.strip_prefix("--settings=").unwrap());
+        assert!(path.is_absolute(), "a file, not inline JSON: {a}");
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    })
 }
 
+/// claude's memory directory for a project root (R18): NFC, then every UTF-16 code unit that
+/// is not an ASCII letter or digit becomes `-`.
 fn memory_of(source: &Path, root: &Path) -> String {
     let project: String = root
         .to_str()
         .unwrap()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .nfc()
+        .collect::<String>()
+        .encode_utf16()
+        .map(|u| match u8::try_from(u) {
+            Ok(b) if b.is_ascii_alphanumeric() => char::from(b),
+            _ => '-',
+        })
         .collect();
     format!("{}/projects/{project}/memory", source.display())
 }
@@ -480,4 +494,115 @@ fn no_memory_for_a_long_project_name() {
         .success();
     let settings = settings_of(&s.sb.only_invocation().args).unwrap();
     assert!(settings.get("autoMemoryDirectory").is_none(), "{settings}");
+}
+
+/// R18: settings travel in a 0600 file under `$REMUDA_HOME/state/settings/`, named by the
+/// content's hash and reused; no settings value appears in claude's arguments.
+#[test]
+fn settings_go_through_a_private_file() {
+    let s = shared();
+    let first = s.run(&["max"]);
+    assert!(
+        !first.args.iter().any(|a| a.contains("opus")),
+        "{:?}",
+        first.args
+    );
+    let path = first.args[1]
+        .strip_prefix("--settings=")
+        .unwrap()
+        .to_string();
+    assert!(
+        Path::new(&path).starts_with(s.sb.remuda_home().join("state/settings")),
+        "{path}"
+    );
+    fs::remove_file(s.sb.claude_out()).unwrap();
+    let again = s.run(&["max"]);
+    assert_eq!(
+        again.args[1], first.args[1],
+        "the same content reuses its file"
+    );
+    let files = fs::read_dir(s.sb.remuda_home().join("state/settings"))
+        .unwrap()
+        .count();
+    assert_eq!(files, 1);
+}
+
+/// R18: authentication keys of the source never reach a member.
+#[test]
+fn authentication_keys_are_withheld() {
+    let s = shared();
+    fs::write(
+        s.source.join("settings.json"),
+        r#"{"model": "opus", "apiKeyHelper": "/bin/key", "forceLoginMethod": "console",
+            "env": {"ANTHROPIC_API_KEY": "sk-x", "CLAUDE_CODE_USE_BEDROCK": "1", "TZ": "UTC"}}"#,
+    )
+    .unwrap();
+    let inv = s.run(&["max"]);
+    let settings = settings_of(&inv.args).unwrap();
+    assert_eq!(settings["model"], json!("opus"));
+    assert_eq!(settings["env"], json!({"TZ": "UTC"}));
+    assert!(settings.get("apiKeyHelper").is_none() && settings.get("forceLoginMethod").is_none());
+    let path = inv.args[1].strip_prefix("--settings=").unwrap();
+    assert!(!fs::read_to_string(path).unwrap().contains("sk-x"));
+}
+
+/// R18: the project's own settings keep precedence over the shared ones.
+#[test]
+fn project_settings_keep_precedence() {
+    let s = shared();
+    let claude_dir = s.sb.work().join(".claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(claude_dir.join("settings.json"), r#"{"model": "haiku"}"#).unwrap();
+    fs::write(
+        claude_dir.join("settings.local.json"),
+        format!(r#"{{"hooks": {{"PreToolUse": [{HOOK}]}}, "cleanupPeriodDays": 7}}"#),
+    )
+    .unwrap();
+    let settings = settings_of(&s.run(&["max"]).args).unwrap();
+    for gone in ["model", "hooks", "cleanupPeriodDays"] {
+        assert!(settings.get(gone).is_none(), "{gone}: {settings}");
+    }
+    assert!(settings.get("enabledPlugins").is_some());
+}
+
+/// R18: a directory outside the Basic Multilingual Plane is two UTF-16 units, two dashes.
+#[test]
+fn memory_encodes_utf16_code_units() {
+    let s = shared();
+    let dir = s.sb.root().canonicalize().unwrap().join("📁x");
+    fs::create_dir_all(&dir).unwrap();
+    s.sb.remuda()
+        .current_dir(&dir)
+        .args(["run", "max"])
+        .assert()
+        .success();
+    let settings = settings_of(&s.sb.only_invocation().args).unwrap();
+    let memory = settings["autoMemoryDirectory"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(memory.ends_with("---x/memory"), "{memory}");
+    assert_eq!(memory, memory_of(&s.source, &dir));
+}
+
+/// R18: when git fails for a reason other than "not a repository", no memory location is
+/// guessed; the launch goes on and says so.
+#[test]
+fn a_failing_git_means_no_memory_and_a_notice() {
+    let s = shared();
+    common::write_executable(
+        &s.sb.bin().join("git"),
+        "#!/bin/sh\necho 'fatal: detected dubious ownership in repository' >&2\nexit 128\n",
+    );
+    s.sb.remuda()
+        .args(["run", "max"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "auto-memory from claude:default is not shared this time: cannot find the project \
+             root (git rev-parse failed: fatal: detected dubious ownership",
+        ));
+    let settings = settings_of(&s.sb.only_invocation().args).unwrap();
+    assert!(settings.get("autoMemoryDirectory").is_none(), "{settings}");
+    assert_eq!(settings["model"], json!("opus"));
 }

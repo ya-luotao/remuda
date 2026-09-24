@@ -211,7 +211,8 @@ $REMUDA_HOME/
 ├── shared/claude/.claude          symlink to the shared configuration's source home
 └── state/
     ├── index.json                 session index cache
-    └── launches.jsonl             launch log
+    ├── launches.jsonl             launch log
+    └── settings/                  shared settings passed to claude (mode 0600)
 ```
 
 `config.toml` lists the registered accounts. `remuda add` and `remuda setup` edit it for you,
@@ -260,12 +261,16 @@ before your own arguments:
 
 - **Instructions:** `CLAUDE.md`, skills, commands and agents, through
   `--add-dir=$REMUDA_HOME/shared/claude`, whose `.claude` entry is a symlink to the source home.
-- **Settings:** the part of the source's `settings.json` that the account's own settings do not
-  define, in one `--settings` option. The account's own values win; identical hook entries are not
-  added twice. If you pass `--settings` yourself, remuda injects no settings and says so.
-- **Plugins:** `--plugin-dir` for each plugin the source enables and has installed.
-- **Auto-memory:** the source's memory directory for the project, so every account remembers the
-  same things about it.
+- **Settings:** the part of the source's `settings.json` that neither the account's own settings
+  nor the project's `.claude/settings.json` and `.claude/settings.local.json` define, so the
+  shared settings behave like user settings; identical hook entries are not added twice. They are
+  passed as one `--settings` file, written with mode 0600 under `$REMUDA_HOME/state/settings/`.
+  Authentication keys (such as `apiKeyHelper` or `env.ANTHROPIC_API_KEY`) are never shared. If
+  you pass `--settings` yourself, remuda injects no settings and says so.
+- **Plugins:** `--plugin-dir` for each plugin the source enables and has installed, unless the
+  account turns it off or has installed it itself.
+- **Auto-memory:** the source's memory directory for the project (found the way claude finds it,
+  with one `git` call), so every account remembers the same things about it.
 
 Nothing is written into any account home. Homes that already share part of their configuration
 through symlinks are detected, and that part is not injected again. `share` applies to Claude

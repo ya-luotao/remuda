@@ -296,6 +296,7 @@ pub fn prepare(
 
 /// The launch path of `remuda run`, the TUI and relay alike (R6, R16, R18, R19): [`prepare`],
 /// plus the shared configuration of `sharing` for session invocations of claude accounts.
+/// `config` is `$REMUDA_HOME/config.toml`.
 #[allow(clippy::too_many_arguments)]
 pub fn plan(
     account: &Account,
@@ -305,10 +306,10 @@ pub fn plan(
     new_session_id: impl FnOnce() -> String,
     sharing: &Sharing,
     env: &Env,
-    shared_dir: &Path,
+    config: &Path,
 ) -> Result<Launch> {
     prepare_with(account, user_args, cwd, ts, new_session_id, |args| {
-        share::inject(sharing, account, args, cwd, env, shared_dir)
+        share::inject(sharing, account, args, cwd, env, config)
     })
 }
 

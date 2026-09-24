@@ -455,6 +455,64 @@ fn tui_relay_copies_then_forks() {
     );
 }
 
+/// R18: a directory typed into the TUI's new-session form is made real before it names the
+/// project: a symlink with a trailing slash and a `..` give the same memory location.
+#[test]
+fn tui_memory_uses_the_real_start_directory() {
+    let sb = Sandbox::new();
+    fs::create_dir_all(sb.home().join(".claude")).unwrap();
+    let max = sb.make_claude_home("max");
+    sb.write_config(&format!(
+        "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{}\"\n\
+         [share.claude]\nfrom = \"default\"\n",
+        max.display()
+    ));
+    let real = project(&sb).canonicalize().unwrap();
+    fs::create_dir_all(real.join("sub")).unwrap();
+    std::os::unix::fs::symlink(&real, sb.root().join("link")).unwrap();
+    let account = named("max", max.to_str().unwrap());
+    let mut deps = deps(&sb);
+    deps.env.insert("PATH".into(), sb.path_var());
+    let mut memories = Vec::new();
+    for typed in [
+        format!("{}/", sb.root().join("link").display()),
+        format!("{}/sub/..", real.display()),
+    ] {
+        let _ = fs::remove_file(sb.claude_out());
+        let request = LaunchRequest {
+            account: account.clone(),
+            args: vec![],
+            cwd: Some(typed.clone().into()),
+            what: "test".into(),
+        };
+        let mut screen = FakeScreen::default();
+        tui::launch_in_foreground(&mut screen, &deps, request).unwrap();
+        let inv = sb.only_invocation();
+        let path = inv.args[0]
+            .strip_prefix("--settings=")
+            .expect("settings injected");
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        memories.push(
+            settings["autoMemoryDirectory"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let encoded: String = real
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let want = format!(
+        "{}/projects/{encoded}/memory",
+        sb.home().join(".claude").display()
+    );
+    assert_eq!(memories, [want.clone(), want]);
+}
+
 // --- codex from the TUI (R17) ---------------------------------------------------------------
 
 const CODEX_ID: &str = "019c1e08-e4f6-7d70-a129-38ec744a3f3c";
