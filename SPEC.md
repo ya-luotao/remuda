@@ -471,6 +471,7 @@ defaults to paths inside the sandbox.
   any other key cancels); if the rollout file was written within the last 10 minutes, the prompt
   adds that it is still being written. Forks need no confirmation.
 - Usage and running sessions: not supported for codex; shown as unavailable in the UI.
+
 ## R18. Shared configuration (M2.5)
 
 Sessions stay with the account that created them; only configuration is shared. remuda shares it
@@ -530,24 +531,33 @@ by injecting launch options, so nothing is written into any home (R13), and home
 - **Never injected: authentication.** Settings that choose credentials, provider, endpoint, or
   organization are removed from the injected settings, whatever the home defines, so a member never
   authenticates or bills as the source, and no secret of the source reaches a member's tools:
-  - the keys `apiKeyHelper`, `proxyAuthHelper`, `awsAuthRefresh`, `awsCredentialExport`,
-    `gcpAuthRefresh`, `forceLoginMethod`, `forceLoginOrgUUID`;
-  - in `env`, every name that starts with `ANTHROPIC_`, `AWS_`, `AZURE_`, `GOOGLE_`, `CLOUDSDK_`,
-    `CLOUD_ML_`, `CLAUDE_CODE_USE_`, `CLAUDE_CODE_SKIP_`, or `_CLAUDE_CODE_`; every name that
-    contains `TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `OAUTH`, `UUID`, or `BASE_URL`;
-    and `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`. Names are matched case-insensitively.
-    Exception: the model-name variables `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, and
-    `ANTHROPIC_DEFAULT_*_MODEL*` are shared, unless the name also contains one of the substrings
-    above.
-  The rules follow claude's own groupings of provider, credential, and endpoint variables in the
-  2.1.281 bundle, widened to prefixes so that new variables are withheld by default. The accounts
+  - the keys `apiKeyHelper`, `proxyAuthHelper`, `otelHeadersHelper`, `awsAuthRefresh`,
+    `awsCredentialExport`, `gcpAuthRefresh`, `forceLoginMethod`, `forceLoginOrgUUID`;
+  - in `env`, names are matched case-insensitively and withheld if any rule matches:
+    - prefix `ANTHROPIC_`, `AWS_`, `AZURE_`, `GOOGLE_`, `GCLOUD_`, `GCE_`, `CLOUDSDK_`,
+      `CLOUD_ML_`, `VERTEX_`, `METADATA_`, `IDENTITY_`, `IMDS_`, `MSI_`, `CLAUDE_CODE_USE_`,
+      `CLAUDE_CODE_SKIP_`, `CLAUDE_CODE_HOST_`, `CLAUDE_CODE_PROVIDER_`,
+      `CLAUDE_CODE_FEDERATION_`, `CLAUDE_CODE_CERT`, `CLAUDE_CODE_CLIENT_CERT`, or `_CLAUDE_CODE_`;
+    - substring `TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `CREDS`, `OAUTH`, `UUID`,
+      `BASE_URL`, or `HEADERS`;
+    - an underscore-separated part equal to `AUTH` (so `…_HOST_AUTH_REFRESH` matches and
+      `GIT_AUTHOR_NAME` does not);
+    - exactly `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `HTTP_PROXY`, `HTTPS_PROXY`,
+      or `ALL_PROXY` (a proxy URL can carry credentials).
+    Exceptions, shared unless a prefix rule or another substring rule matches: the model-name
+    variables `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`,
+    `ANTHROPIC_DEFAULT_*_MODEL*`, and `ANTHROPIC_CUSTOM_MODEL_OPTION*`, and names ending in
+    `_TOKENS` (counts such as `MAX_THINKING_TOKENS`, not secrets).
+  The rules cover claude's own groupings of provider, credential, endpoint, and host-auth variables
+  in the 2.1.281 bundle, widened to prefixes so that new variables are withheld by default. The accounts
   view (R11) lists the settings withheld this way.
 - **Passing settings.** claude uses only the last `--settings` option (verified on 2.1.281), so
   remuda passes exactly one, as a file path, never inline: the injected JSON is written with mode
   0600 to `$REMUDA_HOME/state/settings/<sha256 of the content>.json` (written atomically, reused
   when the content is unchanged; files not used for 30 days are removed when a new one is written,
-  under an exclusive lock on the directory that reuse also takes, so a file is never removed
-  between being chosen and being passed). claude reads the file once at startup and keeps its
+  under an exclusive lock on `state/settings/.lock` (a regular file) that reuse also takes, so a
+  file is never removed between being chosen and being passed; on a filesystem that does not
+  support locking, remuda proceeds without the lock). claude reads the file once at startup and keeps its
   content (2.1.281 bundle).
   This keeps settings values out of the process list and away from per-argument size limits.
   `autoMemoryDirectory` is added to the same JSON when auto-memory is injected. If the user's
@@ -557,17 +567,20 @@ by injecting launch options, so nothing is written into any home (R13), and home
   Note: claude treats a settings file passed with `--settings` like repository settings in one
   check: a cloud or teleport git-bundle upload refuses if such a file sets `env.PATH`, `env.HOME`,
   or similar variables (2.1.281 bundle). remuda shares them anyway; the case is rare.
-- **Plugins.** Enabled plugins are the keys set to `true` in the source settings' `enabledPlugins`,
-  except those set to `false` in the `enabledPlugins` of the home or of the project settings above,
-  and those the home has installed itself with `user` scope, or with `project` / `local` scope for
-  the start directory (listed in its own `plugins/installed_plugins.json`), which would otherwise
-  load twice.
+- **Plugins.** Enabled plugins are the keys whose value in the source settings' `enabledPlugins` is
+  `true` or an array (claude treats both as enabled), except those set to `false` in the
+  `enabledPlugins` of the home or of the project settings above, and those the home has installed
+  itself in a way claude loads here, which would otherwise load twice. claude loads an install
+  (2.1.281 bundle) when its scope is `user` or `managed`, or when its `projectPath` equals the start
+  directory, or when both the `projectPath` and the start directory are inside git repositories
+  with the same project root (auto-memory rule below). If the home's own `installed_plugins.json`
+  exists but is not recognized, remuda injects no plugins (R11 warns).
   Their install paths come from the source's `plugins/installed_plugins.json` (format version 2:
   `plugins.<name@marketplace>` is a list of installs; the first `user`-scoped install with an
   existing `installPath` is used). Basis (verified on 2.1.281): `enabledPlugins` alone does nothing
   in a home that has not installed the plugin, while `--plugin-dir=<install path>` loads it under
-  the same `name:item` names as an installed plugin, including the plugin's MCP servers. An unrecognized file means no plugin injection
-  and an R11 warning, never a failed launch.
+  the same `name:item` names as an installed plugin, including the plugin's MCP servers. An
+  unrecognized file means no plugin injection and an R11 warning, never a failed launch.
 - **Auto-memory.** Memory belongs with configuration, not with sessions: its default location is
   `<home>/projects/<project>/memory/`. remuda points it at the source's copy:
   `<source home>/projects/<project>/memory`, and must compute `<project>` exactly as claude does
@@ -582,7 +595,10 @@ by injecting launch options, so nothing is written into any home (R13), and home
     itself otherwise (a linked worktree, including a worktree of a bare repository); on any other
     outcome the root is the directory containing `.git` (a plain repository, a submodule, a
     separate git dir, a moved worktree). With no `.git` entry up to `/`, the root is the start
-    directory.
+    directory. Not replicated: claude refuses to follow a `.git` symlink, `gitdir`, or `commondir`
+    into network locations (on macOS, paths under `/net`, `/Network`, `/home/<user>`, `/.vol`,
+    `/.file`, and `//` UNC paths) and keeps walking up; in those rare layouts remuda may choose a
+    different project name.
   - The root is NFC-normalized. `<project>` replaces every UTF-16 code unit that is not an ASCII
     letter or digit with `-` (so a character outside the Basic Multilingual Plane becomes `--`).
   - If the root has more than 200 UTF-16 code units, claude truncates and hashes the name
