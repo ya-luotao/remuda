@@ -27,6 +27,13 @@ and makes no network requests of its own.
   of shared session stores, titles, working directories, fuzzy search and a message preview.
 - **Live sessions.** Running interactive and background Claude sessions per account (via
   `claude agents --json`), with attach, logs, stop and remove for background sessions.
+- **Shared configuration.** Name one Claude account as the source, and every other Claude account
+  launches with its instructions (`CLAUDE.md`, skills, commands, agents), settings, enabled
+  plugins and auto-memory, injected as launch options. Nothing is copied into the other homes,
+  and each account's own settings still take precedence.
+- **Relay.** Continue a Claude session under another account, for example when one account runs
+  out of usage: the session is copied into that account's session store and forked there. The
+  original is never modified.
 - **Account checks.** Warnings for conditions that silently break multi-account setups: an
   `ANTHROPIC_API_KEY` that overrides every login, dangling symlinks, missing or logged-out homes,
   and a shared `projects` store without `cleanupPeriodDays`.
@@ -119,6 +126,13 @@ List recent sessions across all accounts:
 remuda sessions --limit 10
 ```
 
+Continue a session under another account (`c` in the TUI does the same for the selected
+session):
+
+```sh
+remuda relay 766560c5-74e6-45f5-89fd-d92926b14898 personal
+```
+
 Codex accounts work the same way with `--provider codex`:
 
 ```sh
@@ -141,6 +155,7 @@ provider is an error that lists the candidates. The bare name `default` always m
 | `remuda sessions [--limit <N>]` | Print the newest sessions: time, attributed accounts, title and working directory (default 30). |
 | `remuda add [--provider <claude\|codex>] <name> <path>` | Register an existing home directory as an account. The provider defaults to `claude`. |
 | `remuda setup [--provider <claude\|codex>] <name> [--email <EMAIL>]` | Create a new home under `$REMUDA_HOME/homes/<provider>/<name>`, register it, and run the agent's login (`claude auth login` or `codex login`). `--email` prefills the Claude login. |
+| `remuda relay <session> <account>` | Continue a Claude session under another Claude account: copy its transcript and checkpoints into that account's session store and fork it there, in the session's last directory, replacing the `remuda` process. `<session>` is a full session ID from the index. |
 | `remuda help [<command>]` | Show help for remuda or a command. |
 
 Account names match `[A-Za-z0-9_-]+`. Because `run` forwards `-h` and `--help` to the agent, use
@@ -159,6 +174,7 @@ Press `?` in the TUI for the key reference.
 | `PgUp` `PgDn` | Page up / down |
 | `Enter` | History: resume the selected session (Codex asks for confirmation first). Live: attach to a background session |
 | `f` | Fork the selected session into a new session; the original is left unchanged |
+| `c` | Continue the selected Claude session under another account: choose the account, and the session is copied into its store and forked there (relay) |
 | `p`, `Space` | Expand or collapse the preview (Live and History) |
 | `n` | Accounts: start a new session with the selected account |
 | `s` | Accounts: set up a new Claude or Codex account, as `remuda setup` does |
@@ -181,7 +197,8 @@ without launching anything.
 
 Resuming a Claude session that is still running elsewhere is refused, because two processes
 writing the same session would overwrite each other. Codex has no source of running sessions, so
-resuming a Codex session in place always asks for confirmation.
+resuming a Codex session in place always asks for confirmation. Forks and relays only read the
+original session, so they are allowed while it runs.
 
 ## Configuration
 
@@ -191,6 +208,7 @@ Remuda keeps its files under `$REMUDA_HOME`, which defaults to `~/.remuda`:
 $REMUDA_HOME/
 ├── config.toml                    account registry; the single source of truth
 ├── homes/<provider>/<name>/       homes created by `remuda setup`
+├── shared/claude/.claude          symlink to the shared configuration's source home
 └── state/
     ├── index.json                 session index cache
     └── launches.jsonl             launch log
@@ -220,6 +238,51 @@ Homes must be absolute paths. The file is validated strictly on load: invalid or
 a registered `default`, or a relative home are reported as errors naming the file. Everything under
 `state/` is a cache and may be deleted at any time; it is rebuilt on the next run.
 
+### Shared configuration
+
+Sessions stay with the account that created them, but configuration can be shared. Name the
+account whose configuration the others get, typically `default` (whose home is `~/.claude`):
+
+```toml
+[share.claude]
+from = "default"
+
+[[account]]
+provider = "claude"
+name = "personal"
+home = "/Users/you/.remuda/homes/claude/personal"
+share = false          # this account keeps only its own configuration
+```
+
+Every other Claude account then starts its sessions (new ones, resumes, forks, `-p` runs; not
+subcommands, `--help` or `--version`) with the source's configuration, injected as launch options
+before your own arguments:
+
+- **Instructions:** `CLAUDE.md`, skills, commands and agents, through
+  `--add-dir=$REMUDA_HOME/shared/claude`, whose `.claude` entry is a symlink to the source home.
+- **Settings:** the part of the source's `settings.json` that the account's own settings do not
+  define, in one `--settings` option. The account's own values win; identical hook entries are not
+  added twice. If you pass `--settings` yourself, remuda injects no settings and says so.
+- **Plugins:** `--plugin-dir` for each plugin the source enables and has installed.
+- **Auto-memory:** the source's memory directory for the project, so every account remembers the
+  same things about it.
+
+Nothing is written into any account home. Homes that already share part of their configuration
+through symlinks are detected, and that part is not injected again. `share` applies to Claude
+accounts only, and `from` must name a Claude account; anything else is a load error. The Accounts
+view warns about problems such as a missing source home or a plugin whose install is gone.
+
+### Relay
+
+`remuda relay <session> <account>`, or `c` in the TUI, continues a Claude session under an account
+whose session store does not have it, for example when the session's own account has run out of
+usage. Remuda copies the transcript (up to its last complete record) and its checkpoints into the
+target account's store, then runs `claude --resume <id> --fork-session` there, in the session's
+last directory and with the shared configuration. The fork is a new session that belongs to the
+target account; the original is never modified, and the copy is hidden from the session history.
+A relay never overwrites anything except its own earlier copy of the same session, and only if
+that copy is unchanged.
+
 ## Safety guarantees
 
 Remuda manages paths to directories that hold agent credentials, so its write boundary is part of
@@ -230,9 +293,11 @@ the specification ([SPEC.md](SPEC.md), R2 and R13):
   never rewrites, canonicalizes or adds or removes a trailing slash from a registered home.
 - **Homes are never moved, renamed or deleted.** `remuda add` only records a name; it does not
   move, copy or create anything.
-- **Writes are confined to `$REMUDA_HOME`:** `config.toml`, `state/`, and the empty directories
-  created by `remuda setup`. Remuda never writes into any account home, and never writes
-  credentials, `.claude.json`, the Keychain, transcripts or `history.jsonl`.
+- **Writes are confined to `$REMUDA_HOME`:** `config.toml`, `state/`, `shared/`, and the empty
+  directories created by `remuda setup`. The one exception is an explicit relay, which copies one
+  transcript and its checkpoints into the target account's `projects/` and `file-history/`.
+  Otherwise remuda never writes into any account home, and it never writes credentials,
+  `.claude.json`, the Keychain, existing transcripts or `history.jsonl`.
 - **Credentials are never read.** Identity and usage come from the agents' own commands
   (`claude auth status --json`, `codex login status`, `claude -p /usage`) and non-secret local
   metadata. Remuda does not read the Keychain, Codex `auth.json` or session `*.key` files.
