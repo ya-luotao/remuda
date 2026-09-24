@@ -265,12 +265,13 @@ before your own arguments:
   nor the project's `.claude/settings.json` and `.claude/settings.local.json` define, so the
   shared settings behave like user settings; identical hook entries are not added twice. They are
   passed as one `--settings` file, written with mode 0600 under `$REMUDA_HOME/state/settings/`.
-  Authentication keys (such as `apiKeyHelper` or `env.ANTHROPIC_API_KEY`) are never shared. If
-  you pass `--settings` yourself, remuda injects no settings and says so.
+  Authentication and provider settings (such as `apiKeyHelper`, `env.ANTHROPIC_API_KEY` or
+  `env.CLAUDE_CODE_USE_BEDROCK`) are never shared. If you pass `--settings` or
+  `--setting-sources` yourself, remuda injects no settings and says so.
 - **Plugins:** `--plugin-dir` for each plugin the source enables and has installed, unless the
-  account turns it off or has installed it itself.
-- **Auto-memory:** the source's memory directory for the project (found the way claude finds it,
-  with one `git` call), so every account remembers the same things about it.
+  account or the project turns it off, or the account has installed it itself.
+- **Auto-memory:** the source's memory directory for the project (found the way claude finds it),
+  so every account remembers the same things about it.
 
 Nothing is written into any account home. Homes that already share part of their configuration
 through symlinks are detected, and that part is not injected again. `share` applies to Claude
