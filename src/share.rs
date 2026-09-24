@@ -192,6 +192,8 @@ pub fn inject(
         // What the home or the project turned off, or the home installed itself for this
         // directory, would otherwise load twice.
         let own_installs = installed_plugins(&home);
+        // Which of them the home has cannot be told: nothing is injected (R11 warns).
+        let own_unknown = matches!(own_installs, Installs::Unrecognized(_));
         let off = |plugin: &str| {
             std::iter::once(&own).chain(&layers).any(|settings| {
                 settings
@@ -201,6 +203,9 @@ pub fn inject(
             })
         };
         for plugin in enabled_plugins(&source_settings) {
+            if own_unknown {
+                break;
+            }
             if off(&plugin) || own_installs.installed_for(&plugin, project.start.as_deref()) {
                 continue;
             }
@@ -233,7 +238,7 @@ pub fn write_settings(dir: &Path, json: &str, now: SystemTime) -> Result<PathBuf
         .with_context(|| format!("cannot create {}", dir.display()))?;
     // Held until this returns: a file is never pruned between being chosen and being marked
     // used, by this remuda or another.
-    let _lock = DirLock::exclusive(dir)?;
+    let _lock = SettingsLock::exclusive(dir)?;
     if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
         fs::OpenOptions::new()
             .write(true)
@@ -261,29 +266,50 @@ pub fn write_settings(dir: &Path, json: &str, now: SystemTime) -> Result<PathBuf
     Ok(path)
 }
 
-/// An exclusive `flock` on a directory, released when dropped (its descriptor closes).
-struct DirLock(fs::File);
+/// The lock file of the settings directory: never a settings file, so never pruned.
+pub const SETTINGS_LOCK: &str = ".lock";
 
-impl DirLock {
-    fn exclusive(dir: &Path) -> Result<DirLock> {
-        let file = fs::File::open(dir).with_context(|| format!("cannot open {}", dir.display()))?;
+/// An exclusive `flock` on `<dir>/.lock` (a regular file, 0600), released when dropped. On a
+/// file system without locking there is no lock, and remuda goes on without it (R18).
+struct SettingsLock(Option<fs::File>);
+
+impl SettingsLock {
+    fn exclusive(dir: &Path) -> Result<SettingsLock> {
+        let path = dir.join(SETTINGS_LOCK);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
         loop {
             // SAFETY: the descriptor is open for the call.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(DirLock(file));
+                return Ok(SettingsLock(Some(file)));
             }
             let e = io::Error::last_os_error();
-            if e.kind() != io::ErrorKind::Interrupted {
-                return Err(e).with_context(|| format!("cannot lock {}", dir.display()));
+            let code = e.raw_os_error().unwrap_or(0);
+            if code == libc::EINTR {
+                continue;
             }
+            // Not a pattern: EOPNOTSUPP and ENOTSUP are one value on Linux.
+            let unsupported = [libc::EBADF, libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP];
+            if unsupported.contains(&code) {
+                return Ok(SettingsLock(None));
+            }
+            return Err(e).with_context(|| format!("cannot lock {}", path.display()));
         }
     }
 }
 
-impl Drop for DirLock {
+impl Drop for SettingsLock {
     fn drop(&mut self) {
-        // SAFETY: the descriptor is still open; closing it would release the lock anyway.
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        if let Some(file) = &self.0 {
+            // SAFETY: the descriptor is still open; closing it would release the lock anyway.
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
     }
 }
 
@@ -315,59 +341,89 @@ fn prune_settings(dir: &Path, now: SystemTime) {
 }
 
 /// Settings keys that choose credentials, provider or organization: never injected (R18).
-pub const AUTH_KEYS: [&str; 7] = [
+pub const AUTH_KEYS: [&str; 8] = [
     "apiKeyHelper",
     "proxyAuthHelper",
+    "otelHeadersHelper",
     "awsAuthRefresh",
     "awsCredentialExport",
     "gcpAuthRefresh",
     "forceLoginMethod",
     "forceLoginOrgUUID",
 ];
-/// `env` names starting with one of these choose a provider, credentials or an endpoint (R18).
-pub const AUTH_ENV_PREFIXES: [&str; 9] = [
+/// `env` names starting with one of these choose a provider, credentials, an endpoint or host
+/// authentication (R18).
+pub const AUTH_ENV_PREFIXES: [&str; 21] = [
     "ANTHROPIC_",
     "AWS_",
     "AZURE_",
     "GOOGLE_",
+    "GCLOUD_",
+    "GCE_",
     "CLOUDSDK_",
     "CLOUD_ML_",
+    "VERTEX_",
+    "METADATA_",
+    "IDENTITY_",
+    "IMDS_",
+    "MSI_",
     "CLAUDE_CODE_USE_",
     "CLAUDE_CODE_SKIP_",
+    "CLAUDE_CODE_HOST_",
+    "CLAUDE_CODE_PROVIDER_",
+    "CLAUDE_CODE_FEDERATION_",
+    "CLAUDE_CODE_CERT",
+    "CLAUDE_CODE_CLIENT_CERT",
     "_CLAUDE_CODE_",
 ];
 /// `env` names containing one of these may hold a secret or an endpoint (R18).
-pub const AUTH_ENV_PARTS: [&str; 8] = [
+pub const AUTH_ENV_PARTS: [&str; 10] = [
     "TOKEN",
     "KEY",
     "SECRET",
     "PASSWORD",
     "CREDENTIAL",
+    "CREDS",
     "OAUTH",
     "UUID",
     "BASE_URL",
+    "HEADERS",
 ];
-/// `env` names that select the account's own files (R2, R18).
-pub const AUTH_ENV_EXACT: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"];
+/// `env` names withheld exactly: the account's own files (R2), and proxy URLs, which can carry
+/// credentials (R18).
+pub const AUTH_ENV_EXACT: [&str; 5] = [
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+];
 
-/// Whether the settings `env` variable `name` is withheld from members (R18). Names are
-/// matched in upper case. The model-name variables (`ANTHROPIC_MODEL`,
-/// `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL*`) are shared, unless the name also
-/// contains a secret-like part.
+/// Whether the settings `env` variable `name` is withheld from members (R18), matched
+/// case-insensitively: an exact name, a prefix, a secret-like part, or an underscore-separated
+/// part `AUTH`. Two kinds of names are exceptions to the one rule that would otherwise catch
+/// them: the model-name variables (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_MODEL`,
+/// `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL*`, `ANTHROPIC_CUSTOM_MODEL_OPTION*`,
+/// excepted from the `ANTHROPIC_` prefix) and counts ending in `_TOKENS` (excepted from the
+/// `TOKEN` part); any other rule still withholds them.
 pub fn withheld_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if AUTH_ENV_EXACT.contains(&upper.as_str()) {
         return true;
     }
-    if AUTH_ENV_PARTS.iter().any(|part| upper.contains(part)) {
-        return true;
-    }
-    let model = upper == "ANTHROPIC_MODEL"
-        || upper == "ANTHROPIC_SMALL_FAST_MODEL"
-        || upper
-            .strip_prefix("ANTHROPIC_DEFAULT_")
-            .is_some_and(|rest| rest.contains("_MODEL"));
-    !model && AUTH_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
+    let model = matches!(
+        upper.as_str(),
+        "ANTHROPIC_MODEL" | "ANTHROPIC_DEFAULT_MODEL" | "ANTHROPIC_SMALL_FAST_MODEL"
+    ) || upper
+        .strip_prefix("ANTHROPIC_DEFAULT_")
+        .is_some_and(|rest| rest.contains("_MODEL"))
+        || upper.starts_with("ANTHROPIC_CUSTOM_MODEL_OPTION");
+    // The part of the name the part rules look at: a count's `_TOKENS` is not a token.
+    let stem = upper.strip_suffix("_TOKENS").unwrap_or(&upper);
+    let prefixed = !model && AUTH_ENV_PREFIXES.iter().any(|p| upper.starts_with(p));
+    let part = AUTH_ENV_PARTS.iter().any(|p| stem.contains(p));
+    let auth = stem.split('_').any(|p| p == "AUTH");
+    prefixed || part || auth
 }
 
 /// The authentication settings `settings` has, as `key` or `env.VAR`: withheld from members
@@ -644,7 +700,8 @@ pub fn missing_from(source: &Map<String, Value>, home: &Map<String, Value>) -> M
     out
 }
 
-/// The plugins `settings` enables: keys of `enabledPlugins` set to `true`.
+/// The plugins `settings` enables: keys of `enabledPlugins` set to `true` or to an array (claude
+/// treats both as enabled).
 pub fn enabled_plugins(settings: &Map<String, Value>) -> Vec<String> {
     settings
         .get("enabledPlugins")
@@ -652,7 +709,7 @@ pub fn enabled_plugins(settings: &Map<String, Value>) -> Vec<String> {
         .map(|plugins| {
             plugins
                 .iter()
-                .filter(|(_, on)| on.as_bool() == Some(true))
+                .filter(|(_, on)| on.as_bool() == Some(true) || on.is_array())
                 .map(|(name, _)| name.clone())
                 .collect()
         })
@@ -692,17 +749,26 @@ impl Installs {
             .find(|p| p.is_absolute() && p.exists())
     }
 
-    /// Whether `plugin` is installed here for a session in `start` (R18): with `user` scope, or
-    /// with `project` / `local` scope for `start` itself.
+    /// Whether an install of `plugin` here is one claude loads for a session in `start` (R18,
+    /// its `wb`): with `user` or `managed` scope, with `projectPath` equal to `start`, or with
+    /// `projectPath` and `start` in git repositories of the same root.
     pub fn installed_for(&self, plugin: &str, start: Option<&Path>) -> bool {
         let Installs::Known(plugins) = self else {
             return false;
         };
+        let start_root = start.and_then(git_root);
         plugins.get(plugin).is_some_and(|installs| {
-            installs.iter().any(|i| match i.scope.as_deref() {
-                Some("user") => true,
-                Some("project" | "local") => start.is_some() && i.project.as_deref() == start,
-                _ => false,
+            installs.iter().any(|i| {
+                if matches!(i.scope.as_deref(), Some("user" | "managed")) {
+                    return true;
+                }
+                let Some(project) = i.project.as_deref() else {
+                    return false;
+                };
+                start == Some(project)
+                    || start_root
+                        .as_ref()
+                        .is_some_and(|root| git_root(project).as_ref() == Some(root))
             })
         })
     }
@@ -770,31 +836,35 @@ pub fn encode_project(root: &str) -> Option<String> {
     )
 }
 
-/// The project root of `start` as claude 2.1.281 finds it, without running git (R18; its
-/// `Gt` and `Ce`/`Ht`): the first directory from `start` up to `/` with a `.git` entry,
-/// mapped from a linked worktree to its main repository by [`linked_worktree_root`]; with no
-/// `.git` anywhere, `start` itself. NFC.
-///
-/// claude also refuses gitdir and commondir paths that lead through network mounts or UNC
-/// spellings; remuda does not reproduce that guard (it only ever reads these files).
+/// The project root of `start` as claude 2.1.281 finds it, without running git (R18): its
+/// [`git_root`], or with no `.git` anywhere up to `/`, `start` itself. NFC.
 pub fn project_root(start: &Path) -> PathBuf {
+    git_root(start).unwrap_or_else(|| nfc_path(start.to_path_buf()))
+}
+
+/// claude's canonical git root (its `Fr`: `Gt`, then `Ce`/`Ht`): the first directory from
+/// `start` up to `/` with a `.git` entry, mapped from a linked worktree to its main repository
+/// by [`linked_worktree_root`]; `None` when there is no `.git` up to `/`. NFC.
+///
+/// Not replicated (R18): claude refuses to follow a `.git` symlink, a `gitdir` or a `commondir`
+/// into network locations (on macOS `/net`, `/Network`, `/home/<user>`, `/.vol`, `/.file`, and
+/// `//` UNC paths) and keeps walking up; in those rare layouts remuda may choose a different
+/// root.
+pub fn git_root(start: &Path) -> Option<PathBuf> {
     let mut dir = start;
-    let found = loop {
+    loop {
         if is_git_entry(&dir.join(".git")) {
-            break Some(dir);
+            let root = linked_worktree_root(dir).unwrap_or_else(|| dir.to_path_buf());
+            return Some(nfc_path(root));
         }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => break None,
-        }
-    };
-    let root = match found {
-        Some(dir) => linked_worktree_root(dir).unwrap_or_else(|| dir.to_path_buf()),
-        None => start.to_path_buf(),
-    };
-    match root.to_str() {
-        Some(r) => PathBuf::from(r.nfc().collect::<String>()),
-        None => root,
+        dir = dir.parent()?;
+    }
+}
+
+fn nfc_path(path: PathBuf) -> PathBuf {
+    match path.to_str() {
+        Some(p) => PathBuf::from(p.nfc().collect::<String>()),
+        None => path,
     }
 }
 
@@ -1518,14 +1588,21 @@ mod tests {
         age(&recent, 10 * day);
         fs::write(settings.join("notes.json"), "mine").unwrap();
         age(&settings.join("notes.json"), 90 * day);
-        // A new file now: `a` (40 days) and `b` (35 days) go; `recent` and `notes.json` stay.
+        age(&settings.join(SETTINGS_LOCK), 90 * day);
+        // A new file now: `a` (40 days) and `b` (35 days) go; `recent`, `notes.json` and the
+        // lock file stay.
         let d = write_settings(&settings, r#"{"d":1}"#, now).unwrap();
         let mut left: Vec<PathBuf> = fs::read_dir(&settings)
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect();
         left.sort();
-        let mut want = vec![recent, d, settings.join("notes.json")];
+        let mut want = vec![
+            recent,
+            d,
+            settings.join("notes.json"),
+            settings.join(SETTINGS_LOCK),
+        ];
         want.sort();
         assert_eq!(left, want);
     }
@@ -1778,16 +1855,175 @@ mod tests {
         );
     }
 
-    /// R18: the settings directory lock excludes a second holder until the first is dropped.
+    /// R18: the settings lock is `.lock`, a regular 0600 file, and excludes a second holder
+    /// until the first is dropped; pruning never removes it.
     #[test]
-    fn the_settings_directory_lock_is_exclusive() {
+    fn the_settings_lock_is_exclusive_and_kept() {
         let dir = tempfile::tempdir().unwrap();
-        let held = DirLock::exclusive(dir.path()).unwrap();
-        let other = fs::File::open(dir.path()).unwrap();
+        let held = SettingsLock::exclusive(dir.path()).unwrap();
+        assert!(held.0.is_some());
+        let lock = dir.path().join(SETTINGS_LOCK);
+        let meta = fs::symlink_metadata(&lock).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        let other = fs::File::open(&lock).unwrap();
         // SAFETY: the descriptor is open for the call.
         let try_lock = || unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(try_lock(), -1, "held elsewhere");
         drop(held);
         assert_eq!(try_lock(), 0);
+    }
+
+    /// R18 (third review): the env rules with claude's host-auth, metadata and Vertex groups,
+    /// proxies and telemetry headers; token counts and model names are kept.
+    #[test]
+    fn the_env_rules_withhold_by_group_and_keep_counts() {
+        for name in [
+            "GCLOUD_PROJECT",
+            "CLAUDE_CODE_HOST_CREDS_FILE",
+            "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH",
+            "GCE_METADATA_HOST",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "ALL_PROXY",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "VERTEX_REGION_CLAUDE_4",
+            "IMDS_ENDPOINT",
+            "MSI_ENDPOINT",
+            "IDENTITY_HEADER",
+            "METADATA_SERVER",
+            "CLAUDE_CODE_CLIENT_CERT",
+            "CLAUDE_CODE_CERT_STORE",
+            "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+            "CLAUDE_CODE_FEDERATION_ROLE",
+            "MY_AUTH",
+            "ANTHROPIC_MAX_TOKENS",
+            "GITHUB_TOKEN_MAX_TOKENS",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_API_KEY",
+        ] {
+            assert!(withheld_env(name), "{name} should be withheld");
+        }
+        for name in [
+            "GIT_AUTHOR_NAME",
+            "MAX_THINKING_TOKENS",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+            "ANTHROPIC_DEFAULT_MODEL",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "DISABLE_TELEMETRY",
+            "AUTHOR",
+            "NO_PROXY",
+        ] {
+            assert!(!withheld_env(name), "{name} should be shared");
+        }
+        let settings = map(json!({"otelHeadersHelper": "/h", "env": {"HTTPS_PROXY": "x"}}));
+        assert_eq!(
+            withheld(&settings),
+            ["otelHeadersHelper", "env.HTTPS_PROXY"]
+        );
+    }
+
+    /// R18: a home install counts as the home's own when claude loads it here: `user` or
+    /// `managed` scope, `projectPath` equal to the start directory, or both in git repositories
+    /// of the same root (claude's `wb`); outside git, only the same path.
+    #[test]
+    fn home_installs_count_when_claude_would_load_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join("a")).unwrap();
+        fs::create_dir_all(repo.join("b")).unwrap();
+        let other = root.join("other");
+        fs::create_dir_all(other.join(".git")).unwrap();
+        let (plain1, plain2) = (root.join("p1"), root.join("p2"));
+        fs::create_dir_all(&plain1).unwrap();
+        fs::create_dir_all(&plain2).unwrap();
+        let install = |scope: &str, project: Option<&Path>| Install {
+            scope: Some(scope.into()),
+            path: Some(PathBuf::from("/i")),
+            project: project.map(Path::to_path_buf),
+        };
+        let with = |i: Install| Installs::Known([("x@m".to_string(), vec![i])].into());
+        let start = repo.join("a");
+        let cases = [
+            (install("user", None), true),
+            (install("managed", None), true),
+            (install("project", Some(&start)), true),
+            (install("local", Some(&repo.join("b"))), true),
+            (install("project", Some(&repo)), true),
+            (install("project", Some(&other)), false),
+            (install("project", None), false),
+            (install("weird", Some(&plain1)), false),
+        ];
+        for (i, want) in cases {
+            assert_eq!(
+                with(i.clone()).installed_for("x@m", Some(&start)),
+                want,
+                "{i:?}"
+            );
+        }
+        // Outside git only the same path counts.
+        let plain = with(install("local", Some(&plain2)));
+        assert!(!plain.installed_for("x@m", Some(&plain1)));
+        assert!(plain.installed_for("x@m", Some(&plain2)));
+        assert!(!plain.installed_for("y@m", Some(&plain2)));
+        assert!(!Installs::Missing.installed_for("x@m", Some(&plain2)));
+        assert_eq!(git_root(&plain1), None);
+        assert_eq!(project_root(&plain1), plain1);
+    }
+
+    /// R18: an `enabledPlugins` array counts as enabled; a home whose own
+    /// `installed_plugins.json` cannot be read gets no plugin at all.
+    #[test]
+    fn plugin_arrays_and_an_unreadable_home_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (source_home, max) = (root.join("src"), root.join("max"));
+        let cache = source_home.join("plugins/cache");
+        fs::create_dir_all(cache.join("a")).unwrap();
+        fs::create_dir_all(max.join("plugins")).unwrap();
+        fs::write(
+            source_home.join("settings.json"),
+            json!({"enabledPlugins": {"a@m": ["skill-one"]}}).to_string(),
+        )
+        .unwrap();
+        fs::write(
+            source_home.join("plugins/installed_plugins.json"),
+            json!({"version": 2, "plugins": {
+                "a@m": [{"scope": "user", "installPath": cache.join("a")}]}})
+            .to_string(),
+        )
+        .unwrap();
+        let sharing = Sharing {
+            source: Some(named("src", &source_home)),
+            opted_out: vec![],
+        };
+        let config = root.join("remuda/config.toml");
+        let run = || {
+            inject(
+                &sharing,
+                &named("max", &max),
+                &["--settings=/x".into()],
+                Some(&root),
+                &Env::new(),
+                &config,
+            )
+            .unwrap()
+            .args
+        };
+        assert_eq!(
+            run(),
+            [format!("--plugin-dir={}", cache.join("a").display())]
+        );
+        fs::write(
+            max.join("plugins/installed_plugins.json"),
+            r#"{"version": 9}"#,
+        )
+        .unwrap();
+        assert_eq!(run(), Vec::<String>::new());
     }
 }

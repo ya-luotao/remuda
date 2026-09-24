@@ -125,6 +125,18 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
         let Some(home) = account.home_dir(env).filter(|d| d.is_dir()) else {
             continue;
         };
+        if !share::resolves_to(&home.join("plugins"), &from.join("plugins"))
+            && let Installs::Unrecognized(path) = share::installed_plugins(&home)
+        {
+            checks.push(Check {
+                account: Some(account.qualified()),
+                message: format!(
+                    "{} is not in a recognized format: plugins from {name} are not shared with \
+                     this account",
+                    path.display()
+                ),
+            });
+        }
         let items = share::instructions(&from, &home);
         if items.partial() {
             checks.push(Check {
@@ -507,6 +519,35 @@ mod tests {
                 &sharing_from(Account::default_for(CLAUDE))
             ),
             []
+        );
+    }
+
+    /// R11, R18: a member whose own `installed_plugins.json` is not recognized gets no
+    /// plugins, and is told.
+    #[test]
+    fn a_members_unrecognized_plugin_list() {
+        let f = fixture();
+        let max = f.root.join("max");
+        fs::create_dir_all(max.join("plugins")).unwrap();
+        let file = max.join("plugins/installed_plugins.json");
+        fs::write(&file, "[]").unwrap();
+        let accounts = vec![Account::default_for(CLAUDE), named("max", &max)];
+        let got = sharing_checks(
+            &accounts,
+            &f.env,
+            &sharing_from(Account::default_for(CLAUDE)),
+        );
+        assert_eq!(
+            messages(&got),
+            [(
+                Some("claude:max"),
+                format!(
+                    "{} is not in a recognized format: plugins from claude:default are not \
+                     shared with this account",
+                    file.display()
+                )
+                .as_str()
+            )]
         );
     }
 

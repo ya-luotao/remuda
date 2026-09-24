@@ -521,10 +521,14 @@ fn settings_go_through_a_private_file() {
         again.args[1], first.args[1],
         "the same content reuses its file"
     );
-    let files = fs::read_dir(s.sb.remuda_home().join("state/settings"))
+    let mut files: Vec<String> = fs::read_dir(s.sb.remuda_home().join("state/settings"))
         .unwrap()
-        .count();
-    assert_eq!(files, 1);
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    let name = Path::new(&path).file_name().unwrap().to_str().unwrap();
+    // One settings file, and the lock that guards the directory.
+    assert_eq!(files, [".lock", name]);
 }
 
 /// R18: authentication keys of the source never reach a member.
