@@ -151,16 +151,30 @@ pub fn parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use super::*;
 
+    /// Written through a `sh` child, so this process never holds a write descriptor on the
+    /// script: on Linux, a child forked by another test thread inherits such a descriptor
+    /// until it execs, and running the script meanwhile fails with ETXTBSY.
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::io::Write;
         let path = dir.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let text = format!("#!/bin/sh\n{body}\n");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
         path
     }
 

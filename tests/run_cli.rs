@@ -3,7 +3,6 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 
 use common::Sandbox;
 use predicates::prelude::*;
@@ -207,8 +206,7 @@ fn run_reports_exec_failure() {
     // Executable, but its interpreter does not exist: execve fails with ENOENT.
     let bad = sb.root().join("badbin");
     fs::create_dir(&bad).unwrap();
-    fs::write(bad.join("claude"), "#!/nonexistent/interpreter\n").unwrap();
-    fs::set_permissions(bad.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&bad.join("claude"), "#!/nonexistent/interpreter\n");
     sb.remuda()
         .env("PATH", format!("{}:/usr/bin:/bin", bad.display()))
         .args(["run", "max", "doctor"])
