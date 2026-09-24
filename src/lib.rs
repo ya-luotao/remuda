@@ -14,6 +14,7 @@ pub mod paths;
 pub mod probe;
 pub mod provider;
 pub mod registry;
+pub mod relay;
 pub mod setup;
 pub mod share;
 pub mod text;

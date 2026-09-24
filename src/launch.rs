@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::Env;
 use crate::provider::Provider;
 use crate::registry::{Account, Home, Sharing};
+use crate::relay::Relay;
 use crate::share::{self, Injected, Shared};
 
 pub const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
@@ -259,6 +260,9 @@ pub struct LaunchRecord {
     /// absent when nothing was.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub shared: Vec<Injected>,
+    /// What a relay copied before this fork (R19); absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<Relay>,
 }
 
 /// A fully decided launch: what to exec and what to log.
@@ -356,6 +360,7 @@ pub fn prepare_with(
         fork_of,
         injected,
         shared: shared.logged(),
+        relay: None,
     };
     Ok(Launch {
         args: [shared.args, args].concat(),
@@ -798,6 +803,7 @@ mod tests {
                 fork_of: None,
                 injected: true,
                 shared: vec![],
+                relay: None,
             }
         );
     }
@@ -1024,6 +1030,7 @@ mod tests {
                 fork_of: None,
                 injected: false,
                 shared: vec![],
+                relay: None,
             }
         );
     }
@@ -1089,6 +1096,7 @@ mod tests {
             fork_of: None,
             injected: false,
             shared: vec![],
+            relay: None,
         };
         append_log(&log, &rec).unwrap();
         append_log(&log, &rec).unwrap();

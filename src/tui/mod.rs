@@ -35,7 +35,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::provider::Provider;
 use crate::registry::{Account, Registry};
-use crate::{Env, launch, paths, setup, share};
+use crate::{Env, launch, paths, relay, setup, share};
 
 use app::{App, Effect, Event, Exit, Key, LaunchRequest, Mode};
 
@@ -304,6 +304,13 @@ fn event_loop(
                         let size = terminal.size()?;
                         let _ = tx.send(Event::Resize(size.width, size.height));
                     }
+                    Effect::Relay { request, source } => {
+                        let event = relay_in_foreground(terminal, &deps, request, &source)?;
+                        // Results come back through the queue, after this batch.
+                        let _ = tx.send(event);
+                        let size = terminal.size()?;
+                        let _ = tx.send(Event::Resize(size.width, size.height));
+                    }
                     Effect::Setup {
                         provider,
                         name,
@@ -363,7 +370,24 @@ pub fn launch_in_foreground(
     deps: &Deps,
     request: LaunchRequest,
 ) -> Result<Event> {
-    let (result, warnings) = run_launch(screen, deps, &request)?;
+    let (result, warnings) = run_launch(screen, deps, &request, None)?;
+    Ok(Event::Launched {
+        request,
+        result,
+        warnings,
+    })
+}
+
+/// A relay (R19): `source` is copied into the store of the request's account (refused
+/// before anything is written when it must be), then its fork runs like
+/// [`launch_in_foreground`]. The TUI steps aside only once the copy is done.
+pub fn relay_in_foreground(
+    screen: &mut impl Screen,
+    deps: &Deps,
+    request: LaunchRequest,
+    source: &relay::Source,
+) -> Result<Event> {
+    let (result, warnings) = run_launch(screen, deps, &request, Some(source))?;
     Ok(Event::Launched {
         request,
         result,
@@ -375,6 +399,7 @@ fn run_launch(
     screen: &mut impl Screen,
     deps: &Deps,
     request: &LaunchRequest,
+    relay: Option<&relay::Source>,
 ) -> Result<(Result<Exit, String>, Vec<String>)> {
     let provider = request.account.provider;
     let Some(program) = deps.program(provider) else {
@@ -383,17 +408,29 @@ fn run_launch(
     };
     let cwd = request.cwd.as_deref().or(deps.cwd.as_deref());
     // The registry as it is now, for its shared configuration (R18).
-    let planned = Registry::load(&deps.config).and_then(|registry| {
-        launch::plan(
+    let log = deps.state_dir.join("launches.jsonl");
+    let ts = (deps.clock)().to_string();
+    let planned = Registry::load(&deps.config).and_then(|registry| match relay {
+        None => launch::plan(
             &request.account,
             request.args.clone(),
             cwd,
-            (deps.clock)().to_string(),
+            ts,
             || uuid::Uuid::new_v4().to_string(),
             &registry.sharing,
             &deps.env,
             &share::dir(&deps.config),
-        )
+        ),
+        Some(source) => relay::prepare(
+            source,
+            &request.account,
+            &registry.all(&deps.env),
+            &registry.sharing,
+            &deps.env,
+            &log,
+            &share::dir(&deps.config),
+            ts,
+        ),
     });
     let plan = match planned {
         Ok(plan) => plan,
@@ -401,7 +438,6 @@ fn run_launch(
     };
     let mut warnings = launch::env_warnings(&deps.env);
     warnings.extend(plan.notices.iter().cloned());
-    let log = deps.state_dir.join("launches.jsonl");
     if let Err(e) = screen.suspend() {
         let _ = screen.resume();
         return Ok((Err(format!("cannot hand the terminal over: {e}")), warnings));

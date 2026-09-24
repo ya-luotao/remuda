@@ -26,13 +26,17 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
 /// Starts `effect` in the background. Leaving the TUI ([`Effect::Quit`], [`Effect::Pick`])
-/// and the foreground runs ([`Effect::Launch`], [`Effect::Setup`]) are the event loop's own
-/// business.
+/// and the foreground runs ([`Effect::Launch`], [`Effect::Relay`], [`Effect::Setup`]) are the
+/// event loop's own business.
 pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
     let deps = Arc::clone(deps);
     let tx = tx.clone();
     match effect {
-        Effect::Quit | Effect::Pick(_) | Effect::Launch(_) | Effect::Setup { .. } => {}
+        Effect::Quit
+        | Effect::Pick(_)
+        | Effect::Launch(_)
+        | Effect::Relay { .. }
+        | Effect::Setup { .. } => {}
         Effect::RefreshIndex => {
             thread::spawn(move || refresh_index(&deps, &tx));
         }

@@ -16,7 +16,7 @@ use crate::{text, usage::format_age};
 
 use super::app::{
     AccountState, App, Confirm, Form, FormKind, Level, ListState, Mode, Overlay, PREVIEW_MESSAGES,
-    Pick, ResumeCodex, View, short_id,
+    Pick, PickFor, ResumeCodex, View, short_id,
 };
 use super::timeline;
 use crate::live::Control;
@@ -287,14 +287,17 @@ fn hints(app: &App) -> String {
     } else if app.history.searching && app.view == View::History {
         "type to filter · ↑/↓: move · enter: keep filter · esc: clear"
     } else if app.preview.expanded && app.view != View::Accounts {
-        "j/k/pgup/pgdn: scroll · esc/p: back · enter: resume · f: fork"
+        "j/k/pgup/pgdn: scroll · esc/p: back · enter: resume · f: fork · c: continue as…"
     } else {
         match app.view {
             View::Accounts => "n: new session · s: set up an account · u: live usage · r: refresh",
             View::Live => {
-                "enter: attach · f: fork · p: preview · l: logs · x: stop · D: rm · a: stopped"
+                "enter: attach · f: fork · c: continue as… · p: preview · l: logs · x: stop · \
+                 D: rm · a: stopped"
             }
-            View::History => "enter: resume · f: fork · p: preview · /: search · a: show all",
+            View::History => {
+                "enter: resume · f: fork · c: continue as… · p: preview · /: search · a: show all"
+            }
         }
     };
     format!(" {text}")
@@ -1020,6 +1023,10 @@ pub const KEYS: &[(&str, &str)] = &[
         "f",
         "fork the selected session (a new id; the original stays as it is)",
     ),
+    (
+        "c",
+        "continue a claude session under another account (copied into its store, then forked)",
+    ),
     ("p / space", "expand the preview"),
     ("n", "accounts: new session with the selected account"),
     (
@@ -1076,7 +1083,11 @@ fn boxed(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {
 }
 
 fn pick_box(app: &App, pick: &Pick, f: &mut Frame, area: Rect) {
-    let verb = if pick.fork { "Fork" } else { "Resume" };
+    let verb = match pick.action {
+        PickFor::Resume => "Resume",
+        PickFor::Fork => "Fork",
+        PickFor::Relay => "Continue",
+    };
     let title = format!("{verb} {} as…", short_id(&pick.session_id));
     let name_w = pick
         .options
@@ -1110,10 +1121,13 @@ fn pick_box(app: &App, pick: &Pick, f: &mut Frame, area: Rect) {
             ];
             // The registry may have changed while the picker is open (R17).
             let registered = app.accounts.iter().any(|a| a.account.qualified() == *q);
-            let problem = if registered {
-                app.store_problem(q, &pick.path)
-            } else {
+            // A relay goes to another store by design: that is not a problem there.
+            let problem = if !registered {
                 Some("no longer registered")
+            } else if pick.action == PickFor::Relay {
+                None
+            } else {
+                app.store_problem(q, &pick.path)
             };
             if let Some(problem) = problem {
                 spans.push(Span::styled(format!("  {problem}"), DIM));
