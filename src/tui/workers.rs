@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::index::{self, Index};
 use crate::provider::{Provider, codex};
-use crate::registry::{Account, Registry};
+use crate::registry::{self, Account, Registry};
 use crate::{attribution, checks, identity, live, transcript, usage};
 
 use super::Deps;
@@ -156,6 +156,21 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                     .ok()
                     .and_then(|t| jiff::Timestamp::try_from(t).ok());
                 let _ = tx.send(Event::RolloutWritten { path, at });
+            });
+        }
+        // The accounts are read again first; the same sender keeps them ahead of the result,
+        // so the rows are rebuilt by the time it is told.
+        Effect::RemoveAccount(account) => {
+            thread::spawn(move || {
+                let result =
+                    registry::unregister(&deps.config, &account).map_err(|e| format!("{e:#}"));
+                if let Ok(registry) = Registry::load(&deps.config) {
+                    let accounts = registry.all(&deps.env);
+                    if accounts != deps.accounts {
+                        let _ = tx.send(Event::Accounts(accounts));
+                    }
+                }
+                let _ = tx.send(Event::AccountRemoved { account, result });
             });
         }
         Effect::Preview(path, provider) => {
@@ -527,5 +542,37 @@ mod tests {
                 result: Err("`claude` not found on PATH".into())
             }]
         );
+    }
+
+    /// R14a, R16: the account leaves config.toml (its home stays), and the registry read
+    /// again arrives before the result.
+    #[test]
+    fn remove_account_rewrites_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let max = deps.accounts[0].clone();
+        let Home::Path(home) = max.home.clone() else {
+            unreachable!()
+        };
+        fs::write(
+            &deps.config,
+            format!("[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{home}\"\n"),
+        )
+        .unwrap();
+        let events = collect(Effect::RemoveAccount(max.clone()), &deps, |e| {
+            matches!(e, Event::AccountRemoved { .. })
+        });
+        assert_eq!(
+            events,
+            [
+                Event::Accounts(vec![Account::default_for(CLAUDE)]),
+                Event::AccountRemoved {
+                    account: max,
+                    result: Ok(())
+                }
+            ]
+        );
+        assert!(!fs::read_to_string(&deps.config).unwrap().contains("max"));
+        assert!(Path::new(&home).join("projects/-w/s1.jsonl").exists());
     }
 }

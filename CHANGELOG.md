@@ -22,7 +22,8 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   there. The original session is never modified.
 - `remuda remove <account>` unregisters an account (SPEC R14a). The home directory is left in
   place, and its path is printed so it can be registered again; `default` and the source of
-  shared configuration cannot be removed.
+  shared configuration cannot be removed. `D` in the TUI's Accounts view does the same after
+  confirmation.
 
 ### Fixed
 

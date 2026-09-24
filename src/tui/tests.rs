@@ -1956,6 +1956,91 @@ fn setup_form_validates_like_remuda_setup() {
     );
 }
 
+/// R16, R14a: `D` in Accounts asks before removing the selected account; `default` is refused.
+#[test]
+fn d_in_accounts_asks_and_refuses_default() {
+    let mut app = app();
+    keys(&mut app, &[Key::Char('1')]);
+    assert_eq!(keys(&mut app, &[Key::Char('D')]), []);
+    assert_eq!(app.overlay, None);
+    let (said, level) = notice(&app).unwrap();
+    assert!(said.contains("implicit"), "{said}");
+    assert_eq!(level, Level::Warn);
+
+    assert_eq!(keys(&mut app, &[Key::Char('j'), Key::Char('D')]), []);
+    assert_eq!(app.overlay, Some(Overlay::RemoveAccount(account("max"))));
+    let all = text(&app);
+    assert!(all.contains("Remove max"), "{all}");
+    assert!(all.contains("/h/max"), "{all}");
+    assert!(all.contains("y: yes · any other key: cancel"), "{all}");
+
+    assert_eq!(keys(&mut app, &[Key::Char('n')]), []);
+    assert_eq!(app.overlay, None);
+    assert_eq!(notice(&app), Some(("cancelled", Level::Info)));
+
+    assert_eq!(
+        keys(&mut app, &[Key::Char('D'), Key::Char('y')]),
+        [Effect::RemoveAccount(account("max"))]
+    );
+    assert_eq!(app.overlay, None);
+}
+
+/// R16: the rows are rebuilt from the registry read again, then the result is told.
+#[test]
+fn removal_result_is_told_and_rows_rebuilt() {
+    let mut app = app();
+    update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("team")]),
+    );
+    assert_eq!(app.accounts.len(), 2);
+    update(
+        &mut app,
+        Event::AccountRemoved {
+            account: account("max"),
+            result: Ok(()),
+        },
+    );
+    let (said, level) = notice(&app).unwrap();
+    assert!(said.contains("removed max"), "{said}");
+    assert!(said.contains("/h/max was left in place"), "{said}");
+    assert_eq!(level, Level::Info);
+
+    update(
+        &mut app,
+        Event::AccountRemoved {
+            account: account("team"),
+            result: Err(
+                "claude:team is the source of shared configuration ([share.claude] from in \
+                 /r/config.toml); change or remove `from` first"
+                    .into(),
+            ),
+        },
+    );
+    let (said, level) = notice(&app).unwrap();
+    assert!(said.starts_with("cannot remove team: "), "{said}");
+    assert!(said.contains("source of shared configuration"), "{said}");
+    assert_eq!(level, Level::Error);
+}
+
+/// R16: an account unregistered while its prompt is open is not removed again.
+#[test]
+fn y_after_the_account_vanished() {
+    let mut app = app();
+    keys(&mut app, &[Key::Char('1'), Key::Char('j'), Key::Char('D')]);
+    assert_eq!(app.overlay, Some(Overlay::RemoveAccount(account("max"))));
+    update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("team")]),
+    );
+    assert_eq!(keys(&mut app, &[Key::Char('y')]), []);
+    assert_eq!(app.overlay, None);
+    assert_eq!(
+        notice(&app),
+        Some(("max is no longer registered", Level::Error))
+    );
+}
+
 #[test]
 fn a_finished_setup_reloads_accounts_and_identities() {
     let mut app = idle_app();

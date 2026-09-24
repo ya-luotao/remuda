@@ -16,7 +16,7 @@ use crate::index::{Entry, Index, Store};
 use crate::launch::{self, Intent};
 use crate::live::{self, Control, LiveId, LiveSession};
 use crate::provider::Provider;
-use crate::registry::{self, Account, CLAUDE, CODEX};
+use crate::registry::{self, Account, CLAUDE, CODEX, Home};
 use crate::relay;
 use crate::setup;
 use crate::transcript::Message;
@@ -143,8 +143,13 @@ pub enum Event {
         short_id: String,
         result: Result<String, String>,
     },
-    /// The registry was read again (after a setup, or by a pre-launch check).
+    /// The registry was read again (after a setup or a removal, or by a pre-launch check).
     Accounts(Vec<Account>),
+    /// [`Effect::RemoveAccount`] finished: done, or why not.
+    AccountRemoved {
+        account: Account,
+        result: Result<(), String>,
+    },
     /// [`Effect::RolloutWritten`]: when the rollout at `path` was last written, if it could be
     /// read.
     RolloutWritten {
@@ -273,6 +278,8 @@ pub enum Effect {
         name: String,
         email: Option<String>,
     },
+    /// `remuda remove` (R14a): unregister the account, then read the registry again.
+    RemoveAccount(Account),
     Quit,
 }
 
@@ -326,6 +333,8 @@ pub enum Overlay {
     Confirm(Confirm),
     /// `y` resumes a codex session in place; any other key cancels (R17).
     ResumeCodex(ResumeCodex),
+    /// `y` unregisters the account (R14a, R16); any other key cancels.
+    RemoveAccount(Account),
 }
 
 /// A codex resume waiting for the user: remuda cannot tell whether the session runs elsewhere.
@@ -942,6 +951,7 @@ impl App {
                 }
             },
             Key::Char('n') if self.view == View::Accounts => self.open_new_session(),
+            Key::Char('D') if self.view == View::Accounts => self.confirm_remove(),
             Key::Char('s') if self.view == View::Accounts => {
                 self.open(Overlay::Form(Form::new(
                     FormKind::Setup,
@@ -965,6 +975,27 @@ impl App {
                 self.navigate(other);
             }
         }
+    }
+
+    /// `D` in Accounts: asks before unregistering the selected account (R16); `default` is
+    /// implicit (R14a).
+    fn confirm_remove(&mut self) {
+        let Some(account) = self
+            .accounts
+            .get(self.accounts_list.selected)
+            .map(|a| a.account.clone())
+        else {
+            return;
+        };
+        if account.home == Home::Default {
+            let text = format!(
+                "{} is the native login: it is implicit and cannot be removed",
+                display_name(&account)
+            );
+            self.notify(Level::Warn, text);
+            return;
+        }
+        self.open(Overlay::RemoveAccount(account));
     }
 
     /// `u`: live usage for every account that has usage (claude) and is not already being
@@ -1052,6 +1083,18 @@ impl App {
                         let check = self.next_check(&request);
                         fx.push(Effect::CheckLaunch { check, request });
                     }
+                    _ => self.notify(Level::Info, "cancelled"),
+                }
+            }
+            Overlay::RemoveAccount(account) => {
+                let account = account.clone();
+                self.overlay = None;
+                match key {
+                    Key::Char('y') if !self.accounts.iter().any(|a| a.account == account) => {
+                        let text = format!("{} is no longer registered", display_name(&account));
+                        self.notify(Level::Error, text);
+                    }
+                    Key::Char('y') => fx.push(Effect::RemoveAccount(account)),
                     _ => self.notify(Level::Info, "cancelled"),
                 }
             }
@@ -2321,6 +2364,19 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             }
         }
         Event::Accounts(accounts) => app.set_accounts(accounts, &mut fx),
+        Event::AccountRemoved { account, result } => {
+            let name = display_name(&account);
+            match result {
+                Ok(()) => {
+                    let text = format!(
+                        "removed {name}; its home {} was left in place",
+                        account.home
+                    );
+                    app.notify(Level::Info, text);
+                }
+                Err(e) => app.notify(Level::Error, format!("cannot remove {name}: {e}")),
+            }
+        }
         Event::RolloutWritten { path, at } => {
             if let Some(Overlay::ResumeCodex(confirm)) = &mut app.overlay
                 && confirm.path == path

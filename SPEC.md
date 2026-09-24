@@ -430,6 +430,9 @@ defaults to paths inside the sandbox.
 - attach writes a launch log entry just like `run` (with `session_id` null); `logs`, `stop`, `rm`,
   and the `auth login` in setup do not.
 - **New account** (`s` in Accounts): equivalent to `remuda setup` (R5).
+- **Remove account** (`D` in Accounts): equivalent to `remuda remove` (R14a) after confirmation
+  (`y` confirms; any other key cancels); the prompt names the home that is kept. Refused on a
+  `default` row. The account list is read again afterwards.
 - **Background sessions** (in Live): `Enter` attaches (`claude attach <id>`, likewise suspending the
   TUI); `l` shows `claude logs <id>` in the preview pane; `x` stops and `D` removes a stopped
   session, both after confirmation (`y` confirms; any other key cancels). Interactive sessions in
