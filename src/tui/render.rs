@@ -1112,7 +1112,10 @@ pub const KEYS: &[(&str, &str)] = &[
     ),
     ("t", "stats: next period (all, today, 7 days, 30 days)"),
     ("u", "query live usage for every account"),
-    ("r", "refresh index, identities, live sessions, checks"),
+    (
+        "r",
+        "refresh index, identities, live sessions, checks (and stats, once opened)",
+    ),
     (
         "ctrl-p",
         "private mode: hide account names, emails, paths, titles and previews (for screenshots)",
