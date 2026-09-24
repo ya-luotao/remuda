@@ -104,15 +104,15 @@ pub enum Event {
         error: Option<String>,
     },
     Identity {
-        account: usize,
+        account: Account,
         identity: Identity,
     },
     CachedUsage {
-        account: usize,
+        account: Account,
         result: Result<CachedUsage, String>,
     },
     LiveUsage {
-        account: usize,
+        account: Account,
         result: Result<LiveUsage, String>,
     },
     Live(Vec<LiveSession>),
@@ -225,8 +225,8 @@ pub enum Effect {
     RefreshIndex,
     Identities,
     CachedUsage,
-    /// `claude -p /usage` for these accounts (indices into [`App::accounts`]).
-    LiveUsage(Vec<usize>),
+    /// `claude -p /usage` for these accounts.
+    LiveUsage(Vec<Account>),
     Live,
     Attribution,
     Checks,
@@ -970,12 +970,12 @@ impl App {
     /// `u`: live usage for every account that has usage (claude) and is not already being
     /// queried.
     fn live_usage(&mut self, fx: &mut Vec<Effect>) {
-        let idle: Vec<usize> = (0..self.accounts.len())
-            .filter(|&i| self.accounts[i].account.provider.has_usage())
-            .filter(|&i| !self.accounts[i].live_pending)
-            .collect();
-        for &i in &idle {
-            self.accounts[i].live_pending = true;
+        let mut idle = Vec::new();
+        for a in &mut self.accounts {
+            if a.account.provider.has_usage() && !a.live_pending {
+                a.live_pending = true;
+                idle.push(a.account.clone());
+            }
         }
         if !idle.is_empty() {
             fx.push(Effect::LiveUsage(idle));
@@ -1229,6 +1229,11 @@ impl App {
             name: name.to_string(),
             email,
         })
+    }
+
+    /// The row of `account`, wherever the account list has moved it.
+    fn row_mut(&mut self, account: &Account) -> Option<&mut AccountState> {
+        self.accounts.iter_mut().find(|a| a.account == *account)
     }
 
     /// The registry changed: account rows are rebuilt (known accounts keep their state) and
@@ -2179,21 +2184,22 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 fx.push(Effect::RefreshIndex);
             }
         }
+        // A result for an account that is no longer listed is dropped.
         Event::Identity { account, identity } => {
-            if let Some(a) = app.accounts.get_mut(account) {
+            if let Some(a) = app.row_mut(&account) {
                 a.identity = Some(identity);
                 a.identity_pending = false;
             }
         }
         Event::CachedUsage { account, result } => {
-            if let Some(a) = app.accounts.get_mut(account) {
+            if let Some(a) = app.row_mut(&account) {
                 a.cached = Some(result);
                 a.cached_pending = false;
             }
         }
         Event::LiveUsage { account, result } => {
             let now = app.now;
-            if let Some(a) = app.accounts.get_mut(account) {
+            if let Some(a) = app.row_mut(&account) {
                 a.live_pending = false;
                 a.live = Some(match result {
                     Ok(LiveUsage::Rows(rows)) => Ok((rows, now)),

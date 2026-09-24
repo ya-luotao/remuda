@@ -21,6 +21,11 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   another account by copying its transcript and checkpoints into the target store and forking it
   there. The original session is never modified.
 
+### Fixed
+
+- TUI: identity and usage results no longer land on another account's row when the account list
+  changes while a query runs.
+
 ## [0.1.0] - 2026-09-24
 
 Initial release.
