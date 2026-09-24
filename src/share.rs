@@ -6,9 +6,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -18,7 +18,6 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::Env;
-use crate::launch;
 use crate::registry::{Account, Sharing};
 
 /// With it set, `--add-dir` also loads `CLAUDE.md` from the added directory (R18).
@@ -121,21 +120,26 @@ pub fn inject(
         }
     }
 
-    let user_settings = user_args
-        .iter()
-        .any(|a| a == "--settings" || a.starts_with("--settings="));
+    // claude takes only the last `--settings`, and `--setting-sources` may leave out the
+    // user's layer the shared settings stand in for: either way, the user decides (R18).
+    let user_settings = user_args.iter().find_map(|a| {
+        ["--settings", "--setting-sources"]
+            .into_iter()
+            .find(|o| a == o || a.strip_prefix(o).is_some_and(|v| v.starts_with('=')))
+    });
     let own_path = home.join("settings.json");
     let settings_shared = resolves_to(&own_path, &from.join("settings.json"));
     let memory_shared = resolves_to(&home.join("projects"), &from.join("projects"));
     let plugins_part = !resolves_to(&home.join("plugins"), &from.join("plugins"));
-    if user_settings && !(settings_shared && memory_shared) {
+    if let Some(option) = user_settings
+        && !(settings_shared && memory_shared)
+    {
         shared.notices.push(format!(
-            "--settings given: settings and auto-memory from {name} are not injected \
-             (claude uses only the last --settings)"
+            "{option} given: settings and auto-memory from {name} are not injected"
         ));
     }
-    let settings_part = !settings_shared && !user_settings;
-    let memory_part = !memory_shared && !user_settings;
+    let settings_part = !settings_shared && user_settings.is_none();
+    let memory_part = !memory_shared && user_settings.is_none();
     if !(settings_part || memory_part || plugins_part) {
         return Ok(shared);
     }
@@ -151,9 +155,9 @@ pub fn inject(
         Map::new()
     };
 
+    let project = Project::locate(cwd);
+    let layers = project.settings(env);
     if settings_part || memory_part {
-        let project = Project::locate(cwd, env);
-        let layers = project.settings(env);
         let mut injected = Map::new();
         if settings_part {
             injected = missing_from(&source_settings, &own);
@@ -166,16 +170,11 @@ pub fn inject(
         let chosen = source_settings.contains_key(MEMORY_KEY)
             || own.contains_key(MEMORY_KEY)
             || layers.iter().any(|l| l.contains_key(MEMORY_KEY));
-        if memory_part && !chosen {
-            match project.memory_dir(&from) {
-                Ok(Some(memory)) => {
-                    injected.insert(MEMORY_KEY.to_string(), Value::String(memory));
-                }
-                Ok(None) => {}
-                Err(why) => shared.notices.push(format!(
-                    "auto-memory from {name} is not shared this time: {why}"
-                )),
-            }
+        if memory_part
+            && !chosen
+            && let Some(memory) = project.memory_dir(&from)
+        {
+            injected.insert(MEMORY_KEY.to_string(), Value::String(memory));
         }
         if !injected.is_empty() {
             let json = serde_json::to_string(&Value::Object(injected))?;
@@ -190,18 +189,19 @@ pub fn inject(
 
     if plugins_part {
         let installs = installed_plugins(&from);
-        // What the home turned off or installed itself would otherwise load twice.
-        let own_installs = match installed_plugins(&home) {
-            Installs::Known(plugins) => plugins,
-            _ => BTreeMap::new(),
-        };
+        // What the home or the project turned off, or the home installed itself for this
+        // directory, would otherwise load twice.
+        let own_installs = installed_plugins(&home);
         let off = |plugin: &str| {
-            own.get("enabledPlugins")
-                .and_then(|p| p.get(plugin))
-                .is_some_and(|on| on.as_bool() == Some(false))
+            std::iter::once(&own).chain(&layers).any(|settings| {
+                settings
+                    .get("enabledPlugins")
+                    .and_then(|p| p.get(plugin))
+                    .is_some_and(|on| on.as_bool() == Some(false))
+            })
         };
         for plugin in enabled_plugins(&source_settings) {
-            if off(&plugin) || own_installs.contains_key(&plugin) {
+            if off(&plugin) || own_installs.installed_for(&plugin, project.start.as_deref()) {
                 continue;
             }
             if let Some(path) = installs.install_path(&plugin) {
@@ -226,6 +226,14 @@ pub const SETTINGS_KEPT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub fn write_settings(dir: &Path, json: &str, now: SystemTime) -> Result<PathBuf> {
     let name = format!("{:x}.json", Sha256::digest(json.as_bytes()));
     let path = dir.join(&name);
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("cannot create {}", dir.display()))?;
+    // Held until this returns: a file is never pruned between being chosen and being marked
+    // used, by this remuda or another.
+    let _lock = DirLock::exclusive(dir)?;
     if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
         fs::OpenOptions::new()
             .write(true)
@@ -234,11 +242,6 @@ pub fn write_settings(dir: &Path, json: &str, now: SystemTime) -> Result<PathBuf
             .with_context(|| format!("cannot use {}", path.display()))?;
         return Ok(path);
     }
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("cannot create {}", dir.display()))?;
     prune_settings(dir, now);
     let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
     let written = (|| -> io::Result<()> {
@@ -256,6 +259,32 @@ pub fn write_settings(dir: &Path, json: &str, now: SystemTime) -> Result<PathBuf
         return Err(e).with_context(|| format!("cannot write {}", path.display()));
     }
     Ok(path)
+}
+
+/// An exclusive `flock` on a directory, released when dropped (its descriptor closes).
+struct DirLock(fs::File);
+
+impl DirLock {
+    fn exclusive(dir: &Path) -> Result<DirLock> {
+        let file = fs::File::open(dir).with_context(|| format!("cannot open {}", dir.display()))?;
+        loop {
+            // SAFETY: the descriptor is open for the call.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(DirLock(file));
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e).with_context(|| format!("cannot lock {}", dir.display()));
+            }
+        }
+    }
+}
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor is still open; closing it would release the lock anyway.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// Removes the settings files of `dir` (`<64 hex digits>.json`) last used before
@@ -286,28 +315,62 @@ fn prune_settings(dir: &Path, now: SystemTime) {
 }
 
 /// Settings keys that choose credentials, provider or organization: never injected (R18).
-pub const AUTH_KEYS: [&str; 6] = [
+pub const AUTH_KEYS: [&str; 7] = [
     "apiKeyHelper",
+    "proxyAuthHelper",
     "awsAuthRefresh",
     "awsCredentialExport",
     "gcpAuthRefresh",
     "forceLoginMethod",
     "forceLoginOrgUUID",
 ];
-/// Variables of `env` in settings that do the same: never injected (R18).
-pub const AUTH_ENV: [&str; 9] = [
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CONFIG_DIR",
-    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+/// `env` names starting with one of these choose a provider, credentials or an endpoint (R18).
+pub const AUTH_ENV_PREFIXES: [&str; 9] = [
+    "ANTHROPIC_",
+    "AWS_",
+    "AZURE_",
+    "GOOGLE_",
+    "CLOUDSDK_",
+    "CLOUD_ML_",
+    "CLAUDE_CODE_USE_",
+    "CLAUDE_CODE_SKIP_",
+    "_CLAUDE_CODE_",
 ];
+/// `env` names containing one of these may hold a secret or an endpoint (R18).
+pub const AUTH_ENV_PARTS: [&str; 8] = [
+    "TOKEN",
+    "KEY",
+    "SECRET",
+    "PASSWORD",
+    "CREDENTIAL",
+    "OAUTH",
+    "UUID",
+    "BASE_URL",
+];
+/// `env` names that select the account's own files (R2, R18).
+pub const AUTH_ENV_EXACT: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"];
 
-/// The authentication keys `settings` sets, as `key` or `env.VAR`: withheld from members
+/// Whether the settings `env` variable `name` is withheld from members (R18). Names are
+/// matched in upper case. The model-name variables (`ANTHROPIC_MODEL`,
+/// `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL*`) are shared, unless the name also
+/// contains a secret-like part.
+pub fn withheld_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if AUTH_ENV_EXACT.contains(&upper.as_str()) {
+        return true;
+    }
+    if AUTH_ENV_PARTS.iter().any(|part| upper.contains(part)) {
+        return true;
+    }
+    let model = upper == "ANTHROPIC_MODEL"
+        || upper == "ANTHROPIC_SMALL_FAST_MODEL"
+        || upper
+            .strip_prefix("ANTHROPIC_DEFAULT_")
+            .is_some_and(|rest| rest.contains("_MODEL"));
+    !model && AUTH_ENV_PREFIXES.iter().any(|p| upper.starts_with(p))
+}
+
+/// The authentication settings `settings` has, as `key` or `env.VAR`: withheld from members
 /// (R11, R18).
 pub fn withheld(settings: &Map<String, Value>) -> Vec<String> {
     let mut keys: Vec<String> = AUTH_KEYS
@@ -317,24 +380,21 @@ pub fn withheld(settings: &Map<String, Value>) -> Vec<String> {
         .collect();
     if let Some(Value::Object(vars)) = settings.get("env") {
         keys.extend(
-            AUTH_ENV
-                .iter()
-                .filter(|k| vars.contains_key(**k))
+            vars.keys()
+                .filter(|k| withheld_env(k))
                 .map(|k| format!("env.{k}")),
         );
     }
     keys
 }
 
-/// Removes the authentication keys from injected settings (an `env` left empty goes too).
+/// Removes the authentication settings from injected settings (an `env` left empty goes too).
 fn strip_auth(settings: &mut Map<String, Value>) {
     for key in AUTH_KEYS {
         settings.remove(key);
     }
     if let Some(Value::Object(vars)) = settings.get_mut("env") {
-        for key in AUTH_ENV {
-            vars.remove(key);
-        }
+        vars.retain(|name, _| !withheld_env(name));
         if vars.is_empty() {
             settings.remove("env");
         }
@@ -342,32 +402,20 @@ fn strip_auth(settings: &mut Map<String, Value>) {
 }
 
 /// Where a session starts, as claude sees it (R18): the launch directory made real and NFC,
-/// and the project root one `git` call finds for it.
+/// and its project root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     /// `None` without a launch directory, or when it cannot be resolved.
     pub start: Option<PathBuf>,
-    /// The project root, or why it is not known.
-    pub root: std::result::Result<PathBuf, String>,
+    /// The project root of `start`, found as claude finds it ([`project_root`]).
+    pub root: Option<PathBuf>,
 }
 
 impl Project {
-    /// Resolves `cwd` and runs `git` (from `PATH`) once for its project root.
-    pub fn locate(cwd: Option<&Path>, env: &Env) -> Project {
+    /// Resolves `cwd` and its project root; runs nothing.
+    pub fn locate(cwd: Option<&Path>) -> Project {
         let start = cwd.and_then(start_dir);
-        let root = match &start {
-            None => Err(match cwd {
-                None => "the launch directory is unknown".to_string(),
-                Some(cwd) => format!("cannot resolve {}", cwd.display()),
-            }),
-            Some(start) => {
-                let path_var = env.get("PATH").map(String::as_str);
-                match launch::find_on_path("git", path_var) {
-                    Ok(git) => project_root(&git, start),
-                    Err(_) => Err("`git` not found on PATH".to_string()),
-                }
-            }
-        };
+        let root = start.as_deref().map(project_root);
         Project { start, root }
     }
 
@@ -383,7 +431,7 @@ impl Project {
             start.join(".claude/settings.json"),
             start.join(".claude/settings.local.json"),
         ];
-        if let Ok(root) = &self.root
+        if let Some(root) = &self.root
             && reads_root_local_settings(root, start, env)
         {
             files.push(root.join(".claude/settings.local.json"));
@@ -395,24 +443,18 @@ impl Project {
             .collect()
     }
 
-    /// `<source>/projects/<project>/memory` (R18); `Ok(None)` when the name is too long for
-    /// remuda to know claude's; `Err` when the project root is not known.
-    pub fn memory_dir(&self, source: &Path) -> std::result::Result<Option<String>, String> {
-        let root = self
-            .root
-            .as_ref()
-            .map_err(|why| format!("cannot find the project root ({why})"))?;
-        let Some(project) = root.to_str().and_then(encode_project) else {
-            return Ok(None);
-        };
-        Ok(Some(
+    /// `<source>/projects/<project>/memory` (R18); `None` without a start directory, or when
+    /// the name is too long for remuda to know claude's.
+    pub fn memory_dir(&self, source: &Path) -> Option<String> {
+        let project = encode_project(self.root.as_ref()?.to_str()?)?;
+        Some(
             source
                 .join("projects")
                 .join(project)
                 .join("memory")
                 .display()
                 .to_string(),
-        ))
+        )
     }
 }
 
@@ -533,16 +575,55 @@ pub fn read_settings(path: &Path) -> Result<Map<String, Value>> {
     }
 }
 
+/// Keys claude's merge replaces instead of combining: compared whole (R18).
+const REPLACED: [&str; 2] = ["fallbackModel", "modelPicker"];
+/// Keys claude's merge combines one level deep: compared entry by entry, where an entry the
+/// other side has is its (R18). The two marketplace keys are one setting.
+const SHALLOW: [&str; 3] = [
+    "extraKnownMarketplaces",
+    "additionalMarketplaces",
+    "managedMcpServers",
+];
+
 /// The part of `source` that `home` does not define, recursively (R18): keys the home lacks
 /// are taken; objects on both sides recurse; for arrays on both sides, the source's elements
 /// that equal none of the home's are taken; any other key the home defines is the home's.
+/// Where claude's merge does not combine (`fallbackModel`, `modelPicker`) the home's value
+/// wins whole; where it merges one level deep (`extraKnownMarketplaces` and its alias
+/// `additionalMarketplaces`, `managedMcpServers`) an entry the home has wins whole.
 pub fn missing_from(source: &Map<String, Value>, home: &Map<String, Value>) -> Map<String, Value> {
     let mut out = Map::new();
     for (key, value) in source {
+        if SHALLOW.contains(&key.as_str())
+            && let Value::Object(entries) = value
+        {
+            let others: Vec<&Value> = match key.as_str() {
+                "managedMcpServers" => home.get(key).into_iter().collect(),
+                _ => ["extraKnownMarketplaces", "additionalMarketplaces"]
+                    .iter()
+                    .filter_map(|k| home.get(*k))
+                    .collect(),
+            };
+            if others.iter().any(|o| !o.is_object()) {
+                continue;
+            }
+            let kept: Map<String, Value> = entries
+                .iter()
+                .filter(|(name, _)| !others.iter().any(|o| o.get(name.as_str()).is_some()))
+                .map(|(name, entry)| (name.clone(), entry.clone()))
+                .collect();
+            if !kept.is_empty() || others.is_empty() {
+                out.insert(key.clone(), Value::Object(kept));
+            }
+            continue;
+        }
         let Some(own) = home.get(key) else {
             out.insert(key.clone(), value.clone());
             continue;
         };
+        if REPLACED.contains(&key.as_str()) {
+            continue;
+        }
         match (value, own) {
             (Value::Object(value), Value::Object(own)) => {
                 let part = missing_from(value, own);
@@ -593,6 +674,8 @@ pub enum Installs {
 pub struct Install {
     pub scope: Option<String>,
     pub path: Option<PathBuf>,
+    /// The directory a `project` or `local` install is for.
+    pub project: Option<PathBuf>,
 }
 
 impl Installs {
@@ -607,6 +690,21 @@ impl Installs {
             .filter(|i| i.scope.as_deref() == Some("user"))
             .filter_map(|i| i.path.as_deref())
             .find(|p| p.is_absolute() && p.exists())
+    }
+
+    /// Whether `plugin` is installed here for a session in `start` (R18): with `user` scope, or
+    /// with `project` / `local` scope for `start` itself.
+    pub fn installed_for(&self, plugin: &str, start: Option<&Path>) -> bool {
+        let Installs::Known(plugins) = self else {
+            return false;
+        };
+        plugins.get(plugin).is_some_and(|installs| {
+            installs.iter().any(|i| match i.scope.as_deref() {
+                Some("user") => true,
+                Some("project" | "local") => start.is_some() && i.project.as_deref() == start,
+                _ => false,
+            })
+        })
     }
 }
 
@@ -639,6 +737,10 @@ pub fn installed_plugins(home: &Path) -> Installs {
                                 .get("installPath")
                                 .and_then(Value::as_str)
                                 .map(PathBuf::from),
+                            project: install
+                                .get("projectPath")
+                                .and_then(Value::as_str)
+                                .map(PathBuf::from),
                         })
                         .collect();
                     (name, installs)
@@ -668,61 +770,104 @@ pub fn encode_project(root: &str) -> Option<String> {
     )
 }
 
-/// The project root of `start` by claude's rule (R18), from one `git rev-parse`: the top level
-/// when the git dir is the common dir (a plain repository, a submodule, a separate git dir);
-/// for a linked worktree, the parent of a common dir named `.git`, else the common dir itself
-/// (a worktree of a bare repository). Outside any repository, and inside a bare one, `start`
-/// itself. `Err` when git cannot run or fails for another reason.
-pub fn project_root(git: &Path, start: &Path) -> std::result::Result<PathBuf, String> {
-    let out = Command::new(git)
-        .arg("-C")
-        .arg(start)
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-common-dir",
-            // Last: in a bare repository only this one fails.
-            "--show-toplevel",
-        ])
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run {}: {e}", git.display()))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let lines: Vec<&str> = stdout.lines().collect();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() {
-        if stderr.contains("not a git repository")
-            || (lines.len() == 2 && stderr.contains("must be run in a work tree"))
-        {
-            return Ok(start.to_path_buf());
+/// The project root of `start` as claude 2.1.281 finds it, without running git (R18; its
+/// `Gt` and `Ce`/`Ht`): the first directory from `start` up to `/` with a `.git` entry,
+/// mapped from a linked worktree to its main repository by [`linked_worktree_root`]; with no
+/// `.git` anywhere, `start` itself. NFC.
+///
+/// claude also refuses gitdir and commondir paths that lead through network mounts or UNC
+/// spellings; remuda does not reproduce that guard (it only ever reads these files).
+pub fn project_root(start: &Path) -> PathBuf {
+    let mut dir = start;
+    let found = loop {
+        if is_git_entry(&dir.join(".git")) {
+            break Some(dir);
         }
-        let why = stderr.lines().next().unwrap_or("").trim();
-        return Err(format!("git rev-parse failed: {why}"));
-    }
-    let [git_dir, common, top] = lines.as_slice() else {
-        return Err(format!("unexpected git rev-parse output: {stdout:?}"));
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break None,
+        }
     };
-    let (common_path, top_path) = (Path::new(common), Path::new(top));
-    if !common_path.is_absolute() || !top_path.is_absolute() {
-        return Err(format!("unexpected git rev-parse output: {stdout:?}"));
+    let root = match found {
+        Some(dir) => linked_worktree_root(dir).unwrap_or_else(|| dir.to_path_buf()),
+        None => start.to_path_buf(),
+    };
+    match root.to_str() {
+        Some(r) => PathBuf::from(r.nfc().collect::<String>()),
+        None => root,
     }
-    let root = if git_dir == common {
-        top_path.to_path_buf()
-    } else if common_path.file_name().is_some_and(|n| n == ".git") {
-        common_path
-            .parent()
-            .ok_or_else(|| format!("unexpected git common dir {common}"))?
-            .to_path_buf()
+}
+
+/// claude's `ke`: a `.git` that is a directory or a file, also through a symlink whose target
+/// reads as UTF-8.
+fn is_git_entry(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            fs::read_link(path).is_ok_and(|t| t.to_str().is_some())
+                && fs::metadata(path).is_ok_and(|m| m.is_dir() || m.is_file())
+        }
+        Ok(meta) => meta.is_dir() || meta.is_file(),
+        Err(_) => false,
+    }
+}
+
+/// claude's `Ht`: for `dir` whose `.git` is a file `gitdir: <path>` naming a git dir with a
+/// `commondir`, that sits in `<common>/worktrees/`, and whose own `gitdir` file points back (by
+/// realpath) at this `.git`: the main repository's root, which is the parent of a common dir
+/// named `.git` and the common dir itself otherwise (a bare repository's worktree, unless that
+/// directory has a `.git` of its own). `None` on any other outcome: `dir` is the root.
+fn linked_worktree_root(dir: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(dir.join(".git")).ok()?;
+    let gitdir = text.trim().strip_prefix("gitdir:")?.trim();
+    let git_dir = resolve(dir, gitdir);
+    let common = resolve(
+        &git_dir,
+        read_plain_file(&git_dir.join("commondir"))?.trim(),
+    );
+    if git_dir.parent()? != common.join("worktrees") {
+        return None;
+    }
+    let back = read_plain_file(&git_dir.join("gitdir"))?;
+    let back = fs::canonicalize(resolve(&git_dir, back.trim())).ok()?;
+    if back != fs::canonicalize(dir).ok()?.join(".git") {
+        return None;
+    }
+    if common.file_name().is_some_and(|n| n == ".git") {
+        return common.parent().map(Path::to_path_buf);
+    }
+    if is_git_entry(&common.join(".git")) {
+        return None;
+    }
+    Some(common)
+}
+
+/// The contents of `path` when it is a regular file, not a symlink (claude's `YR`).
+fn read_plain_file(path: &Path) -> Option<String> {
+    if !fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    fs::read_to_string(path).ok()
+}
+
+/// Node's `path.resolve(base, p)`: `p` if absolute, else `base/p`, normalized lexically (no
+/// `.` or `..` components, no trailing slash).
+fn resolve(base: &Path, p: &str) -> PathBuf {
+    let joined = if Path::new(p).is_absolute() {
+        PathBuf::from(p)
     } else {
-        common_path.to_path_buf()
+        base.join(p)
     };
-    let root = root
-        .to_str()
-        .map(|r| PathBuf::from(r.nfc().collect::<String>()))
-        .unwrap_or(root);
-    Ok(root)
+    let mut out = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -834,11 +979,13 @@ mod tests {
 
     fn git() -> PathBuf {
         let path = std::env::var("PATH").ok();
-        launch::find_on_path("git", path.as_deref()).expect("git on PATH")
+        crate::launch::find_on_path("git", path.as_deref()).expect("git on PATH")
     }
 
-    /// Runs git in `dir` without any user or system configuration.
+    /// Runs git in `dir` without any user or system configuration (to build fixtures only:
+    /// remuda itself runs no git).
     fn run_git(dir: &Path, args: &[&str]) {
+        use std::process::{Command, Stdio};
         let status = Command::new(git())
             .arg("-C")
             .arg(dir)
@@ -860,32 +1007,14 @@ mod tests {
         assert!(status.success(), "git {args:?} in {}", dir.display());
     }
 
-    /// An executable script, written through a `sh` child (no write descriptor of ours can
-    /// leak into another test's child: ETXTBSY on Linux).
-    fn script(path: &Path, body: &str) {
-        let mut child = Command::new("/bin/sh")
-            .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
-            .arg(path)
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
-            .unwrap();
-        assert!(child.wait().unwrap().success());
-    }
-
-    /// R18: the project root by claude's rule, with real git: a plain repository (and its
-    /// subdirectories), a linked worktree, a submodule, a separate git dir, a worktree of a
-    /// bare repository, a cwd inside a bare repository, and no repository at all.
+    /// R18: the project root as claude finds it, by walking the file system (fixtures made
+    /// with real git): a plain repository and its subdirectories (also inside `.git/hooks`), a
+    /// linked worktree, a submodule, a separate git dir, a worktree of a bare repository, a
+    /// bare repository itself, and no repository at all.
     #[test]
     fn project_roots_follow_claudes_rule() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let git = git();
         let repo = root.join("my repo");
         fs::create_dir_all(repo.join("src/deep")).unwrap();
         run_git(&repo, &["init", "-q"]);
@@ -895,7 +1024,7 @@ mod tests {
             &repo,
             &["worktree", "add", "-q", tree.to_str().unwrap(), "-b", "t"],
         );
-        // A submodule: its own git dir lives in the superproject's `.git/modules`.
+        fs::create_dir_all(tree.join("x")).unwrap();
         let lib = root.join("lib");
         fs::create_dir_all(&lib).unwrap();
         run_git(&lib, &["init", "-q"]);
@@ -910,7 +1039,6 @@ mod tests {
                 "vendor/lib",
             ],
         );
-        // A separate git dir.
         let sep = root.join("sep");
         run_git(
             &root,
@@ -922,7 +1050,6 @@ mod tests {
                 sep.to_str().unwrap(),
             ],
         );
-        // A bare repository and a worktree of it.
         let bare = root.join("bare.git");
         run_git(
             &root,
@@ -953,7 +1080,9 @@ mod tests {
         let cases = [
             (repo.clone(), repo.clone()),
             (repo.join("src/deep"), repo.clone()),
+            (repo.join(".git/hooks"), repo.clone()),
             (tree.clone(), repo.clone()),
+            (tree.join("x"), repo.clone()),
             (repo.join("vendor/lib"), repo.join("vendor/lib")),
             (sep.clone(), sep.clone()),
             (bare_tree.join("x"), bare.clone()),
@@ -961,38 +1090,51 @@ mod tests {
             (plain.clone(), plain.clone()),
         ];
         for (start, want) in cases {
-            assert_eq!(
-                project_root(&git, &start),
-                Ok(want),
-                "from {}",
-                start.display()
-            );
+            assert_eq!(project_root(&start), want, "from {}", start.display());
         }
     }
 
-    /// R18: when git is missing or fails for another reason, the root is not guessed: no
-    /// auto-memory, and a reason to say.
+    /// R18: a worktree whose main repository no longer points back at it (moved), and a
+    /// gitfile that leads nowhere (the main repository moved), are their own roots.
     #[test]
-    fn a_failing_git_is_not_a_project_root() {
+    fn moved_worktrees_and_broken_gitfiles_are_their_own_roots() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).unwrap();
-        script(
-            &bin.join("git"),
-            "echo 'fatal: detected dubious ownership in repository' >&2; exit 128",
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        let tree = root.join("tree");
+        run_git(
+            &repo,
+            &["worktree", "add", "-q", tree.to_str().unwrap(), "-b", "t"],
         );
-        let e = project_root(&bin.join("git"), &root).unwrap_err();
-        assert!(e.contains("dubious ownership"), "{e}");
-        let env: Env = [("PATH".to_string(), bin.display().to_string())].into();
-        let project = Project::locate(Some(&root), &env);
-        assert!(project.memory_dir(Path::new("/src")).is_err());
-
-        let none: Env = [("PATH".to_string(), root.join("empty").display().to_string())].into();
-        let project = Project::locate(Some(&root), &none);
-        assert_eq!(project.start.as_deref(), Some(root.as_path()));
-        let e = project.memory_dir(Path::new("/src")).unwrap_err();
-        assert!(e.contains("`git` not found"), "{e}");
+        assert_eq!(project_root(&tree), repo);
+        // Moved: the back-pointer names the old place.
+        let moved = root.join("moved");
+        fs::rename(&tree, &moved).unwrap();
+        assert_eq!(project_root(&moved), moved);
+        // The main repository moved: the gitfile leads nowhere.
+        let other = root.join("other");
+        fs::rename(&repo, &other).unwrap();
+        assert_eq!(project_root(&moved), moved);
+        // A gitfile that is not `gitdir:` at all, with trailing whitespace.
+        let odd = root.join("odd");
+        fs::create_dir_all(odd.join("sub")).unwrap();
+        fs::write(odd.join(".git"), "not a gitdir line \n").unwrap();
+        assert_eq!(project_root(&odd.join("sub")), odd);
+        // Relative paths and surrounding whitespace in the gitfile and commondir.
+        let rel = root.join("rel");
+        run_git(
+            &other,
+            &["worktree", "add", "-q", rel.to_str().unwrap(), "-b", "r"],
+        );
+        fs::write(
+            rel.join(".git"),
+            "gitdir:   ../other/.git/worktrees/rel  \n\n",
+        )
+        .unwrap();
+        assert_eq!(project_root(&rel), other);
     }
 
     /// R18: the start directory is the launch directory made real and NFC: a symlinked path,
@@ -1221,36 +1363,123 @@ mod tests {
         );
     }
 
-    /// R18: authentication keys never travel to a member, whatever the home defines; R11
-    /// lists them.
+    /// R18: authentication settings never travel to a member, whatever the home defines: the
+    /// listed keys, and `env` names by prefix, by secret-like part, or exactly; model names are
+    /// shared. R11 lists them.
     #[test]
     fn authentication_is_never_injected() {
         let source = map(json!({
             "apiKeyHelper": "/bin/key",
+            "proxyAuthHelper": "/bin/proxy",
             "forceLoginOrgUUID": "org",
-            "awsAuthRefresh": "x",
             "model": "opus",
-            "env": {"ANTHROPIC_API_KEY": "sk", "ANTHROPIC_BASE_URL": "https://x", "FOO": "1"},
+            "env": {
+                "ANTHROPIC_API_KEY": "sk",
+                "ANTHROPIC_AWS_API_KEY": "k",
+                "ANTHROPIC_MODEL": "opus",
+                "ANTHROPIC_SMALL_FAST_MODEL": "haiku",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "s",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "o",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL_TOKEN": "t",
+                "AWS_BEARER_TOKEN_BEDROCK": "b",
+                "AWS_REGION": "us-east-1",
+                "CLAUDE_CODE_USE_MANTLE": "1",
+                "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+                "_CLAUDE_CODE_X": "1",
+                "GOOGLE_CLOUD_PROJECT": "p",
+                "CLOUD_ML_REGION": "r",
+                "github_token": "gh",
+                "MY_SERVICE_BASE_URL": "https://x",
+                "CLAUDE_CONFIG_DIR": "/c",
+                "DISABLE_TELEMETRY": "1",
+                "BASH_DEFAULT_TIMEOUT_MS": "1000",
+            },
         }));
         assert_eq!(
             withheld(&source),
             [
                 "apiKeyHelper",
-                "awsAuthRefresh",
+                "proxyAuthHelper",
                 "forceLoginOrgUUID",
                 "env.ANTHROPIC_API_KEY",
-                "env.ANTHROPIC_BASE_URL"
+                "env.ANTHROPIC_AWS_API_KEY",
+                "env.ANTHROPIC_DEFAULT_OPUS_MODEL_TOKEN",
+                "env.AWS_BEARER_TOKEN_BEDROCK",
+                "env.AWS_REGION",
+                "env.CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+                "env.CLAUDE_CODE_USE_MANTLE",
+                "env.CLAUDE_CONFIG_DIR",
+                "env.CLOUD_ML_REGION",
+                "env.GOOGLE_CLOUD_PROJECT",
+                "env.MY_SERVICE_BASE_URL",
+                "env._CLAUDE_CODE_X",
+                "env.github_token",
             ]
         );
         let mut injected = missing_from(&source, &Map::new());
         strip_auth(&mut injected);
         assert_eq!(
             Value::Object(injected),
-            json!({"model": "opus", "env": {"FOO": "1"}})
+            json!({"model": "opus", "env": {
+                "ANTHROPIC_MODEL": "opus",
+                "ANTHROPIC_SMALL_FAST_MODEL": "haiku",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "s",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "o",
+                "DISABLE_TELEMETRY": "1",
+                "BASH_DEFAULT_TIMEOUT_MS": "1000",
+            }})
         );
         let mut only_auth = map(json!({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}));
         strip_auth(&mut only_auth);
         assert_eq!(only_auth, Map::new(), "an emptied env goes too");
+    }
+
+    /// R18: where claude's merge replaces (`fallbackModel`, `modelPicker`), the other side's
+    /// value wins whole; where it merges one level deep (`extraKnownMarketplaces` and its alias
+    /// `additionalMarketplaces`, `managedMcpServers`), each entry the other side has wins whole.
+    #[test]
+    fn keys_claude_does_not_merge_deeply_are_compared_whole() {
+        let source = map(json!({
+            "fallbackModel": ["opus", "sonnet"],
+            "modelPicker": {"options": [{"id": "opus"}]},
+            "extraKnownMarketplaces": {
+                "shared": {"source": {"source": "github", "repo": "a/b"}},
+                "mine": {"source": {"source": "github", "repo": "src/m"}},
+                "aliased": {"source": {"source": "github", "repo": "src/x"}},
+            },
+            "managedMcpServers": {
+                "db": {"command": "db", "args": ["--src"]},
+                "web": {"command": "web"},
+            },
+        }));
+        let home = map(json!({
+            "fallbackModel": ["haiku"],
+            "modelPicker": {"default": "sonnet"},
+            "extraKnownMarketplaces": {"mine": {"source": {"source": "directory"}}},
+            "additionalMarketplaces": {"aliased": {"source": {"source": "directory"}}},
+            "managedMcpServers": {"db": {"command": "db", "env": {"A": "1"}}},
+        }));
+        assert_eq!(
+            Value::Object(missing_from(&source, &home)),
+            json!({
+                "extraKnownMarketplaces": {
+                    "shared": {"source": {"source": "github", "repo": "a/b"}},
+                },
+                "managedMcpServers": {"web": {"command": "web"}},
+            })
+        );
+        // Not defined on the other side: everything goes, as for any key.
+        assert_eq!(missing_from(&source, &Map::new()), source);
+        // Every entry taken: the key goes.
+        let all = map(json!({"managedMcpServers": {"db": {}, "web": {}}}));
+        assert_eq!(missing_from(&source, &all).get("managedMcpServers"), None);
+        // The source's alias against the home's canonical spelling.
+        let alias = map(json!({"additionalMarketplaces": {"mine": {}, "new": {}}}));
+        let canonical = map(json!({"extraKnownMarketplaces": {"mine": {}}}));
+        assert_eq!(
+            Value::Object(missing_from(&alias, &canonical)),
+            json!({"additionalMarketplaces": {"new": {}}})
+        );
     }
 
     /// R18: settings travel as `<sha256>.json`, mode 0600; the same content reuses its file
@@ -1449,5 +1678,116 @@ mod tests {
             got.args,
             [format!("--plugin-dir={}", cache.join("a").display())]
         );
+    }
+
+    /// R18: a plugin is not injected when the project turns it off, or when the home installed
+    /// it for this directory (`project` / `local` scope); a home install for another directory
+    /// does not count.
+    #[test]
+    fn project_disables_and_scoped_home_installs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (source_home, max, work) = (root.join("src"), root.join("max"), root.join("work"));
+        let cache = source_home.join("plugins/cache");
+        for p in ["a", "b", "c", "d"] {
+            fs::create_dir_all(cache.join(p)).unwrap();
+        }
+        fs::create_dir_all(max.join("plugins")).unwrap();
+        fs::create_dir_all(work.join(".claude")).unwrap();
+        fs::write(
+            source_home.join("settings.json"),
+            json!({"enabledPlugins": {"a@m": true, "b@m": true, "c@m": true, "d@m": true}})
+                .to_string(),
+        )
+        .unwrap();
+        let install = |p: &str| json!([{"scope": "user", "installPath": cache.join(p)}]);
+        fs::write(
+            source_home.join("plugins/installed_plugins.json"),
+            json!({"version": 2, "plugins": {"a@m": install("a"), "b@m": install("b"),
+                                             "c@m": install("c"), "d@m": install("d")}})
+            .to_string(),
+        )
+        .unwrap();
+        // The project turns `a` off (local settings) ...
+        fs::write(
+            work.join(".claude/settings.local.json"),
+            json!({"enabledPlugins": {"a@m": false}}).to_string(),
+        )
+        .unwrap();
+        // ... the home installed `b` for this directory, `c` for another one.
+        fs::write(
+            max.join("plugins/installed_plugins.json"),
+            json!({"version": 2, "plugins": {
+                "b@m": [{"scope": "project", "installPath": "/own/b", "projectPath": work}],
+                "c@m": [{"scope": "local", "installPath": "/own/c", "projectPath": "/elsewhere"}],
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let sharing = Sharing {
+            source: Some(named("src", &source_home)),
+            opted_out: vec![],
+        };
+        let config = root.join("remuda/config.toml");
+        let got = inject(
+            &sharing,
+            &named("max", &max),
+            &["--setting-sources=user".into()],
+            Some(&work),
+            &Env::new(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            got.args,
+            [
+                format!("--plugin-dir={}", cache.join("c").display()),
+                format!("--plugin-dir={}", cache.join("d").display()),
+            ]
+        );
+        // `--setting-sources` (either form), like `--settings`: no settings, a notice.
+        assert_eq!(
+            got.notices,
+            ["--setting-sources given: settings and auto-memory from claude:src are not injected"]
+        );
+        let got = inject(
+            &sharing,
+            &named("max", &max),
+            &["--setting-sources".into(), "user".into()],
+            Some(&work),
+            &Env::new(),
+            &config,
+        )
+        .unwrap();
+        assert!(!got.args.iter().any(|a| a.starts_with("--settings")));
+        assert_eq!(got.notices.len(), 1);
+        // Neither is a prefix match: `--settingsx` is not `--settings`.
+        let got = inject(
+            &sharing,
+            &named("max", &max),
+            &["--settingsx".into()],
+            Some(&work),
+            &Env::new(),
+            &config,
+        )
+        .unwrap();
+        assert!(
+            got.args.iter().any(|a| a.starts_with("--settings=")),
+            "{:?}",
+            got.args
+        );
+    }
+
+    /// R18: the settings directory lock excludes a second holder until the first is dropped.
+    #[test]
+    fn the_settings_directory_lock_is_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = DirLock::exclusive(dir.path()).unwrap();
+        let other = fs::File::open(dir.path()).unwrap();
+        // SAFETY: the descriptor is open for the call.
+        let try_lock = || unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(try_lock(), -1, "held elsewhere");
+        drop(held);
+        assert_eq!(try_lock(), 0);
     }
 }

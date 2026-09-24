@@ -349,10 +349,7 @@ fn tui_launches_get_shared_configuration() {
     };
     assert_eq!(
         warnings,
-        &[
-            "--settings given: settings and auto-memory from claude:default are not injected \
-           (claude uses only the last --settings)"
-        ]
+        &["--settings given: settings and auto-memory from claude:default are not injected"]
     );
     let inv = sb.only_invocation();
     let shared = sb.remuda_home().join("shared/claude");

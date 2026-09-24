@@ -534,13 +534,19 @@ fn authentication_keys_are_withheld() {
     fs::write(
         s.source.join("settings.json"),
         r#"{"model": "opus", "apiKeyHelper": "/bin/key", "forceLoginMethod": "console",
-            "env": {"ANTHROPIC_API_KEY": "sk-x", "CLAUDE_CODE_USE_BEDROCK": "1", "TZ": "UTC"}}"#,
+            "env": {"ANTHROPIC_API_KEY": "sk-x", "CLAUDE_CODE_USE_BEDROCK": "1", "TZ": "UTC",
+                    "CLAUDE_CODE_USE_MANTLE": "1", "AWS_BEARER_TOKEN_BEDROCK": "b",
+                    "ANTHROPIC_AWS_API_KEY": "k", "ANTHROPIC_MODEL": "opus",
+                    "DISABLE_TELEMETRY": "1"}}"#,
     )
     .unwrap();
     let inv = s.run(&["max"]);
     let settings = settings_of(&inv.args).unwrap();
     assert_eq!(settings["model"], json!("opus"));
-    assert_eq!(settings["env"], json!({"TZ": "UTC"}));
+    assert_eq!(
+        settings["env"],
+        json!({"TZ": "UTC", "ANTHROPIC_MODEL": "opus", "DISABLE_TELEMETRY": "1"})
+    );
     assert!(settings.get("apiKeyHelper").is_none() && settings.get("forceLoginMethod").is_none());
     let path = inv.args[1].strip_prefix("--settings=").unwrap();
     assert!(!fs::read_to_string(path).unwrap().contains("sk-x"));
@@ -585,24 +591,55 @@ fn memory_encodes_utf16_code_units() {
     assert_eq!(memory, memory_of(&s.source, &dir));
 }
 
-/// R18: when git fails for a reason other than "not a repository", no memory location is
-/// guessed; the launch goes on and says so.
+/// R18: remuda runs no git to find the project root: a `git` on PATH is never called, and a
+/// `GIT_DIR` in the environment changes nothing (claude walks the file system too).
 #[test]
-fn a_failing_git_means_no_memory_and_a_notice() {
+fn the_project_root_comes_from_the_file_system_not_git() {
     let s = shared();
+    let marker = s.sb.root().join("git-ran");
     common::write_executable(
         &s.sb.bin().join("git"),
-        "#!/bin/sh\necho 'fatal: detected dubious ownership in repository' >&2\nexit 128\n",
+        &format!("#!/bin/sh\n: > '{}'\nexit 1\n", marker.display()),
     );
+    let root = s.sb.root().canonicalize().unwrap();
+    let repo = root.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::create_dir_all(repo.join("src")).unwrap();
     s.sb.remuda()
+        .current_dir(repo.join("src"))
+        .env("GIT_DIR", root.join("elsewhere/.git"))
         .args(["run", "max"])
         .assert()
-        .success()
-        .stderr(predicate::str::contains(
-            "auto-memory from claude:default is not shared this time: cannot find the project \
-             root (git rev-parse failed: fatal: detected dubious ownership",
-        ));
+        .success();
+    assert!(!marker.exists(), "git was run");
     let settings = settings_of(&s.sb.only_invocation().args).unwrap();
-    assert!(settings.get("autoMemoryDirectory").is_none(), "{settings}");
-    assert_eq!(settings["model"], json!("opus"));
+    assert_eq!(
+        settings["autoMemoryDirectory"],
+        json!(memory_of(&s.source, &repo))
+    );
+}
+
+/// R18: `--setting-sources` (either form), like `--settings`, means no injected settings or
+/// auto-memory, said on stderr.
+#[test]
+fn setting_sources_suppress_injected_settings() {
+    for form in [
+        &["--setting-sources", "user"][..],
+        &["--setting-sources=user,local"],
+    ] {
+        let s = shared();
+        let mut args = vec!["run", "max"];
+        args.extend_from_slice(form);
+        s.sb.remuda()
+            .args(&args)
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(
+                "--setting-sources given: settings and auto-memory from claude:default are not \
+                 injected",
+            ));
+        let inv = s.sb.only_invocation();
+        assert!(settings_of(&inv.args).is_none(), "{:?}", inv.args);
+        assert!(inv.args[0].starts_with("--add-dir="));
+    }
 }
