@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -19,6 +20,8 @@ const POLL: Duration = Duration::from_millis(10);
 const GRACE: Duration = Duration::from_millis(100);
 /// How long a JSON-RPC server gets to exit after its stdin closed, before it is killed.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
+/// How long a JSON-RPC server's process group gets to go after SIGTERM, before SIGKILL.
+const TERM_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -148,10 +151,13 @@ pub fn run_json_rpc(
 ) -> Result<HashMap<u64, Value>, String> {
     let deadline = Instant::now() + timeout;
     let mut cmd = Command::new(program);
+    // Its own process group, so that its children go with it: codex installed through npm or
+    // bun is a node shim whose child is the real server.
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     launch::apply_env(&mut cmd, change);
     let mut child = Reaper(
         cmd.spawn()
@@ -214,16 +220,45 @@ fn response(line: &str, ids: &HashSet<u64>) -> Option<(u64, Value)> {
     (ids.contains(&id) && answered).then_some((id, value))
 }
 
-/// A child that is killed and reaped when dropped, so that no path out of
-/// [`run_json_rpc`] (a timeout, an early exit, an error) leaves it running or unreaped. Killing
-/// and waiting for a child that was already reaped does nothing.
+/// A child leading its own process group that is terminated with the group and reaped when
+/// dropped, so that no path out of [`run_json_rpc`] (a timeout, an early exit, an error, or a
+/// server that does not exit after its stdin closed) leaves it, or a process it started,
+/// running. Killing and waiting for a child that was already reaped does nothing.
 struct Reaper(Child);
 
 impl Drop for Reaper {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        terminate_group(&mut self.0);
     }
+}
+
+/// SIGTERM to `child`'s process group (its id: it leads the group), up to [`TERM_GRACE`] for
+/// every member to go, then SIGKILL to what is left; the direct child is killed and reaped
+/// either way. An empty group is not signalled again.
+fn terminate_group(child: &mut Child) {
+    if let Ok(pgid) = libc::pid_t::try_from(child.id())
+        && signal_group(pgid, libc::SIGTERM)
+    {
+        let until = Instant::now() + TERM_GRACE;
+        let mut alive = true;
+        while alive && Instant::now() < until {
+            thread::sleep(POLL);
+            // Reaps the direct child once it exited: a zombie still counts as a member.
+            let _ = child.try_wait();
+            alive = signal_group(pgid, 0);
+        }
+        if alive {
+            signal_group(pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `kill(-pgid, signal)`: whether the group had a member to signal.
+fn signal_group(pgid: libc::pid_t, signal: libc::c_int) -> bool {
+    // SAFETY: kill(2) takes no pointers; a negative pid names the process group.
+    unsafe { libc::kill(-pgid, signal) == 0 }
 }
 
 /// Waits for `child` to exit until `until`; `None` if it is still running (or cannot be waited
@@ -492,6 +527,68 @@ mod tests {
             ),
             Err("exited before answering".to_string())
         );
+    }
+
+    /// Whether process `pid` is gone, waiting up to 5 s for it to be (a killed orphan is
+    /// reaped by init).
+    fn gone(pid: libc::pid_t) -> bool {
+        let until = Instant::now() + Duration::from_secs(5);
+        // SAFETY: kill(2) with signal 0 only checks that the process exists.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            if Instant::now() >= until {
+                return false;
+            }
+            thread::sleep(POLL);
+        }
+        true
+    }
+
+    /// The pid a script wrote to `path`.
+    fn pid_in(path: &Path) -> libc::pid_t {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// The server's process group goes with it: a process it started is terminated on a
+    /// timeout, and one that ignores SIGTERM is killed after the grace. (The timeout leaves the
+    /// script time to write both pids.)
+    #[test]
+    fn json_rpc_kills_the_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = script(
+            dir.path(),
+            "s",
+            "sleep 30 & echo $! > \"$1/plain\"; (trap '' TERM; exec sleep 30) & \
+             echo $! > \"$1/stubborn\"; exec sleep 30",
+        );
+        let d = dir.path().to_str().unwrap();
+        let start = Instant::now();
+        let result = run_json_rpc(&p, &[d], &keep(), &[], &[1], Duration::from_secs(2));
+        assert_eq!(result, Err("timed out after 2s".to_string()));
+        assert!(start.elapsed() < Duration::from_secs(6));
+        for name in ["plain", "stubborn"] {
+            assert!(gone(pid_in(&dir.path().join(name))), "{name} survived");
+        }
+    }
+
+    /// After an answer, a process the server left behind is terminated too.
+    #[test]
+    fn json_rpc_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = script(
+            dir.path(),
+            "s",
+            "read a; sleep 30 & echo $! > \"$1/left\"; echo '{\"id\":1,\"result\":1}'; \
+             cat >/dev/null",
+        );
+        let d = dir.path().to_str().unwrap();
+        let lines = ["{}".to_string()];
+        let result = run_json_rpc(&p, &[d], &keep(), &lines, &[1], Duration::from_secs(10));
+        assert!(result.is_ok(), "{result:?}");
+        assert!(gone(pid_in(&dir.path().join("left"))), "left survived");
     }
 
     #[test]
