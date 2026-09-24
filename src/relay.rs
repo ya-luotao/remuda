@@ -134,7 +134,7 @@ pub fn prepare(
     sharing: &Sharing,
     env: &Env,
     launch_log: &Path,
-    shared_dir: &Path,
+    config: &Path,
     ts: String,
 ) -> Result<Launch> {
     let dest = check(source, target, env, launch_log)?;
@@ -147,7 +147,7 @@ pub fn prepare(
         || uuid::Uuid::new_v4().to_string(),
         sharing,
         env,
-        shared_dir,
+        config,
     )?;
     plan.record.relay = Some(copy(source, &dest, accounts, env)?);
     Ok(plan)

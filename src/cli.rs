@@ -14,7 +14,7 @@ use crate::index::{self, Index};
 use crate::provider::Provider;
 use crate::registry::{self, Account, Registry};
 use crate::{Env, paths};
-use crate::{attribution, launch, live, probe, relay, setup, share, text, transcript, tui, usage};
+use crate::{attribution, launch, live, probe, relay, setup, text, transcript, tui, usage};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -224,7 +224,7 @@ fn relay(config: &Path, session: &str, reference: &str, ctx: &Context) -> Result
         &registry.sharing,
         &ctx.env,
         &log,
-        &share::dir(config),
+        config,
         (ctx.clock)().to_string(),
     )?;
     eprintln!(
@@ -327,7 +327,7 @@ fn exec_as(
         || uuid::Uuid::new_v4().to_string(),
         &registry.sharing,
         &ctx.env,
-        &share::dir(config),
+        config,
     )?;
     exec_plan(config, &program, &plan, None, ctx)
 }
