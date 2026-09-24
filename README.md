@@ -38,6 +38,13 @@ and makes no network requests of its own.
 - **Account checks.** Warnings for conditions that silently break multi-account setups: an
   `ANTHROPIC_API_KEY` that overrides every login, dangling symlinks, missing or logged-out homes,
   and a shared `projects` store without `cleanupPeriodDays`.
+- **Token statistics.** Input, cache, output and reasoning tokens per account and model, for
+  today, the last 7 or 30 days, or all time, counted from the agents' own transcripts:
+  `remuda stats` and the TUI's Stats view. Each request counts once, even when a message is
+  written in several records, a session is forked or relayed, or a store is shared by several
+  accounts. No cost is estimated, and no agent is run.
+- **Private mode.** `Ctrl-P` in the TUI hides account names, emails, organizations, paths,
+  session titles and message previews, for screenshots.
 - **Codex support.** Codex accounts (`CODEX_HOME`) can be registered, set up, launched, indexed,
   resumed and forked, with their usage limits. `remuda list` shows a Codex account's login method;
   its email and plan appear after a live usage query. Live sessions are not available for Codex,
@@ -155,6 +162,7 @@ provider is an error that lists the candidates. The bare name `default` always m
 | `remuda usage [<account>] [--live] [--timeout <SECONDS>]` | Print usage limits for every account, or for one. Without `--live`, reads the agent's local cache. With `--live`, asks each account's agent in parallel (`claude -p /usage`, `codex app-server`) and exits 1 if any query fails. `--timeout` applies to each live query (default 90). |
 | `remuda list [--timeout <SECONDS>]` | Print every account with its login identity (email, organization and plan; for Codex, the login method only) and home. `--timeout` applies to each identity query (default 15). |
 | `remuda sessions [--limit <N>]` | Print the newest sessions: time, attributed accounts, title and working directory (default 30). |
+| `remuda stats [<account>] [--period today\|7d\|30d\|all]` | Print tokens per account and model for a period (default `all`), counted from the transcripts; with an account, only the sections that include it. The first run reads every transcript whole, which can take tens of seconds on a large history; later runs read only what changed, using the cache in `state/stats.json`. |
 | `remuda add [--provider <claude\|codex>] <name> <path>` | Register an existing home directory as an account. The provider defaults to `claude`. |
 | `remuda setup [--provider <claude\|codex>] <name> [--email <EMAIL>]` | Create a new home under `$REMUDA_HOME/homes/<provider>/<name>`, register it, and run the agent's login (`claude auth login` or `codex login`). `--email` prefills the Claude login. |
 | `remuda remove <account>` | Unregister an account: remove it from `config.toml`. Its home directory and everything in it are left in place, and its path is printed so `remuda add` can register it again. `default` and the source of `[share.claude]` cannot be removed. |
@@ -166,15 +174,14 @@ Account names match `[A-Za-z0-9_-]+`. Because `run` forwards `-h` and `--help` t
 
 ## TUI
 
-The TUI has three views, Accounts, Live and History, with a preview pane for the selected session.
-Press `?` in the TUI for the key reference.
+The TUI has four views, Accounts, Live, History and Stats, with a preview pane for the selected
+session in Live and History. Press `?` in the TUI for the key reference.
 
 | Key | Action |
 | --- | --- |
-| `1` `2` `3`, `Tab`, `Shift-Tab` | Switch view: Accounts, Live, History |
-| `j` `k`, `↑` `↓` | Move the selection |
-| `g` `G`, `Home` `End` | First / last row |
-| `PgUp` `PgDn` | Page up / down |
+| `1` `2` `3` `4`, `Tab`, `Shift-Tab` | Switch view: Accounts, Live, History, Stats |
+| `j` `k`, `↑` `↓` | Move the selection (Stats: scroll) |
+| `g` `G`, `Home` `End`, `PgUp` `PgDn` | First / last row, page up / down |
 | `Enter` | History: resume the selected session (Codex asks for confirmation first). Live: attach to a background session |
 | `f` | Fork the selected session into a new session; the original is left unchanged |
 | `c` | Continue the selected Claude session under another account: choose the account, and the session is copied into its store and forked there (relay) |
@@ -186,22 +193,47 @@ Press `?` in the TUI for the key reference.
 | `D` | Accounts: remove the selected account from the registry; its home is kept (asks for confirmation). Live: remove a stopped background session (asks for confirmation) |
 | `/` | History: fuzzy search over title, working directory and accounts |
 | `a` | History: also show teammate, SDK and Codex subagent sessions. Live: also show stopped background sessions |
+| `t` | Stats: next period (all time, today, last 7 days, last 30 days) |
 | `u` | Query live usage for every account |
-| `r` | Refresh the index, identities, live sessions and checks |
+| `r` | Refresh the index, identities, live sessions and checks, and the statistics once the Stats view has been opened |
 | `Esc` | Go back: collapse the preview, close logs, clear the search, or cancel a form or pending launch check |
-| `?` | Show the key reference; any key closes it |
-| `q`, `Ctrl-C` | Quit |
+| `Ctrl-P` | Turn private mode on or off, anywhere, including in forms, the search prompt, confirmations and the help box |
+| `?` · `q`, `Ctrl-C` | Show the key reference (any key but `Ctrl-P` closes it) · Quit |
 
 In an expanded preview, the movement keys scroll the preview instead of the list. In forms, `Tab`
 or `↓` moves to the next field, `Shift-Tab` or `↑` to the previous one, `Enter` submits and `Esc`
-cancels. Confirmations accept `y`; any other key cancels. In the account picker opened by
-`remuda run` without an account, `Enter` launches the selected account and `Esc` or `q` exits
-without launching anything.
+cancels. Confirmations accept `y`; any other key except `Ctrl-P` cancels. In the account picker
+opened by `remuda run` without an account, `Enter` launches the selected account and `Esc` or `q`
+exits without launching anything.
 
 Resuming a Claude session that is still running elsewhere is refused, because two processes
 writing the same session would overwrite each other. Codex has no source of running sessions, so
 resuming a Codex session in place always asks for confirmation. Forks and relays only read the
 original session, so they are allowed while it runs.
+
+The Stats view computes the statistics in the background the first time it opens, with the
+reading progress in the status line, and again on each `r`; the first computation reads every
+transcript whole.
+
+### Private mode
+
+`Ctrl-P` turns private mode on or off; the header then shows `PRIVATE`. It is off when the TUI
+starts and is not saved. While it is on, the TUI shows:
+
+- account names as aliases, `account-1`, `account-2`, … (`codex:account-1` for Codex), numbered
+  when the TUI starts and stable while it runs; `default` is shown as is;
+- emails as `•••@•••`, and organizations, session titles, first messages, session names, message
+  previews, background session logs, search text and typed form values as `•••`;
+- paths with every component masked, and `$HOME` as `~` (`~/•••/•••`);
+- notices, errors and check messages with the above replaced, as a best effort: a path is
+  recognized from a `/` or `~/` that begins a word, or from a directory remuda knows.
+
+It keeps visible the numbers (usage percentages, reset times, token counts), model names, plans,
+login methods, providers, session IDs, pids and times. It does not hide the output of an agent
+after remuda hands it the terminal (the line remuda prints just before does follow private mode),
+and the command-line commands have no private mode. In VS Code's integrated terminal on Linux and
+Windows, `Ctrl-P` opens Quick Open; add `workbench.action.quickOpen` to
+`terminal.integrated.commandsToSkipShell` with a leading `-` so the key reaches remuda.
 
 ## Configuration
 
@@ -214,6 +246,7 @@ $REMUDA_HOME/
 ├── shared/claude/.claude          symlink to the shared configuration's source home
 └── state/
     ├── index.json                 session index cache
+    ├── stats.json                 token statistics cache
     ├── launches.jsonl             launch log
     └── settings/                  shared settings passed to claude (mode 0600)
 ```
