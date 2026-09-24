@@ -140,6 +140,15 @@ pub fn old_state() -> String {
     line(json!({"record_type": "state"}))
 }
 
+/// A `token_count` event: the rate limits codex recorded after a model turn (R10).
+pub fn token_count(rate_limits: Value, ts: &str) -> String {
+    record(
+        "event_msg",
+        ts,
+        json!({"type": "token_count", "info": null, "rate_limits": rate_limits}),
+    )
+}
+
 /// One line of `<home>/session_index.jsonl`.
 pub fn thread_name(id: &str, name: &str) -> String {
     line(json!({"id": id, "thread_name": name, "updated_at": "2026-09-20T10:00:00Z"}))
@@ -147,8 +156,16 @@ pub fn thread_name(id: &str, name: &str) -> String {
 
 /// `<home>/sessions/2026/09/20/rollout-2026-09-20T10-00-00-<id>.jsonl`, written; returns it.
 pub fn write_rollout(home: &Path, id: &str, contents: &str) -> PathBuf {
-    let dir = home.join("sessions/2026/09/20");
-    fs::create_dir_all(&dir).unwrap();
+    write_rollout_in(&home.join("sessions/2026/09/20"), id, contents)
+}
+
+/// The same rollout, archived: `<home>/archived_sessions/rollout-…-<id>.jsonl`.
+pub fn write_archived_rollout(home: &Path, id: &str, contents: &str) -> PathBuf {
+    write_rollout_in(&home.join("archived_sessions"), id, contents)
+}
+
+fn write_rollout_in(dir: &Path, id: &str, contents: &str) -> PathBuf {
+    fs::create_dir_all(dir).unwrap();
     let path = dir.join(format!("rollout-2026-09-20T10-00-00-{id}.jsonl"));
     fs::write(&path, contents).unwrap();
     path

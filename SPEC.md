@@ -15,7 +15,7 @@ implemented.
 
 ## R1. Model
 
-- **Provider**: an agent CLI (v1: `claude` is fully supported; `codex` supports accounts, the session index, launch, resume, and fork, but not usage or live sessions; see R4 and R17).
+- **Provider**: an agent CLI (v1: `claude` is fully supported; `codex` supports accounts, usage, the session index, launch, resume, and fork, but not live sessions; see R4 and R17).
 - **Account**: `(provider, name, home)`. `home` is the provider's isolation directory, or the
   special value `default`.
 - `name` matches `[A-Za-z0-9_-]+` and is unique within a provider. On the command line an account
@@ -87,8 +87,8 @@ the UI, not reported as an error:
 | Capability | claude | codex (M3) |
 | --- | --- | --- |
 | Isolation variable / `default` semantics | `CLAUDE_CONFIG_DIR` / must be unset | `CODEX_HOME` / unset (explicitly setting it to `~/.codex` is equivalent to leaving it unset; verified) |
-| Identity | `claude auth status --json` (R10a) | `codex login status`: login method only (ChatGPT / API key / not logged in), **no email**; `auth.json` is not read (it holds credentials) |
-| Usage | cached `cachedUsageUtilization`; live `claude -p /usage` (R10) | not supported |
+| Identity | `claude auth status --json` (R10a) | `codex login status`: login method only (ChatGPT / API key / not logged in); the email and plan come from the live query (`account/read`, R10, R10a); `auth.json` is not read (it holds credentials) |
+| Usage | cached `cachedUsageUtilization`; live `claude -p /usage` (R10) | cached: the rate limits codex records in its rollouts; live: `codex app-server` `account/rateLimits/read` (R10) |
 | Session index | `projects/*/*.jsonl` (R8) | `sessions/YYYY/MM/DD/rollout-*-<id>.jsonl` (R17) |
 | Running processes | `claude agents --json` (R7) | no machine-readable source (`codex agents` is interactive only): not supported |
 | Attribution | pre-assigned `--session-id` + `history.jsonl` (R9) | sessions are stored per `CODEX_HOME`: the home containing the rollout is the owner, exactly |
@@ -101,6 +101,23 @@ the UI, not reported as an error:
   digits of the sha256 of the **normalized** path, so different spellings of the same directory make
   no difference to codex (remuda still applies R2's byte-for-byte rule to codex; it is simply no
   longer a necessary condition).
+- `codex app-server` (marked experimental; verified on 0.155.1, field names from
+  `codex app-server generate-json-schema`): JSON-RPC over stdio, one JSON message per line. The
+  client sends `initialize` (`{"clientInfo": {"name", "version"}}`) and the `initialized`
+  notification, then its requests; responses carry the request's `id`, may arrive in any order,
+  and are interleaved with notifications. It honors `CODEX_HOME`.
+  - Once its stdin closes, pending requests go unanswered, and it exits only after its startup
+    completes. So remuda keeps stdin open until every answer has arrived, then closes it.
+  - On timeout, its whole process group is terminated: an npm or bun install is a node shim whose
+    child is the real server.
+  - Its startup does what launching Codex does: it may refresh a stale login token at the
+    provider, contacts the provider's and plugin endpoints, and writes Codex's own state into the
+    home (SQLite databases, `installation_id`, `skills/.system`, `.tmp/plugins-clone-*`, `tmp/`);
+    for a logged-in home it takes about 1.5 s, against 0.05 s and no network for
+    `codex login status`. That is why remuda runs it only for explicit live queries (R10), never
+    for `list` or the identities of the accounts view.
+  - remuda calls only `initialize`, `account/rateLimits/read`, and `account/read`, never a method
+    that changes anything (such as `account/rateLimitResetCredit/consume` or `account/logout`).
 - Codex's `$CODEX_HOME/<name>.config.toml` is a configuration layer under the same login, **not**
   account isolation; remuda does not treat it as an account.
 
@@ -276,35 +293,66 @@ appeared in no `history.jsonl`.
 
 ## R10. Usage
 
-- For each account, show the 5-hour window, the weekly window, and the per-model weekly limits:
-  utilization and reset time.
+- For each account, show its usage windows with utilization and reset time: claude's 5-hour
+  window, weekly window, and per-model weekly limits; codex's windows under the same labels (below).
 - The reset times of all accounts are drawn on a single timeline, so that the account with the most
   headroom right now is easy to pick.
 - Two data sources:
-  1. **Cached** (instant, default): the local cache the agent writes itself (Claude: the
+  1. **Cached** (instant, default): what the agent itself recorded locally. Claude: the
      `cachedUsageUtilization` in `.claude.json`, which has `fetchedAtMs` and ISO-format
-     `resets_at`). The cache time is always shown.
-  2. **Live** (refreshed on demand): run `claude -p /usage --no-session-persistence` in the
-     account's environment, so that claude itself queries with that account's credentials. Basis
-     (verified on 2.1.280): `/usage` is a local command that supports non-interactive use and does
-     not call the model (0 tokens, no cost); with `--no-session-persistence` it leaves no
-     transcript. It takes anywhere from 2 to 20 seconds (it scans the local session history), so
-     the default timeout is 90 seconds.
-     Accounts are queried in parallel.
-- The live source produces only human-readable text (`--output-format json` merely places the same
-  text in `result`). remuda parses only the `Current session` / `Current week (…)` lines; if it
-  cannot parse them it displays the text as-is and never crashes. This format is not a public
+     `resets_at`. Codex: the rate limits in its rollouts (below). The cache time is always shown.
+  2. **Live** (refreshed on demand), run in the account's environment, so that the agent itself
+     queries with that account's credentials. Accounts are queried in parallel; the default
+     timeout is 90 seconds.
+     - Claude: `claude -p /usage --no-session-persistence`. Basis (verified on 2.1.280): `/usage`
+       is a local command that supports non-interactive use and does not call the model (0
+       tokens, no cost); with `--no-session-persistence` it leaves no transcript. It takes
+       anywhere from 2 to 20 seconds (it scans the local session history).
+     - Codex: one `codex app-server` (R4) per account, which is sent both
+       `account/rateLimits/read` with `{"excludeResetCreditDetails": true}` and `account/read`
+       with `{"refreshToken": false}`, and answers both (about a second or two). The rate limits
+       are the usage; `account/read` also gives the account's email and plan (R10a).
+- Claude's live source produces only human-readable text (`--output-format json` merely places the
+  same text in `result`). remuda parses only the `Current session` / `Current week (…)` lines; if
+  it cannot parse them it displays the text as-is and never crashes. This format is not a public
   interface and may change between versions.
-- A live query does **not** refresh the local cache (verified: `fetchedAtMs` is unchanged after
-  consecutive runs); the two sources are displayed separately.
+- **Codex, cached** (verified on 0.155.1 against 1456 real rollouts): each model turn appends
+  `{"timestamp", "type": "event_msg", "payload": {"type": "token_count", "rate_limits": {…}}}`.
+  `rate_limits` (may be null) holds `limit_id`, `limit_name`, and the windows `primary` and
+  `secondary`, each `{"used_percent", "window_minutes", "resets_at"}` (Unix seconds, may be null)
+  or null. `limit_id` is `codex` for the account's general limit, another ID for a per-model limit
+  (e.g. `codex_bengalfox`, named `GPT-5.3-Codex-Spark`), and null in 2025 rollouts (windows of 299
+  and 10079 minutes). The cached value is the general limit (`limit_id` `codex` or null, with a
+  usable window) of the newest such record by `timestamp`, in `<home>/sessions/**/rollout-*.jsonl`
+  and `<home>/archived_sessions/rollout-*.jsonl`; the cache time is that record's `timestamp`.
+  Per-model limits are shown live only. The scan is bounded: rollouts newest first by mtime, at
+  most 16, stopping at the first whose mtime is older than the best record found (none of its
+  records can be newer); each is read from its end, 64 KB growing ×4 up to 1 MB.
+- **Codex, live**: the general limit is `rateLimitsByLimitId.codex`, else `rateLimits`; every
+  other entry of `rateLimitsByLimitId` is a per-model limit, named by its `limitName`, else its
+  key. Windows are `{"usedPercent", "windowDurationMins", "resetsAt"}`. An error response to
+  `account/rateLimits/read` (a logged-out home answers -32600 "codex account authentication
+  required to read rate limits") is that account's failure; a response without a usable window is
+  shown as is. `account/read` is extra: if it fails, is not recognized, or names no logged-in
+  account, the usage is still shown, without an email or plan.
+- **Codex windows** are labeled by duration, not position (a Pro plan's `primary` window is weekly,
+  with no `secondary`): minutes rounded to whole hours; 5 hours is `Session`, 168 hours is
+  `Week (all models)`, any other duration `<N>h window` (`<N>d window` for whole days). A
+  per-model limit's name replaces `all models` in `Week (<name>)` and is appended to the others
+  (`Session (<name>)`). A window without a numeric percentage and a positive duration is dropped.
+  Rows: the general limit first, then per-model limits, each by window length.
+- Codex credits, reset credits, spend control, and upsell data are not shown (R4).
+- A live query does **not** refresh the local cache (verified for claude: `fetchedAtMs` is
+  unchanged after consecutive runs); the two sources are displayed separately.
 - remuda makes no network requests of its own and never reads credentials to call the agent's usage
   endpoint directly.
-- The cache format is undocumented and parsed on a best-effort basis: unrecognized formats degrade
-  to missing rows, and parsing never crashes.
-- `remuda usage [--live]` prints the same information as plain text for direct use from the shell.
-- The live source provides no severity: the TUI marks 75% as a warning and 90% as critical. The
-  live source's reset times are claude's localized text; the timeline makes a best effort to parse
-  them into instants and otherwise uses the cached reset time of the same limit.
+- The cache formats are undocumented and parsed on a best-effort basis: unrecognized formats
+  degrade to missing rows, and parsing never crashes.
+- `remuda usage [--live]` prints the same information as plain text for direct use from the shell;
+  a codex account's live header also shows its email and plan.
+- The live sources provide no severity: 75% is marked as a warning and 90% as critical. Claude's
+  live reset times are localized text; the timeline makes a best effort to parse them into instants
+  and otherwise uses the cached reset time of the same limit. Codex reports instants.
 
 ## R10a. Identity
 
@@ -313,6 +361,13 @@ appeared in no `history.jsonl`.
 - If the command fails, fall back to reading `oauthAccount` from `.claude.json` (for `default`,
   `~/.claude.json`).
 - `configDirectory` can be used to confirm that the path remuda passed actually took effect.
+- Codex (verified on 0.155.1): `codex login status`, run in the account's environment. It prints
+  to stderr, and exits 1 when not logged in: `Logged in using <method>` (an API key's masked key
+  is not kept) or `Not logged in`. That is the login method only, no email; `auth.json` is not
+  read (it holds credentials).
+- A codex account's email and plan appear after a live query (R10): its `account/read` gives
+  `{"type": "chatgpt", "email", "planType"}` (`unknown` counts as no plan; codex has no
+  organization). A later identity refresh shows the login method again.
 
 ## R11. Checks in the accounts view
 
@@ -351,7 +406,10 @@ The complete set of v1 write operations:
 
 remuda never writes credentials, `.claude.json`, the Keychain, transcripts, `history.jsonl`, or
 `*.key` files, never writes into any home directory except for the relay copies above, and never makes network requests of its own
-(live usage is queried by the agent itself; see R10).
+(live usage is queried by the agent itself; see R10). Network use and writes into a home by an
+agent are the agent's own, and happen only in live queries (`claude -p /usage`, `codex app-server`;
+R4, R10) or in the other agent commands remuda runs in an account's environment (`claude auth
+status`, `codex login status`, which creates `tmp/`, a launch, a login).
 
 ## R14. `add <name> <path>`
 
@@ -389,10 +447,13 @@ remuda never writes credentials, `.claude.json`, the Keychain, transcripts, `his
 
 Every test runs in a sealed sandbox: a fresh `HOME` and `REMUDA_HOME`, and a fake `claude` on PATH
 that prints its own environment and arguments and returns fixtures for `agents --json`,
-`auth status --json`, and `-p /usage`; tests never touch real logins or sessions. Fixtures for
-transcripts, `sessions/*.json`, `history.jsonl`, and `.claude.json` are derived from real structures
-and anonymized. In library-level tests where `FAKE_CLAUDE_OUT` / `HOME` are not set, the fake claude
-defaults to paths inside the sandbox.
+`auth status --json`, and `-p /usage`, and, when a test installs it, a fake `codex` that records
+the same, answers `login status`, and acts as `app-server`: it reads JSON-RPC lines from stdin,
+records them, answers `initialize`, `account/read`, and `account/rateLimits/read` from fixtures
+with a notification before each answer, and exits when stdin closes; tests never touch real logins
+or sessions. Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jsonl`, and
+`.claude.json` are derived from real structures and anonymized. In library-level tests where
+`FAKE_CLAUDE_OUT` / `HOME` are not set, the fake claude defaults to paths inside the sandbox.
 
 ## R16. TUI actions (M2)
 
@@ -493,7 +554,8 @@ defaults to paths inside the sandbox.
   first** ("remuda cannot confirm that this session is not running elsewhere"; `y` resumes anyway,
   any other key cancels); if the rollout file was written within the last 10 minutes, the prompt
   adds that it is still being written. Forks need no confirmation.
-- Usage and running sessions: not supported for codex; shown as unavailable in the UI.
+- Running sessions: not supported for codex; shown as unavailable in the UI. Identity and usage:
+  R4, R10, R10a.
 
 ## R18. Shared configuration (M2.5)
 

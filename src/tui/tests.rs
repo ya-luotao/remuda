@@ -19,7 +19,7 @@ use crate::index::{Entry, Store};
 use crate::live::{Control, LiveSession, Source};
 use crate::registry::{Account, CLAUDE, CODEX, Home};
 use crate::transcript::{Message, Role};
-use crate::usage::{CachedUsage, LiveUsage, Resets, UsageRow};
+use crate::usage::{CachedUsage, LiveResult, LiveUsage, Resets, UsageRow};
 
 const NOW: &str = "2026-09-24T12:00:00Z";
 
@@ -520,7 +520,7 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
         &mut app,
         Event::LiveUsage {
             account: account("max"),
-            result: Ok(LiveUsage::Rows(vec![row("Session", 55.0, None, None)])),
+            result: Ok(LiveUsage::Rows(vec![row("Session", 55.0, None, None)]).into()),
         },
     );
     // Only the accounts that finished can be asked again.
@@ -532,7 +532,7 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
         &mut app,
         Event::LiveUsage {
             account: account("max"),
-            result: Ok(LiveUsage::Rows(vec![row("Session", 56.0, None, None)])),
+            result: Ok(LiveUsage::Rows(vec![row("Session", 56.0, None, None)]).into()),
         },
     );
     assert_eq!(app.accounts[1].rows()[0].percent, 56.0);
@@ -547,7 +547,7 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
         &mut app,
         Event::LiveUsage {
             account: account("default"),
-            result: Ok(LiveUsage::Unrecognized("??".into())),
+            result: Ok(LiveUsage::Unrecognized("??".into()).into()),
         },
     );
     assert_eq!(
@@ -574,7 +574,7 @@ fn late_results_follow_their_account_when_rows_move() {
         &mut app,
         Event::LiveUsage {
             account: account("team"),
-            result: Ok(LiveUsage::Rows(vec![row("Session", 42.0, None, None)])),
+            result: Ok(LiveUsage::Rows(vec![row("Session", 42.0, None, None)]).into()),
         },
     );
     assert_eq!(app.accounts[1].rows()[0].percent, 42.0);
@@ -586,7 +586,7 @@ fn late_results_follow_their_account_when_rows_move() {
         &mut app,
         Event::LiveUsage {
             account: account("max"),
-            result: Ok(LiveUsage::Rows(vec![row("Session", 99.0, None, None)])),
+            result: Ok(LiveUsage::Rows(vec![row("Session", 99.0, None, None)]).into()),
         },
     );
     update(
@@ -2538,7 +2538,8 @@ fn populated_accounts() -> App {
                     severity: None,
                     resets: Some(Resets::Text("Sep 30 at 11:59am (UTC)".into())),
                 },
-            ])),
+            ])
+            .into()),
         },
     );
     update(
@@ -3066,42 +3067,128 @@ fn resume_c(verb: &str) -> LaunchRequest {
     }
 }
 
+/// R10, R10a: codex accounts have cached and live usage like claude's; the login method comes
+/// from `codex login status`, and a live query also tells the email and plan.
 #[test]
-fn codex_accounts_show_their_login_method_and_no_usage() {
+fn codex_accounts_show_identity_and_usage() {
     let mut app = codex_app();
+    // Wide enough for the timeline's legend.
+    update(&mut app, Event::Resize(160, 30));
     keys(&mut app, &[Key::Char('1')]);
+    let method = Identity::LoggedIn {
+        email: None,
+        org: None,
+        plan: None,
+        method: Some("ChatGPT".into()),
+        cached: false,
+    };
     update(
         &mut app,
         Event::Identity {
             account: codex_account("work"),
-            identity: Identity::LoggedIn {
-                email: None,
-                org: None,
-                plan: None,
-                method: Some("ChatGPT".into()),
-                cached: false,
-            },
+            identity: method.clone(),
         },
     );
     update(
         &mut app,
         Event::CachedUsage {
             account: codex_account("work"),
-            result: Err("usage is not available for codex".into()),
+            result: cached(vec![row(
+                "Week (all models)",
+                99.0,
+                None,
+                Some("2026-09-26T12:00:00Z"),
+            )]),
+        },
+    );
+    let lines = screen(&app);
+    let (i, work) = line_with(&lines, "codex:work ");
+    for part in ["logged in (ChatGPT)", "99%", "cached"] {
+        assert!(work.contains(part), "{part}: {work}");
+    }
+    let (_, track) = line_with(&lines[i + 1..], "codex:work ");
+    assert!(track.contains('W') && track.contains("W 2d"), "{track}");
+
+    // `u` asks every account, codex's too.
+    assert_eq!(
+        keys(&mut app, &[Key::Char('u')]),
+        [Effect::LiveUsage(vec![
+            account("default"),
+            account("max"),
+            codex_account("default"),
+            codex_account("work"),
+        ])]
+    );
+    let spark = "GPT-5.3-Codex-Spark";
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: codex_account("work"),
+            result: Ok(LiveResult {
+                usage: LiveUsage::Rows(vec![
+                    row(
+                        "Week (all models)",
+                        99.0,
+                        None,
+                        Some("2026-09-26T12:00:00Z"),
+                    ),
+                    row(
+                        &format!("Session ({spark})"),
+                        5.0,
+                        None,
+                        Some("2026-09-24T14:00:00Z"),
+                    ),
+                    row(
+                        &format!("Week ({spark})"),
+                        7.0,
+                        None,
+                        Some("2026-09-28T12:00:00Z"),
+                    ),
+                ]),
+                identity: Some(Identity::LoggedIn {
+                    email: Some("c@example.com".into()),
+                    org: None,
+                    plan: Some("pro".into()),
+                    method: Some("ChatGPT".into()),
+                    cached: false,
+                }),
+            }),
+        },
+    );
+    // A live result without an identity leaves the row's alone.
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: codex_account("default"),
+            result: Ok(LiveUsage::Rows(vec![row("Session", 1.0, None, None)]).into()),
+        },
+    );
+    let lines = screen(&app);
+    let (_, work) = line_with(&lines, "codex:work ");
+    for part in ["c@example.com", "pro", "99%", "5%", "7%", "live"] {
+        assert!(work.contains(part), "{part}: {work}");
+    }
+    let (_, header) = line_with(&lines, "ACCOUNT");
+    assert!(header.contains(&format!("{spark} 5h")), "{header}");
+    let (_, native) = line_with(&lines, "codex:default ");
+    assert!(native.contains("not logged in"), "{native}");
+    let all = lines.join("\n");
+    for part in [format!("g session ({spark})"), format!("g week ({spark})")] {
+        assert!(all.contains(&part), "{part}: {all}");
+    }
+    assert_eq!(all.matches(&format!("g week ({spark})")).count(), 1);
+
+    // A later identity refresh (`codex login status`) shows the login method again.
+    update(
+        &mut app,
+        Event::Identity {
+            account: codex_account("work"),
+            identity: method,
         },
     );
     let lines = screen(&app);
     let (_, work) = line_with(&lines, "codex:work ");
     assert!(work.contains("logged in (ChatGPT)"), "{work}");
-    assert!(work.contains('—') && !work.contains("no cache"), "{work}");
-    let (_, native) = line_with(&lines, "codex:default ");
-    assert!(native.contains("not logged in"), "{native}");
-    // Live usage is claude's only.
-    assert_eq!(
-        keys(&mut app, &[Key::Char('u')]),
-        [Effect::LiveUsage(vec![account("default"), account("max")])]
-    );
-    assert!(app.accounts[3].live.is_none() && !app.accounts[3].live_pending);
 }
 
 #[test]

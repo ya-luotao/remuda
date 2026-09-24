@@ -20,7 +20,7 @@ use crate::registry::{self, Account, CLAUDE, CODEX, Home};
 use crate::relay;
 use crate::setup;
 use crate::transcript::Message;
-use crate::usage::{CachedUsage, LiveUsage, UsageRow};
+use crate::usage::{CachedUsage, LiveResult, LiveUsage, UsageRow};
 
 use super::{render, search};
 
@@ -113,7 +113,7 @@ pub enum Event {
     },
     LiveUsage {
         account: Account,
-        result: Result<LiveUsage, String>,
+        result: Result<LiveResult, String>,
     },
     Live(Vec<LiveSession>),
     /// Launch log and `history.jsonl` attribution (live sessions are merged in by the app).
@@ -998,12 +998,11 @@ impl App {
         self.open(Overlay::RemoveAccount(account));
     }
 
-    /// `u`: live usage for every account that has usage (claude) and is not already being
-    /// queried.
+    /// `u`: live usage for every account that is not already being queried.
     fn live_usage(&mut self, fx: &mut Vec<Effect>) {
         let mut idle = Vec::new();
         for a in &mut self.accounts {
-            if a.account.provider.has_usage() && !a.live_pending {
+            if !a.live_pending {
                 a.live_pending = true;
                 idle.push(a.account.clone());
             }
@@ -2245,8 +2244,17 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             if let Some(a) = app.row_mut(&account) {
                 a.live_pending = false;
                 a.live = Some(match result {
-                    Ok(LiveUsage::Rows(rows)) => Ok((rows, now)),
-                    Ok(LiveUsage::Unrecognized(_)) => Err("output not recognized".to_string()),
+                    Ok(LiveResult { usage, identity }) => {
+                        // Codex's live query also tells the email and plan (R10); a later
+                        // identity refresh (`codex login status`) shows the login method again.
+                        if let Some(identity) = identity {
+                            a.identity = Some(identity);
+                        }
+                        match usage {
+                            LiveUsage::Rows(rows) => Ok((rows, now)),
+                            LiveUsage::Unrecognized(_) => Err("output not recognized".to_string()),
+                        }
+                    }
                     Err(e) => Err(e),
                 });
             }

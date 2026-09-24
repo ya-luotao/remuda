@@ -1,5 +1,5 @@
 //! Login identity of an account (SPEC R4, R10a): `claude auth status --json`, or
-//! `codex login status`.
+//! `codex login status`; and codex's `account/read`, answered in a live usage query (R10).
 
 use std::fs;
 use std::path::Path;
@@ -80,6 +80,48 @@ pub fn parse_login_status(text: &str) -> Option<Identity> {
         plan: None,
         method: Some(method.to_string()),
         cached: false,
+    })
+}
+
+/// Parses the result of codex's `account/read` (R10, R10a): `account: null` (or no account
+/// while `requiresOpenaiAuth` is present) is not logged in; a `chatgpt` account has an email and
+/// a plan (`unknown` counts as none), other types only their login method. `None` if the result
+/// is not recognizable.
+pub fn parse_account_read(result: &Value) -> Option<Identity> {
+    let result = result.as_object()?;
+    let account = match result.get("account") {
+        Some(Value::Null) => return Some(Identity::NotLoggedIn),
+        None if result.contains_key("requiresOpenaiAuth") => return Some(Identity::NotLoggedIn),
+        None => return None,
+        Some(account) => account,
+    };
+    let method = |m: &str| Identity::LoggedIn {
+        email: None,
+        org: None,
+        plan: None,
+        method: Some(m.to_string()),
+        cached: false,
+    };
+    Some(match account.get("type")?.as_str()? {
+        "chatgpt" => {
+            let text = |key: &str| {
+                account
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            };
+            Identity::LoggedIn {
+                email: text("email"),
+                org: None,
+                plan: text("planType").filter(|plan| plan != "unknown"),
+                method: Some("ChatGPT".to_string()),
+                cached: false,
+            }
+        }
+        "apiKey" => method("API key"),
+        "amazonBedrock" => method("Amazon Bedrock"),
+        other => method(other),
     })
 }
 
@@ -217,6 +259,73 @@ mod tests {
             plan: plan.map(str::to_string),
             method: None,
             cached,
+        }
+    }
+
+    /// R10, R10a: codex's `account/read` result.
+    #[test]
+    fn account_read_cases() {
+        let read = |text: &str| parse_account_read(&serde_json::from_str(text).unwrap());
+        let chatgpt = |email: Option<&str>, plan: Option<&str>| Identity::LoggedIn {
+            email: email.map(str::to_string),
+            org: None,
+            plan: plan.map(str::to_string),
+            method: Some("ChatGPT".into()),
+            cached: false,
+        };
+        let method = |m: &str| Identity::LoggedIn {
+            email: None,
+            org: None,
+            plan: None,
+            method: Some(m.into()),
+            cached: false,
+        };
+        assert_eq!(
+            read(
+                r#"{"account": {"type": "chatgpt", "email": "cx@example.com", "planType": "pro"},
+                "requiresOpenaiAuth": true}"#
+            ),
+            Some(chatgpt(Some("cx@example.com"), Some("pro")))
+        );
+        let unknown =
+            read(r#"{"account": {"type": "chatgpt", "email": null, "planType": "unknown"}}"#);
+        assert_eq!(unknown, Some(chatgpt(None, None)));
+        assert_eq!(unknown.unwrap().who(), "logged in (ChatGPT)");
+        assert_eq!(
+            read(r#"{"account": {"type": "chatgpt", "email": "", "planType": ""}}"#),
+            Some(chatgpt(None, None))
+        );
+        assert_eq!(
+            read(r#"{"account": {"type": "apiKey"}, "requiresOpenaiAuth": true}"#),
+            Some(method("API key"))
+        );
+        assert_eq!(
+            read(r#"{"account": {"type": "amazonBedrock"}}"#),
+            Some(method("Amazon Bedrock"))
+        );
+        assert_eq!(
+            read(r#"{"account": {"type": "somethingNew"}}"#),
+            Some(method("somethingNew"))
+        );
+        for logged_out in [
+            r#"{"account": null, "requiresOpenaiAuth": true}"#,
+            r#"{"requiresOpenaiAuth": false}"#,
+        ] {
+            assert_eq!(
+                read(logged_out),
+                Some(Identity::NotLoggedIn),
+                "{logged_out}"
+            );
+        }
+        for bad in [
+            "null",
+            "[]",
+            "{}",
+            r#"{"account": {}}"#,
+            r#"{"account": {"type": 3}}"#,
+            r#"{"account": "x"}"#,
+        ] {
+            assert_eq!(read(bad), None, "{bad}");
         }
     }
 

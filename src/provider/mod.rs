@@ -131,11 +131,6 @@ impl Provider {
         }
     }
 
-    /// Usage limits can be read (R10); codex: not supported (R4).
-    pub fn has_usage(self) -> bool {
-        self == Provider::Claude
-    }
-
     /// Running sessions can be listed (R7); codex has no machine-readable source (R4).
     pub fn has_live(self) -> bool {
         self == Provider::Claude
