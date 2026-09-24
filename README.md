@@ -17,8 +17,9 @@ and makes no network requests of its own.
 - **Account registry.** Register existing agent homes in place with `remuda add`, or create new
   ones with `remuda setup`, which runs the agent's own login. Each provider's native login is
   always available as the implicit `default` account.
-- **Usage at a glance.** Five-hour, weekly and per-model weekly limits for every Claude account,
-  read from the agent's local cache or queried live through `claude -p /usage`. The TUI draws
+- **Usage at a glance.** Five-hour, weekly and per-model limits for every Claude and Codex
+  account, read from what the agent records locally (Claude's usage cache, the rate limits in
+  Codex rollouts) or queried live through `claude -p /usage` and `codex app-server`. The TUI draws
   every account's reset times on one shared seven-day timeline.
 - **Launching with attribution.** `remuda run <account>` executes the agent with the account's
   home selected. New Claude sessions get a pre-assigned `--session-id`, and every launch is
@@ -38,8 +39,9 @@ and makes no network requests of its own.
   `ANTHROPIC_API_KEY` that overrides every login, dangling symlinks, missing or logged-out homes,
   and a shared `projects` store without `cleanupPeriodDays`.
 - **Codex support.** Codex accounts (`CODEX_HOME`) can be registered, set up, launched, indexed,
-  resumed and forked. Usage limits and live sessions are not available for Codex, because Codex
-  exposes no machine-readable source for them.
+  resumed and forked, with their usage limits. `remuda list` shows a Codex account's login method;
+  its email and plan appear after a live usage query. Live sessions are not available for Codex,
+  because Codex exposes no machine-readable list of running sessions.
 
 ## Status
 
@@ -102,7 +104,7 @@ Check who each account is logged in as, and how much of each usage limit is left
 ```sh
 remuda list
 remuda usage          # from each account's local cache, instantly
-remuda usage --live   # asks claude now; takes a few seconds per account
+remuda usage --live   # asks each agent now; takes a few seconds per account
 ```
 
 Open the TUI to browse accounts, live sessions and history, and to start or resume sessions:
@@ -150,11 +152,12 @@ provider is an error that lists the candidates. The bare name `default` always m
 | --- | --- |
 | `remuda` | Open the TUI. Requires a terminal on standard input and output. |
 | `remuda run [<account>] [args...]` | Launch the account's agent, replacing the `remuda` process. `args` are passed to the agent verbatim. Without an account, the TUI account picker opens first; that form takes no other arguments. |
-| `remuda usage [<account>] [--live] [--timeout <SECONDS>]` | Print usage limits for every account, or for one. Without `--live`, reads the agent's local cache. With `--live`, runs `claude -p /usage` per account in parallel and exits 1 if any query fails. `--timeout` applies to each live query (default 90). |
+| `remuda usage [<account>] [--live] [--timeout <SECONDS>]` | Print usage limits for every account, or for one. Without `--live`, reads the agent's local cache. With `--live`, asks each account's agent in parallel (`claude -p /usage`, `codex app-server`) and exits 1 if any query fails. `--timeout` applies to each live query (default 90). |
 | `remuda list [--timeout <SECONDS>]` | Print every account with its login identity (email, organization and plan; for Codex, the login method only) and home. `--timeout` applies to each identity query (default 15). |
 | `remuda sessions [--limit <N>]` | Print the newest sessions: time, attributed accounts, title and working directory (default 30). |
 | `remuda add [--provider <claude\|codex>] <name> <path>` | Register an existing home directory as an account. The provider defaults to `claude`. |
 | `remuda setup [--provider <claude\|codex>] <name> [--email <EMAIL>]` | Create a new home under `$REMUDA_HOME/homes/<provider>/<name>`, register it, and run the agent's login (`claude auth login` or `codex login`). `--email` prefills the Claude login. |
+| `remuda remove <account>` | Unregister an account: remove it from `config.toml`. Its home directory and everything in it are left in place, and its path is printed so `remuda add` can register it again. `default` and the source of `[share.claude]` cannot be removed. |
 | `remuda relay <session> <account>` | Continue a Claude session under another Claude account: copy its transcript and checkpoints into that account's session store and fork it there, in the session's last directory, replacing the `remuda` process. `<session>` is a full session ID from the index. |
 | `remuda help [<command>]` | Show help for remuda or a command. |
 
@@ -180,10 +183,10 @@ Press `?` in the TUI for the key reference.
 | `s` | Accounts: set up a new Claude or Codex account, as `remuda setup` does |
 | `l` | Live: show a background session's logs in the preview |
 | `x` | Live: stop a background session (asks for confirmation) |
-| `D` | Live: remove a stopped background session (asks for confirmation) |
+| `D` | Accounts: remove the selected account from the registry; its home is kept (asks for confirmation). Live: remove a stopped background session (asks for confirmation) |
 | `/` | History: fuzzy search over title, working directory and accounts |
 | `a` | History: also show teammate, SDK and Codex subagent sessions. Live: also show stopped background sessions |
-| `u` | Query live usage for every Claude account |
+| `u` | Query live usage for every account |
 | `r` | Refresh the index, identities, live sessions and checks |
 | `Esc` | Go back: collapse the preview, close logs, clear the search, or cancel a form or pending launch check |
 | `?` | Show the key reference; any key closes it |
@@ -215,8 +218,8 @@ $REMUDA_HOME/
     └── settings/                  shared settings passed to claude (mode 0600)
 ```
 
-`config.toml` lists the registered accounts. `remuda add` and `remuda setup` edit it for you,
-preserving comments and unknown keys, and it can also be edited by hand:
+`config.toml` lists the registered accounts. `remuda add`, `remuda setup` and `remuda remove`
+edit it for you, preserving comments and unknown keys, and it can also be edited by hand:
 
 ```toml
 [[account]]
@@ -297,18 +300,21 @@ the specification ([SPEC.md](SPEC.md), R2 and R13):
 - **Home paths are stored and passed byte-for-byte.** The agent may key its credentials to the
   exact path string (Claude Code on macOS names its Keychain entry after a hash of it), so remuda
   never rewrites, canonicalizes or adds or removes a trailing slash from a registered home.
-- **Homes are never moved, renamed or deleted.** `remuda add` only records a name; it does not
-  move, copy or create anything.
+- **Homes are never moved, renamed or deleted.** `remuda add` only records a name and
+  `remuda remove` only forgets it; neither moves, copies, creates or deletes anything.
 - **Writes are confined to `$REMUDA_HOME`:** `config.toml`, `state/`, `shared/`, and the empty
   directories created by `remuda setup`. The one exception is an explicit relay, which copies one
   transcript and its checkpoints into the target account's `projects/` and `file-history/`.
   Otherwise remuda never writes into any account home, and it never writes credentials,
   `.claude.json`, the Keychain, existing transcripts or `history.jsonl`.
 - **Credentials are never read.** Identity and usage come from the agents' own commands
-  (`claude auth status --json`, `codex login status`, `claude -p /usage`) and non-secret local
-  metadata. Remuda does not read the Keychain, Codex `auth.json` or session `*.key` files.
+  (`claude auth status --json`, `codex login status`, `claude -p /usage`, `codex app-server`) and
+  non-secret local metadata (the usage cache in `.claude.json`, the rate limits in Codex
+  rollouts). Remuda does not read the Keychain, Codex `auth.json` or session `*.key` files.
 - **No network requests of its own.** Live usage is queried by the agent itself, with the
-  account's own login.
+  account's own login, and only when you ask for it (`remuda usage --live`, `u` in the TUI). A
+  live query starts the agent: `codex app-server` behaves like launching Codex, so it may refresh
+  the account's login token and writes Codex's own state into the home.
 
 ## Documentation
 

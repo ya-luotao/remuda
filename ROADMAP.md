@@ -18,8 +18,8 @@ and planned work.
   home path string (SPEC R2), so an existing home can only be registered in place, never moved into
   a conventional location.
 - **Prefer the agent CLI's machine-readable output over private files.** `claude agents --json`,
-  `claude auth status --json`, and `claude -p /usage` are CLI interfaces and are more stable than
-  undocumented file formats.
+  `claude auth status --json`, `claude -p /usage`, `codex login status`, and `codex app-server` are
+  CLI interfaces and are more stable than undocumented file formats.
 - **New sessions get a pre-assigned `--session-id`.** The session ID is known before launch, which
   makes attribution exact and lets `remuda run` exec directly (SPEC R6, R9).
 
@@ -34,6 +34,7 @@ and planned work.
 | 2026-09-23 | Pre-assign new session IDs with `--session-id` | The ID is known before launch, so attribution is exact and `run` can exec directly (R6, R9) |
 | 2026-09-24 | Sessions are not shared between accounts; configuration is | Exact attribution, no cross-account cleanup, work and personal sessions stay apart; switching accounts mid-session is covered by relay (R19) |
 | 2026-09-24 | Share configuration by launch-time injection, not symlinks | No writes into homes (R13), no drift, new accounts share automatically; plugin packaging rejected because it namespaces agent and skill names (R18) |
+| 2026-09-24 | Codex live usage and identity through `codex app-server`, only on explicit live queries; `list` keeps `codex login status` | `account/rateLimits/read` and `account/read` are machine-readable and codex reads its own credentials, so `auth.json` stays unread; but starting app-server is like launching Codex (it may refresh a token, uses the network, writes state into the home, takes about 1.5 s), so it runs only when live usage is asked for (R4, R10, R10a) |
 
 ## Technology
 
@@ -55,13 +56,15 @@ and planned work.
   attribution.
 - **Preview**: the last few messages of the selected session.
 - Actions: start a new session in a directory with the selected account; resume the selected
-  session (optionally under a different account); set up a new account.
+  session (optionally under a different account); set up a new account; remove an account from the
+  registry.
 
 ## Milestones
 
 **M0 · CLI core** — **Done**
 Registry, `add`, `setup` (`claude auth login`), `run` (pre-assigned `--session-id`, launch log,
-exec), `list` (`auth status --json`), `usage [--live]`, and the sealed test harness.
+exec), `list` (`auth status --json`), `usage [--live]`, and the sealed test harness. `remove`
+(SPEC R14a; `D` in the TUI's Accounts view) was added later.
 
 **M1 · Read-only TUI** — **Done**
 Accounts, Live (`claude agents --json`), History (deduplication, titles, incremental cache,
@@ -73,7 +76,9 @@ optional naming with `-n`); the account picker for `run` without an account; set
 stop for background sessions (via `claude attach|logs|stop`).
 
 **M3 · Codex provider** — **Done**
-Codex accounts (`CODEX_HOME`), the rollout session index, and launch / resume / fork (SPEC R4, R17).
+Codex accounts (`CODEX_HOME`), identity (`codex login status`; email and plan from a live query),
+usage (cached from the rate limits in rollouts, live through `codex app-server`), the rollout
+session index, and launch / resume / fork (SPEC R4, R10, R10a, R17).
 
 **M2.5 · Shared configuration and relay** — **Implemented; dogfooding pending**
 Sessions stay with the account that created them; configuration is shared by injection at launch
@@ -103,14 +108,20 @@ so such a setup first moves `projects` to per-account stores.
 It affects only a very narrow timing window:
 
 - A launch request whose running check is already in progress still launches after the check
-  passes, even if its account was removed in the meantime (`pending` holds an `Account`).
+  passes, even if its account was removed in the meantime by another process (`remuda remove`
+  elsewhere; `D` in the TUI cancels a pending launch first). `pending` holds an `Account`.
 
 ## Open questions
 
 1. Whether session variables inherited when a child claude is launched from inside a claude session
    need to be stripped (R6).
 2. Whether `claude --resume <id>` looks up sessions only under the current project directory (R6).
-3. Codex `default` home semantics and keyring isolation (R4).
+3. Stability of the experimental `codex app-server` methods remuda uses (`account/rateLimits/read`,
+   `account/read`; R4, R10).
 
-Resolved: stale cached usage is addressed by on-demand live queries via
-`claude -p /usage --no-session-persistence` (R10).
+Resolved:
+
+- Stale cached usage is addressed by on-demand live queries via
+  `claude -p /usage --no-session-persistence` (R10).
+- Codex `default` home semantics and keyring isolation: `CODEX_HOME=~/.codex` equals leaving it
+  unset, and the keyring key hashes the normalized path (R4, verified on 0.155.1).
