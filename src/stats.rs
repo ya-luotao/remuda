@@ -20,6 +20,7 @@ use crate::attribution::Attribution;
 use crate::index::{self, RefreshStats, Stat};
 use crate::provider::Provider;
 use crate::registry::{self, Account};
+use crate::text::{self, human_count};
 use crate::transcript::{contains, read_at};
 
 /// Bump whenever [`Row`], [`FileStats`] or the counting rules change: a mismatching cache is
@@ -1113,6 +1114,119 @@ pub fn report(
     }
 }
 
+/// Column headers of [`format`].
+const COLUMNS: [&str; 7] = [
+    "MODEL",
+    "INPUT",
+    "CACHE READ",
+    "CACHE WRITE",
+    "OUTPUT",
+    "REASONING",
+    "TOTAL",
+];
+
+/// `table` as plain text for `remuda stats`: a title, the column headers, then each section
+/// (its accounts joined by ` + `, or `unattributed`) with its models and their total, and last
+/// the `overall` section. With `filter` (`provider:name`), only the sections including that
+/// account, and no overall section. Counts are [`human_count`]s; a count the providers of a row
+/// do not record is `-` (cache write: claude only; reasoning: codex only). Columns align over
+/// the whole output.
+pub fn format(table: &Table, filter: Option<&str>, tz: &TimeZone) -> String {
+    let mut blocks: Vec<(String, Vec<[String; 7]>)> = table
+        .sections
+        .iter()
+        .filter(|s| filter.is_none_or(|f| s.accounts.iter().any(|a| a == f)))
+        .map(|s| {
+            let label = match s.accounts.is_empty() {
+                true => "unattributed".to_string(),
+                false => s.accounts.join(" + "),
+            };
+            (label, format_rows(&s.models))
+        })
+        .collect();
+    if filter.is_none() {
+        blocks.push(("overall".to_string(), format_rows(&table.overall)));
+    }
+    let header = COLUMNS.map(str::to_string);
+    let mut widths = [0; 7];
+    for row in blocks.iter().flat_map(|(_, rows)| rows).chain([&header]) {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(text::width(cell));
+        }
+    }
+    let line = |row: &[String; 7]| {
+        let mut line = text::pad(&row[0], widths[0]);
+        for (cell, &width) in row.iter().zip(&widths).skip(1) {
+            line.push_str("  ");
+            line.push_str(&" ".repeat(width.saturating_sub(text::width(cell))));
+            line.push_str(cell);
+        }
+        line + "\n"
+    };
+
+    let mut out = format!("Tokens · {}", table.period.label());
+    if let Some(since) = table.since {
+        let since = since.to_zoned(tz.clone()).strftime("%Y-%m-%d %H:%M");
+        out.push_str(&format!(" (since {since})"));
+    }
+    out.push_str("\n\n");
+    out.push_str(&line(&header));
+    for (i, (label, rows)) in blocks.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(label);
+        out.push('\n');
+        if rows.is_empty() {
+            out.push_str("  no tokens\n");
+        }
+        for row in rows {
+            out.push_str(&line(row));
+        }
+    }
+    out
+}
+
+/// The cells of each model, then of their total; none without models.
+fn format_rows(models: &[ModelRow]) -> Vec<[String; 7]> {
+    if models.is_empty() {
+        return Vec::new();
+    }
+    let cells = |name: String, t: &Tokens, claude: bool, codex: bool| {
+        let count = |n: u64, recorded: bool| match recorded {
+            true => human_count(n),
+            false => "-".to_string(),
+        };
+        [
+            name,
+            human_count(t.input),
+            human_count(t.cache_read),
+            count(t.cache_write, claude),
+            human_count(t.output),
+            count(t.reasoning, codex),
+            human_count(t.total()),
+        ]
+    };
+    let has = |p: Provider| models.iter().any(|m| m.provider == p);
+    let mut total = Tokens::default();
+    let mut rows = Vec::new();
+    for m in models {
+        total.add(&m.tokens);
+        let (claude, codex) = (
+            m.provider == Provider::Claude,
+            m.provider == Provider::Codex,
+        );
+        rows.push(cells(format!("  {}", m.model), &m.tokens, claude, codex));
+    }
+    rows.push(cells(
+        "  total".to_string(),
+        &total,
+        has(Provider::Claude),
+        has(Provider::Codex),
+    ));
+    rows
+}
+
 /// Most tokens first, then by provider and model.
 fn model_rows(models: &Models<'_>) -> Vec<ModelRow> {
     let mut rows: Vec<ModelRow> = models
@@ -1187,6 +1301,111 @@ mod tests {
         assert_eq!(
             Period::ALL.map(Period::next),
             [Period::Week, Period::Month, Period::All, Period::Today]
+        );
+    }
+
+    fn model(provider: Provider, model: &str, t: [u64; 5]) -> ModelRow {
+        let [input, cache_read, cache_write, output, reasoning] = t;
+        ModelRow {
+            provider,
+            model: model.into(),
+            tokens: Tokens {
+                input,
+                cache_read,
+                cache_write,
+                output,
+                reasoning,
+            },
+        }
+    }
+
+    #[test]
+    fn format_aligns_columns_and_dashes_what_a_provider_does_not_record() {
+        let claude = model(Provider::Claude, "claude-test", [8, 1_234_567, 160, 90, 0]);
+        let codex = model(Provider::Codex, "gpt-test", [1500, 200, 0, 30, 12]);
+        let table = Table {
+            period: Period::Week,
+            since: Some("2026-09-17T16:00:00Z".parse().unwrap()),
+            sections: vec![
+                Section {
+                    accounts: vec!["claude:default".into()],
+                    models: vec![claude.clone()],
+                },
+                Section {
+                    accounts: vec!["claude:max".into()],
+                    models: vec![],
+                },
+                Section {
+                    accounts: vec!["codex:work".into()],
+                    models: vec![codex.clone()],
+                },
+                Section {
+                    accounts: vec!["claude:default".into(), "claude:max".into()],
+                    models: vec![claude.clone()],
+                },
+                Section {
+                    accounts: vec![],
+                    models: vec![codex.clone()],
+                },
+            ],
+            overall: vec![claude, codex],
+        };
+        let tz = TimeZone::fixed(jiff::tz::offset(8));
+        assert_eq!(
+            format(&table, None, &tz),
+            "\
+Tokens · last 7 days (since 2026-09-18 00:00)
+
+MODEL          INPUT  CACHE READ  CACHE WRITE  OUTPUT  REASONING  TOTAL
+claude:default
+  claude-test      8        1.2M          160      90          -   1.2M
+  total            8        1.2M          160      90          -   1.2M
+
+claude:max
+  no tokens
+
+codex:work
+  gpt-test      1.5K         200            -      30         12   1.7K
+  total         1.5K         200            -      30         12   1.7K
+
+claude:default + claude:max
+  claude-test      8        1.2M          160      90          -   1.2M
+  total            8        1.2M          160      90          -   1.2M
+
+unattributed
+  gpt-test      1.5K         200            -      30         12   1.7K
+  total         1.5K         200            -      30         12   1.7K
+
+overall
+  claude-test      8        1.2M          160      90          -   1.2M
+  gpt-test      1.5K         200            -      30         12   1.7K
+  total         1.5K        1.2M          160     120         12   1.2M
+"
+        );
+        let filtered = format(&table, Some("claude:max"), &tz);
+        let labels: Vec<&str> = filtered
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with(' '))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Tokens · last 7 days (since 2026-09-18 00:00)",
+                "MODEL          INPUT  CACHE READ  CACHE WRITE  OUTPUT  REASONING  TOTAL",
+                "claude:max",
+                "claude:default + claude:max",
+            ]
+        );
+        let all = Table {
+            period: Period::All,
+            since: None,
+            sections: vec![],
+            overall: vec![],
+        };
+        assert_eq!(
+            format(&all, None, &tz),
+            "Tokens · all time\n\nMODEL  INPUT  CACHE READ  CACHE WRITE  OUTPUT  REASONING  TOTAL\n\
+             overall\n  no tokens\n"
         );
     }
 

@@ -129,6 +129,7 @@ remuda run [<account>] [args]   launch the agent under an account; without an ac
 remuda usage [<account>] [--live]  print per-account usage as plain text (R10)
 remuda list                     accounts, login identity, home
 remuda sessions [--limit N]     print recent sessions as plain text: time, account attribution, title, cwd (R8, R9)
+remuda stats [<account>] [--period P]  print tokens per account and model (R20)
 remuda add <name> <path>        register an existing home directory (R14)
 remuda setup <name>             create a new home and run `claude auth login`
 remuda remove <account>         unregister an account; its home is left in place (R14a)
@@ -810,3 +811,6 @@ estimated, and computing them runs no agent command.
   any other one whole; only complete lines are parsed. Records of one message read in two
   refreshes merge by their key. The first computation reads every transcript whole (measured:
   20,895 files, 17.2 GB).
+- **Command**: `remuda stats [<account>] [--period today|7d|30d|all]` prints one period
+  (default `all`). With an account, it prints only the sections that include that account, and no
+  overall section. Reading progress goes to stderr, as for `sessions`.

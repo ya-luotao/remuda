@@ -13,6 +13,7 @@ use crate::identity::{self, Identity};
 use crate::index::{self, Index};
 use crate::provider::Provider;
 use crate::registry::{self, Account, Registry};
+use crate::stats::{self, Period};
 use crate::{Env, paths};
 use crate::{attribution, launch, live, probe, relay, setup, text, transcript, tui, usage};
 
@@ -62,6 +63,14 @@ enum Command {
         /// How many sessions to show
         #[arg(long, value_name = "N", default_value = "30")]
         limit: usize,
+    },
+    /// Tokens per account and model, from the transcripts (no agent is run)
+    Stats {
+        /// Only the sections that include this account (`name` or `provider:name`)
+        account: Option<String>,
+        /// `today`, `7d`, `30d` or `all`; a period starts at local midnight
+        #[arg(long, value_name = "PERIOD", default_value = "all", value_parser = parse_period)]
+        period: Period,
     },
     /// Create a new home under $REMUDA_HOME/homes/<provider>/<name>, register it and log in
     Setup {
@@ -155,6 +164,7 @@ fn dispatch(cli: Cli, ctx: &Context) -> Result<ExitCode> {
             timeout,
         }) => usage(&config, account, live, timeout, ctx),
         Some(Command::Sessions { limit }) => sessions(&config, limit, ctx),
+        Some(Command::Stats { account, period }) => stats(&config, account, period, ctx),
         Some(Command::Setup {
             provider,
             name,
@@ -252,7 +262,7 @@ fn refreshed_index(
     let cache = state.join("index.json");
     let mut index = Index::load(&cache);
     let stores = index::stores(accounts, &ctx.env);
-    let mut progress = IndexingProgress::new(ctx.stderr_is_tty);
+    let mut progress = IndexingProgress::new(ctx.stderr_is_tty, "indexing transcripts", "indexed");
     let mut stderr = std::io::stderr();
     index::refresh(&mut index, &stores, |p| {
         progress.report(p.done, p.total, &mut stderr)
@@ -483,11 +493,16 @@ const QUIET_INDEXING: Duration = Duration::from_secs(1);
 /// ... and then at most this often.
 const PROGRESS_EVERY: Duration = Duration::from_millis(200);
 
-/// Indexing progress for `remuda sessions` on stderr: only when stderr is a terminal (piped
-/// output never sees a `\r`-rewritten line), only once indexing takes longer than
-/// [`QUIET_INDEXING`], at most every [`PROGRESS_EVERY`]; the line is cleared at the end.
+/// Progress reading transcripts (`remuda sessions`, `remuda stats`) on stderr: only when
+/// stderr is a terminal (piped output never sees a `\r`-rewritten line), only once reading
+/// takes longer than [`QUIET_INDEXING`], at most every [`PROGRESS_EVERY`]; the line is cleared
+/// at the end.
 struct IndexingProgress {
     tty: bool,
+    /// `indexing transcripts`: what is being done, before `done/total`.
+    doing: &'static str,
+    /// `indexed`: what was done, before `N transcripts`.
+    done: &'static str,
     quiet: Duration,
     every: Duration,
     started: std::time::Instant,
@@ -498,9 +513,11 @@ struct IndexingProgress {
 const REWRITE_LINE: &str = "\r\x1b[2K";
 
 impl IndexingProgress {
-    fn new(tty: bool) -> Self {
+    fn new(tty: bool, doing: &'static str, done: &'static str) -> Self {
         IndexingProgress {
             tty,
+            doing,
+            done,
             quiet: QUIET_INDEXING,
             every: PROGRESS_EVERY,
             started: std::time::Instant::now(),
@@ -517,18 +534,19 @@ impl IndexingProgress {
             Some(last) => last.elapsed() >= self.every,
         };
         if due {
-            let _ = write!(
-                out,
-                "{REWRITE_LINE}remuda: indexing transcripts {done}/{total}"
-            );
+            let _ = write!(out, "{REWRITE_LINE}remuda: {} {done}/{total}", self.doing);
             let _ = out.flush();
             self.reported = Some(std::time::Instant::now());
         }
     }
 
-    fn finish(&self, indexed: usize, out: &mut impl std::io::Write) {
+    fn finish(&self, files: usize, out: &mut impl std::io::Write) {
         if self.reported.is_some() {
-            let _ = writeln!(out, "{REWRITE_LINE}remuda: indexed {indexed} transcripts");
+            let _ = writeln!(
+                out,
+                "{REWRITE_LINE}remuda: {} {files} transcripts",
+                self.done
+            );
         }
     }
 }
@@ -592,6 +610,50 @@ fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
         ]);
     }
     print!("{}", format_table(&rows));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `remuda stats`: the statistics cache (`state/stats.json`) brought up to date and saved when
+/// it changed (a failed save is a warning), attribution without live sessions, then one
+/// period's table, only the sections of `account` if given (R5, R20). Runs no agent.
+fn stats(
+    config: &Path,
+    account: Option<String>,
+    period: Period,
+    ctx: &Context,
+) -> Result<ExitCode> {
+    let registry = Registry::load(config)?;
+    let accounts = registry.all(&ctx.env);
+    let filter = match account {
+        Some(reference) => Some(registry.resolve(&reference)?.qualified()),
+        None => None,
+    };
+    let state = state_dir(config);
+    let path = state.join("stats.json");
+    let mut cache = stats::Cache::load(&path);
+    let sources = stats::sources(&accounts, &ctx.env);
+    let mut progress = IndexingProgress::new(ctx.stderr_is_tty, "reading transcripts", "read");
+    let mut stderr = std::io::stderr();
+    let refreshed = stats::refresh(&mut cache, &sources, |done, total| {
+        progress.report(done, total, &mut stderr)
+    });
+    progress.finish(cache.files.len(), &mut stderr);
+    // An unchanged cache is not rewritten (it is tens of MB on a large corpus).
+    let changed = refreshed.reused != refreshed.files || refreshed.removed > 0;
+    if (changed || !path.exists())
+        && let Err(e) = cache.save(&path)
+    {
+        eprintln!(
+            "remuda: warning: cannot write statistics cache {}: {e:#}",
+            path.display()
+        );
+    }
+    let attribution = attribution::collect(&accounts, &ctx.env, &state.join("launches.jsonl"), &[]);
+    let report = stats::report(&cache, &sources, &attribution, &accounts, ctx.now, &ctx.tz);
+    print!(
+        "{}",
+        stats::format(report.table(period), filter.as_deref(), &ctx.tz)
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -742,6 +804,11 @@ fn format_table(rows: &[Vec<String>]) -> String {
     out
 }
 
+/// `today`, `7d`, `30d` or `all`.
+fn parse_period(s: &str) -> std::result::Result<Period, String> {
+    Period::parse(s).ok_or_else(|| format!("expected today, 7d, 30d or all, got {s:?}"))
+}
+
 /// A positive, finite number of seconds.
 fn parse_timeout(s: &str) -> std::result::Result<Duration, String> {
     let secs: f64 = s.parse().map_err(|_| format!("not a number: {s:?}"))?;
@@ -772,6 +839,8 @@ mod tests {
     fn progress(tty: bool) -> IndexingProgress {
         IndexingProgress {
             tty,
+            doing: "indexing transcripts",
+            done: "indexed",
             quiet: Duration::ZERO,
             every: Duration::ZERO,
             started: std::time::Instant::now(),
@@ -813,5 +882,18 @@ mod tests {
         p.report(1, 2, &mut out);
         p.finish(2, &mut out);
         assert_eq!(String::from_utf8(out).unwrap(), "");
+    }
+
+    #[test]
+    fn progress_names_what_it_reads() {
+        let mut p = progress(true);
+        (p.doing, p.done) = ("reading transcripts", "read");
+        let mut out = Vec::new();
+        p.report(3, 20, &mut out);
+        p.finish(20, &mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\r\x1b[2Kremuda: reading transcripts 3/20\r\x1b[2Kremuda: read 20 transcripts\n"
+        );
     }
 }
