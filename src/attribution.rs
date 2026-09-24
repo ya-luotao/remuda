@@ -13,12 +13,15 @@ use crate::index::{Entry, Store};
 use crate::live::LiveSession;
 use crate::provider::Provider;
 use crate::registry::{Account, CLAUDE};
+use crate::relay;
 use crate::transcript::complete_lines;
 
-/// `session_id -> {provider:name}`.
+/// `session_id -> {provider:name}`, and the relay copies the launch log records.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Attribution {
     map: BTreeMap<String, BTreeSet<String>>,
+    /// Transcripts copied by a relay (R19): hidden from History, attributed to nobody.
+    relay_copies: BTreeSet<PathBuf>,
 }
 
 impl Attribution {
@@ -46,7 +49,13 @@ impl Attribution {
         self.map.is_empty()
     }
 
-    /// Adds `$REMUDA_HOME/state/launches.jsonl`: lines with a non-null `session_id`.
+    /// Whether the transcript at `path` is a relay's copy (R19).
+    pub fn is_relay_copy(&self, path: &Path) -> bool {
+        self.relay_copies.contains(path)
+    }
+
+    /// Adds `$REMUDA_HOME/state/launches.jsonl`: lines with a non-null `session_id`, and the
+    /// relay copies (R19). Lines from before relays and shared configuration parse alike.
     pub fn add_launch_log(&mut self, path: &Path) {
         #[derive(Deserialize)]
         struct Launch {
@@ -60,6 +69,9 @@ impl Attribution {
             }) = serde_json::from_slice(line)
             {
                 self.add(&id, &account);
+            }
+            if let Some(copy) = relay::copy_in(line) {
+                self.relay_copies.insert(copy);
             }
         });
     }

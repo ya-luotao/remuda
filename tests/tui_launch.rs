@@ -385,6 +385,76 @@ fn tui_launches_get_shared_configuration() {
     assert_eq!(sb.invocations().len(), 1);
 }
 
+/// R16, R19: `c` in the TUI copies the selected row's transcript into the target's store and
+/// forks it there in the foreground; the TUI steps aside only after the copy. A file at the
+/// destination that remuda did not copy is refused before anything is written or run.
+#[test]
+fn tui_relay_copies_then_forks() {
+    const ID: &str = "766560c5-74e6-45f5-89fd-d92926b14898";
+    let sb = Sandbox::new();
+    let max = sb.make_claude_home("max");
+    let team = sb.make_claude_home("team");
+    sb.register(&[("max", &max), ("team", &team)]);
+    let dir = project(&sb).canonicalize().unwrap();
+    let project_dir = max.join("projects/-w");
+    fs::create_dir_all(&project_dir).unwrap();
+    let transcript = project_dir.join(format!("{ID}.jsonl"));
+    fs::write(&transcript, "{\"a\":1}\n{\"b\":").unwrap();
+    let source = remuda::relay::Source {
+        transcript: transcript.canonicalize().unwrap(),
+        store: max.join("projects").canonicalize().unwrap(),
+        session_id: ID.into(),
+        cwd_last: Some(dir.display().to_string()),
+    };
+    let team_account = named("team", team.to_str().unwrap());
+    let request = LaunchRequest {
+        account: team_account.clone(),
+        args: Provider::Claude.resume_args(ID, &dir, true),
+        cwd: Some(dir.clone()),
+        what: "continue 766560c5 as team".into(),
+    };
+    let mut deps = deps(&sb);
+    deps.accounts = vec![named("max", max.to_str().unwrap()), team_account];
+
+    // Someone else's file where the copy would go.
+    let dest = team.join("projects/-w").join(format!("{ID}.jsonl"));
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    fs::write(&dest, "theirs\n").unwrap();
+    let mut screen = FakeScreen::default();
+    let event = tui::relay_in_foreground(&mut screen, &deps, request.clone(), &source).unwrap();
+    assert!(
+        screen.calls.is_empty(),
+        "refused before the TUI steps aside"
+    );
+    let Err(e) = exit_of(&event) else {
+        panic!("{event:?}")
+    };
+    assert!(e.contains("remuda does not overwrite it"), "{e}");
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "theirs\n");
+    assert!(sb.invocations().is_empty());
+
+    fs::remove_file(&dest).unwrap();
+    let mut screen = FakeScreen::default();
+    let event = tui::relay_in_foreground(&mut screen, &deps, request, &source).unwrap();
+    assert_eq!(exit_of(&event), &Ok(Exit::Code(0)));
+    assert_eq!(screen.calls, ["suspend", "resume"]);
+    assert_eq!(fs::read_to_string(&dest).unwrap(), "{\"a\":1}\n");
+    let inv = sb.only_invocation();
+    assert_eq!(inv.cwd, dir);
+    assert_eq!(inv.config_dir.as_deref(), Some(team.to_str().unwrap()));
+    assert_eq!(
+        inv.args[..4],
+        ["--resume", ID, "--fork-session", "--session-id"]
+    );
+    let log = sb.launches();
+    assert_eq!(log[0]["fork_of"], json!(ID));
+    assert_eq!(log[0]["session_id"], json!(inv.args[4]));
+    assert_eq!(
+        log[0]["relay"]["transcript"],
+        json!(dest.canonicalize().unwrap())
+    );
+}
+
 // --- codex from the TUI (R17) ---------------------------------------------------------------
 
 const CODEX_ID: &str = "019c1e08-e4f6-7d70-a129-38ec744a3f3c";

@@ -14,7 +14,7 @@ use crate::index::{self, Index};
 use crate::provider::Provider;
 use crate::registry::{self, Account, Registry};
 use crate::{Env, paths};
-use crate::{attribution, launch, live, probe, setup, share, text, transcript, tui, usage};
+use crate::{attribution, launch, live, probe, relay, setup, share, text, transcript, tui, usage};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -73,6 +73,14 @@ enum Command {
         /// Passed to `claude auth login --email` (claude only)
         #[arg(long)]
         email: Option<String>,
+    },
+    /// Continue a claude session under another account: copy it into that account's
+    /// projects store and fork it there (the original is not modified)
+    Relay {
+        /// Full session ID of an indexed claude session
+        session: String,
+        /// Account to continue under: `name` or `claude:name`
+        account: String,
     },
     /// Launch claude as an account; all arguments after the account go to claude verbatim
     ///
@@ -148,7 +156,109 @@ fn dispatch(cli: Cli, ctx: &Context) -> Result<ExitCode> {
             email,
         }) => setup(&config, parse_provider(&provider)?, &name, email, ctx),
         Some(Command::Run { account, args }) => run_account(&config, account, args, ctx),
+        Some(Command::Relay { session, account }) => relay(&config, &session, &account, ctx),
     }
+}
+
+/// `remuda relay <session> <account>` (R19): the session is looked up in the index (brought up
+/// to date first, like `remuda sessions`), copied into the account's store and forked there
+/// by exec'ing claude, as `run` does.
+fn relay(config: &Path, session: &str, reference: &str, ctx: &Context) -> Result<ExitCode> {
+    let registry = Registry::load(config)?;
+    let target = registry.resolve(reference)?;
+    if target.provider != Provider::Claude {
+        bail!(
+            "{} is not a claude account: only claude sessions are relayed",
+            target.qualified()
+        );
+    }
+    if !launch::is_session_id(session) {
+        bail!("{session:?} is not a full session ID (a UUID)");
+    }
+    let program = claude_program(ctx)?;
+    let accounts = registry.all(&ctx.env);
+    let state = state_dir(config);
+    let log = state.join("launches.jsonl");
+    let (index, _) = refreshed_index(&accounts, &state, ctx);
+    let mut copies = attribution::Attribution::default();
+    copies.add_launch_log(&log);
+    let found: Vec<&index::Entry> = index
+        .entries
+        .values()
+        .filter(|e| e.provider == Provider::Claude && e.session_id == session)
+        .filter(|e| !copies.is_relay_copy(&e.path))
+        .collect();
+    let target_store = target
+        .home_dir(&ctx.env)
+        .and_then(|home| std::fs::canonicalize(home.join("projects")).ok());
+    let entry = match found.as_slice() {
+        [] => bail!("session {session} is not in the index of any claude account"),
+        [one] => *one,
+        // The copy in the target's own store is refused below, with the reason.
+        several => match several
+            .iter()
+            .find(|e| Some(&e.store) == target_store.as_ref())
+        {
+            Some(here) => *here,
+            None => bail!(
+                "session {session} is in several stores ({}); relay the one you mean from the \
+                 TUI (`c` in History)",
+                several
+                    .iter()
+                    .map(|e| e.path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+    };
+    let source = relay::Source {
+        transcript: entry.path.clone(),
+        store: entry.store.clone(),
+        session_id: entry.session_id.clone(),
+        cwd_last: entry.cwd_last.clone(),
+    };
+    let plan = relay::prepare(
+        &source,
+        &target,
+        &accounts,
+        &registry.sharing,
+        &ctx.env,
+        &log,
+        &share::dir(config),
+        (ctx.clock)().to_string(),
+    )?;
+    eprintln!(
+        "remuda: copied session {session} into the projects store of {}; forking it there as {}",
+        target.qualified(),
+        plan.record.session_id.as_deref().unwrap_or("a new session")
+    );
+    let cwd = source.cwd_last.as_deref().map(Path::new);
+    exec_plan(config, &program, &plan, cwd, ctx)
+}
+
+/// The index cache brought up to date with the stores of `accounts` and saved (a failed save
+/// is a warning), with progress on a terminal; and those stores.
+fn refreshed_index(
+    accounts: &[Account],
+    state: &Path,
+    ctx: &Context,
+) -> (Index, Vec<index::Store>) {
+    let cache = state.join("index.json");
+    let mut index = Index::load(&cache);
+    let stores = index::stores(accounts, &ctx.env);
+    let mut progress = IndexingProgress::new(ctx.stderr_is_tty);
+    let mut stderr = std::io::stderr();
+    index::refresh(&mut index, &stores, |p| {
+        progress.report(p.done, p.total, &mut stderr)
+    });
+    progress.finish(index.entries.len(), &mut stderr);
+    if let Err(e) = index.save(&cache) {
+        eprintln!(
+            "remuda: warning: cannot write index cache {}: {e:#}",
+            cache.display()
+        );
+    }
+    (index, stores)
 }
 
 /// `remuda run`: a fast path that reads only `config.toml` and then execs claude (R6).
@@ -405,21 +515,7 @@ impl IndexingProgress {
 fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
     let accounts = Registry::load(config)?.all(&ctx.env);
     let state = state_dir(config);
-    let cache = state.join("index.json");
-    let mut index = Index::load(&cache);
-    let stores = index::stores(&accounts, &ctx.env);
-    let mut progress = IndexingProgress::new(ctx.stderr_is_tty);
-    let mut stderr = std::io::stderr();
-    index::refresh(&mut index, &stores, |p| {
-        progress.report(p.done, p.total, &mut stderr)
-    });
-    progress.finish(index.entries.len(), &mut stderr);
-    if let Err(e) = index.save(&cache) {
-        eprintln!(
-            "remuda: warning: cannot write index cache {}: {e:#}",
-            cache.display()
-        );
-    }
+    let (index, stores) = refreshed_index(&accounts, &state, ctx);
 
     let path_var = ctx.env.get("PATH").map(String::as_str);
     let claude = claude_program(ctx).ok();
@@ -438,7 +534,12 @@ fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
             .map(String::from)
             .to_vec(),
     ];
-    for entry in index.sorted().into_iter().take(limit) {
+    // A relay's copy is not a session of its own (R19).
+    let shown = index
+        .sorted()
+        .into_iter()
+        .filter(|e| !owners.is_relay_copy(&e.path));
+    for entry in shown.take(limit) {
         let when = entry
             .last_activity()
             .or_else(|| Timestamp::from_nanosecond(entry.mtime_ns).ok())
