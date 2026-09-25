@@ -14,6 +14,30 @@ hand off sessions in any directory, from one TUI or CLI.
 
 Remuda never touches credentials and makes no network requests of its own.
 
+## How it works
+
+An account is a name for an agent home directory: the directory where that login keeps its
+credentials, sessions and settings. Remuda keeps the names in one registry, reads what each home
+holds, and launches the agent with the home selected.
+
+```text
+     remuda run work         remuda  (TUI)          remuda usage · sessions · stats
+            │                      │                            │
+            └──────────────────────┼────────────────────────────┘
+                                   ▼
+                  ~/.remuda/config.toml   (accounts = named homes)
+                                   │
+       ┌───────────────────────────┼────────────────────────────┐
+       ▼                           ▼                            ▼
+  claude:default              claude:work                  codex:research
+  CLAUDE_CONFIG_DIR unset     CLAUDE_CONFIG_DIR=           CODEX_HOME=
+  (~/.claude, native login)   ~/.claude-work               ~/.codex-research
+       │                           │                            │
+       └──── each home keeps its own login, sessions and usage limits ────┘
+             remuda reads them and launches the agent in them;
+             it never moves, rewrites or logs in to them itself
+```
+
 ## Highlights
 
 - **Every account's limits on one screen.** Five-hour, weekly and per-model limits for each
@@ -39,8 +63,22 @@ Remuda never touches credentials and makes no network requests of its own.
   native login, and named accounts are used only through `remuda`. Accounts are registered where
   they already are, and their homes are never moved or rewritten.
 
-Codex accounts can be registered, set up, launched, indexed, resumed and forked, with their
-usage limits and token statistics. Live sessions, relay and shared configuration are Claude-only.
+What each provider supports:
+
+| Feature | Claude | Codex |
+| --- | :---: | :---: |
+| Register, set up and remove accounts | ✓ | ✓ |
+| Launch, resume and fork sessions | ✓ | ✓ ¹ |
+| Login identity | ✓ | ✓ ² |
+| Usage limits, cached and live | ✓ | ✓ |
+| Session history, search and preview | ✓ | ✓ |
+| Token statistics and estimated cost | ✓ | ✓ |
+| Live sessions (attach, logs, stop) | ✓ | – |
+| Relay to another account | ✓ | – |
+| Shared configuration and the configuration pane | ✓ | – |
+
+¹ Codex has no list of running sessions, so resuming a Codex session in place asks for
+confirmation first. ² The login method only; the email and plan appear after a live usage query.
 
 ## Installation
 
@@ -98,6 +136,28 @@ Four views, Accounts, Live, History and Stats, with a preview pane for the selec
 Live and History and a configuration pane for the selected account in Accounts. Press `?` for the
 key reference.
 
+The Accounts view, with every account's limits and their resets on one timeline:
+
+```text
+ remuda  1 Accounts  2 Live  3 History  4 Stats                                   ?: help · q: quit
+Accounts ───────────────────────────────────────────────────────────────────────────────────────────
+ACCOUNT EMAIL           ORG PLAN SESSION WEEK  Fable SOURCE
+default me@example.com  Org max      34%   77%  100% cached 5m ago
+max     max@example.com Org max      12%   91%     - live 0s ago
+team    not logged in   -   -          -     -     - no cache
+Resets · next 7 days ───────────────────────────────────────────────────────────────────────────────
+        now       +1d        +2d       +3d       +4d       +5d        +6d     +7d next
+default ·S········|··········f·········W·········|·········|··········|·········| S 2h00m W 3d00h
+max     S·········|··········|·········|·········|·········|··········W·········| S 1h00m W 5d23h
+team    ··········|··········|·········|·········|·········|··········|·········|
+        S session · W week (all models) · f week (Fable)
+Checks ─────────────────────────────────────────────────────────────────────────────────────────────
+! ANTHROPIC_API_KEY is set: it overrides every account's /login
+! team: not logged in
+
+ n: new session · p: config · s: set up · D: remove · u: live usage · r: refresh
+```
+
 | Key | Action |
 | --- | --- |
 | `1` `2` `3` `4`, `Tab`, `Shift-Tab` | Switch view: Accounts, Live, History, Stats |
@@ -132,9 +192,16 @@ Remuda keeps its files under `$REMUDA_HOME`, which defaults to `~/.remuda`:
 $REMUDA_HOME/
 ├── config.toml                    account registry; the single source of truth
 ├── homes/<provider>/<name>/       homes created by `remuda setup`
-├── shared/claude/.claude          links to the source's CLAUDE.md, agents, skills and commands
-└── state/                         caches (index, stats, launch log, shared settings); safe to delete
+├── shared/claude/.claude/         links to the source's CLAUDE.md, agents, skills and commands
+└── state/                         caches and logs; safe to delete, rebuilt on the next run
+    ├── index.json                 session index
+    ├── stats.json                 token statistics
+    ├── launches.jsonl             one line per launch: account, directory, session ID
+    └── settings/                  shared settings passed to members (mode 0600)
 ```
+
+Deleting `launches.jsonl` loses the attribution of sessions started through remuda that no
+`history.jsonl` records, and makes relay copies show up in History again.
 
 `config.toml` lists the registered accounts. `remuda add`, `remuda setup` and `remuda remove`
 edit it for you, preserving comments and unknown keys, and it can also be edited by hand:
@@ -221,6 +288,8 @@ degrades to missing fields rather than errors.
 - [docs/GUIDE.md](docs/GUIDE.md): TUI details, private mode, shared configuration, relay, account
   checks and data sources
 - [SPEC.md](SPEC.md): behavior specification; the contract that the tests enforce
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the code is organized, with diagrams of the
+  launch, relay, indexing and TUI flows
 - [ROADMAP.md](ROADMAP.md): milestones, planned work and open questions
 - [CHANGELOG.md](CHANGELOG.md): release history
 - [CONTRIBUTING.md](CONTRIBUTING.md): development workflow and release process
