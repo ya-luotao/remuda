@@ -1,5 +1,6 @@
-//! The TUI (SPEC R5, R7-R11, R16): accounts with usage and reset timeline, live sessions,
-//! session history with search and preview, and launching claude from them.
+//! The TUI (SPEC R5, R7-R11, R16, R19-R22): accounts with usage, reset timeline and
+//! configuration, live sessions, session history with search and preview, token statistics,
+//! private mode, and launching the agents from them.
 //!
 //! [`app`] holds the state and the pure `update`; [`render`] draws it; this module owns the
 //! terminal and the event loop (including foreground launches, which suspend the TUI), and

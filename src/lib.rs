@@ -1,7 +1,8 @@
 //! remuda: multi-account and session manager for coding-agent CLIs.
 //!
 //! Library code never reads the process environment; `main.rs` captures it once and passes
-//! an [`Env`] snapshot down.
+//! an [`Env`] snapshot down. `docs/ARCHITECTURE.md` maps the modules to the SPEC entries
+//! they implement.
 
 pub mod account_config;
 pub mod attribution;

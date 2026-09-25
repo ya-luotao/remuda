@@ -45,11 +45,15 @@ and planned work.
 - `clap`: subcommands
 - `serde` / `serde_json`: line-by-line JSONL parsing, skipping malformed lines
 - `toml_edit`: preserves comments when writing `config.toml` (R3)
-- `nucleo`: fuzzy search
+- `nucleo-matcher`: fuzzy search
+- `jiff`: timestamps, the system time zone, statistics periods
+- `unicode-normalization`: NFC for home paths and project names (R2, R18); `unicode-width`:
+  display columns; `sha2`: settings file names (R18); `uuid`: pre-assigned session IDs (R6);
+  `libc`: terminal modes and process groups
 - The index and statistics caches are single files under `state/`; move to SQLite only if data
   volume requires it
-- A single crate (lib + bin), organized into modules:
-  `registry`, `provider/{claude,codex}`, `usage`, `live`, `index`, `launch`, `tui`, `cli`
+- A single crate (lib + bin); the modules and how data flows between them are described in
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## TUI
 

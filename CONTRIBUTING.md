@@ -31,10 +31,20 @@ names or doc comments.
 
 Remuda is a single Rust crate (library and binary) targeting macOS and Linux. The minimum
 supported Rust version is declared as `rust-version` in [Cargo.toml](Cargo.toml).
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) maps the SPEC entries to modules, shows how launches,
+relays, indexing and the TUI work, and lists where to start for common changes.
 
 ```sh
 cargo build
 cargo run -- --help
+```
+
+To time the session index against your real history (read-only; the cache goes to a temporary
+directory), use the examples:
+
+```sh
+cargo run --release --example corpus_timing -- [<projects dir> [<history.jsonl>]]
+cargo run --release --example codex_timing -- [<codex home>]
 ```
 
 ### Hermetic tests
