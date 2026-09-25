@@ -106,18 +106,21 @@ so such a setup first moves `projects` to per-account stores.
 - Cleanup: only via a `claude project purge --dry-run` preview followed by confirmed execution;
   remuda never deletes files itself. Note that with a shared `projects` directory, cleanup affects
   every account.
-- Show plugins in the accounts view: `claude plugin list --json`.
 - Interact with running sessions through `messagingSocketPath`.
 - Relocate homes using `CLAUDE_SECURESTORAGE_CONFIG_DIR` (R2).
 - `--private` for command-line output (R21 covers the TUI only).
 
 ## Known issues
 
-It affects only a very narrow timing window:
-
 - A launch request whose running check is already in progress still launches after the check
   passes, even if its account was removed in the meantime by another process (`remuda remove`
-  elsewhere; `D` in the TUI cancels a pending launch first). `pending` holds an `Account`.
+  elsewhere; `D` in the TUI cancels a pending launch first). `pending` holds an `Account`. This
+  affects only a very narrow timing window.
+- The Configuration pane (R22) confines only the paths a plugin manifest names to the plugin
+  directory. The plugin's own `hooks/hooks.json`, `.mcp.json`, and the files under `agents/`,
+  `skills/`, and `commands/` are still opened when they are symlinks pointing outside it, which
+  can reveal at most top-level key names or frontmatter. Low risk, since a plugin can already run
+  hooks as the user; a follow-up is to confine them the same way.
 
 ## Open questions
 

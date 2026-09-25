@@ -781,8 +781,9 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   `ephemeral_1h_input_tokens` over the `message` entries that record `cache_creation`, else the
   top-level one, at most the cache write; the rest of the cache write is 5-minute, including a
   cache write recorded without lifetimes.
-- **Fast mode and US-only inference** are read from `usage.speed` (`"fast"`) and
-  `usage.inference_geo` (`"us"`), the values the API documents; in the sample above only
+- **Fast mode and US-only inference** (**[unverified]**: neither was ever observed in
+  transcripts) are read from `usage.speed` (`"fast"`) and `usage.inference_geo` (`"us"`), the
+  values the API documents; in the sample above only
   `"standard"`, `"not_available"`, and `"global"` occurred. They apply to the message, not to its
   advisor calls, whose entries record neither.
 - **Advisor calls.** `usage.iterations` lists the requests behind a message, and the top-level
@@ -858,10 +859,12 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   `gpt-5.6-sol`'s price is a promotional one, through 2026-11-21. Other codex models have no
   public API price (`codex-auto-review`, codex's own routing id, and `gpt-5.3-codex-spark`, for
   example) and are priced only by `[prices]`.
-  - Fast mode on `claude-opus-5-5`, `claude-opus-5`, and `claude-opus-4-8` doubles every price
+  - **[unverified]** (as the API documents; not observed): fast mode on `claude-opus-5-5`,
+    `claude-opus-5`, and `claude-opus-4-8` doubles every price
     (input 8, 10, and 10; output 40, 50, and 50; the cache prices keep their ratio to input); on
     other models it is priced as standard.
-  - US-only inference multiplies every price by 1.1 on the models from 4.6 on: `claude-fable-5-1`,
+  - **[unverified]** (as the API documents; not observed): US-only inference multiplies every
+    price by 1.1 on the models from 4.6 on: `claude-fable-5-1`,
     `claude-fable-5`, `claude-mythos-5-1`, `claude-mythos-5`, `claude-opus-5-5`, `claude-opus-5`,
     `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-5`, and
     `claude-sonnet-4-6`; with fast mode, both apply.
