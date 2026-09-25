@@ -5,6 +5,9 @@ Details behind the overview in the [README](../README.md). The normative behavio
 
 ## TUI interaction
 
+In a terminal at least 40 rows tall, the header is three rows and shows the remuda mark beside
+the views; a shorter terminal keeps the one-line header, leaving the rows to the views.
+
 In an expanded preview, the movement keys scroll the preview instead of the list. In forms, `Tab`
 or `↓` moves to the next field, `Shift-Tab` or `↑` to the previous one, `Enter` submits and `Esc`
 cancels. Confirmations accept `y`; any other key except `Ctrl-P` cancels. In the account picker

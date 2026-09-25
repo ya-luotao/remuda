@@ -42,6 +42,13 @@ const OK: Style = Style::new().fg(Color::Green);
 const USER: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 const CODEX_STYLE: Style = Style::new().fg(Color::Magenta);
 
+/// From this height on, the header is three lines tall and shows the mark.
+pub const TALL: u16 = 40;
+
+/// The mark (docs/VI.md) in box-drawing characters: two parallel tracks that turn the same way
+/// into an `r`. Their right and bottom ends line up, as in the SVG.
+const MARK: [&str; 3] = [" ╭─────", " │╭────", " ││"];
+
 /// Header, body, status and hints.
 struct Frame4 {
     header: Rect,
@@ -51,8 +58,13 @@ struct Frame4 {
 }
 
 fn frame_areas(area: Rect) -> Frame4 {
+    let header = if area.height >= TALL {
+        MARK.len() as u16
+    } else {
+        1
+    };
     let [header, body, status, hints] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(header),
         Constraint::Fill(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -158,16 +170,28 @@ pub fn render_with(app: &App, snapshot: &mut privacy::Snapshot, f: &mut Frame) {
 
 fn draw(app: &App, f: &mut Frame) {
     let areas = frame_areas(f.area());
-    let header = header(app);
+    let mut header = header(app);
+    // A tall header draws the mark around the line of views, which takes its middle row.
+    let mut line = areas.header;
+    if areas.header.height > 1 {
+        for (i, row) in MARK.iter().enumerate() {
+            if i == 1 {
+                header.spans.insert(0, Span::styled(*row, BOLD));
+            } else {
+                f.render_widget(
+                    Line::styled(*row, BOLD),
+                    Rect::new(line.x, line.y + i as u16, line.width, 1),
+                );
+            }
+        }
+        line = Rect::new(line.x, line.y + 1, line.width, 1);
+    }
     let keys = Line::styled("?: help · q: quit ", DIM);
-    // The views come first where both do not fit (private mode's mark takes room).
-    let room = header.width() + keys.width() <= areas.header.width as usize;
-    f.render_widget(header, areas.header);
+    // The views come first where both do not fit (the logo and `PRIVATE` take room).
+    let room = header.width() + keys.width() <= line.width as usize;
+    f.render_widget(header, line);
     if room {
-        f.render_widget(
-            Paragraph::new(keys).alignment(Alignment::Right),
-            areas.header,
-        );
+        f.render_widget(Paragraph::new(keys).alignment(Alignment::Right), line);
     }
     match app.view {
         View::Accounts => accounts_view(app, f, areas.body),

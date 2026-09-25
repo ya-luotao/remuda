@@ -2572,6 +2572,29 @@ fn accounts_view_loading() {
     assert!(all.contains("u: live usage"), "{all}");
 }
 
+/// A tall terminal draws the mark around the line of views; a shorter one keeps the one-line
+/// header, and the body starts right below it.
+#[test]
+fn header_shows_the_mark_when_tall() {
+    let mut app = app();
+    update(&mut app, Event::Resize(80, render::TALL));
+    let lines = screen(&app);
+    assert_eq!(lines[0], " ╭─────");
+    assert!(
+        lines[1].starts_with(" │╭──── remuda  1 Accounts  2 Live"),
+        "{}",
+        lines[1]
+    );
+    assert!(lines[1].ends_with("?: help · q: quit"), "{}", lines[1]);
+    assert_eq!(lines[2], " ││");
+    assert!(lines[3].starts_with("Accounts"), "{}", lines[3]);
+
+    update(&mut app, Event::Resize(80, render::TALL - 1));
+    let lines = screen(&app);
+    assert!(lines[0].starts_with(" remuda  1 Accounts"), "{}", lines[0]);
+    assert!(lines[1].starts_with("Accounts"), "{}", lines[1]);
+}
+
 #[test]
 fn accounts_view_populated() {
     let app = populated_accounts();
@@ -4157,7 +4180,7 @@ fn stats_columns_align_in_every_row() {
     );
     // Numeric columns shown (SHARE, a bar, is not one of them).
     for (width, columns) in [(80, 6), (75, 6), (70, 5), (60, 5), (160, 7)] {
-        update(&mut app, Event::Resize(width, 40));
+        update(&mut app, Event::Resize(width, render::TALL - 1));
         let lines = screen(&app);
         let header = &lines[2];
         let ends: Vec<usize> = [
@@ -4446,7 +4469,7 @@ fn stats_view_shows_cost_share_and_unpriced_models() {
 #[test]
 fn stats_chart_draws_the_period_over_time() {
     let mut app = stats_app();
-    update(&mut app, Event::Resize(80, 40));
+    update(&mut app, Event::Resize(80, render::TALL - 1));
     let priced_overall = vec![priced(
         model(CLAUDE, "claude-haiku-test", [30, 0, 0, 5, 0]),
         79_000_000_000_000,
@@ -4521,13 +4544,13 @@ fn stats_chart_draws_the_period_over_time() {
     let lines = screen(&app);
     let (_, labels) = line_with(&lines, "2025-");
     assert!(labels.trim_end().ends_with("2026-09-21"), "{labels}");
-    update(&mut app, Event::Resize(40, 40));
+    update(&mut app, Event::Resize(40, render::TALL - 1));
     let lines = screen(&app);
     assert_eq!(lines[2].trim_end(), "Cost per month");
     assert!(lines[10].contains("2026-09"), "{}", lines[10]);
 
     // No timestamps: no chart.
-    update(&mut app, Event::Resize(80, 40));
+    update(&mut app, Event::Resize(80, render::TALL - 1));
     show(&mut app, unpriced, vec![]);
     let lines = screen(&app);
     assert!(lines[2].starts_with("ACCOUNT / MODEL"), "{}", lines[2]);

@@ -52,6 +52,9 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   and weekly windows show as Session and Week, per-model limits by name, on the same timeline as
   Claude's. The live query also shows a Codex account's email and plan.
 
+- The TUI header shows the remuda mark, drawn in box-drawing characters, in terminals at least
+  40 rows tall; shorter terminals keep the one-line header.
+
 ### Changed
 
 - Shared instructions (SPEC R18) are exposed through per-item links:
