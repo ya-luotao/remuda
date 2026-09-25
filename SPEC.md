@@ -13,9 +13,27 @@ change: this file and `tests/` must be updated in the same commit. Tests referen
 anchor (e.g. `R2`). Entries marked **[unverified]** must be confirmed experimentally before they are
 implemented.
 
+Entries are numbered in the order they were added, and the numbers never change, since tests cite
+them. By area:
+
+| Area | Entries |
+| --- | --- |
+| Foundations | [R1](#r1-model) model · [R2](#r2-home-path-invariant) home path invariant · [R3](#r3-registry) registry · [R4](#r4-provider-contract) provider contract · [R12](#r12-symlinks-in-homes) symlinks in homes · [R13](#r13-write-boundary) write boundary · [R15](#r15-testing) testing |
+| Commands and launching | [R5](#r5-commands) commands · [R6](#r6-launch-run-and-launches-from-the-tui) launch · [R14](#r14-add-name-path) `add` · [R14a](#r14a-remove-account) `remove` · [R16](#r16-tui-actions) TUI actions · [R17](#r17-codex) Codex |
+| Sessions | [R7](#r7-running-sessions) running sessions · [R8](#r8-session-index) session index · [R9](#r9-session-attribution) attribution |
+| Accounts view | [R10](#r10-usage) usage · [R10a](#r10a-identity) identity · [R11](#r11-checks-in-the-accounts-view) checks · [R22](#r22-account-configuration-tui) account configuration |
+| Across accounts | [R18](#r18-shared-configuration) shared configuration · [R19](#r19-relay-continuing-a-session-under-another-account) relay |
+| Statistics | [R20](#r20-token-statistics) token statistics and cost |
+| Privacy | [R21](#r21-private-mode-tui) private mode |
+
+How the entries map onto the code is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## R1. Model
 
-- **Provider**: an agent CLI (v1: `claude` is fully supported; `codex` supports accounts, usage, the session index, launch, resume, and fork, but not live sessions; see R4 and R17).
+- **Provider**: an agent CLI. `claude` is fully supported. `codex` supports accounts, identity,
+  usage, the session index, token statistics, launch, resume, and fork; running sessions (R7),
+  relay (R19), shared configuration (R18), and the configuration pane (R22) are claude-only (R4,
+  R17).
 - **Account**: `(provider, name, home)`. `home` is the provider's isolation directory, or the
   special value `default`.
 - `name` matches `[A-Za-z0-9_-]+` and is unique within a provider. On the command line an account
@@ -46,7 +64,7 @@ switching to a different, logged-out account.
   environment, even if remuda itself runs in an environment where it is set (for example, when the
   TUI is opened inside a claude session).
 - `CLAUDE_SECURESTORAGE_CONFIG_DIR` decouples the Keychain key from the directory (undocumented).
-  v1 does not use it; it is recorded here only as a future escape hatch for relocating homes. If it
+  remuda does not use it; it is recorded here only as a future escape hatch for relocating homes. If it
   is already set in the environment at launch, remuda warns and leaves it unchanged.
 
 ## R3. Registry
@@ -93,7 +111,7 @@ switching to a different, logged-out account.
 Each provider declares the following capabilities. A missing capability is shown as unavailable in
 the UI, not reported as an error:
 
-| Capability | claude | codex (M3) |
+| Capability | claude | codex |
 | --- | --- | --- |
 | Isolation variable / `default` semantics | `CLAUDE_CONFIG_DIR` / must be unset | `CODEX_HOME` / unset (explicitly setting it to `~/.codex` is equivalent to leaving it unset; verified) |
 | Identity | `claude auth status --json` (R10a) | `codex login status`: login method only (ChatGPT / API key / not logged in); the email and plan come from the live query (`account/read`, R10, R10a); `auth.json` is not read (it holds credentials) |
@@ -133,20 +151,29 @@ the UI, not reported as an error:
 ## R5. Commands
 
 ```
-remuda                          open the TUI
-remuda run [<account>] [args]   launch the agent under an account; without an account, open the TUI picker
-remuda usage [<account>] [--live]  print per-account usage as plain text (R10)
-remuda list                     accounts, login identity, home
-remuda sessions [--limit N]     print recent sessions as plain text: time, account attribution, title, cwd (R8, R9)
-remuda stats [<account>] [--period P]  print tokens and estimated cost per account and model (R20)
-remuda add <name> <path>        register an existing home directory (R14)
-remuda setup <name>             create a new home and run `claude auth login`
-remuda remove <account>         unregister an account; its home is left in place (R14a)
-remuda relay <session> <account>  continue a session under another account (R19)
+remuda                                             open the TUI
+remuda run [<account>] [args]                      launch the agent under an account (R6); without
+                                                   an account, open the TUI picker (R16)
+remuda usage [<account>] [--live] [--timeout S]    per-account usage as plain text (R10)
+remuda list [--timeout S]                          accounts, login identity, home (R10a)
+remuda sessions [--limit N]                        recent sessions: time, account attribution,
+                                                   title, cwd (R8, R9)
+remuda stats [<account>] [--period P]              tokens and estimated cost per account and
+                                                   model (R20)
+remuda add [--provider P] <name> <path>            register an existing home directory (R14, R17)
+remuda setup [--provider P] <name> [--email E]     create a new home and run the agent's login
+                                                   (`claude auth login`, `codex login`; R17)
+remuda remove <account>                            unregister an account; its home is left in
+                                                   place (R14a)
+remuda relay <session> <account>                   continue a session under another account (R19)
+remuda help [<command>]                            help for remuda or a command
 ```
 
 - There is no shell integration, global routing, or per-directory binding.
-- `run` passes `args` through to the agent unchanged.
+- `run` passes `args` through to the agent unchanged. Because `-h` and `--help` after `run` go to
+  the agent too, the help of `run` itself is `remuda help run`.
+- `--provider` is `claude` (the default) or `codex`. `--timeout` is in seconds, per query:
+  `usage --live` defaults to 90, `list` to 15.
 
 ## R6. Launch (`run` and launches from the TUI)
 
@@ -167,6 +194,18 @@ remuda relay <session> <account>  continue a session under another account (R19)
     `--session-id`, `--teleport`, `--from-pr`, `--cloud`;
   - `--help` / `-h`, `--version` / `-v`.
   When in doubt, nothing is injected.
+
+  ```text
+  claude arguments
+    ├─ any argument is a subcommand name, -h/--help or -v/--version
+    │    ──► not a session: passed through; no ID, no shared configuration (R18)
+    ├─ no resume, continue or attach option, and no --session-id
+    │    ──► new session: --session-id <uuid> injected
+    ├─ --resume <id> and --fork-session, with no --session-id and no other resume option
+    │    ──► fork: --session-id <uuid> injected, fork_of = <id>
+    └─ anything else (resume, continue, attach, other fork forms)
+         ──► existing session: passed through; the ID is logged when the arguments name it
+  ```
 - A resume with `--fork-session` produces a new session ID. For the form `--resume <id>
   --fork-session` (an explicit ID, with no user-supplied `--session-id`), remuda injects a
   pre-assigned `--session-id <uuid>`; `-c --fork-session`, `--resume --fork-session` without an ID,
@@ -395,8 +434,8 @@ appeared in no `history.jsonl`.
 
 ## R12. Symlinks in homes
 
-- v1 detects symlinks in a home that point elsewhere and displays them as `-> <target>`.
-- v1 does not create, delete, or modify any symlink in a home (the item links remuda keeps under
+- remuda detects symlinks in a home that point elsewhere and displays them as `-> <target>`.
+- remuda does not create, delete, or modify any symlink in a home (the item links remuda keeps under
   `$REMUDA_HOME/shared/`, R18, are its own). Any future write operation that encounters a symlink
   must either write through it or refuse; it must never replace the symlink with a private copy.
 - Configuration is shared without symlinks, by injection at launch (R18). Existing symlink layouts
@@ -404,7 +443,7 @@ appeared in no `history.jsonl`.
 
 ## R13. Write boundary
 
-The complete set of v1 write operations:
+The complete set of remuda's write operations:
 
 - `$REMUDA_HOME/config.toml`, `$REMUDA_HOME/state/**`, `$REMUDA_HOME/shared/**` (R18)
 - On an explicit relay (R19), and only then: a copy of one transcript into
@@ -415,8 +454,8 @@ The complete set of v1 write operations:
   by `claude auth login` itself, optionally with `--email` prefilled)
 
 remuda never writes credentials, `.claude.json`, the Keychain, transcripts, `history.jsonl`, or
-`*.key` files, never writes into any home directory except for the relay copies above, and never makes network requests of its own
-(live usage is queried by the agent itself; see R10). Network use and writes into a home by an
+`*.key` files, never writes into any home directory except for the relay copies above, and never
+makes network requests of its own (live usage is queried by the agent itself; see R10). Network use and writes into a home by an
 agent are the agent's own, and happen only in live queries (`claude -p /usage`, `codex app-server`;
 R4, R10) or in the other agent commands remuda runs in an account's environment (`claude auth
 status`, `codex login status`, which creates `tmp/`, a launch, a login).
@@ -465,7 +504,7 @@ or sessions. Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jso
 `.claude.json` are derived from real structures and anonymized. In library-level tests where
 `FAKE_CLAUDE_OUT` / `HOME` are not set, the fake claude defaults to paths inside the sandbox.
 
-## R16. TUI actions (M2)
+## R16. TUI actions
 
 - Every launch reuses the `run` path (R6): the same environment changes, `--session-id` injection,
   and launch log. The TUI first leaves the alternate screen and restores the terminal, spawns the
@@ -518,9 +557,10 @@ or sessions. Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jso
   the TUI account picker; once an account is chosen, the TUI exits and execs claude as
   `remuda run <account>` would.
 - **Configuration** (`p` or Space in Accounts): the selected account's configuration (R22).
-- Preview expansion moved from `Enter` to `p` (or Space).
+- **Preview** (`p` or Space in History / Live): expands or collapses the preview (R8); `Enter`
+  resumes or attaches, as above.
 
-## R17. Codex (M3)
+## R17. Codex
 
 - Accounts: `remuda add --provider codex <name> <path>`, `remuda setup --provider codex <name>` (the
   new home is at `$REMUDA_HOME/homes/codex/<name>`, and login uses `codex login`). The implicit
@@ -569,7 +609,7 @@ or sessions. Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jso
 - Running sessions: not supported for codex; shown as unavailable in the UI. Identity and usage:
   R4, R10, R10a.
 
-## R18. Shared configuration (M2.5)
+## R18. Shared configuration
 
 Sessions stay with the account that created them; only configuration is shared. remuda shares it
 by injecting launch options, so nothing is written into any home (R13), and homes created by
@@ -740,12 +780,19 @@ by injecting launch options, so nothing is written into any home (R13), and home
   - remuda does not inject `autoMemoryDirectory` if the source, the home, or the project's local
     settings already set it.
 - **Order.** Injected options come before the user's arguments, each in the `--option=value` form,
-  so that a variadic option (such as `--add-dir`) cannot consume the user's arguments. The launch
+  so that a variadic option (such as `--add-dir`) cannot consume the user's arguments.
+
+  ```text
+  claude --add-dir=$REMUDA_HOME/shared/claude --settings=<file> --plugin-dir=<install> …  <user args>
+         └─ instructions ──────────────────┘ └─ settings, ───┘ └─ one per plugin ──┘  └─ with R6's
+                                               auto-memory                               --session-id
+  ```
+ The launch
   log (R6) records the injected option names and the byte size of each value, not the values.
 - `run` stays a fast path (R6): injection reads a handful of settings files and
   `installed_plugins.json`, runs no subprocess, and scans no sessions.
 
-## R19. Relay: continuing a session under another account (M2.5)
+## R19. Relay: continuing a session under another account
 
 A relay continues a session under an account whose `projects` store does not contain it (verified
 on 2.1.281: `--resume <id>` in another home fails with "No conversation found"). The original
@@ -777,6 +824,20 @@ every session still belongs to exactly one account.
   destination transcript is replaced only if the launch log records it as an earlier relay copy
   and its size and mtime still equal the recorded ones; otherwise the relay is refused.
   Checkpoint files are immutable (`<hash>@v<n>`): existing ones are kept, missing ones are copied.
+- **Sequence.**
+
+  ```text
+  source store (read only)                    target account's home
+  file-history/<id>/*        ── (a) copy ─►  file-history/<id>/*
+  (union over the homes sharing that store)
+  projects/<dir>/<id>.jsonl  ── (b) copy ─►  projects/<dir>/<id>.jsonl   (the relay copy)
+                                             (c) launch log record (fork_of, relay)
+                                             (d) claude --resume <id> --fork-session
+                                                        --session-id <new>        in cwd_last
+                                                   └─► projects/<dir>/<new>.jsonl (the target's)
+  ```
+
+  A failure in (c), or before claude starts in (d), removes the copy made in (b).
 - **Launch.** Under the target account, in `cwd_last`, with R18 injection:
   `claude --resume <id> --fork-session --session-id <new uuid>`. The launch log records `fork_of`
   and a `relay` object: the source transcript path, the copied paths, and the copy's size and
