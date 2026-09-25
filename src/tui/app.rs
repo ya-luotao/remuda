@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 
+use crate::account_config::ConfigView;
 use crate::attribution;
 use crate::attribution::Attribution;
 use crate::checks::Check;
@@ -127,6 +128,12 @@ pub enum Event {
     Preview {
         path: PathBuf,
         result: Result<Vec<Message>, String>,
+    },
+    /// [`Effect::Config`] number `request` answered for `account` (R22).
+    Config {
+        request: u64,
+        account: Account,
+        result: Result<Box<ConfigView>, String>,
     },
     /// The transcript stores (realpaths of `projects`) and the accounts sharing each.
     Stores(Vec<Store>),
@@ -254,6 +261,13 @@ pub enum Effect {
     Stats,
     /// The last messages of a transcript or rollout of this provider.
     Preview(PathBuf, Provider),
+    /// The account's configuration for a new session in `cwd` (R22), answered by
+    /// [`Event::Config`].
+    Config {
+        request: u64,
+        account: Account,
+        cwd: Option<PathBuf>,
+    },
     /// Checks right before a launch, answered by [`Event::LaunchChecked`]: the request's
     /// directory exists, and a session resumed in place ([`LaunchRequest::resumes`]) is not
     /// running in any account by a fresh `agents --json` of every account (R16). `check`
@@ -519,6 +533,24 @@ pub struct Preview {
     pub scroll: usize,
 }
 
+/// The Configuration pane of the accounts view (R22).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConfigPane {
+    /// `p`: beside or below the view.
+    pub open: bool,
+    /// `p` again: the whole view; the movement keys scroll it.
+    pub expanded: bool,
+    /// First line shown.
+    pub scroll: usize,
+    /// Number of the last [`Effect::Config`]: only its answer is kept.
+    pub request: u64,
+    /// The account shown: the selection's when last requested.
+    pub account: Option<Account>,
+    /// The last answer for `account`; kept while it is read again.
+    pub loaded: Option<Result<ConfigView, String>>,
+    pub loading: bool,
+}
+
 /// The Stats view (R20): computed the first time it opens, then on each `r`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatsState {
@@ -571,6 +603,7 @@ pub struct App {
     /// File-system and environment checks; `None` until they ran.
     pub checks: Option<Vec<Check>>,
     pub checks_in_flight: bool,
+    pub config: ConfigPane,
 
     pub index: Index,
     /// `(done, total)` while a refresh is running.
@@ -647,6 +680,7 @@ impl App {
             accounts_list: ListState::default(),
             checks: None,
             checks_in_flight: false,
+            config: ConfigPane::default(),
             index: Index::default(),
             indexing: None,
             index_in_flight: false,
@@ -784,6 +818,7 @@ impl App {
         // Transcripts may have grown: load the preview again.
         self.preview.loaded = None;
         self.preview.settled = 0;
+        self.reload_config(fx);
     }
 
     /// Computes the statistics, unless a computation is running: they are never computed twice
@@ -927,6 +962,7 @@ impl App {
     }
 
     fn clamp_lists(&mut self) {
+        self.config.scroll = self.config.scroll.min(self.config_max_scroll());
         let heights = View::ALL.map(|v| render::list_height(self, v));
         self.accounts_list.clamp(self.accounts.len(), heights[0]);
         self.live_list.clamp(self.live_rows.len(), heights[1]);
@@ -994,10 +1030,102 @@ impl App {
         true
     }
 
+    /// Points the Configuration pane at the selected account, reading its configuration when
+    /// the account changed (R22).
+    fn retarget_config(&mut self, fx: &mut Vec<Effect>) {
+        if !self.config.open || self.mode != Mode::Browse {
+            return;
+        }
+        let Some(account) = self
+            .accounts
+            .get(self.accounts_list.selected)
+            .map(|a| a.account.clone())
+        else {
+            return;
+        };
+        if self.config.account.as_ref() == Some(&account) {
+            return;
+        }
+        self.config.account = Some(account.clone());
+        self.config.loaded = None;
+        self.config.scroll = 0;
+        self.config.loading = false;
+        if account.provider == CLAUDE {
+            self.request_config(account, fx);
+        }
+    }
+
+    /// `r`: the account shown is read again; what it showed stays until the answer.
+    fn reload_config(&mut self, fx: &mut Vec<Effect>) {
+        if !self.config.open {
+            return;
+        }
+        if let Some(account) = self.config.account.clone()
+            && account.provider == CLAUDE
+        {
+            self.request_config(account, fx);
+        }
+    }
+
+    fn request_config(&mut self, account: Account, fx: &mut Vec<Effect>) {
+        self.config.request += 1;
+        self.config.loading = true;
+        fx.push(Effect::Config {
+            request: self.config.request,
+            account,
+            cwd: self.cwd.clone(),
+        });
+    }
+
+    /// `p` in Accounts: open, expanded, closed (R22).
+    fn cycle_config(&mut self, fx: &mut Vec<Effect>) {
+        if !self.config.open {
+            self.config.open = true;
+            self.retarget_config(fx);
+        } else if !self.config.expanded {
+            self.config.expanded = true;
+            self.config.scroll = 0;
+        } else {
+            self.close_config();
+        }
+    }
+
+    /// The request number is kept: answers still to come stay dropped.
+    fn close_config(&mut self) {
+        self.config = ConfigPane {
+            request: self.config.request,
+            ..ConfigPane::default()
+        };
+    }
+
+    fn config_max_scroll(&self) -> usize {
+        render::config_line_count(self).saturating_sub(render::config_height(self))
+    }
+
+    /// `PgUp` / `PgDn` scroll the pane; while it is expanded, the movement keys too.
+    fn scroll_config(&mut self, key: Key) -> bool {
+        let page = render::config_height(self).max(1);
+        let max = self.config_max_scroll();
+        let scroll = self.config.scroll.min(max);
+        let expanded = self.config.expanded;
+        self.config.scroll = match key {
+            Key::PageDown => scroll + page,
+            Key::PageUp => scroll.saturating_sub(page),
+            Key::Char('j') | Key::Down if expanded => scroll + 1,
+            Key::Char('k') | Key::Up if expanded => scroll.saturating_sub(1),
+            Key::Char('g') | Key::Home if expanded => 0,
+            Key::Char('G') | Key::End if expanded => max,
+            _ => return false,
+        }
+        .min(max);
+        true
+    }
+
     fn switch(&mut self, view: View, fx: &mut Vec<Effect>) {
         self.view = view;
         self.preview.expanded = false;
         self.preview.scroll = 0;
+        self.config.expanded = false;
         // Computed the first time the view opens, then on `r` (R20).
         if view == View::Stats && !self.stats.requested {
             self.request_stats(fx);
@@ -1081,6 +1209,21 @@ impl App {
             Key::Char('p' | ' ') if matches!(self.view, View::Live | View::History) => {
                 self.preview.expanded = !self.preview.expanded;
                 self.preview.scroll = 0;
+            }
+            Key::Char('p' | ' ') if self.view == View::Accounts => self.cycle_config(fx),
+            Key::Esc if self.view == View::Accounts && self.config.expanded => {
+                self.config.expanded = false;
+                self.config.scroll = 0;
+            }
+            Key::Esc if self.view == View::Accounts && self.config.open => self.close_config(),
+            Key::PageUp | Key::PageDown
+                if self.view == View::Accounts && self.config.open && !self.config.expanded =>
+            {
+                self.scroll_config(key);
+            }
+            // The whole view is the pane's: the other keys of Accounts wait.
+            _ if self.view == View::Accounts && self.config.expanded => {
+                self.scroll_config(key);
             }
             _ if self.preview.expanded => match key {
                 Key::Esc => {
@@ -1457,6 +1600,8 @@ impl App {
             fx.push(Effect::Checks);
         }
         self.refresh_sessions(fx);
+        // Read again at the end of the update: a setup or a removal may have changed it.
+        self.config.account = None;
         self.clamp_lists();
     }
 
@@ -2461,6 +2606,23 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 app.preview.loaded = Some((path, result));
             }
         }
+        Event::Config {
+            request,
+            account,
+            result,
+        } => {
+            if request == app.config.request && app.config.account.as_ref() == Some(&account) {
+                // The source may be a name not seen yet (R21).
+                if let Ok(view) = &result
+                    && let Some(source) = view.role.source()
+                {
+                    app.aliases.note(source);
+                }
+                app.config.loaded = Some(result.map(|view| *view));
+                app.config.loading = false;
+                app.clamp_lists();
+            }
+        }
         Event::Stores(stores) => {
             for name in stores.iter().flat_map(|s| &s.accounts) {
                 app.aliases.note(name);
@@ -2593,6 +2755,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             warnings,
         } => app.on_launched(request, result, warnings, &mut fx),
     }
+    app.retarget_config(&mut fx);
     app.retarget_preview();
     fx
 }

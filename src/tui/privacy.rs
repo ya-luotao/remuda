@@ -1,6 +1,7 @@
 //! Private mode (SPEC R21): what the TUI shows while it is on. [`redacted`] makes a copy of
-//! the [`App`] with account names aliased and emails, organizations, paths and session
-//! content masked, and the screen is drawn from that copy only. Every struct and enum it
+//! the [`App`] with account names aliased and emails, organizations, paths, session content
+//! and the descriptions of the configuration pane (R22) masked, and the screen is drawn from
+//! that copy only. Every struct and enum it
 //! copies is destructured without `..`: a field added later does not compile until it is
 //! decided how private mode shows it.
 
@@ -8,6 +9,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use crate::account_config::{
+    ConfigView, Content, Entry as ConfigEntry, Item, Mcp, Memory, Origin, Plugin, PluginContents,
+    Role as ConfigRole, Summary, Synced,
+};
 use crate::checks::Check;
 use crate::identity::Identity;
 use crate::index::{Entry, Index, Store};
@@ -15,13 +20,14 @@ use crate::launch;
 use crate::live::{LiveId, LiveSession};
 use crate::provider::Provider;
 use crate::registry::{Account, DEFAULT_NAME, Home};
+use crate::share::Skip;
 use crate::stats::{self, ModelRow, Report, Section, Table};
 use crate::transcript::Message;
 use crate::usage::{CachedUsage, Resets, UsageRow};
 
 use super::app::{
-    AccountState, App, Confirm, Field, Form, FormKind, History, LaunchRequest, Logs, Mask, Notice,
-    Overlay, Pick, Preview, ResumeCodex, StatsState,
+    AccountState, App, ConfigPane, Confirm, Field, Form, FormKind, History, LaunchRequest, Logs,
+    Mask, Notice, Overlay, Pick, Preview, ResumeCodex, StatsState,
 };
 
 /// What masked text shows.
@@ -395,6 +401,7 @@ pub fn redacted(app: &App) -> App {
         accounts_list,
         checks,
         checks_in_flight,
+        config,
         index,
         indexing,
         index_in_flight,
@@ -446,6 +453,7 @@ pub fn redacted(app: &App) -> App {
             .as_ref()
             .map(|checks| checks.iter().map(|c| r.check(c)).collect()),
         checks_in_flight: *checks_in_flight,
+        config: r.config_pane(config),
         index: r.index(index),
         indexing: *indexing,
         index_in_flight: *index_in_flight,
@@ -886,6 +894,177 @@ impl Redactor<'_> {
         }
     }
 
+    /// The Configuration pane (R22): names stay, descriptions are masked, paths too.
+    fn config_pane(&self, pane: &ConfigPane) -> ConfigPane {
+        let ConfigPane {
+            open,
+            expanded,
+            scroll,
+            request,
+            account,
+            loaded,
+            loading,
+        } = pane;
+        ConfigPane {
+            open: *open,
+            expanded: *expanded,
+            scroll: *scroll,
+            request: *request,
+            account: account.as_ref().map(|a| self.account(a)),
+            loaded: loaded
+                .as_ref()
+                .map(|l| self.scrub_result(l, |v| self.config_view(v))),
+            loading: *loading,
+        }
+    }
+
+    fn config_view(&self, view: &ConfigView) -> ConfigView {
+        let ConfigView {
+            role,
+            instructions,
+            synced,
+            stale_overrides,
+            plugins,
+            disabled_plugins,
+            settings_origin,
+            own_settings,
+            shared_settings,
+            withheld,
+            memory,
+            mcp,
+            problems,
+        } = view;
+        let Memory { dir, origin, files } = memory;
+        ConfigView {
+            role: match role {
+                ConfigRole::Alone => ConfigRole::Alone,
+                ConfigRole::Source => ConfigRole::Source,
+                ConfigRole::OptedOut { source } => ConfigRole::OptedOut {
+                    source: self.alias(source),
+                },
+                ConfigRole::SourceMissing { source } => ConfigRole::SourceMissing {
+                    source: self.alias(source),
+                },
+                ConfigRole::Member { source } => ConfigRole::Member {
+                    source: self.alias(source),
+                },
+            },
+            instructions: instructions.iter().map(|i| self.config_item(i)).collect(),
+            synced: match synced {
+                Synced::None => Synced::None,
+                Synced::Skills { skills, others } => Synced::Skills {
+                    skills: skills.iter().map(|e| self.config_entry(e)).collect(),
+                    others: *others,
+                },
+                Synced::Unmatched { buckets } => Synced::Unmatched { buckets: *buckets },
+            },
+            stale_overrides: stale_overrides.clone(),
+            plugins: plugins.iter().map(|p| self.plugin(p)).collect(),
+            disabled_plugins: *disabled_plugins,
+            settings_origin: origin_copy(settings_origin),
+            own_settings: summary(own_settings),
+            shared_settings: summary(shared_settings),
+            withheld: withheld.clone(),
+            memory: Memory {
+                dir: dir.as_deref().map(|d| self.path(d)),
+                origin: origin_copy(origin),
+                files: *files,
+            },
+            mcp: {
+                let Mcp { user, project } = mcp;
+                Mcp {
+                    user: user.clone(),
+                    project: project.clone(),
+                }
+            },
+            problems: problems.iter().map(|p| self.scrub.text(p)).collect(),
+        }
+    }
+
+    fn config_item(&self, item: &Item) -> Item {
+        let Item {
+            name,
+            origin,
+            link,
+            content,
+        } = item;
+        Item {
+            name,
+            origin: origin_copy(origin),
+            link: link.as_deref().map(|l| self.path_buf(l)),
+            content: match content {
+                Content::File { bytes, lines } => Content::File {
+                    bytes: *bytes,
+                    lines: *lines,
+                },
+                Content::Entries(entries) => {
+                    Content::Entries(entries.iter().map(|e| self.config_entry(e)).collect())
+                }
+                Content::Broken => Content::Broken,
+            },
+        }
+    }
+
+    /// Names, models, efforts and tools stay (R21); the description is masked.
+    fn config_entry(&self, entry: &ConfigEntry) -> ConfigEntry {
+        let ConfigEntry {
+            name,
+            description,
+            model,
+            effort,
+            tools,
+            link,
+            broken,
+            off,
+        } = entry;
+        ConfigEntry {
+            name: name.clone(),
+            description: description.as_ref().map(|_| MASK.to_string()),
+            model: model.clone(),
+            effort: effort.clone(),
+            tools: tools.clone(),
+            link: link.as_deref().map(|l| self.path_buf(l)),
+            broken: *broken,
+            off: *off,
+        }
+    }
+
+    fn plugin(&self, plugin: &Plugin) -> Plugin {
+        let Plugin {
+            name,
+            origin,
+            version,
+            scope,
+            installs,
+            path,
+            contents,
+        } = plugin;
+        Plugin {
+            name: name.clone(),
+            origin: origin_copy(origin),
+            version: version.clone(),
+            scope: scope.clone(),
+            installs: *installs,
+            path: path.as_deref().map(|p| self.path_buf(p)),
+            contents: contents.as_ref().map(|c| {
+                let PluginContents {
+                    agents,
+                    skills,
+                    commands,
+                    hooks,
+                    mcp_servers,
+                } = c;
+                PluginContents {
+                    agents: agents.iter().map(|e| self.config_entry(e)).collect(),
+                    skills: skills.iter().map(|e| self.config_entry(e)).collect(),
+                    commands: commands.iter().map(|e| self.config_entry(e)).collect(),
+                    hooks: hooks.clone(),
+                    mcp_servers: mcp_servers.clone(),
+                }
+            }),
+        }
+    }
+
     fn store(&self, store: &Store) -> Store {
         let Store {
             provider,
@@ -924,6 +1103,41 @@ impl Redactor<'_> {
             cwd: cwd.as_deref().map(|p| self.path_buf(p)),
             what: self.scrub.text(what),
         }
+    }
+}
+
+fn origin_copy(origin: &Origin) -> Origin {
+    match origin {
+        Origin::Own => Origin::Own,
+        Origin::Shared => Origin::Shared,
+        Origin::AlreadySource => Origin::AlreadySource,
+        Origin::NotShared(skip) => Origin::NotShared(match skip {
+            Skip::TurnedOff => Skip::TurnedOff,
+            Skip::OwnInstall => Skip::OwnInstall,
+            Skip::NotInstalled => Skip::NotInstalled,
+            Skip::UnrecognizedList => Skip::UnrecognizedList,
+        }),
+        Origin::Project => Origin::Project,
+    }
+}
+
+/// Key names and counts only: shown as they are (R21, R22).
+fn summary(summary: &Summary) -> Summary {
+    let Summary {
+        model,
+        permissions,
+        hooks,
+        env,
+        status_line,
+        other,
+    } = summary;
+    Summary {
+        model: model.clone(),
+        permissions: *permissions,
+        hooks: hooks.clone(),
+        env: env.clone(),
+        status_line: *status_line,
+        other: other.clone(),
     }
 }
 

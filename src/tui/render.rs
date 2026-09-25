@@ -8,6 +8,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use crate::account_config::{
+    ConfigView, Content, Entry as ConfigEntry, Origin, PluginContents, Role as ConfigRole, Summary,
+    Synced,
+};
 use crate::identity::Identity;
 use crate::index::Entry;
 use crate::pricing::PRICES_AS_OF;
@@ -24,6 +28,7 @@ use super::{privacy, timeline};
 use crate::live::Control;
 use crate::provider::Provider;
 use crate::registry::Account;
+use crate::share::Skip;
 
 /// From this width on, the preview sits beside the list instead of below it.
 pub const WIDE: u16 = 120;
@@ -334,10 +339,14 @@ fn hints(app: &App) -> String {
         "type to filter · ↑/↓: move · enter: keep filter · esc: clear"
     } else if app.preview.expanded && app.view != View::Accounts {
         "j/k/pgup/pgdn: scroll · esc/p: back · enter: resume · f: fork · c: continue as…"
+    } else if app.view == View::Accounts && app.config.expanded {
+        "j/k/pgup/pgdn: scroll · p: close · esc: back · r: refresh"
+    } else if app.view == View::Accounts && app.config.open {
+        "p: expand · esc: close · pgup/pgdn: scroll · j/k: account · n: new session · r: refresh"
     } else {
         match app.view {
             View::Accounts => {
-                "n: new session · s: set up an account · D: remove · u: live usage · r: refresh"
+                "n: new session · p: config · s: set up · D: remove · u: live usage · r: refresh"
             }
             View::Live => {
                 "enter: attach · f: fork · c: continue as… · p: preview · l: logs · x: stop · \
@@ -545,15 +554,82 @@ fn accounts_view(app: &App, f: &mut Frame, mut area: Rect) {
         area.y += 1;
         area.height = area.height.saturating_sub(1);
     }
-    let n = app.accounts.len() as u16;
-    let [table, timeline_area, checks_area] = Layout::vertical([
-        Constraint::Length(n + 2),
-        Constraint::Length(n + 3),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
+    let a = accounts_areas(app, area);
+    if let Some(table) = a.table {
+        let name_w = accounts_table(app, f, table);
+        if let Some(timeline_area) = a.timeline {
+            timeline_view(app, f, timeline_area, name_w as usize);
+        }
+    }
+    if let Some(checks_area) = a.checks {
+        checks_view(app, f, checks_area);
+    }
+    if let Some(config) = a.config {
+        config_pane(app, f, config);
+    }
+}
 
-    // Table.
+/// The accounts view's parts; the Configuration pane (R22) beside them from [`WIDE`] columns
+/// on, below the table otherwise, or over the whole body when expanded.
+struct AccountsAreas {
+    table: Option<Rect>,
+    timeline: Option<Rect>,
+    checks: Option<Rect>,
+    config: Option<Rect>,
+}
+
+fn accounts_areas(app: &App, area: Rect) -> AccountsAreas {
+    let n = app.accounts.len() as u16;
+    let stacked = |area: Rect| {
+        let [table, timeline, checks] = Layout::vertical([
+            Constraint::Length(n + 2),
+            Constraint::Length(n + 3),
+            Constraint::Fill(1),
+        ])
+        .areas(area);
+        AccountsAreas {
+            table: Some(table),
+            timeline: Some(timeline),
+            checks: Some(checks),
+            config: None,
+        }
+    };
+    if !app.config.open || app.mode != Mode::Browse {
+        return stacked(area);
+    }
+    if app.config.expanded {
+        return AccountsAreas {
+            table: None,
+            timeline: None,
+            checks: None,
+            config: Some(area),
+        };
+    }
+    if area.width >= WIDE {
+        let [left, _, right] = Layout::horizontal([
+            Constraint::Percentage(58),
+            Constraint::Length(1),
+            Constraint::Fill(1),
+        ])
+        .areas(area);
+        return AccountsAreas {
+            config: Some(right),
+            ..stacked(left)
+        };
+    }
+    // The selected row stays in sight: the timeline and the checks give way.
+    let [table, config] =
+        Layout::vertical([Constraint::Length(n + 2), Constraint::Fill(1)]).areas(area);
+    AccountsAreas {
+        table: Some(table),
+        timeline: None,
+        checks: None,
+        config: Some(config),
+    }
+}
+
+/// The account table; returns the width of its name column.
+fn accounts_table(app: &App, f: &mut Frame, table: Rect) -> u16 {
     let columns = usage_columns(app);
     let name_w = app
         .accounts
@@ -619,9 +695,7 @@ fn accounts_view(app: &App, f: &mut Frame, mut area: Rect) {
         },
     ));
     f.render_widget(Paragraph::new(lines), table);
-
-    timeline_view(app, f, timeline_area, name_w as usize);
-    checks_view(app, f, checks_area);
+    name_w
 }
 
 /// A model-scoped limit's label, `Week (<model>)` or `Session (<model>)` (codex, R10):
@@ -771,6 +845,492 @@ fn checks_view(app: &App, f: &mut Frame, area: Rect) {
         }
     }
     f.render_widget(Paragraph::new(lines), area);
+}
+
+// ---- Configuration (R22) -------------------------------------------------------------
+
+/// The Configuration pane's text area (below its title line); empty when it is not shown.
+fn config_text_area(app: &App) -> Rect {
+    let body = frame_areas(screen(app)).body;
+    match accounts_areas(app, body).config {
+        Some(area) => Rect {
+            y: area.y + 1,
+            height: area.height.saturating_sub(1),
+            ..area
+        },
+        None => Rect::default(),
+    }
+}
+
+/// Lines the Configuration pane shows at once.
+pub fn config_height(app: &App) -> usize {
+    config_text_area(app).height as usize
+}
+
+/// Lines the Configuration pane scrolls over at its current width.
+pub fn config_line_count(app: &App) -> usize {
+    config_lines(app, config_text_area(app).width as usize).len()
+}
+
+fn config_title(app: &App) -> String {
+    let Some(account) = &app.config.account else {
+        return "Configuration".to_string();
+    };
+    let mut title = format!("Configuration · {}", short(&account.qualified()));
+    if let Some(cwd) = &app.cwd {
+        title.push_str(&format!(
+            " · for {}",
+            tilde(app, &cwd.display().to_string())
+        ));
+    }
+    if app.config.expanded {
+        title.push_str(" (esc: back)");
+    }
+    title
+}
+
+fn config_pane(app: &App, f: &mut Frame, area: Rect) {
+    let title = config_title(app);
+    f.render_widget(
+        Paragraph::new(section(
+            &text::truncate(&title, area.width as usize),
+            area.width,
+        )),
+        Rect { height: 1, ..area },
+    );
+    let text_area = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    let lines = config_lines(app, text_area.width as usize);
+    let height = text_area.height as usize;
+    let scroll = app.config.scroll.min(lines.len().saturating_sub(height));
+    let shown: Vec<Line> = lines.into_iter().skip(scroll).take(height).collect();
+    f.render_widget(Paragraph::new(shown), text_area);
+}
+
+/// The Configuration pane's lines at `width`: every line fits (lists wrap with a hanging
+/// indent, anything else is truncated).
+pub fn config_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let mut out = ConfigLines {
+        lines: Vec::new(),
+        width,
+    };
+    if width == 0 {
+        return out.lines;
+    }
+    if app
+        .config
+        .account
+        .as_ref()
+        .is_some_and(|a| a.provider != Provider::Claude)
+    {
+        out.line("configuration listing is Claude-only", DIM);
+        return out.lines;
+    }
+    match &app.config.loaded {
+        None => out.line("reading configuration…", DIM),
+        Some(Err(e)) => out.wrapped("", &format!("cannot read configuration: {e}"), CRIT),
+        Some(Ok(view)) => config_view_lines(app, view, &mut out),
+    }
+    out.lines
+}
+
+/// Lines of the pane, each made to fit `width`.
+struct ConfigLines {
+    lines: Vec<Line<'static>>,
+    width: usize,
+}
+
+impl ConfigLines {
+    fn line(&mut self, text: &str, style: Style) {
+        self.lines
+            .push(Line::styled(text::truncate(text, self.width), style));
+    }
+
+    /// `text` wrapped after `prefix`, the next lines indented as far.
+    fn wrapped(&mut self, prefix: &str, text: &str, style: Style) {
+        let indent = text::width(prefix);
+        let room = self.width.saturating_sub(indent).max(1);
+        for (i, l) in text::wrap(text, room).into_iter().enumerate() {
+            let lead = if i == 0 {
+                prefix.to_string()
+            } else {
+                " ".repeat(indent)
+            };
+            self.line(&format!("{lead}{l}"), style);
+        }
+    }
+
+    fn heading(&mut self, title: &str) {
+        self.lines.push(Line::raw(""));
+        self.line(title, BOLD);
+    }
+}
+
+fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
+    let src = v.role.source();
+    let src_short = src.map(short).unwrap_or_default();
+    let (role, style) = match &v.role {
+        ConfigRole::Alone => (
+            "no shared configuration ([share.claude] is not set)".to_string(),
+            DIM,
+        ),
+        ConfigRole::Source => (
+            "the shared-configuration source: other Claude accounts get this at launch".to_string(),
+            DIM,
+        ),
+        ConfigRole::OptedOut { .. } => {
+            (format!("share = false: gets nothing from {src_short}"), DIM)
+        }
+        ConfigRole::SourceMissing { .. } => (
+            format!("{src_short}'s home does not exist: nothing is shared"),
+            WARN,
+        ),
+        ConfigRole::Member { .. } => (format!("gets {src_short}'s configuration at launch"), DIM),
+    };
+    out.wrapped("", &role, style);
+    for p in &v.problems {
+        out.wrapped("! ", p, WARN);
+    }
+
+    // Instructions.
+    out.heading("Instructions");
+    let link = |l: &Option<std::path::PathBuf>| {
+        l.as_ref()
+            .map_or(String::new(), |t| format!(" -> {}", t.display()))
+    };
+    for item in &v.instructions {
+        let origin = origin_label(&item.origin, src);
+        match &item.content {
+            Content::File { bytes, lines } => out.line(
+                &format!(
+                    "  {} · {origin} · {lines} lines · {}{}",
+                    item.name,
+                    byte_size(*bytes),
+                    link(&item.link)
+                ),
+                Style::new(),
+            ),
+            Content::Broken => out.line(
+                &format!("  {} · broken link{}", item.name, link(&item.link)),
+                WARN,
+            ),
+            Content::Entries(entries) => {
+                out.line(
+                    &format!(
+                        "  {} · {origin} · {}{}",
+                        item.name,
+                        entries.len(),
+                        link(&item.link)
+                    ),
+                    Style::new(),
+                );
+                let agents = item.name == "agents";
+                for e in entries {
+                    entry_lines(e, agents, out);
+                }
+            }
+        }
+    }
+    match &v.synced {
+        Synced::None => {}
+        Synced::Skills { skills, others } => {
+            out.line(
+                &format!("  synced skills (claude.ai) · {}", skills.len()),
+                Style::new(),
+            );
+            for e in skills {
+                entry_lines(e, false, out);
+            }
+            if *others > 0 {
+                out.line(&format!("  {others} synced buckets of other accounts"), DIM);
+            }
+        }
+        Synced::Unmatched { buckets } => out.wrapped(
+            "  ",
+            &format!(
+                "synced skills: cannot tell which of {buckets} buckets is this account's (no \
+                 account ids in .claude.json)"
+            ),
+            DIM,
+        ),
+    }
+    if !v.stale_overrides.is_empty() {
+        out.wrapped(
+            "  skill overrides naming no skill here: ",
+            &v.stale_overrides.join(", "),
+            WARN,
+        );
+    }
+    if v.instructions.is_empty() && v.synced == Synced::None && v.stale_overrides.is_empty() {
+        out.line("  none", DIM);
+    }
+
+    // Plugins.
+    out.heading("Plugins");
+    for p in &v.plugins {
+        let origin = origin_label(&p.origin, src);
+        match (&p.path, p.origin) {
+            (Some(_), _) => {
+                let mut line = format!("  {}", p.name);
+                for part in [&p.version, &p.scope].into_iter().flatten() {
+                    line.push_str(&format!(" · {part}"));
+                }
+                line.push_str(&format!(" · {origin}"));
+                if p.installs > 1 {
+                    line.push_str(&format!(" · {} installs", p.installs));
+                }
+                out.line(&line, Style::new());
+            }
+            (None, Origin::NotShared(_)) => {
+                out.line(&format!("  {} · {origin}", p.name), DIM);
+            }
+            (None, _) => out.line(
+                &format!("  {} · {origin} · not installed here", p.name),
+                WARN,
+            ),
+        }
+        if let Some(c) = &p.contents {
+            plugin_content_lines(c, out);
+        }
+    }
+    if v.disabled_plugins > 0 {
+        out.line(&format!("  {} disabled", v.disabled_plugins), DIM);
+    }
+    if v.plugins.is_empty() && v.disabled_plugins == 0 {
+        out.line("  none", DIM);
+    }
+
+    // Settings.
+    out.heading("Settings");
+    out.line(
+        &format!(
+            "  settings.json · {}",
+            origin_label(&v.settings_origin, src)
+        ),
+        Style::new(),
+    );
+    summary_lines(&v.own_settings, out);
+    if !v.shared_settings.is_empty() {
+        out.line(
+            &format!("  injected · {}", origin_label(&Origin::Shared, src)),
+            Style::new(),
+        );
+        summary_lines(&v.shared_settings, out);
+    }
+    if !v.withheld.is_empty() {
+        let prefix = match v.role {
+            ConfigRole::Source => "  withheld from members (authentication): ",
+            _ => "  not shared (authentication): ",
+        };
+        out.wrapped(prefix, &v.withheld.join(", "), DIM);
+    }
+
+    // Auto-memory.
+    out.heading("Auto-memory");
+    match &v.memory.dir {
+        Some(dir) => {
+            let files = match v.memory.files {
+                Some(n) => format!("{n} files"),
+                None => "not created yet".to_string(),
+            };
+            out.wrapped(
+                "  ",
+                &format!(
+                    "{} · {} · {files}",
+                    tilde(app, dir),
+                    origin_label(&v.memory.origin, src)
+                ),
+                Style::new(),
+            );
+        }
+        None => out.line("  unknown for this directory", DIM),
+    }
+
+    // MCP servers.
+    out.heading("MCP servers");
+    if !v.mcp.user.is_empty() {
+        out.wrapped("  user: ", &v.mcp.user.join(", "), Style::new());
+    }
+    if !v.mcp.project.is_empty() {
+        out.wrapped("  project: ", &v.mcp.project.join(", "), Style::new());
+    }
+    if v.mcp.user.is_empty() && v.mcp.project.is_empty() {
+        out.line("  none", DIM);
+    }
+    if matches!(v.role, ConfigRole::Member { .. }) {
+        out.wrapped(
+            "  ",
+            "the account's own: shared configuration does not include .claude.json",
+            DIM,
+        );
+    }
+}
+
+/// An agent, skill or command under its item.
+fn entry_lines(e: &ConfigEntry, agent: bool, out: &mut ConfigLines) {
+    let link = e
+        .link
+        .as_ref()
+        .map_or(String::new(), |t| format!(" -> {}", t.display()));
+    if e.broken {
+        out.line(&format!("    {} · broken link{link}", e.name), WARN);
+        return;
+    }
+    let off = if e.off { " (off)" } else { "" };
+    if agent {
+        let mut line = format!("    {}", e.name);
+        if let Some(model) = &e.model {
+            line.push_str(&format!(" · {model}"));
+        }
+        if let Some(effort) = &e.effort {
+            line.push_str(&format!(" · effort {effort}"));
+        }
+        if let Some(tools) = &e.tools {
+            line.push_str(&format!(" · tools {tools}"));
+        }
+        out.line(&format!("{line}{off}{link}"), Style::new());
+        if let Some(d) = &e.description {
+            out.wrapped("      ", d, DIM);
+        }
+        return;
+    }
+    let description = e
+        .description
+        .as_ref()
+        .map_or(String::new(), |d| format!(" — {d}"));
+    out.line(
+        &format!("    {}{off}{description}{link}", e.name),
+        Style::new(),
+    );
+}
+
+/// What an installed plugin adds: counts, then the names.
+fn plugin_content_lines(c: &PluginContents, out: &mut ConfigLines) {
+    let hooks: usize = c.hooks.iter().map(|(_, n)| n).sum();
+    let off = c.skills.iter().filter(|s| s.off).count();
+    let mut counts = Vec::new();
+    for (what, n) in [
+        ("agents", c.agents.len()),
+        ("skills", c.skills.len()),
+        ("commands", c.commands.len()),
+        ("hooks", hooks),
+        ("mcp", c.mcp_servers.len()),
+    ] {
+        if n == 0 {
+            continue;
+        }
+        let mut part = format!("{what} {n}");
+        if what == "skills" && off > 0 {
+            part.push_str(&format!(" ({off} off)"));
+        }
+        counts.push(part);
+    }
+    if counts.is_empty() {
+        return;
+    }
+    out.line(&format!("    {}", counts.join(" · ")), DIM);
+    let named = |entries: &[ConfigEntry], agents: bool| {
+        entries
+            .iter()
+            .map(|e| {
+                let mut name = e.name.clone();
+                if agents && let Some(model) = &e.model {
+                    name.push_str(&format!(" ({model})"));
+                }
+                if e.off {
+                    name.push_str(" (off)");
+                }
+                name
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let hooks = c
+        .hooks
+        .iter()
+        .map(|(event, n)| format!("{event} {n}"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    for (prefix, list) in [
+        ("    agents: ", named(&c.agents, true)),
+        ("    skills: ", named(&c.skills, false)),
+        ("    commands: ", named(&c.commands, false)),
+        ("    hooks: ", hooks),
+        ("    mcp: ", c.mcp_servers.join(", ")),
+    ] {
+        if !list.is_empty() {
+            out.wrapped(prefix, &list, DIM);
+        }
+    }
+}
+
+/// A settings summary: key names and counts, never values.
+fn summary_lines(s: &Summary, out: &mut ConfigLines) {
+    if s.is_empty() {
+        out.line("    nothing set", DIM);
+        return;
+    }
+    if let Some(model) = &s.model {
+        out.line(&format!("    model {model}"), Style::new());
+    }
+    let [allow, ask, deny] = s.permissions;
+    if allow + ask + deny > 0 {
+        out.line(
+            &format!("    permissions allow {allow} · ask {ask} · deny {deny}"),
+            Style::new(),
+        );
+    }
+    if !s.hooks.is_empty() {
+        let hooks = s
+            .hooks
+            .iter()
+            .map(|(event, n)| format!("{event} {n}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        out.wrapped("    hooks ", &hooks, Style::new());
+    }
+    if !s.env.is_empty() {
+        out.wrapped("    env ", &s.env.join(", "), Style::new());
+    }
+    if s.status_line {
+        out.line("    statusLine", Style::new());
+    }
+    if !s.other.is_empty() {
+        out.wrapped("    other ", &s.other.join(", "), Style::new());
+    }
+}
+
+/// Where an item comes from, for the pane; `src` is the source account.
+fn origin_label(origin: &Origin, src: Option<&str>) -> String {
+    let src = src.map(short).unwrap_or("the source");
+    match origin {
+        Origin::Own => "own".to_string(),
+        Origin::Shared => format!("shared from {src}"),
+        Origin::AlreadySource => format!("already {src}'s"),
+        Origin::Project => "set by the project".to_string(),
+        Origin::NotShared(Skip::TurnedOff) => "not shared: turned off here".to_string(),
+        Origin::NotShared(Skip::OwnInstall) => "not shared: installed by this home".to_string(),
+        Origin::NotShared(Skip::NotInstalled) => "not shared: no user install".to_string(),
+        Origin::NotShared(Skip::UnrecognizedList) => {
+            "not shared: installed_plugins.json not recognized".to_string()
+        }
+    }
+}
+
+/// `812 B`, `1.2 KB`, `3.4 MB`.
+fn byte_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < KB * KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{:.1} MB", b / (KB * KB))
+    }
 }
 
 // ---- Live ----------------------------------------------------------------------------
@@ -1089,7 +1649,10 @@ pub const KEYS: &[(&str, &str)] = &[
         "c",
         "continue a claude session under another account (copied into its store, then forked)",
     ),
-    ("p / space", "expand the preview"),
+    (
+        "p / space",
+        "expand the preview · accounts: show the account's configuration, then expand it",
+    ),
     ("n", "accounts: new session with the selected account"),
     (
         "s",

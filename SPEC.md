@@ -517,6 +517,7 @@ or sessions. Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jso
 - **`remuda run` without an account** (in which case no other arguments are allowed either): opens
   the TUI account picker; once an account is chosen, the TUI exits and execs claude as
   `remuda run <account>` would.
+- **Configuration** (`p` or Space in Accounts): the selected account's configuration (R22).
 - Preview expansion moved from `Enter` to `p` (or Space).
 
 ## R17. Codex (M3)
@@ -658,8 +659,8 @@ by injecting launch options, so nothing is written into any home (R13), and home
   This keeps settings values out of the process list and away from per-argument size limits.
   `autoMemoryDirectory` is added to the same JSON when auto-memory is injected. If the user's
   arguments already contain `--settings`, remuda injects no settings and no auto-memory and says so
-  on stderr. A settings file of the source or home that is not a JSON object is an error for the
-  launch.
+  on stderr. A settings file of the source or home that is not a JSON object, or not a regular
+  file (a FIFO or a device would block), is an error for the launch.
   Note: claude treats a settings file passed with `--settings` like repository settings in one
   check: a cloud or teleport git-bundle upload refuses if such a file sets `env.PATH`, `env.HOME`,
   or similar variables (2.1.281 bundle). remuda shares them anyway; the case is rare.
@@ -944,7 +945,8 @@ status and hint lines, notices, the help box) shows:
 - **Paths** (homes, working directories, stores, the directory remuda started in, form values):
   each component is shown as `•••`, and a leading `$HOME` as `~` (`~/•••/•••`).
 - **Session content**: titles, first messages, session names, preview messages, background
-  session logs, and search text are shown as `•••`.
+  session logs, search text, and the descriptions in the configuration pane (R22) are shown as
+  `•••`.
 - **Free text** (notices, errors, check messages, the description of a pending launch): account
   names are replaced by their aliases, as whole words; emails, organization names, live session
   names, the search text, and the values typed in the open form are masked; text in `“…”` is
@@ -954,6 +956,85 @@ status and hint lines, notices, the help box) shows:
   word with an `@` is masked.
 
 Numbers (usage percentages, reset times, token counts, costs, and the Stats chart), model names,
-plans, login methods,
-providers, session IDs, pids, and times stay visible. The line remuda prints before handing the
-terminal to a child (R16) shows no path and follows the same rules.
+plans, login methods, providers, session IDs, pids, and times stay visible, and so do the names
+of configuration items (R22): agents, skills, commands, plugins, hook events, settings keys,
+`env` variables, MCP servers, and an agent's model, effort, and tools. The line remuda prints
+before handing the terminal to a child (R16) shows no path and follows the same rules.
+
+## R22. Account configuration (TUI)
+
+For the selected claude account, the accounts view shows what its sessions load and where each
+part comes from. It only reads: nothing is written (R13), no agent command runs, and credentials
+(`.credentials.json`, the Keychain, `*.key`) are never opened.
+
+- **Keys.** `p` or Space in Accounts opens the Configuration pane (beside the view from 120
+  columns on, below the account table otherwise); pressed again, the pane takes the whole view;
+  again, it closes. `Esc` steps back one of these. While the pane is beside or below, the
+  selection moves as usual and the pane follows it, and `PgUp` / `PgDn` scroll the pane; while it
+  takes the whole view, the movement keys scroll it. The account picker of `remuda run` (R5) has
+  no pane.
+- **When it is read.** In the background, never while drawing: when the pane opens, when the
+  selected account changes while it is open, on `r`, and when the account list is read again
+  (after a setup or a removal). For a codex account the pane says that configuration listing is
+  Claude-only.
+- **For a directory.** What a session loads depends on where it starts (project settings,
+  plugins installed for a project, the auto-memory project, project MCP servers). The pane
+  describes a new session started in the directory remuda was started in (the default of R16's
+  new session), and its title names both: `Configuration · <account> · for <directory>`.
+- **The same plan as a launch.** What shared configuration adds (R18) is decided by the very
+  step that decides a launch's injection for a new session in that directory, without the
+  launch's writes (the `.claude` link and the settings file), so the pane cannot disagree with a
+  launch. A settings file that would fail the launch (not a JSON object) is shown as a problem.
+- **Origins.** Each item is tagged *own* (in the account's home), *shared from <source>*
+  (injected at launch, R18), *already the source's* (the home's item, or a plugin's install,
+  resolves by realpath to the source's, so nothing is injected for it, R12), or *not shared*
+  with the reason (authentication, turned off by the home or the project, installed by the home
+  itself, no user install, an unrecognized `installed_plugins.json`). An account that is the
+  source, has `share = false`, or whose source home is missing says so once instead of listing
+  the source's items. A symlink shows as `-> <target>`; one whose target does not exist, as
+  broken.
+- **Instructions.** `CLAUDE.md` (size and lines); `agents/*.md` (top level), by the `name` of
+  their frontmatter or else the file name, with its `description`, `model`, `effort`, and
+  `tools`; `skills/<dir>/SKILL.md`, by `name` or the directory name, with its `description`;
+  `commands/**/*.md` (at most 4 levels), a subdirectory shown as `dir:name`. Symlinks are
+  followed; only regular files are opened; frontmatter is read from a file's first 8 KB; at most
+  500 entries are listed per directory.
+- **Synced skills.** `skills/synced/<organization>_<account>/` holds the claude.ai skills of one
+  login, and a `skills` directory shared by several homes holds every login's buckets. The pane
+  lists only the bucket named by `oauthAccount.organizationUuid` and `accountUuid` in the
+  account's own `.claude.json`, as synced skills, with the number of other buckets; without those
+  ids it says that the bucket cannot be matched. `synced` is never listed as a skill, and bucket
+  names are never shown.
+- **Skill overrides.** A skill set to `"off"` in `skillOverrides` of the settings a session gets
+  (the home's, the project's, the injected) is shown as off; an override naming no skill the pane
+  lists (own, shared, synced, or a plugin's, as `<skill>` or `<plugin>:<skill>`) is listed as
+  stale.
+- **Plugins.** The home's enabled plugins (`enabledPlugins` `true` or an array), each with the
+  install claude loads for that directory (R18's load rule; when several do, one made for the
+  directory, `local` then `project`, before `user` then `managed`, else the first in the file),
+  its version and scope, and the number of install records; or marked not installed. Plugins set
+  to `false` are counted, not listed. Then the source's enabled plugins, injected or not with the
+  reason. For each installed plugin: its agents, skills, and commands (as above, in its install
+  directory), its hook events with counts (`hooks/hooks.json`, or `hooks` in
+  `.claude-plugin/plugin.json`), and the names of its MCP servers (`.mcp.json`, or `mcpServers`
+  in `.claude-plugin/plugin.json`).
+- **Settings.** The home's `settings.json` and the injected part of the source's, each
+  summarized as: model; permission rule counts (allow, ask, deny); hook events with the number of
+  hooks of each; `env` names; whether a status line is set; the names of other keys. The
+  source's settings withheld as authentication (R18) are listed by name: for a member as not
+  shared, for the source as withheld from members.
+- **Auto-memory.** The directory a session there uses, `autoMemoryDirectory` as injected, else
+  as set by the project's settings, else by the home's, else `<home>/projects/<project>/memory`
+  (R18's project name), and how many `*.md` files it holds.
+- **MCP servers.** The names in `mcpServers` of the account's `.claude.json` (user scope) and of
+  its `projects` entry for the project, whose key is the project root of R18 (read from the
+  2.1.281 bundle). They belong to the account: shared configuration does not include
+  `.claude.json`.
+- **No values.** Settings are summarized by key names and counts: no `env` value, hook command,
+  permission rule, or MCP server definition is shown. `.claude.json` is parsed for those names
+  and the two ids only; its other values are not kept.
+- **Private mode (R21).** Names stay visible (agents, skills, commands, plugins, hook events,
+  settings keys, `env` variables, MCP servers, and an agent's model, effort, and tools);
+  descriptions are masked as `•••`; paths (link targets, install and memory directories, the
+  directory in the title) are masked as in R21; the source account is shown by its alias;
+  problems are free text.

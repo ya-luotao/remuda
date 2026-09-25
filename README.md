@@ -95,7 +95,8 @@ Account names match `[A-Za-z0-9_-]+`. Because `run` forwards `-h` and `--help` t
 ## TUI
 
 Four views, Accounts, Live, History and Stats, with a preview pane for the selected session in
-Live and History. Press `?` for the key reference.
+Live and History and a configuration pane for the selected account in Accounts. Press `?` for the
+key reference.
 
 | Key | Action |
 | --- | --- |
@@ -105,7 +106,7 @@ Live and History. Press `?` for the key reference.
 | `Enter` | History: resume the selected session (Codex asks for confirmation first). Live: attach to a background session |
 | `f` | Fork the selected session into a new session; the original is left unchanged |
 | `c` | Continue the selected Claude session under another account (relay) |
-| `p`, `Space` | Expand or collapse the preview (Live and History) |
+| `p`, `Space` | Live and History: expand or collapse the preview. Accounts: show the selected account's configuration (instructions, plugins, settings, auto-memory, MCP servers, and where each comes from); press again to expand it, again to close it. `PgUp` `PgDn` scroll it |
 | `n` | Accounts: start a new session with the selected account |
 | `s` | Accounts: set up a new Claude or Codex account, as `remuda setup` does |
 | `l` | Live: show a background session's logs in the preview |
@@ -116,7 +117,7 @@ Live and History. Press `?` for the key reference.
 | `t` | Stats: next period (all time, today, last 7 days, last 30 days) |
 | `u` | Query live usage for every account |
 | `r` | Refresh the index, identities, live sessions and checks, and the statistics once the Stats view has been opened |
-| `Esc` | Go back: collapse the preview, close logs, clear the search, or cancel a form or pending launch check |
+| `Esc` | Go back: collapse the preview or the configuration pane, close logs, clear the search, or cancel a form or pending launch check |
 | `Ctrl-P` | Turn private mode on or off, anywhere |
 | `?` · `q`, `Ctrl-C` | Show the key reference (any key but `Ctrl-P` closes it) · Quit |
 

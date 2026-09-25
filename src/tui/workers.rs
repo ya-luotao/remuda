@@ -12,7 +12,7 @@ use crate::index::{self, Index};
 use crate::pricing::Prices;
 use crate::provider::{Provider, codex};
 use crate::registry::{self, Account, Registry};
-use crate::{attribution, checks, identity, live, stats, transcript, usage};
+use crate::{account_config, attribution, checks, identity, live, stats, transcript, usage};
 
 use super::Deps;
 use super::app::{self, Effect, Event, LaunchRequest, PREVIEW_MESSAGES};
@@ -190,6 +190,41 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                 }
                 .map_err(|e| e.to_string());
                 let _ = tx.send(Event::Preview { path, result });
+            });
+        }
+        Effect::Config {
+            request,
+            account,
+            cwd,
+        } => {
+            thread::spawn(move || {
+                let result = if account.provider != Provider::Claude {
+                    Err("configuration listing is Claude-only".to_string())
+                } else {
+                    let read = |sharing: &registry::Sharing| {
+                        account_config::read(&account, sharing, cwd.as_deref(), &deps.env)
+                    };
+                    Ok(Box::new(match Registry::load(&deps.config) {
+                        Ok(registry) => read(&registry.sharing),
+                        // The account's own configuration still shows.
+                        Err(e) => {
+                            let mut view = read(&registry::Sharing::default());
+                            view.problems.insert(
+                                0,
+                                format!(
+                                    "cannot read {}: {e:#}; shared configuration unknown",
+                                    deps.config.display()
+                                ),
+                            );
+                            view
+                        }
+                    }))
+                };
+                let _ = tx.send(Event::Config {
+                    request,
+                    account,
+                    result,
+                });
             });
         }
     }
@@ -683,6 +718,85 @@ mod tests {
             [Event::LiveUsage {
                 account: max,
                 result: Err("`claude` not found on PATH".into())
+            }]
+        );
+    }
+
+    /// R22: an account's configuration is read in the background and comes back with its
+    /// request number; a codex account has none to list.
+    #[test]
+    fn configuration_is_read_in_the_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let max = deps.accounts[0].clone();
+        let events = collect(
+            Effect::Config {
+                request: 3,
+                account: max.clone(),
+                cwd: None,
+            },
+            &deps,
+            |_| true,
+        );
+        let [
+            Event::Config {
+                request: 3,
+                account,
+                result: Ok(view),
+            },
+        ] = events.as_slice()
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(account, &max);
+        assert_eq!(view.role, account_config::Role::Alone);
+        assert_eq!(view.problems, Vec::<String>::new());
+
+        // A registry that cannot be read: the account's own configuration, and why.
+        fs::write(&deps.config, "not toml [").unwrap();
+        let events = collect(
+            Effect::Config {
+                request: 4,
+                account: max.clone(),
+                cwd: None,
+            },
+            &deps,
+            |_| true,
+        );
+        let [
+            Event::Config {
+                result: Ok(view), ..
+            },
+        ] = events.as_slice()
+        else {
+            panic!("{events:?}")
+        };
+        assert!(
+            view.problems[0].ends_with("; shared configuration unknown"),
+            "{:?}",
+            view.problems
+        );
+
+        let work = Account {
+            provider: Provider::Codex,
+            name: "work".into(),
+            home: Home::Path(dir.path().join("work").display().to_string()),
+        };
+        let events = collect(
+            Effect::Config {
+                request: 5,
+                account: work.clone(),
+                cwd: None,
+            },
+            &deps,
+            |_| true,
+        );
+        assert_eq!(
+            events,
+            [Event::Config {
+                request: 5,
+                account: work,
+                result: Err("configuration listing is Claude-only".into()),
             }]
         );
     }

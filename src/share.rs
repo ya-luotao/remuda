@@ -74,6 +74,59 @@ pub struct Injected {
     pub bytes: usize,
 }
 
+/// What a session launch of an account gets from the source (R18), decided without writing
+/// anything: [`apply`] turns it into launch options, and the accounts view shows it (R22).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Plan {
+    /// The source (`provider:name`) and its home; `None`: nothing is injected (not a member, or
+    /// the source's home is missing).
+    pub source: Option<(String, PathBuf)>,
+    /// The home's instruction items against the source's: `--add-dir` when
+    /// [`Instructions::needs_injection`].
+    pub instructions: Instructions,
+    /// Components the home already shares with the source (same realpath, R12): not injected.
+    pub settings_shared: bool,
+    pub memory_shared: bool,
+    pub plugins_shared: bool,
+    /// The content of the single `--settings` (authentication removed, `autoMemoryDirectory`
+    /// included when remuda adds it); empty: no `--settings`.
+    pub settings: Map<String, Value>,
+    /// The `autoMemoryDirectory` remuda adds (also in `settings`), if any.
+    pub memory: Option<String>,
+    /// Each plugin the source enables, in order, injected as `--plugin-dir` or why not; empty
+    /// when the plugins are shared by realpath or not part of the launch.
+    pub plugins: Vec<PluginPlan>,
+    /// Messages for the user that need no write (a `--settings` / `--setting-sources` given).
+    pub notices: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginPlan {
+    /// `name@marketplace`.
+    pub name: String,
+    pub outcome: Result<PluginDir, Skip>,
+}
+
+/// The source's install of a plugin, passed as `--plugin-dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginDir {
+    pub path: PathBuf,
+    pub version: Option<String>,
+}
+
+/// Why a plugin the source enables is not injected (R18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Skip {
+    /// `false` in the `enabledPlugins` of the home or of the project's settings.
+    TurnedOff,
+    /// The home has installed it itself in a way claude loads here.
+    OwnInstall,
+    /// The source has no `user` install whose path exists (R11).
+    NotInstalled,
+    /// The home's or the source's `installed_plugins.json` is not recognized (R11).
+    UnrecognizedList,
+}
+
 /// What `account` gets from the source of `sharing` for a session launched with `user_args`
 /// in `cwd` (R18). Nothing for the source itself, an account with `share = false`, a codex
 /// account, or a source whose home is missing (R11 warns about that). Each component is
@@ -91,34 +144,33 @@ pub fn inject(
     env: &Env,
     config: &Path,
 ) -> Result<Shared> {
-    let mut shared = Shared::default();
+    apply(&plan(sharing, account, user_args, cwd, env)?, config)
+}
+
+/// The reads of [`inject`], without its writes (R18, R22): what `account` gets from the source
+/// of `sharing` for a session launched with `user_args` in `cwd`, and why each plugin the
+/// source enables is or is not injected. Fails as [`inject`] does: only on a settings file of
+/// the source or the home that is not a JSON object.
+pub fn plan(
+    sharing: &Sharing,
+    account: &Account,
+    user_args: &[String],
+    cwd: Option<&Path>,
+    env: &Env,
+) -> Result<Plan> {
+    let mut plan = Plan::default();
     let Some(source) = sharing.source_for(account) else {
-        return Ok(shared);
+        return Ok(plan);
     };
     let (Some(from), Some(home)) = (source.home_dir(env), account.home_dir(env)) else {
-        return Ok(shared);
+        return Ok(plan);
     };
     if !from.is_dir() {
-        return Ok(shared);
+        return Ok(plan);
     }
     let name = source.qualified();
-
-    if instructions(&from, &home).needs_injection() {
-        let shared_dir = dir(config);
-        match ensure_link(&shared_dir, &from) {
-            Ok(()) => {
-                shared
-                    .args
-                    .push(format!("--add-dir={}", shared_dir.display()));
-                shared
-                    .env
-                    .push((CLAUDE_MD_VAR.to_string(), "1".to_string()));
-            }
-            Err(e) => shared.notices.push(format!(
-                "instructions from {name} are not shared this time: {e:#}"
-            )),
-        }
-    }
+    plan.source = Some((name.clone(), from.clone()));
+    plan.instructions = instructions(&from, &home);
 
     // claude takes only the last `--settings`, and `--setting-sources` may leave out the
     // user's layer the shared settings stand in for: either way, the user decides (R18).
@@ -130,18 +182,24 @@ pub fn inject(
     let own_path = home.join("settings.json");
     let settings_shared = resolves_to(&own_path, &from.join("settings.json"));
     let memory_shared = resolves_to(&home.join("projects"), &from.join("projects"));
-    let plugins_part = !resolves_to(&home.join("plugins"), &from.join("plugins"));
+    let plugins_shared = resolves_to(&home.join("plugins"), &from.join("plugins"));
+    plan.settings_shared = settings_shared;
+    plan.memory_shared = memory_shared;
+    plan.plugins_shared = plugins_shared;
+    let plugins_part = !plugins_shared;
     if let Some(option) = user_settings
         && !(settings_shared && memory_shared)
     {
-        shared.notices.push(format!(
+        plan.notices.push(format!(
             "{option} given: settings and auto-memory from {name} are not injected"
         ));
     }
     let settings_part = !settings_shared && user_settings.is_none();
     let memory_part = !memory_shared && user_settings.is_none();
+    // Before any settings file is read: a launch that shares everything by symlink does not
+    // fail on a malformed one.
     if !(settings_part || memory_part || plugins_part) {
-        return Ok(shared);
+        return Ok(plan);
     }
 
     let source_settings = read_settings(&from.join("settings.json"))?;
@@ -174,17 +232,10 @@ pub fn inject(
             && !chosen
             && let Some(memory) = project.memory_dir(&from)
         {
-            injected.insert(MEMORY_KEY.to_string(), Value::String(memory));
+            injected.insert(MEMORY_KEY.to_string(), Value::String(memory.clone()));
+            plan.memory = Some(memory);
         }
-        if !injected.is_empty() {
-            let json = serde_json::to_string(&Value::Object(injected))?;
-            match write_settings(&settings_dir(config), &json, SystemTime::now()) {
-                Ok(path) => shared.args.push(format!("--settings={}", path.display())),
-                Err(e) => shared.notices.push(format!(
-                    "settings from {name} are not shared this time: {e:#}"
-                )),
-            }
-        }
+        plan.settings = injected;
     }
 
     if plugins_part {
@@ -203,15 +254,75 @@ pub fn inject(
             })
         };
         for plugin in enabled_plugins(&source_settings) {
-            if own_unknown {
-                break;
+            let outcome = if own_unknown {
+                Err(Skip::UnrecognizedList)
+            } else if off(&plugin) {
+                Err(Skip::TurnedOff)
+            } else if own_installs.installed_for(&plugin, project.start.as_deref()) {
+                Err(Skip::OwnInstall)
+            } else if matches!(installs, Installs::Unrecognized(_)) {
+                Err(Skip::UnrecognizedList)
+            } else {
+                match installs.user_install(&plugin) {
+                    Some(Install {
+                        path: Some(path),
+                        version,
+                        ..
+                    }) => Ok(PluginDir {
+                        path: path.clone(),
+                        version: version.clone(),
+                    }),
+                    _ => Err(Skip::NotInstalled),
+                }
+            };
+            plan.plugins.push(PluginPlan {
+                name: plugin,
+                outcome,
+            });
+        }
+    }
+    Ok(plan)
+}
+
+/// The writes of [`inject`] for `plan` (R18): the `.claude` link next to `config` when
+/// instructions are injected, and the settings file. What cannot be made is left out of the
+/// launch, with a notice.
+pub fn apply(plan: &Plan, config: &Path) -> Result<Shared> {
+    let mut shared = Shared::default();
+    let Some((name, from)) = &plan.source else {
+        return Ok(shared);
+    };
+    if plan.instructions.needs_injection() {
+        let shared_dir = dir(config);
+        match ensure_link(&shared_dir, from) {
+            Ok(()) => {
+                shared
+                    .args
+                    .push(format!("--add-dir={}", shared_dir.display()));
+                shared
+                    .env
+                    .push((CLAUDE_MD_VAR.to_string(), "1".to_string()));
             }
-            if off(&plugin) || own_installs.installed_for(&plugin, project.start.as_deref()) {
-                continue;
-            }
-            if let Some(path) = installs.install_path(&plugin) {
-                shared.args.push(format!("--plugin-dir={}", path.display()));
-            }
+            Err(e) => shared.notices.push(format!(
+                "instructions from {name} are not shared this time: {e:#}"
+            )),
+        }
+    }
+    shared.notices.extend(plan.notices.iter().cloned());
+    if !plan.settings.is_empty() {
+        let json = serde_json::to_string(&Value::Object(plan.settings.clone()))?;
+        match write_settings(&settings_dir(config), &json, SystemTime::now()) {
+            Ok(path) => shared.args.push(format!("--settings={}", path.display())),
+            Err(e) => shared.notices.push(format!(
+                "settings from {name} are not shared this time: {e:#}"
+            )),
+        }
+    }
+    for plugin in &plan.plugins {
+        if let Ok(install) = &plugin.outcome {
+            shared
+                .args
+                .push(format!("--plugin-dir={}", install.path.display()));
         }
     }
     Ok(shared)
@@ -617,10 +728,35 @@ pub fn ensure_link(dir: &Path, source: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Opens `path` for reading only when it is a regular file (symlinks followed): a FIFO or a
+/// device would block the reader, or read the terminal (R22). Checked again on the open file,
+/// in case it was replaced in between.
+pub fn open_regular(path: &Path) -> io::Result<fs::File> {
+    let not_regular = || io::Error::new(io::ErrorKind::InvalidInput, "not a regular file");
+    if !fs::metadata(path)?.is_file() {
+        return Err(not_regular());
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
+    Ok(file)
+}
+
+/// The whole of the regular file `path` ([`open_regular`]).
+pub fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    io::Read::read_to_end(&mut open_regular(path)?, &mut bytes)?;
+    Ok(bytes)
+}
+
 /// A `settings.json` as an object: missing is empty; anything but a JSON object is an error
 /// for the launch (R18).
 pub fn read_settings(path: &Path) -> Result<Map<String, Value>> {
-    let bytes = match fs::read(path) {
+    let bytes = match read_regular(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Map::new()),
         Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
@@ -733,20 +869,21 @@ pub struct Install {
     pub path: Option<PathBuf>,
     /// The directory a `project` or `local` install is for.
     pub project: Option<PathBuf>,
+    pub version: Option<String>,
 }
 
 impl Installs {
     /// The first `user`-scoped install of `plugin` whose `installPath` exists.
     pub fn install_path(&self, plugin: &str) -> Option<&Path> {
-        let Installs::Known(plugins) = self else {
-            return None;
-        };
-        plugins
-            .get(plugin)?
+        self.user_install(plugin)?.path.as_deref()
+    }
+
+    /// The first `user`-scoped install of `plugin` whose `installPath` is absolute and exists:
+    /// the one injected (R18).
+    pub fn user_install(&self, plugin: &str) -> Option<&Install> {
+        self.installs(plugin)
             .iter()
-            .filter(|i| i.scope.as_deref() == Some("user"))
-            .filter_map(|i| i.path.as_deref())
-            .find(|p| p.is_absolute() && p.exists())
+            .find(|i| i.scope.as_deref() == Some("user") && i.path.as_deref().is_some_and(present))
     }
 
     /// Whether an install of `plugin` here is one claude loads for a session in `start` (R18,
@@ -758,20 +895,62 @@ impl Installs {
         };
         let start_root = start.and_then(git_root);
         plugins.get(plugin).is_some_and(|installs| {
-            installs.iter().any(|i| {
-                if matches!(i.scope.as_deref(), Some("user" | "managed")) {
-                    return true;
-                }
-                let Some(project) = i.project.as_deref() else {
-                    return false;
-                };
-                start == Some(project)
-                    || start_root
-                        .as_ref()
-                        .is_some_and(|root| git_root(project).as_ref() == Some(root))
-            })
+            installs
+                .iter()
+                .any(|i| loads(i, start, start_root.as_deref()))
         })
     }
+
+    /// The install of `plugin` a session in `start` uses (R22): among those claude loads there
+    /// ([`Installs::installed_for`]) whose `installPath` is absolute and exists, the most
+    /// specific (`local`, `project`, `user`, `managed`, then any other scope), the first in the
+    /// file among equals.
+    pub fn effective(&self, plugin: &str, start: Option<&Path>) -> Option<&Install> {
+        let start_root = start.and_then(git_root);
+        let rank = |i: &Install| match i.scope.as_deref() {
+            Some("local") => 0,
+            Some("project") => 1,
+            Some("user") => 2,
+            Some("managed") => 3,
+            _ => 4,
+        };
+        self.installs(plugin)
+            .iter()
+            .filter(|i| {
+                loads(i, start, start_root.as_deref()) && i.path.as_deref().is_some_and(present)
+            })
+            .min_by_key(|i| rank(i))
+    }
+
+    /// The number of install records of `plugin`; 0 when the list is not known.
+    pub fn count(&self, plugin: &str) -> usize {
+        self.installs(plugin).len()
+    }
+
+    fn installs(&self, plugin: &str) -> &[Install] {
+        match self {
+            Installs::Known(plugins) => plugins.get(plugin).map_or(&[], Vec::as_slice),
+            _ => &[],
+        }
+    }
+}
+
+/// An `installPath` that can be used: absolute and existing.
+fn present(path: &Path) -> bool {
+    path.is_absolute() && path.exists()
+}
+
+/// Whether claude loads install `i` for a session in `start`, whose git root is `start_root`
+/// (its `wb`, [`Installs::installed_for`]).
+fn loads(i: &Install, start: Option<&Path>, start_root: Option<&Path>) -> bool {
+    if matches!(i.scope.as_deref(), Some("user" | "managed")) {
+        return true;
+    }
+    let Some(project) = i.project.as_deref() else {
+        return false;
+    };
+    start == Some(project)
+        || start_root.is_some_and(|root| git_root(project).as_deref() == Some(root))
 }
 
 /// Reads `<home>/plugins/installed_plugins.json` (R18: format version 2).
@@ -782,7 +961,7 @@ pub fn installed_plugins(home: &Path) -> Installs {
         plugins: BTreeMap<String, Vec<Value>>,
     }
     let path = home.join("plugins").join("installed_plugins.json");
-    let bytes = match fs::read(&path) {
+    let bytes = match read_regular(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Installs::Missing,
         Err(_) => return Installs::Unrecognized(path),
@@ -807,6 +986,10 @@ pub fn installed_plugins(home: &Path) -> Installs {
                                 .get("projectPath")
                                 .and_then(Value::as_str)
                                 .map(PathBuf::from),
+                            version: install
+                                .get("version")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
                         })
                         .collect();
                     (name, installs)
@@ -1607,6 +1790,35 @@ mod tests {
         assert_eq!(left, want);
     }
 
+    /// R18, R22: settings and plugin lists are read only from regular files, so a FIFO (or a
+    /// device) fails at once instead of blocking a launch or the configuration pane.
+    #[test]
+    fn only_regular_files_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = |path: &Path| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        };
+        let settings = dir.path().join("settings.json");
+        fifo(&settings);
+        let list = dir.path().join("plugins/installed_plugins.json");
+        fifo(&list);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (s, home) = (settings.clone(), dir.path().to_path_buf());
+        std::thread::spawn(move || {
+            let _ = tx.send((read_settings(&s).is_err(), installed_plugins(&home)));
+        });
+        let (settings_err, installs) = rx.recv_timeout(Duration::from_secs(10)).expect("blocked");
+        assert!(settings_err);
+        assert_eq!(installs, Installs::Unrecognized(list));
+        assert!(
+            read_settings(&dir.path().join("missing.json"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// R18: the injected settings also yield to the project's `.claude/settings.json` and
     /// `.claude/settings.local.json` of the start directory, and to the local settings of the
     /// project root when claude reads those; nothing that turns out empty is passed.
@@ -1946,6 +2158,7 @@ mod tests {
             scope: Some(scope.into()),
             path: Some(PathBuf::from("/i")),
             project: project.map(Path::to_path_buf),
+            version: None,
         };
         let with = |i: Install| Installs::Known([("x@m".to_string(), vec![i])].into());
         let start = repo.join("a");
@@ -2025,5 +2238,186 @@ mod tests {
         )
         .unwrap();
         assert_eq!(run(), Vec::<String>::new());
+    }
+
+    /// R18, R22: the plan decides what a launch gets without writing anything; `inject` then
+    /// writes exactly what it decided.
+    #[test]
+    fn plan_decides_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (source_home, max) = (root.join("src"), root.join("max"));
+        for d in [&source_home, &max] {
+            fs::create_dir_all(d).unwrap();
+        }
+        fs::write(source_home.join("CLAUDE.md"), "x").unwrap();
+        fs::write(source_home.join("settings.json"), r#"{"model":"opus"}"#).unwrap();
+        let sharing = Sharing {
+            source: Some(named("src", &source_home)),
+            opted_out: vec![],
+        };
+        let config = root.join("remuda/config.toml");
+        let env: Env = [("PATH".to_string(), std::env::var("PATH").unwrap())].into();
+        let memory = format!(
+            "{}/projects/{}/memory",
+            source_home.display(),
+            encode_project(root.to_str().unwrap()).unwrap()
+        );
+
+        let got = plan(&sharing, &named("max", &max), &[], Some(&root), &env).unwrap();
+        assert_eq!(
+            got.source,
+            Some(("claude:src".to_string(), source_home.clone()))
+        );
+        assert_eq!(got.instructions.missing, ["CLAUDE.md"]);
+        assert_eq!(
+            Value::Object(got.settings.clone()),
+            json!({"autoMemoryDirectory": memory, "model": "opus"})
+        );
+        assert_eq!(got.memory.as_deref(), Some(memory.as_str()));
+        assert_eq!(got.plugins, []);
+        assert!(!super::dir(&config).exists());
+        assert!(!settings_dir(&config).exists());
+
+        let shared = inject(
+            &sharing,
+            &named("max", &max),
+            &[],
+            Some(&root),
+            &env,
+            &config,
+        )
+        .unwrap();
+        let want = Value::Object(got.settings).to_string();
+        let file = settings_dir(&config).join(format!("{:x}.json", Sha256::digest(&want)));
+        assert_eq!(
+            shared.args,
+            [
+                format!("--add-dir={}", super::dir(&config).display()),
+                format!("--settings={}", file.display()),
+            ]
+        );
+    }
+
+    /// R18, R22: the plan records, for each plugin the source enables and in its order, the
+    /// install injected or why none is.
+    #[test]
+    fn plan_records_why_each_plugin_is_or_is_not_injected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (source_home, max, work) = (root.join("src"), root.join("max"), root.join("work"));
+        let cache = source_home.join("plugins/cache");
+        for p in ["a", "b", "c", "d"] {
+            fs::create_dir_all(cache.join(p)).unwrap();
+        }
+        fs::create_dir_all(max.join("plugins")).unwrap();
+        fs::create_dir_all(work.join(".claude")).unwrap();
+        fs::write(
+            source_home.join("settings.json"),
+            json!({"enabledPlugins": {"a@m": true, "b@m": true, "c@m": true, "d@m": true}})
+                .to_string(),
+        )
+        .unwrap();
+        let install =
+            |p: &str| json!([{"scope": "user", "installPath": cache.join(p), "version": "1.0.0"}]);
+        let list = source_home.join("plugins/installed_plugins.json");
+        fs::write(
+            &list,
+            json!({"version": 2, "plugins": {"a@m": install("a"), "b@m": install("b"),
+                                             "c@m": install("c"), "d@m": install("d")}})
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            work.join(".claude/settings.local.json"),
+            json!({"enabledPlugins": {"a@m": false}}).to_string(),
+        )
+        .unwrap();
+        let own_list = max.join("plugins/installed_plugins.json");
+        fs::write(
+            &own_list,
+            json!({"version": 2, "plugins": {
+                "b@m": [{"scope": "project", "installPath": "/own/b", "projectPath": work}],
+                "c@m": [{"scope": "local", "installPath": "/own/c", "projectPath": "/elsewhere"}],
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let sharing = Sharing {
+            source: Some(named("src", &source_home)),
+            opted_out: vec![],
+        };
+        let outcomes = || {
+            plan(&sharing, &named("max", &max), &[], Some(&work), &Env::new())
+                .unwrap()
+                .plugins
+                .into_iter()
+                .map(|p| (p.name, p.outcome))
+                .collect::<Vec<_>>()
+        };
+        let installed = |p: &str| {
+            Ok(PluginDir {
+                path: cache.join(p),
+                version: Some("1.0.0".into()),
+            })
+        };
+        assert_eq!(
+            outcomes(),
+            [
+                ("a@m".to_string(), Err(Skip::TurnedOff)),
+                ("b@m".to_string(), Err(Skip::OwnInstall)),
+                ("c@m".to_string(), installed("c")),
+                ("d@m".to_string(), installed("d")),
+            ]
+        );
+
+        // The source's install of `d` is gone.
+        fs::remove_dir_all(cache.join("d")).unwrap();
+        assert_eq!(outcomes()[3], ("d@m".to_string(), Err(Skip::NotInstalled)));
+
+        // The home's list cannot be read: none is injected.
+        fs::write(&own_list, r#"{"version": 9}"#).unwrap();
+        assert_eq!(
+            outcomes()
+                .into_iter()
+                .map(|(_, outcome)| outcome)
+                .collect::<Vec<_>>(),
+            vec![Err(Skip::UnrecognizedList); 4]
+        );
+    }
+
+    /// R22: of the installs of one plugin, a session uses the most specific that claude loads
+    /// there and whose path exists; `user_install` is what a launch injects (R18).
+    #[test]
+    fn the_effective_install_is_the_most_specific_that_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (start, other, plain) = (root.join("start"), root.join("other"), root.join("plain"));
+        let (v1, v2, v3) = (root.join("i/v1"), root.join("i/v2"), root.join("i/v3"));
+        for d in [&start, &other, &plain, &v1, &v2, &v3] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let install = |scope: &str, path: &Path, project: Option<&Path>, version: &str| Install {
+            scope: Some(scope.into()),
+            path: Some(path.to_path_buf()),
+            project: project.map(Path::to_path_buf),
+            version: Some(version.into()),
+        };
+        let records = vec![
+            install("user", &v1, None, "1"),
+            install("project", &v2, Some(&other), "2"),
+            install("local", &v3, Some(&start), "3"),
+            install("user", &root.join("i/gone"), None, "4"),
+        ];
+        let installs = Installs::Known([("x@m".to_string(), records.clone())].into());
+        assert_eq!(installs.effective("x@m", Some(&start)), Some(&records[2]));
+        assert_eq!(installs.effective("x@m", Some(&plain)), Some(&records[0]));
+        assert_eq!(installs.effective("x@m", None), Some(&records[0]));
+        assert_eq!(installs.effective("y@m", Some(&start)), None);
+        assert_eq!(installs.count("x@m"), 4);
+        assert_eq!(installs.count("y@m"), 0);
+        assert_eq!(Installs::Missing.count("x@m"), 0);
+        assert_eq!(installs.user_install("x@m"), Some(&records[0]));
+        assert_eq!(installs.install_path("x@m"), Some(v1.as_path()));
     }
 }

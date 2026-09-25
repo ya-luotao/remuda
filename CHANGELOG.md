@@ -17,6 +17,12 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   layouts are detected so nothing loads twice. Opt an account out with `share = false`.
   Authentication and provider settings are never shared, and shared settings travel to claude as
   a private (0600) file rather than on the command line.
+- Account configuration in the TUI (SPEC R22): `p` or Space in the Accounts view shows the
+  selected Claude account's instructions (`CLAUDE.md`, agents with model, effort and tools,
+  skills, commands), plugins and what each adds, a settings summary (key names and counts, never
+  values), auto-memory directory and MCP server names, each marked as the account's own, shared
+  from the shared-configuration source, already the source's, or not shared, for a session in
+  remuda's directory. It reads only, and uses the same plan as a launch's shared configuration.
 - Relay (SPEC R19): `remuda relay <session> <account>` and `c` in the TUI continue a session under
   another account by copying its transcript and checkpoints into the target store and forking it
   there. The original session is never modified.

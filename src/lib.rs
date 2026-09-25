@@ -3,6 +3,7 @@
 //! Library code never reads the process environment; `main.rs` captures it once and passes
 //! an [`Env`] snapshot down.
 
+pub mod account_config;
 pub mod attribution;
 pub mod checks;
 pub mod cli;
