@@ -67,6 +67,21 @@ pub fn human_count(n: u64) -> String {
     format!("{}T", (n + unit / 2) / unit)
 }
 
+/// A cost in picodollars (10⁻¹² USD) for a narrow column, rounded half up to the cent: below
+/// $1,000 with two decimals (`$0.00`, `$0.42`, `$12.34`, `$999.99`), a nonzero cost below half a
+/// cent as `<$0.01`, from $1,000 on as [`human_count`] of whole dollars (`$1K`, `$1.2K`, `$118K`).
+pub fn human_usd(pico: u128) -> String {
+    let cents = pico.saturating_add(5_000_000_000) / 10_000_000_000;
+    if pico > 0 && cents == 0 {
+        return "<$0.01".to_string();
+    }
+    if cents < 100_000 {
+        return format!("${}.{:02}", cents / 100, cents % 100);
+    }
+    let dollars = pico.saturating_add(500_000_000_000) / 1_000_000_000_000;
+    format!("${}", human_count(dollars.min(u128::from(u64::MAX)) as u64))
+}
+
 /// `s` wrapped to lines of at most `max` columns: at spaces where possible, inside a word
 /// when the word alone is too wide. Existing line breaks are kept; tabs count as spaces.
 pub fn wrap(s: &str, max: usize) -> Vec<String> {
@@ -378,6 +393,27 @@ mod tests {
             (u64::MAX, "18446744T"),
         ] {
             assert_eq!(human_count(n), shown, "{n}");
+        }
+    }
+
+    #[test]
+    fn human_usd_rounds_to_cents_then_units() {
+        for (pico, shown) in [
+            (0, "$0.00"),
+            (1, "<$0.01"),
+            (4_999_999_999, "<$0.01"),
+            (5_000_000_000, "$0.01"),
+            (420_000_000_000, "$0.42"),
+            (12_344_999_999_999, "$12.34"),
+            (999_994_999_999_999, "$999.99"),
+            (999_995_000_000_000, "$1K"),
+            (1_234_000_000_000_000, "$1.2K"),
+            (45_600_000_000_000_000, "$45.6K"),
+            (118_000_000_000_000_000, "$118K"),
+            (1_200_000_000_000_000_000, "$1.2M"),
+            (u128::MAX, "$18446744T"),
+        ] {
+            assert_eq!(human_usd(pico), shown, "{pico}");
         }
     }
 

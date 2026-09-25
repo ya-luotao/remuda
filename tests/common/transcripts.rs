@@ -127,6 +127,27 @@ pub fn usage(input: u64, output: u64, cache_write: u64, cache_read: u64) -> Valu
            "service_tier": "standard", "inference_geo": "not_available"})
 }
 
+/// `message.usage` with the cache write split by lifetime.
+pub fn usage_split(
+    input: u64,
+    output: u64,
+    write_5m: u64,
+    write_1h: u64,
+    cache_read: u64,
+) -> Value {
+    let mut usage = usage(input, output, write_5m + write_1h, cache_read);
+    usage["cache_creation"] = json!({"ephemeral_5m_input_tokens": write_5m,
+                                     "ephemeral_1h_input_tokens": write_1h});
+    usage
+}
+
+/// `usage` with `speed` and `inference_geo` set.
+pub fn with_flags(mut usage: Value, speed: &str, geo: &str) -> Value {
+    usage["speed"] = json!(speed);
+    usage["inference_geo"] = json!(geo);
+    usage
+}
+
 /// One content block's record of assistant message `id` (claude writes one per block, each
 /// repeating the message's usage), with its `requestId`.
 pub fn assistant_usage(session: &str, id: &str, model: &str, usage: Value, ts: &str) -> String {

@@ -777,6 +777,7 @@ impl Redactor<'_> {
                     since,
                     sections,
                     overall,
+                    series,
                 } = table;
                 Table {
                     period: *period,
@@ -792,6 +793,8 @@ impl Redactor<'_> {
                         })
                         .collect(),
                     overall: overall.iter().map(model_row).collect(),
+                    // Numbers over time; no account in it.
+                    series: series.clone(),
                 }
             })
             .collect();
@@ -991,17 +994,19 @@ fn message(m: &Message) -> Message {
     }
 }
 
-/// Model names and counts are shown.
+/// Model names, counts and costs are shown.
 fn model_row(m: &ModelRow) -> ModelRow {
     let ModelRow {
         provider,
         model,
         tokens,
+        cost,
     } = m;
     ModelRow {
         provider: *provider,
         model: model.clone(),
         tokens: *tokens,
+        cost: *cost,
     }
 }
 

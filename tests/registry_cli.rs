@@ -431,3 +431,32 @@ fn add_allows_other_dirs_under_home() {
         .assert()
         .success();
 }
+
+/// R3, R14, R14a, R20: `add` and `remove` keep `[prices]` and its comments as written.
+#[test]
+fn add_and_remove_keep_price_overrides() {
+    let sb = Sandbox::new();
+    let max = sb.make_claude_home("max");
+    let team = sb.make_claude_home("team");
+    let prices = "# priced by hand\n[prices.\"claude-test\"] # mine\ninput = 3\noutput = 15\n";
+    sb.write_config(&format!(
+        "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{}\"\n\n{prices}",
+        max.display()
+    ));
+    sb.remuda()
+        .args(["add", "team", team.to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(sb.read_config().contains(prices), "{}", sb.read_config());
+    assert_eq!(
+        stored(&sb),
+        [
+            row("claude", "max", max.to_str().unwrap()),
+            row("claude", "team", team.to_str().unwrap()),
+        ]
+    );
+    sb.remuda().args(["remove", "team"]).assert().success();
+    assert!(sb.read_config().contains(prices), "{}", sb.read_config());
+    assert_eq!(stored(&sb), [row("claude", "max", max.to_str().unwrap())]);
+    sb.remuda().arg("stats").assert().success();
+}

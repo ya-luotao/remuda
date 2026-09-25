@@ -31,6 +31,13 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   relay copies and shared stores; a session attributed to several accounts is counted once, for
   those accounts together. The counts are cached in `state/stats.json`; the first run reads every
   transcript whole.
+- Estimated cost in the token statistics (SPEC R20): a COST column in `remuda stats` and the Stats
+  view at public API list prices, built in as of 2026-09-24 (an estimate, not a bill), pricing
+  5-minute and 1-hour cache writes, fast mode and US-only inference separately, and Codex's
+  long-context requests at their own price; `[prices."<model>"]` in `config.toml` overrides or
+  adds prices. The Stats view charts the period's cost over time and shows each account's share.
+  The statistics cache moves to schema 2, so the first run afterwards reads every transcript
+  again.
 - Private mode in the TUI (SPEC R21): `Ctrl-P`, anywhere, hides account names (shown as aliases),
   emails, organizations, paths, session titles, previews, logs and typed text, for screenshots.
   Numbers, model names and session IDs stay visible.

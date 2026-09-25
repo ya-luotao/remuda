@@ -15,11 +15,12 @@ use jiff::tz::TimeZone;
 use remuda::Env;
 use remuda::attribution::Attribution;
 use remuda::index::RefreshStats;
+use remuda::pricing::Prices;
 use remuda::provider::Provider;
 use remuda::registry::{Account, Home};
 use remuda::stats::{
-    self, Cache, ModelRow, Period, Report, SCHEMA_VERSION, Section, Source, SourceKind, Table,
-    Tokens,
+    self, Cache, Cost, ModelRow, Period, Report, SCHEMA_VERSION, Section, Source, SourceKind,
+    Table, Tokens,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -40,6 +41,7 @@ struct Fixture {
     accounts: Vec<Account>,
     attribution: Attribution,
     cache: Cache,
+    prices: Prices,
     now: Timestamp,
     tz: TimeZone,
 }
@@ -59,6 +61,7 @@ impl Fixture {
             accounts: vec![Account::default_for(Provider::Claude)],
             attribution: Attribution::default(),
             cache: Cache::default(),
+            prices: Prices::default(),
             now: NOW.parse().unwrap(),
             tz: TimeZone::UTC,
         }
@@ -117,6 +120,7 @@ impl Fixture {
             &self.sources(),
             &self.attribution,
             &self.accounts,
+            &self.prices,
             self.now,
             &self.tz,
         )
@@ -147,11 +151,17 @@ fn edited(record: &str, edit: impl FnOnce(&mut Value)) -> String {
     cl::line(v)
 }
 
+/// Tokens with the cache write all 1-hour, as `cl::usage` records it.
 fn toks(input: u64, cache_read: u64, cache_write: u64, output: u64, reasoning: u64) -> Tokens {
+    toks6(input, cache_read, 0, cache_write, output, reasoning)
+}
+
+fn toks6(input: u64, read: u64, w5m: u64, w1h: u64, output: u64, reasoning: u64) -> Tokens {
     Tokens {
         input,
-        cache_read,
-        cache_write,
+        cache_read: read,
+        cache_write_5m: w5m,
+        cache_write_1h: w1h,
         output,
         reasoning,
     }
@@ -204,7 +214,8 @@ fn msg_a2() -> String {
 const A1_A2: Tokens = Tokens {
     input: 4,
     cache_read: 500,
-    cache_write: 100,
+    cache_write_5m: 0,
+    cache_write_1h: 100,
     output: 45,
     reasoning: 0,
 };
@@ -501,6 +512,7 @@ fn a_relay_copy_counts_for_the_original() {
             &f.sources(),
             &attribution,
             &f.accounts,
+            &f.prices,
             f.now,
             &f.tz,
         );
@@ -635,6 +647,11 @@ fn codex_fork_replays_count_once_at_the_original_time() {
             provider: Provider::Codex,
             model: "gpt-test-b".into(),
             tokens: toks(40, 80, 0, 10, 1),
+            // gpt-test-b has no price.
+            cost: Cost {
+                pico_usd: 0,
+                unpriced_tokens: 130,
+            },
         }]
     );
     assert_eq!(
@@ -995,16 +1012,23 @@ fn cache_round_trips_and_a_schema_mismatch_rebuilds() {
         .unwrap()];
     assert_eq!(claude["session_id"], S_A);
     assert_eq!(claude["models"], json!(["claude-test"]));
-    // One row per request: [key, ts, model, flags, input, cache read, cache write, output,
-    // reasoning].
+    // One row per request: [key, ts, model, flags, input, cache read, cache write 5m, cache
+    // write 1h, output, reasoning].
     let row = claude["rows"][0].as_array().unwrap();
-    assert_eq!(row.len(), 9);
+    assert_eq!(row.len(), 10);
     assert_eq!(
         row[1..],
-        json!([1_789_898_460, 0, 0, 3, 300, 100, 40, 0])
+        json!([1_789_898_460, 0, 0, 3, 300, 0, 100, 40, 0])
             .as_array()
             .unwrap()[..]
     );
+    // A cache of schema 1 (a single cache write) is rebuilt.
+    assert_eq!(SCHEMA_VERSION, 2);
+    let old = f.root.join("old-stats.json");
+    fs::write(&old, "{\"schema_version\":1,\"files\":{}}").unwrap();
+    let loaded = Cache::load(&old);
+    assert!(loaded.files.is_empty());
+    assert_eq!(loaded.schema_version, 2);
 
     let mut other = v.clone();
     other["schema_version"] = json!(SCHEMA_VERSION + 1);
@@ -1072,4 +1096,317 @@ fn vanished_files_stop_counting() {
     let table = f.report().table(Period::All).clone();
     assert_eq!(of(&table.overall, "claude-test"), toks(7, 0, 0, 7, 0));
     assert_eq!(f.report().files, 1);
+}
+
+/// The row of `model` in the cache entry of `path`, as the cache stores it.
+fn cached_row(f: &Fixture, path: &Path, model: &str) -> Vec<Value> {
+    let file = serde_json::to_value(&f.cache.files[path]).unwrap();
+    let index = file["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|m| m == model)
+        .unwrap_or_else(|| panic!("no {model} in {file}"));
+    file["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r[2] == index)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// R20: the cache write is split by lifetime: `cache_creation` of the message, or, with
+/// several `message` entries in `usage.iterations`, their sum; an advisor call by its own; a
+/// cache write recorded without lifetimes is 5-minute.
+#[test]
+fn cache_write_is_split_by_lifetime() {
+    let mut f = Fixture::new();
+    let record = |id: &str, model: &str, usage: Value| {
+        cl::assistant_usage(S_A, id, model, usage, &cl::ts(1))
+    };
+    let unsplit = edited(&record("msg_c2", "claude-b", cl::usage(1, 1, 50, 0)), |v| {
+        v["message"]["usage"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_creation");
+    });
+    // As claude records a message with an advisor call: the top-level split is the first
+    // `message` entry's.
+    let entry = |kind: &str, write: u64, m5: u64, h1: u64| {
+        json!({"type": kind, "input_tokens": 1, "output_tokens": 1,
+               "cache_read_input_tokens": 0, "cache_creation_input_tokens": write,
+               "cache_creation": {"ephemeral_5m_input_tokens": m5,
+                                  "ephemeral_1h_input_tokens": h1}})
+    };
+    let mut advised = cl::usage(2, 2, 3430, 0);
+    advised["cache_creation"] = json!({"ephemeral_5m_input_tokens": 0,
+                                       "ephemeral_1h_input_tokens": 896});
+    let mut advisor = entry("advisor_message", 40, 40, 0);
+    advisor["model"] = json!("claude-advisor-test");
+    advised["iterations"] = json!([
+        entry("message", 896, 0, 896),
+        advisor,
+        entry("message", 2534, 2534, 0)
+    ]);
+    f.write(
+        &format!("{S_A}.jsonl"),
+        &[
+            record("msg_c1", "claude-a", cl::usage_split(1, 1, 30, 70, 0)),
+            unsplit,
+            record("msg_c3", "claude-c", advised),
+        ]
+        .concat(),
+    );
+    let table = f.all();
+    let split = |model: &str| {
+        let t = of(&table.overall, model);
+        (t.cache_write_5m, t.cache_write_1h)
+    };
+    assert_eq!(split("claude-a"), (30, 70));
+    assert_eq!(split("claude-b"), (50, 0));
+    assert_eq!(split("claude-c"), (2534, 896));
+    assert_eq!(of(&table.overall, "claude-c").cache_write(), 3430);
+    assert_eq!(split("claude-advisor-test"), (40, 0));
+}
+
+/// R20: fast mode (`usage.speed`) and US-only inference (`usage.inference_geo`) are kept with
+/// the request, from any of its records or copies, and priced; an advisor call has neither.
+#[test]
+fn fast_and_us_flags_are_recorded_and_priced() {
+    let mut f = Fixture::new();
+    let opus = "claude-opus-5-5";
+    let mut flagged = cl::with_flags(cl::usage_split(1_000_000, 0, 0, 0, 0), "fast", "us");
+    flagged["iterations"] = json!([
+        {"type": "message", "input_tokens": 1_000_000, "output_tokens": 0,
+         "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+        {"type": "advisor_message", "model": "claude-advisor-test", "input_tokens": 10,
+         "output_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+    ]);
+    let plain = cl::usage_split(1_000_000, 0, 0, 0, 0);
+    let at = cl::ts(1);
+    // msg_f1: a record without the flags, then two with them.
+    let f1 = |usage: &Value| cl::assistant_usage(S_A, "msg_f1", opus, usage.clone(), &at);
+    // msg_f2: without them here, with them in a fork's copy.
+    let f2 = |usage: &Value| cl::assistant_usage(S_A, "msg_f2", opus, usage.clone(), &at);
+    let a = f.write(
+        &format!("{S_A}.jsonl"),
+        &[f1(&plain), f1(&flagged), f1(&flagged), f2(&plain)].concat(),
+    );
+    f.write(&format!("{S_B}.jsonl"), &cl::forked(&f2(&flagged), S_A));
+    let table = f.all();
+    let row = cached_row(&f, &a, opus);
+    assert_eq!(row[3], 6, "fast and US-only: {row:?}");
+    assert_eq!(cached_row(&f, &a, "claude-advisor-test")[3], 0);
+    // $4 per million input tokens, doubled, and a tenth more: $8.80 per request.
+    let cost = table.overall.iter().find(|m| m.model == opus).unwrap().cost;
+    assert_eq!(
+        (cost.pico_usd, cost.unpriced_tokens),
+        (2 * 8_800_000_000_000, 0)
+    );
+}
+
+/// R20: each request is priced once (a fork's copy too), the sections' costs add up to the
+/// overall cost, and a request without a price is counted as not priced, until `[prices]`
+/// gives one. Codex requests are priced at codex's prices, a long-context one at its own.
+#[test]
+fn costs_add_up_and_unpriced_requests_are_counted() {
+    let mut f = Fixture::new();
+    f.claude("max");
+    let work = f.codex("work");
+    let msg = |session: &str, id: &str, model: &str, usage: Value| {
+        cl::assistant_usage(session, id, model, usage, &cl::ts(1))
+    };
+    let m1 = msg(S_A, "msg_1", "claude-opus-4-6", cl::usage(1000, 100, 0, 0));
+    f.write(
+        &format!("{S_A}.jsonl"),
+        &[
+            m1.clone(),
+            msg(
+                S_A,
+                "msg_2",
+                "claude-haiku-4-5-20251001",
+                cl::usage_split(500, 50, 200, 300, 1000),
+            ),
+            msg(S_A, "msg_3", "claude-test", cl::usage(10, 10, 0, 0)),
+        ]
+        .concat(),
+    );
+    f.write(
+        &format!("{S_B}.jsonl"),
+        &[
+            cl::forked(&m1, S_A),
+            msg(S_B, "msg_4", "claude-opus-4-6", cl::usage(2000, 0, 0, 0)),
+        ]
+        .concat(),
+    );
+    f.attribute(S_A, "claude:default");
+    f.attribute(S_B, "claude:max");
+    let first = [100_000, 20_000, 1_000, 500];
+    cx::write_rollout(
+        &work,
+        R1,
+        &[
+            cx::model_turn("gpt-5.4", &cx::ts(1)),
+            cx::tokens(first, first, &cx::ts(2)),
+            // Input 300K with cached: more than 272K, the long-context price.
+            cx::tokens(
+                [400_000, 220_000, 2_000, 500],
+                [300_000, 200_000, 1_000, 0],
+                &cx::ts(3),
+            ),
+        ]
+        .concat(),
+    );
+    let table = f.all();
+    let cost = |model: &str| {
+        table
+            .overall
+            .iter()
+            .find(|m| m.model == model)
+            .unwrap()
+            .cost
+    };
+    // Input 3,000 at $5 and output 100 at $25 per million; the fork's copy once.
+    assert_eq!(
+        cost("claude-opus-4-6").pico_usd,
+        3_000 * 5_000_000 + 100 * 25_000_000
+    );
+    // Input, output, 5-minute and 1-hour cache write, cache read.
+    assert_eq!(
+        cost("claude-haiku-4-5-20251001").pico_usd,
+        500 * 1_000_000 + 50 * 5_000_000 + 200 * 1_250_000 + 300 * 2_000_000 + 1000 * 100_000
+    );
+    assert_eq!(
+        cost("gpt-5.4").pico_usd,
+        80_000 * 2_500_000
+            + 20_000 * 250_000
+            + 1_000 * 15_000_000
+            + 100_000 * 5_000_000
+            + 200_000 * 500_000
+            + 1_000 * 22_500_000
+    );
+    let test = cost("claude-test");
+    assert_eq!((test.pico_usd, test.unpriced_tokens), (0, 20));
+    let sections: u128 = table.sections.iter().map(|s| s.cost().pico_usd).sum();
+    let overall: u128 = table.overall.iter().map(|m| m.cost.pico_usd).sum();
+    assert_eq!(sections, overall);
+    assert_eq!(stats::unpriced_models(&table.overall), ["claude-test"]);
+
+    f.prices = Prices::from_document(
+        &"[prices.\"claude-test\"]\ninput = 1\noutput = 1\ncache_read = 1\n\
+          cache_write_5m = 1\ncache_write_1h = 1\n"
+            .parse()
+            .unwrap(),
+    )
+    .unwrap();
+    let table = f.report().table(Period::All).clone();
+    let test = table
+        .overall
+        .iter()
+        .find(|m| m.model == "claude-test")
+        .unwrap();
+    assert_eq!(
+        (test.cost.pico_usd, test.cost.unpriced_tokens),
+        (20_000_000, 0)
+    );
+    assert!(stats::unpriced_models(&table.overall).is_empty());
+}
+
+/// R20: the chart's buckets: today by local hour, 7 and 30 days by local day from the period's
+/// start, all by local day from the first request; a request without a timestamp is counted but
+/// not charted.
+#[test]
+fn series_buckets_by_local_hour_and_day() {
+    let mut f = Fixture::new();
+    f.tz = TimeZone::fixed(jiff::tz::offset(8));
+    let at = [
+        Some("2026-09-23T17:30:00Z"),
+        Some("2026-09-23T15:30:00Z"),
+        Some("2026-09-10T00:00:00Z"),
+        Some("2026-07-01T00:00:00Z"),
+        None,
+    ];
+    // Output 1, 2, 4, …: a sum tells which messages a bucket holds.
+    let text: String = at
+        .iter()
+        .enumerate()
+        .map(|(i, ts)| {
+            let record = cl::assistant_usage(
+                S_A,
+                &format!("msg_{i}"),
+                "claude-test",
+                cl::usage(0, 1 << i, 0, 0),
+                ts.unwrap_or("x"),
+            );
+            match ts {
+                Some(_) => record,
+                None => edited(&record, |v| {
+                    v.as_object_mut().unwrap().remove("timestamp");
+                }),
+            }
+        })
+        .collect();
+    f.write(&format!("{S_A}.jsonl"), &text);
+    f.refresh();
+    let report = f.report();
+    let series = |p: Period| &report.table(p).series;
+    let starts =
+        |p: Period| -> Vec<String> { series(p).iter().map(|b| b.start.to_string()).collect() };
+    let charted = |p: Period| -> u64 { series(p).iter().map(|b| b.tokens.output).sum() };
+    let today = starts(Period::Today);
+    assert_eq!(today.len(), 24);
+    assert_eq!(today[0], "2026-09-23T16:00:00Z");
+    assert_eq!(today[23], "2026-09-24T15:00:00Z");
+    assert_eq!(series(Period::Today)[1].tokens.output, 0b1);
+    let week = starts(Period::Week);
+    assert_eq!(week.len(), 7);
+    assert_eq!(week[0], "2026-09-17T16:00:00Z");
+    assert_eq!(week[6], "2026-09-23T16:00:00Z");
+    assert_eq!(series(Period::Week)[5].tokens.output, 0b10);
+    assert_eq!(series(Period::Week)[6].tokens.output, 0b1);
+    assert_eq!(starts(Period::Month).len(), 30);
+    let all = starts(Period::All);
+    // 2026-07-01 08:00 local to 2026-09-24: 31 + 31 + 24 days.
+    assert_eq!(all.len(), 86);
+    assert_eq!(all[0], "2026-06-30T16:00:00Z");
+    for p in Period::ALL {
+        let total = of(&report.table(p).overall, "claude-test").output;
+        let undated = if p == Period::All { 0b10000 } else { 0 };
+        assert_eq!(charted(p), total - undated, "{p:?}");
+    }
+    assert_eq!(charted(Period::All), 0b1111);
+
+    // Nothing with a timestamp: no chart for all.
+    let mut f = Fixture::new();
+    f.write(
+        &format!("{S_A}.jsonl"),
+        &edited(&msg_a2(), |v| {
+            v.as_object_mut().unwrap().remove("timestamp");
+        }),
+    );
+    f.refresh();
+    let report = f.report();
+    assert!(report.table(Period::All).series.is_empty());
+    assert_eq!(report.table(Period::Week).series.len(), 7);
+}
+
+/// R20: today's buckets are the day's real hours: 23 on the day DST starts, 25 on the day it
+/// ends.
+#[test]
+fn today_follows_dst() {
+    let mut f = Fixture::new();
+    f.tz = TimeZone::posix("EST5EDT,M3.2.0,M11.1.0").unwrap();
+    for (now, hours) in [
+        ("2026-03-08T18:00:00Z", 23),
+        ("2026-11-01T18:00:00Z", 25),
+        ("2026-09-24T18:00:00Z", 24),
+    ] {
+        f.now = now.parse().unwrap();
+        let report = f.report();
+        assert_eq!(report.table(Period::Today).series.len(), hours, "{now}");
+        assert_eq!(report.table(Period::Week).series.len(), 7, "{now}");
+    }
 }

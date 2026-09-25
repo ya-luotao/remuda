@@ -80,6 +80,8 @@ pub struct Registry {
     pub accounts: Vec<Account>,
     /// `[share.claude]` and the accounts that opt out of it (R3, R18).
     pub sharing: Sharing,
+    /// `[prices."<model>"]` overrides (R3, R20).
+    pub prices: crate::pricing::Prices,
 }
 
 /// Shared configuration (R18): whose configuration other claude accounts get.
@@ -121,6 +123,7 @@ impl Registry {
             registry.parse_accounts(tables)?;
         }
         registry.sharing.source = registry.share_source(doc)?;
+        registry.prices = crate::pricing::Prices::from_document(doc)?;
         Ok(registry)
     }
 
@@ -1184,6 +1187,100 @@ mod tests {
         fs::write(&config, accounts).unwrap();
         unregister(&config, &acc("claude", "max", "/m")).unwrap();
         assert_eq!(fs::read_to_string(&config).unwrap(), "");
+    }
+
+    /// R3, R20: `[prices."<model>"]` is part of the registry.
+    #[test]
+    fn parses_price_overrides() {
+        let reg = parse(
+            "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n\n\
+             [prices.\"claude-test\"]\ninput = 3\noutput = 15\n",
+        )
+        .unwrap();
+        assert_eq!(reg.accounts, [acc("claude", "max", "/m")]);
+        assert_eq!(reg.prices.overrides["claude-test"].input, 3_000_000);
+        assert_eq!(parse("").unwrap().prices, crate::pricing::Prices::default());
+    }
+
+    /// R3: an invalid `[prices]` table fails loading, like any other invalid entry.
+    #[test]
+    fn rejects_invalid_price_overrides() {
+        for (text, want) in [
+            (
+                "[prices.\"x\"]\ninput = 1\noutput = 1\ncached = 1\n",
+                "unknown key `cached`",
+            ),
+            ("[prices.\"x\"]\noutput = 1\n", "missing `input`"),
+            (
+                "[prices.\"x\"]\ninput = -1\noutput = 1\n",
+                "must be from 0 to 1000000",
+            ),
+        ] {
+            let err = format!("{:#}", parse(text).unwrap_err());
+            assert!(err.contains(want), "{text}\n=> {err}");
+        }
+    }
+
+    /// R3, R14, R14a: adding and removing accounts keeps `[prices]` and its comments; a new
+    /// account goes after the last one, before `[prices]`.
+    #[test]
+    fn append_and_remove_preserve_price_overrides() {
+        let prices = "# priced by hand\n[prices.\"claude-test\"] # mine\ninput = 3\n\
+                      output = 15 # list\n";
+        let original = format!(
+            "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n\n{prices}"
+        );
+        let mut doc: DocumentMut = original.parse().unwrap();
+        append_account(&mut doc, &acc("claude", "team", "/t")).unwrap();
+        let out = doc.to_string();
+        for kept in [
+            "# priced by hand",
+            "[prices.\"claude-test\"] # mine",
+            "output = 15 # list",
+        ] {
+            assert!(out.contains(kept), "{kept:?} lost:\n{out}");
+        }
+        assert!(
+            out.find("name = \"team\"").unwrap() < out.find("[prices").unwrap(),
+            "{out}"
+        );
+        let reg = parse(&out).unwrap();
+        assert_eq!(
+            reg.accounts,
+            [acc("claude", "max", "/m"), acc("claude", "team", "/t")]
+        );
+        assert_eq!(reg.prices, parse(&original).unwrap().prices);
+
+        let two = format!(
+            "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n\n\
+             [[account]]\nprovider = \"claude\"\nname = \"team\"\nhome = \"/t\"\n\n{prices}"
+        );
+        for index in [0, 1] {
+            let out = removed(&two, index);
+            assert!(out.ends_with(&format!("\n{prices}")), "{index}:\n{out}");
+            let reg = parse(&out).unwrap();
+            assert_eq!(reg.accounts.len(), 1);
+            assert_eq!(reg.prices.overrides["claude-test"].output, 15_000_000);
+        }
+
+        // The removed account's comment block, separated from it by a blank line, moves in
+        // front of `[prices]`, the next table.
+        let out = removed(
+            &format!(
+                "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n\n\
+                 # kept block\n\n[[account]]\nprovider = \"claude\"\nname = \"team\"\n\
+                 home = \"/t\"\n\n{prices}"
+            ),
+            1,
+        );
+        assert_eq!(
+            out,
+            format!(
+                "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n\n\
+                 # kept block\n\n{prices}"
+            )
+        );
+        assert_eq!(parse(&out).unwrap().accounts, [acc("claude", "max", "/m")]);
     }
 
     #[test]

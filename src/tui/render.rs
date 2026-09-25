@@ -10,7 +10,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::identity::Identity;
 use crate::index::Entry;
-use crate::stats::{self, ModelRow, Table};
+use crate::pricing::PRICES_AS_OF;
+use crate::stats::{self, Cost, ModelRow, Step, Table, Tokens};
 use crate::transcript::{Role, one_line};
 use crate::usage::{self, Resets, UsageRow};
 use crate::{text, usage::format_age};
@@ -293,7 +294,7 @@ fn status_line(app: &App) -> Line<'static> {
             spans.push(stats_status(app));
             if let Some(e) = &app.stats.error {
                 spans.push(sep());
-                spans.push(Span::styled(format!("stats cache: {e}"), CRIT));
+                spans.push(Span::styled(e.clone(), CRIT));
             }
             return Line::from(spans);
         }
@@ -1125,22 +1126,35 @@ pub const KEYS: &[(&str, &str)] = &[
 
 // ---- Stats ---------------------------------------------------------------------------
 
-/// The Stats view's numeric columns: header and width. The name column takes the rest.
-const STATS_COLUMNS: [(&str, usize); 6] = [
+/// The Stats view's numeric columns and the share bar: header and width. The name column takes
+/// the rest.
+const STATS_COLUMNS: [(&str, usize); 8] = [
     ("INPUT", 7),
     ("CACHE READ", 10),
     ("CACHE WRITE", 11),
     ("OUTPUT", 7),
     ("REASONING", 9),
     ("TOTAL", 7),
+    ("COST", 8),
+    ("SHARE", 6),
 ];
-/// When the name column would be narrower, REASONING is dropped, then CACHE WRITE.
+/// While the name column would be narrower than [`STATS_MIN_NAME`]: REASONING, then SHARE, then
+/// CACHE WRITE go.
+const STATS_DROP: [usize; 3] = [4, 7, 2];
 const STATS_MIN_NAME: usize = 16;
 const STATS_NAME: &str = "ACCOUNT / MODEL";
-/// The title and the column header stay put above the scrolled lines.
-const STATS_CHROME: u16 = 2;
+/// Only the title stays put above the scrolled lines (the column header is pinned in place of
+/// the first one once scrolled past).
+const STATS_CHROME: u16 = 1;
+/// The chart: bar rows, label width, widest bar slot (bar + gap).
+const CHART_ROWS: usize = 6;
+const CHART_LABEL: usize = 7;
+const CHART_MAX_SLOT: usize = 4;
+const BARS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+const SHARES: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+const CHART_STYLE: Style = Style::new().fg(Color::Cyan);
 
-/// Lines of the Stats body below its title and column header.
+/// Lines of the Stats body below its title.
 pub fn stats_height(app: &App) -> usize {
     frame_areas(screen(app))
         .body
@@ -1150,7 +1164,9 @@ pub fn stats_height(app: &App) -> usize {
 
 /// Lines the Stats view scrolls over at the current width.
 pub fn stats_line_count(app: &App) -> usize {
-    stats_lines(app, frame_areas(screen(app)).body.width).len()
+    stats_lines(app, frame_areas(screen(app)).body.width)
+        .0
+        .len()
 }
 
 fn stats_table(app: &App) -> Option<&Table> {
@@ -1169,10 +1185,10 @@ fn stats_label(accounts: &[String]) -> String {
     }
 }
 
-/// The width of the name column and the numeric columns shown (indexes into
-/// [`STATS_COLUMNS`]) at `width`: the name column is as wide as its widest name (so a wide
-/// terminal keeps the numbers next to the names), at most what the numbers leave; narrower
-/// than [`STATS_MIN_NAME`], it takes REASONING's place, then CACHE WRITE's.
+/// The width of the name column and the columns shown (indexes into [`STATS_COLUMNS`]) at
+/// `width`: the name column is as wide as its widest name (so a wide terminal keeps the numbers
+/// next to the names), at most what the columns leave; narrower than [`STATS_MIN_NAME`], it
+/// takes the places of [`STATS_DROP`] in turn.
 fn stats_columns(app: &App, width: u16) -> (usize, Vec<usize>) {
     let mut widest = text::width(STATS_NAME);
     if let Some(table) = stats_table(app) {
@@ -1188,7 +1204,7 @@ fn stats_columns(app: &App, width: u16) -> (usize, Vec<usize>) {
         let numbers: usize = shown.iter().map(|&i| STATS_COLUMNS[i].1 + 1).sum();
         (width as usize).saturating_sub(numbers)
     };
-    for dropped in [4, 2] {
+    for dropped in STATS_DROP {
         if room(&shown) >= STATS_MIN_NAME {
             break;
         }
@@ -1197,10 +1213,12 @@ fn stats_columns(app: &App, width: u16) -> (usize, Vec<usize>) {
     (room(&shown).min(widest), shown)
 }
 
-/// A Stats line: the name truncated and padded to its column, then the counts right-aligned.
+/// A Stats line: the name truncated and padded to its column, then the counts and the cost
+/// right-aligned, then `share` left-aligned.
 fn stats_row(
     name: &str,
-    counts: &[String; 6],
+    counts: &[String; 7],
+    share: &str,
     style: Style,
     columns: &(usize, Vec<usize>),
 ) -> Line<'static> {
@@ -1210,21 +1228,51 @@ fn stats_row(
         style,
     )];
     for &i in shown {
-        let pad = STATS_COLUMNS[i].1.saturating_sub(text::width(&counts[i]));
-        spans.push(Span::styled(
-            format!(" {}{}", " ".repeat(pad), counts[i]),
-            style,
-        ));
+        let (_, w) = STATS_COLUMNS[i];
+        let cell = match counts.get(i) {
+            Some(count) => format!(
+                " {}{count}",
+                " ".repeat(w.saturating_sub(text::width(count)))
+            ),
+            None => format!(" {}", text::pad(share, w)),
+        };
+        spans.push(Span::styled(cell, style));
     }
     Line::from(spans)
 }
 
-/// A bold row with the models' total, then a row per model (codex's in its color); an empty
-/// section is one row saying so.
+/// Whether the Stats view measures by cost (anything in the period is priced) or by tokens.
+fn stats_measure(table: &Table) -> bool {
+    table.overall.iter().any(|m| m.cost.pico_usd > 0)
+}
+
+/// What a chart bar or share bar measures: picodollars, or tokens.
+fn measure(cost: bool, tokens: &Tokens, c: &Cost) -> u128 {
+    match cost {
+        true => c.pico_usd,
+        false => u128::from(tokens.total()),
+    }
+}
+
+/// A bar of `value`'s share of `base`, at most `width` columns, in eighths of a column; at
+/// least an eighth for a nonzero value.
+fn share_bar(value: u128, base: u128, width: usize) -> String {
+    if base == 0 || value == 0 {
+        return String::new();
+    }
+    let full = 8 * width as u128;
+    let eighths =
+        (value.saturating_mul(full).saturating_add(base / 2) / base).clamp(1, full) as usize;
+    "█".repeat(eighths / 8) + SHARES[eighths % 8]
+}
+
+/// A bold row with the models' total (and its share of `share`'s base when given), then a row
+/// per model (codex's in its color); an empty section is one row saying so.
 fn stats_block(
     label: &str,
     models: &[ModelRow],
     columns: &(usize, Vec<usize>),
+    share: Option<(bool, u128)>,
     lines: &mut Vec<Line<'static>>,
 ) {
     if models.is_empty() {
@@ -1237,10 +1285,14 @@ fn stats_block(
         ]));
         return;
     }
-    let (total, providers) = stats::sum(models);
+    let (total, cost, providers) = stats::sum(models);
+    let bar = share.map_or_else(String::new, |(by_cost, base)| {
+        share_bar(measure(by_cost, &total, &cost), base, STATS_COLUMNS[7].1)
+    });
     lines.push(stats_row(
         label,
-        &stats::counts(&total, &providers),
+        &stats::counts(&total, &cost, &providers),
+        &bar,
         BOLD,
         columns,
     ));
@@ -1249,52 +1301,181 @@ fn stats_block(
             Provider::Codex => CODEX_STYLE,
             Provider::Claude => Style::new(),
         };
-        let counts = stats::counts(&m.tokens, &[m.provider]);
+        let counts = stats::counts(&m.tokens, &m.cost, &[m.provider]);
         lines.push(stats_row(
             &format!("  {}", m.model),
             &counts,
+            "",
             style,
             columns,
         ));
     }
 }
 
-/// The scrolled part of the Stats view: every section of the period, then Overall; while the
-/// first report is computed, what is being done. Reads only `app.stats` (R20).
-pub fn stats_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+/// The chart of the period over time: a caption, [`CHART_ROWS`] rows of bars (the top one
+/// labeled with the largest bar's value), the axis, the first and last buckets' times, and a
+/// blank line; nothing when nothing in the period has a timestamp or there is no room.
+fn stats_chart(app: &App, table: &Table, width: u16) -> Vec<Line<'static>> {
+    let cost = stats_measure(table);
+    let room = (width as usize).saturating_sub(CHART_LABEL + 1);
+    if room == 0 || table.series.is_empty() {
+        return Vec::new();
+    }
+    let (step, buckets) = stats::chart_series(table, room, &app.tz);
+    let values: Vec<u128> = buckets
+        .iter()
+        .map(|b| measure(cost, &b.tokens, &b.cost))
+        .collect();
+    let max = values.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return Vec::new();
+    }
+    let n = buckets.len();
+    let slot = (room / n).clamp(1, CHART_MAX_SLOT);
+    let bar = if slot >= 2 { slot - 1 } else { 1 };
+    let gap = slot - bar;
+    let full = (CHART_ROWS * 8) as u128;
+    let eighths: Vec<usize> = values
+        .iter()
+        .map(|&v| match v {
+            0 => 0,
+            v => (v.saturating_mul(full).saturating_add(max / 2) / max).clamp(1, full) as usize,
+        })
+        .collect();
+
+    let what = match cost {
+        true => "Cost",
+        false => "Tokens",
+    };
+    let unpriced = if cost { "" } else { " (nothing priced)" };
+    let mut lines = vec![Line::styled(
+        format!("{what} per {}{unpriced}", step.noun()),
+        DIM,
+    )];
+    let top = match cost {
+        true => text::human_usd(max),
+        false => text::human_count(u64::try_from(max).unwrap_or(u64::MAX)),
+    };
+    for r in 0..CHART_ROWS {
+        let label = match r {
+            0 => {
+                let top = text::truncate(&top, CHART_LABEL);
+                format!("{}{top}", " ".repeat(CHART_LABEL - text::width(&top)))
+            }
+            _ => " ".repeat(CHART_LABEL),
+        };
+        let below = (CHART_ROWS - 1 - r) * 8;
+        let bars: String = eighths
+            .iter()
+            .map(|&e| {
+                let fill = e.saturating_sub(below).min(8);
+                BARS[fill].to_string().repeat(bar) + &" ".repeat(gap)
+            })
+            .collect();
+        lines.push(Line::from(vec![
+            Span::styled(label + "│", DIM),
+            Span::styled(bars, CHART_STYLE),
+        ]));
+    }
+    lines.push(Line::styled(
+        format!("{}└{}", " ".repeat(CHART_LABEL), "─".repeat(n * slot)),
+        DIM,
+    ));
+    let format = match (step, app.stats.period) {
+        (Step::Hour, _) => "%H:%M",
+        (Step::Day | Step::Week, stats::Period::All) => "%Y-%m-%d",
+        (Step::Day | Step::Week, _) => "%m-%d",
+        (Step::Month, _) => "%Y-%m",
+    };
+    let at = |b: &stats::Bucket| {
+        b.start
+            .to_zoned(app.tz.clone())
+            .strftime(format)
+            .to_string()
+    };
+    let first = at(&buckets[0]);
+    let mut axis = format!("{}{first}", " ".repeat(CHART_LABEL + 1));
+    let last = at(&buckets[n - 1]);
+    let end = CHART_LABEL + 1 + (n - 1) * slot + bar;
+    if n > 1
+        && let Some(start) = end.checked_sub(text::width(&last))
+        && start >= text::width(&axis) + 2
+    {
+        axis.push_str(&" ".repeat(start - text::width(&axis)));
+        axis.push_str(&last);
+    }
+    lines.push(Line::styled(axis, DIM));
+    lines.push(Line::raw(""));
+    lines
+}
+
+/// The scrolled part of the Stats view: the chart, the column header, every section of the
+/// period, then Overall, and the models not priced; while the first report is computed, what
+/// is being done. Also the index of the column header's line (none while computing). Reads only
+/// `app.stats` (R20).
+pub fn stats_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Option<usize>) {
     let Some(table) = stats_table(app) else {
         let doing = match app.stats.progress {
             Some((done, total)) if done < total => format!("reading transcripts {done}/{total}…"),
             _ => "computing…".to_string(),
         };
-        return vec![Line::styled(doing, DIM)];
+        return (vec![Line::styled(doing, DIM)], None);
     };
     let columns = stats_columns(app, width);
-    let mut lines = Vec::new();
+    let mut lines = stats_chart(app, table, width);
+    let header_at = lines.len();
+    let [a, b, c, d, e, f, g, share] = STATS_COLUMNS.map(|(h, _)| h.to_string());
+    lines.push(stats_row(
+        STATS_NAME,
+        &[a, b, c, d, e, f, g],
+        &share,
+        DIM,
+        &columns,
+    ));
+    let by_cost = stats_measure(table);
+    let (total, cost, _) = stats::sum(&table.overall);
+    let base = measure(by_cost, &total, &cost);
     for s in &table.sections {
-        stats_block(&stats_label(&s.accounts), &s.models, &columns, &mut lines);
+        stats_block(
+            &stats_label(&s.accounts),
+            &s.models,
+            &columns,
+            Some((by_cost, base)),
+            &mut lines,
+        );
     }
     lines.push(Line::raw(""));
-    stats_block("Overall", &table.overall, &columns, &mut lines);
-    lines
+    stats_block("Overall", &table.overall, &columns, None, &mut lines);
+    let unpriced = stats::unpriced_models(&table.overall);
+    if !unpriced.is_empty() {
+        let note = format!("  not priced: {}", unpriced.join(", "));
+        lines.push(Line::styled(text::truncate(&note, width as usize), DIM));
+    }
+    (lines, Some(header_at))
 }
 
 fn stats_view(app: &App, f: &mut Frame, area: Rect) {
-    let title = format!("Tokens · {} (t: period)", app.stats.period.label());
-    let columns = stats_columns(app, area.width);
-    let header = STATS_COLUMNS.map(|(h, _)| h.to_string());
-    let mut lines = vec![
-        section(&title, area.width),
-        stats_row(STATS_NAME, &header, DIM, &columns),
-    ];
-    let body = stats_lines(app, area.width);
+    let title = format!(
+        "Tokens · {} · cost ≈ API list price (t: period)",
+        app.stats.period.label()
+    );
+    let mut lines = vec![section(&title, area.width)];
+    let (body, header_at) = stats_lines(app, area.width);
     let height = area.height.saturating_sub(STATS_CHROME) as usize;
     let scroll = app.stats.scroll.min(body.len().saturating_sub(height));
-    lines.extend(body.into_iter().skip(scroll).take(height));
+    let mut visible: Vec<Line<'static>> = body.iter().skip(scroll).take(height).cloned().collect();
+    // Scrolled past, the column header takes the first line's place.
+    if let Some(at) = header_at.filter(|&at| scroll > at)
+        && let Some(first) = visible.first_mut()
+    {
+        *first = body[at].clone();
+    }
+    lines.extend(visible);
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// The Stats status: the computation's progress, else when the report was computed.
+/// The Stats status: the computation's progress, else when the report was computed and the
+/// prices' date.
 fn stats_status(app: &App) -> Span<'static> {
     let s = &app.stats;
     match (s.in_flight, s.progress, s.computed) {
@@ -1302,11 +1483,18 @@ fn stats_status(app: &App) -> Span<'static> {
             Span::styled(format!("reading transcripts {done}/{total}…"), WARN)
         }
         (true, _, _) => Span::styled("computing statistics…", WARN),
-        (false, _, Some(at)) => Span::raw(format!(
-            "computed {} · {} transcripts",
-            at.to_zoned(app.tz.clone()).strftime("%H:%M:%S"),
-            s.report.as_ref().map_or(0, |r| r.files)
-        )),
+        (false, _, Some(at)) => {
+            let mut text = format!(
+                "computed {} · {} transcripts",
+                at.to_zoned(app.tz.clone()).strftime("%H:%M:%S"),
+                s.report.as_ref().map_or(0, |r| r.files)
+            );
+            // An error needs the room more than the prices' date.
+            if s.error.is_none() {
+                text.push_str(&format!(" · prices as of {PRICES_AS_OF}"));
+            }
+            Span::raw(text)
+        }
         (false, _, None) => Span::raw(""),
     }
 }

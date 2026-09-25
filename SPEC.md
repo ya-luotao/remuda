@@ -66,6 +66,13 @@ switching to a different, logged-out account.
 
   [share.claude]
   from = "default"          # optional: the account whose configuration is shared (R18)
+
+  [prices."claude-opus-4-6"]  # optional: USD per million tokens, instead of the built-in price (R20)
+  input = 5
+  output = 25
+  cache_read = 0.50
+  cache_write_5m = 6.25
+  cache_write_1h = 10
   ```
 - Homes created by `setup` live at `$REMUDA_HOME/homes/<provider>/<name>`; homes registered with
   `add` stay where they are.
@@ -74,8 +81,10 @@ switching to a different, logged-out account.
   symlink, writes go through the symlink.
 - Loading validates strictly: an invalid name, a duplicate name, a claimed `default`, a named
   account whose `home` is not an absolute path, `share` on a codex account, a `[share.claude] from`
-  that names no claude account, and similar problems are all reported as errors
-  naming the file; remuda neither guesses nor skips.
+  that names no claude account, a `[prices."<model>"]` that is not a table, has a key other than
+  `input`, `output`, `cache_read`, `cache_write_5m`, and `cache_write_1h`, lacks `input` or
+  `output`, or has a price that is not a number from 0 to 1,000,000, and similar problems are all
+  reported as errors naming the file; remuda neither guesses nor skips.
 - Runtime state (index cache, statistics cache, launch log) lives in `$REMUDA_HOME/state/` and may
   be deleted and rebuilt at any time.
 
@@ -129,7 +138,7 @@ remuda run [<account>] [args]   launch the agent under an account; without an ac
 remuda usage [<account>] [--live]  print per-account usage as plain text (R10)
 remuda list                     accounts, login identity, home
 remuda sessions [--limit N]     print recent sessions as plain text: time, account attribution, title, cwd (R8, R9)
-remuda stats [<account>] [--period P]  print tokens per account and model (R20)
+remuda stats [<account>] [--period P]  print tokens and estimated cost per account and model (R20)
 remuda add <name> <path>        register an existing home directory (R14)
 remuda setup <name>             create a new home and run `claude auth login`
 remuda remove <account>         unregister an account; its home is left in place (R14a)
@@ -741,26 +750,44 @@ every session still belongs to exactly one account.
 
 ## R20. Token statistics
 
-Token counts per account and model, read from the agents' own transcripts, for a period. No cost is
-estimated, and computing them runs no agent command.
+Token counts per account and model, read from the agents' own transcripts, for a period, and their
+estimated cost: what the requests would cost at the providers' public API list prices (prices as
+of 2026-09-24). Most accounts are subscription logins, so the cost is an estimate for comparison
+(≈ API list price), not a bill. Computing them runs no agent command and makes no network request:
+the prices are built into remuda and can be overridden in `config.toml` (R3).
 
 - **Counts.** Input, cache read, cache write, output, and reasoning. The total is input + cache
   read + cache write + output (reasoning is part of output). A count a provider does not record is
-  shown as `-`: claude records no reasoning apart from output, codex no cache write.
+  shown as `-`: claude records no reasoning apart from output, codex no cache write. Claude's
+  cache write is counted by cache lifetime, 5 minutes and 1 hour, which are priced differently,
+  and shown as one count.
 - **Claude** (verified on 2.1.71–2.1.281 against 1,064,472 records in 19,431 transcripts): an
   assistant record (`"type": "assistant"`) carries `message.id`, `message.model`, and
   `message.usage` with `input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`
-  (cache write), and `output_tokens`. Claude writes one record per content block, each repeating
-  the message's usage, with `output_tokens` growing while the message streams. So a message is
-  counted once, by its `message.id` (in the corpus no id was shared by two requests), with the
-  largest value of each count among its records and the timestamp of its first. Not counted:
-  other record types (a `progress` record repeats a subagent's message, which is counted from the
-  subagent's transcript; a tool result's `usage` sums a subagent's), records without
-  `message.id`, and the model `<synthetic>` (claude's placeholder messages, whose usage is zero).
+  (cache write), and `output_tokens`, and `cache_creation` with `ephemeral_5m_input_tokens` and
+  `ephemeral_1h_input_tokens`, the cache write by lifetime. Claude writes one record per content
+  block, each repeating the message's usage, with `output_tokens` growing while the message
+  streams. So a message is counted once, by its `message.id` (in the corpus no id was shared by
+  two requests), with the largest value of each count among its records and the timestamp of its
+  first. Not counted: other record types (a `progress` record repeats a subagent's message, which
+  is counted from the subagent's transcript; a tool result's `usage` sums a subagent's), records
+  without `message.id`, and the model `<synthetic>` (claude's placeholder messages, whose usage is
+  zero).
+- **Cache lifetime** (verified on 2.1.211–2.1.281 against 210,026 messages): `usage.cache_creation`
+  matches the cache write of a message with at most one `message` entry in `usage.iterations`;
+  with several (2,511 messages, each with an advisor call) it is the first entry's, and the sum
+  over the `message` entries matches. So the 1-hour cache write is the sum of
+  `ephemeral_1h_input_tokens` over the `message` entries that record `cache_creation`, else the
+  top-level one, at most the cache write; the rest of the cache write is 5-minute, including a
+  cache write recorded without lifetimes.
+- **Fast mode and US-only inference** are read from `usage.speed` (`"fast"`) and
+  `usage.inference_geo` (`"us"`), the values the API documents; in the sample above only
+  `"standard"`, `"not_available"`, and `"global"` occurred. They apply to the message, not to its
+  advisor calls, whose entries record neither.
 - **Advisor calls.** `usage.iterations` lists the requests behind a message, and the top-level
   usage is the sum of its `message` entries (12,735 of 12,741 records). An `advisor_message`
   entry is a separate request to its own `model`, not included in the top-level usage; each is
-  counted under that model.
+  counted under that model. Its cache write is split by lifetime from its own `cache_creation`.
 - **Claude transcripts**: in each `projects` store (a store shared by several homes is read once,
   R8), every top-level `<project>/*.jsonl`, and every `*.jsonl` at any depth below a directory
   `<project>/<session id>/` (subagent transcripts, such as `subagents/agent-*.jsonl` and
@@ -797,27 +824,105 @@ estimated, and computing them runs no agent command.
 - **Periods**: today, the last 7 days, the last 30 days, all. A period starts at local midnight
   (the system time zone) of today, of 6 days before, or of 29 days before; a message is in it when
   its timestamp is not earlier than the start. All also includes messages without a timestamp.
+- **Cost.** Each request is priced by its model and counts, and the costs are summed. Built-in
+  prices, USD per million tokens:
+
+  | Model | Input | 5-minute cache write | 1-hour cache write | Cache read | Output |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | `claude-fable-5-1`, `claude-mythos-5-1` | 10 | 12.50 | 20 | 0.25 | 50 |
+  | `claude-fable-5`, `claude-mythos-5` | 10 | 12.50 | 20 | 1 | 50 |
+  | `claude-opus-5-5` | 4 | 5 | 8 | 0.20 | 20 |
+  | `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-opus-4-5` | 5 | 6.25 | 10 | 0.50 | 25 |
+  | `claude-opus-4-1`, `claude-opus-4` | 15 | 18.75 | 30 | 1.50 | 75 |
+  | `claude-sonnet-5` | 2 | 2.50 | 4 | 0.20 | 10 |
+  | `claude-sonnet-4-6`, `claude-sonnet-4-5`, `claude-sonnet-4` | 3 | 3.75 | 6 | 0.30 | 15 |
+  | `claude-haiku-4-5` | 1 | 1.25 | 2 | 0.10 | 5 |
+  | `claude-3-5-haiku` | 0.80 | 1 | 1.60 | 0.08 | 4 |
+
+  Codex, USD per million tokens:
+
+  | Model | Input | Cached input | Output | Long context |
+  | --- | ---: | ---: | ---: | :---: |
+  | `gpt-6-astra` | 10 | 1 | 50 | yes |
+  | `gpt-6-sol` | 2 | 0.20 | 10 | yes |
+  | `gpt-5.6-sol` | 4 | 0.40 | 20 | yes |
+  | `gpt-5.6-terra` | 2 | 0.20 | 12 | yes |
+  | `gpt-5.5` | 5 | 0.50 | 30 | yes |
+  | `gpt-5.4` | 2.50 | 0.25 | 15 | yes |
+  | `gpt-5.3-codex`, `gpt-5.2-codex`, `gpt-5.2` | 1.75 | 0.175 | 14 | no |
+  | `gpt-5.1-codex-max`, `gpt-5.1-codex`, `gpt-5-codex`, `gpt-5` | 1.25 | 0.125 | 10 | no |
+  | `gpt-5.1-codex-mini` | 0.25 | 0.025 | 2 | no |
+  | `o4-mini` | 1.10 | 0.275 | 4.40 | no |
+
+  `gpt-5.6-sol`'s price is a promotional one, through 2026-11-21. Other codex models have no
+  public API price (`codex-auto-review`, codex's own routing id, and `gpt-5.3-codex-spark`, for
+  example) and are priced only by `[prices]`.
+  - Fast mode on `claude-opus-5-5`, `claude-opus-5`, and `claude-opus-4-8` doubles every price
+    (input 8, 10, and 10; output 40, 50, and 50; the cache prices keep their ratio to input); on
+    other models it is priced as standard.
+  - US-only inference multiplies every price by 1.1 on the models from 4.6 on: `claude-fable-5-1`,
+    `claude-fable-5`, `claude-mythos-5-1`, `claude-mythos-5`, `claude-opus-5-5`, `claude-opus-5`,
+    `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-5`, and
+    `claude-sonnet-4-6`; with fast mode, both apply.
+  - Codex: input without cached at the input price, cached input at the cached price, and output
+    (reasoning included, not priced again) at the output price.
+  - Codex long context, on the models marked above: a request with more than 272,000 input
+    tokens, cached included, is priced whole at twice the input and cached prices and 1.5 times
+    the output price.
+  - A model is found by its id without a trailing `-YYYYMMDD` (`claude-haiku-4-5-20251001` is
+    `claude-haiku-4-5`), exactly: `claude-fable-5` and `claude-fable-5-1` differ, and no prefix
+    matches. Claude's prices apply to claude's requests, codex's to codex's.
+  - `[prices."<model>"]` in `config.toml` (R3) gives the price of a model, found by the id as
+    recorded or else without its date: it replaces the built-in price or prices a model that has
+    none. Fast mode, US-only inference, and codex long context apply to it as to the built-in
+    model of the same id. A count whose price it leaves out is not priced. For codex,
+    `cache_read` is the cached-input price.
+  - A request is not priced when its model has no price (`unknown` included) or a nonzero count
+    of it has none; its tokens are still counted. A cost that leaves such requests out is shown
+    followed by `+` (`$12.34+`), one with nothing priced as `-`, and the models with such
+    requests are named below the table.
+  - Not modelled (known limitations): the long-context premium of `claude-sonnet-4-5` and
+    `claude-sonnet-4` (input beyond 200K tokens; the 4.6 and later models have none), batch and
+    priority processing, codex's fast and priority processing (rollouts do not record it),
+    server tools such as web search, and data residency other than US-only.
+  - The cost is exact (integer picodollars; override prices are rounded to 10⁻⁶ USD per million
+    tokens) and shown rounded to the cent: below $1,000 with two decimals (`$0.42`, `$12.34`), a
+    cost that is not zero but below half a cent as `<$0.01`, and from $1,000 on like counts
+    (`$1.2K`, `$45.6K`, `$118K`, `$1.2M`).
 - **Shown**, for a period: every account in registry order (including those with nothing in the
-  period), then each group of accounts, then unattributed. Each lists the tokens per model (the
-  model id as recorded), most first, and their total. Then the tokens per model over everything.
-  Counts below 1,000 are shown whole, others in K, M, B, or T, with one decimal below 100
-  (`1.2M`, `93.3B`, `118K`).
+  period), then each group of accounts, then unattributed. Each lists the tokens and cost per
+  model (the model id as recorded), most tokens first, and their total. Then the tokens and cost
+  per model over everything. Counts below 1,000 are shown whole, others in K, M, B, or T, with
+  one decimal below 100 (`1.2M`, `93.3B`, `118K`).
 - **Only transcripts that exist count**: tokens of transcripts deleted since (claude deletes those
   older than `cleanupPeriodDays`) are no longer counted.
 - **Cache**: `$REMUDA_HOME/state/stats.json`, with a schema version, rebuilt on a mismatch,
   written atomically, deletable at any time (R3). For each transcript it holds what was counted
-  from it (a 64-bit FNV-1a hash of each request's key, its timestamp, model, and counts), how far
-  the transcript was read, and, for codex, the last total and model. Transcripts are read like the
+  from it (a 64-bit FNV-1a hash of each request's key, its timestamp, model, counts with the
+  cache write by lifetime, and whether it used fast mode or US-only inference), how far the
+  transcript was read, and, for codex, the last total and model. Transcripts are read like the
   index (R8): an unchanged file is not read again, a grown one only from its last complete line,
   any other one whole; only complete lines are parsed. Records of one message read in two
   refreshes merge by their key. The first computation reads every transcript whole (measured:
-  20,895 files, 17.2 GB).
+  20,895 files, 17.2 GB), and so does the first one after the schema version changes (version 2
+  added the cache lifetimes and pricing flags).
 - **Command**: `remuda stats [<account>] [--period today|7d|30d|all]` prints one period
-  (default `all`). With an account, it prints only the sections that include that account, and no
-  overall section. Reading progress goes to stderr, as for `sessions`.
+  (default `all`) with a COST column, then a line saying the cost is ≈ API list price and the
+  prices' date, and a line naming the models not priced, if any. With an account, it prints only
+  the sections that include that account, and no overall section. Reading progress goes to
+  stderr, as for `sessions`.
 - **TUI**: view `4`, Stats. The statistics are computed in the background the first time the
-  view opens, and again on each `r` after that, with reading progress shown. `t` in the view cycles
-  the period (all, today, 7 days, 30 days).
+  view opens, and again on each `r` after that, with reading progress shown; `r` also reads the
+  prices in `config.toml` again (when they cannot be read, the built-in prices are used and the
+  status line says so). `t` in the view cycles the period (all, today, 7 days, 30 days).
+  The title says the cost is ≈ API list price, and the status line gives the prices' date unless it shows an error. Above
+  the table, a chart shows the period over time: a bar per hour (today), per day (7 and 30 days),
+  or, for all, per day from the first request with a timestamp (at most 3,660 days back), else
+  per week (from Monday), else per month, whichever is the finest that fits the width; buckets
+  that still do not fit are dropped from the oldest. The bars are the cost, or the tokens when
+  nothing in the period is priced. Requests without a timestamp, or with one after today, are
+  not charted. Each section's row has a bar showing its share of the period's cost (or tokens).
+  The column header stays in view once the chart is scrolled past.
 
 ## R21. Private mode (TUI)
 
@@ -848,6 +953,7 @@ status and hint lines, notices, the help box) shows:
   as whole components, to the next `: `, `, `, `; `, quote, or bracket, or to the end; and each
   word with an `@` is masked.
 
-Numbers (usage percentages, reset times, token counts), model names, plans, login methods,
+Numbers (usage percentages, reset times, token counts, costs, and the Stats chart), model names,
+plans, login methods,
 providers, session IDs, pids, and times stay visible. The line remuda prints before handing the
 terminal to a child (R16) shows no path and follows the same rules.

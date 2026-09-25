@@ -30,8 +30,9 @@ Remuda never touches credentials and makes no network requests of its own.
   with nothing copied into their homes.
 - **Checks for silent breakage.** Warnings for an `ANTHROPIC_API_KEY` that overrides every
   login, dangling symlinks, missing or logged-out homes, and similar multi-account pitfalls.
-- **Token statistics.** Input, cache, output and reasoning tokens per account and model, counted
-  from the agents' own transcripts.
+- **Token statistics and cost.** Input, cache, output and reasoning tokens per account and model,
+  counted from the agents' own transcripts, with an estimated cost at API list prices and a chart
+  over time.
 - **Built for screenshots.** `Ctrl-P` switches the TUI into a private mode that hides names,
   emails, paths and session titles.
 - **Out of your way.** Remuda does not take over your shell: typing `claude` still uses your
@@ -81,7 +82,7 @@ the bare name means `claude:default`, and the Codex one is `codex:default`.
 | `remuda usage [<account>] [--live] [--timeout <SECONDS>]` | Print usage limits for every account, or for one. Without `--live`, reads the agent's local cache. With `--live`, asks each account's agent in parallel (`claude -p /usage`, `codex app-server`) and exits 1 if any query fails. `--timeout` applies to each live query (default 90). |
 | `remuda list [--timeout <SECONDS>]` | Print every account with its login identity (email, organization and plan; for Codex, the login method only) and home. `--timeout` applies to each identity query (default 15). |
 | `remuda sessions [--limit <N>]` | Print the newest sessions: time, attributed accounts, title and working directory (default 30). |
-| `remuda stats [<account>] [--period today\|7d\|30d\|all]` | Print tokens per account and model for a period (default `all`); with an account, only the sections that include it. The first run reads every transcript whole, which can take tens of seconds on a large history; later runs read only what changed. |
+| `remuda stats [<account>] [--period today\|7d\|30d\|all]` | Print tokens per account and model for a period (default `all`); with an account, only the sections that include it. The first run reads every transcript whole, which can take tens of seconds on a large history; later runs read only what changed. Shows each model's estimated cost (≈ API list price, prices built in as of 2026-09-24; an estimate, not a bill). |
 | `remuda add [--provider <claude\|codex>] <name> <path>` | Register an existing home directory as an account. The provider defaults to `claude`. |
 | `remuda setup [--provider <claude\|codex>] <name> [--email <EMAIL>]` | Create a new home under `$REMUDA_HOME/homes/<provider>/<name>`, register it, and run the agent's login (`claude auth login` or `codex login`). `--email` prefills the Claude login. |
 | `remuda remove <account>` | Unregister an account. Its home and everything in it are left in place, and its path is printed so `remuda add` can register it again. `default` and the source of `[share.claude]` cannot be removed. |
@@ -150,11 +151,22 @@ home = "/Users/you/.claude-work"
 provider = "codex"
 name = "research"
 home = "/Users/you/.codex-research"
+
+[prices."claude-opus-4-6"]   # optional: USD per million tokens, instead of the built-in price
+input = 5
+output = 25
+cache_read = 0.50
+cache_write_5m = 6.25
+cache_write_1h = 10
 ```
 
 Homes must be absolute paths. The file is validated strictly on load: invalid or duplicate names,
 a registered `default`, or a relative home are reported as errors naming the file. Everything under
 `state/` is rebuilt on the next run.
+
+Costs in the statistics use prices built into remuda (as of 2026-09-24); `[prices."<model>"]`
+overrides a model's price or prices one remuda does not know (for Codex, `cache_read` is the
+cached-input price).
 
 With `[share.claude]`, every other Claude account launches with the source's instructions,
 settings (without authentication or provider settings), enabled plugins and auto-memory, injected
@@ -184,7 +196,8 @@ the specification ([SPEC.md](SPEC.md), R2 and R13):
 - **No network requests of its own.** Live usage is queried by the agent itself, with the
   account's own login, and only when you ask for it (`remuda usage --live`, `u` in the TUI). A
   live query starts the agent: `codex app-server` behaves like launching Codex, so it may refresh
-  the account's login token and writes Codex's own state into the home.
+  the account's login token and writes Codex's own state into the home. Cost estimates use
+  prices built into remuda; nothing is fetched.
 
 ## Status
 

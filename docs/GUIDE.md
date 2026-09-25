@@ -18,7 +18,8 @@ original session, so they are allowed while it runs.
 
 The Stats view computes the statistics in the background the first time it opens, with the
 reading progress in the status line, and again on each `r`; the first computation reads every
-transcript whole.
+transcript whole. Above the table, a chart shows the period's cost (or tokens, when nothing is
+priced) per hour, day, week or month, and each account's row shows its share.
 
 ## Private mode
 
@@ -33,7 +34,7 @@ starts and is not saved. While it is on, the TUI shows:
 - notices, errors and check messages with the above replaced, as a best effort: a path is
   recognized from a `/` or `~/` that begins a word, or from a directory remuda knows.
 
-It keeps visible the numbers (usage percentages, reset times, token counts), model names, plans,
+It keeps visible the numbers (usage percentages, reset times, token counts, costs), model names, plans,
 login methods, providers, session IDs, pids and times. It does not hide the output of an agent
 after remuda hands it the terminal (the line remuda prints just before does follow private mode),
 and the command-line commands have no private mode. In VS Code's integrated terminal on Linux and
@@ -90,6 +91,36 @@ target account; the original is never modified, and the copy is hidden from the 
 A relay never overwrites anything except its own earlier copy of the same session, and only if
 that copy is unchanged.
 
+## Cost estimates
+
+The statistics price each request at the provider's public API list price, built into remuda (as
+of 2026-09-24). Claude's 5-minute and 1-hour cache writes are priced separately, as are fast mode
+(twice the price on the models that offer it) and US-only inference (1.1 times the price on the
+models from 4.6 on), as the transcripts record them. A Codex request with more than 272K input
+tokens is priced at the long-context price on the models that have one.
+
+To price a model remuda does not know, or to use another price, add a `[prices."<model>"]` table
+to `config.toml`, in USD per million tokens:
+
+```toml
+[prices."claude-opus-4-6"]
+input = 5
+output = 25
+cache_read = 0.50
+cache_write_5m = 6.25
+cache_write_1h = 10
+```
+
+`input` and `output` are required; `cache_read` (for Codex, the cached-input price),
+`cache_write_5m` and `cache_write_1h` are optional, and a count whose price is left out is not
+priced. The table applies to the model id as recorded, or to it without a trailing date
+(`claude-haiku-4-5` also prices `claude-haiku-4-5-20251001`).
+
+A cost followed by `+` (`$12.34+`) leaves out requests that could not be priced, and `-` means
+nothing could be; the models concerned are named below the table. Not modelled: the long-context
+premium of Claude Sonnet 4.5 and 4, batch and priority processing, and server tools such as web
+search.
+
 ## Account checks
 
 The Accounts view warns about conditions that silently break multi-account setups: an
@@ -107,7 +138,9 @@ shared `projects` store without `cleanupPeriodDays`, and problems with the share
   Codex exposes no machine-readable list of running sessions.
 - **Token statistics** are counted from the agents' own transcripts. Each request counts once,
   even when a message is written in several records, a session is forked or relayed, or a store
-  is shared by several accounts. No cost is estimated, and no agent is run.
+  is shared by several accounts. Each request is also priced at the provider's public API list
+  price (built in, as of 2026-09-24), which estimates what the usage would cost on the API; for
+  subscription logins it is not a bill. No agent is run and nothing is fetched.
 - **Attribution:** new Claude sessions get a pre-assigned `--session-id`, and every launch is
   recorded in `state/launches.jsonl`, so each session can be attributed to the account that
   started it.

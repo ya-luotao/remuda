@@ -105,11 +105,13 @@ fn block(stdout: &str, label: &str) -> Vec<String> {
         .collect()
 }
 
-/// The section labels: lines that are neither blank nor indented, after the title and header.
+/// The section labels: lines that are neither blank nor indented, after the title and header
+/// and before the cost note.
 fn labels(stdout: &str) -> Vec<&str> {
     stdout
         .lines()
         .skip(3)
+        .take_while(|l| !l.starts_with("Cost ≈"))
         .filter(|l| !l.is_empty() && !l.starts_with(' '))
         .collect()
 }
@@ -236,7 +238,8 @@ fn stats_by_account_and_model() {
             "WRITE",
             "OUTPUT",
             "REASONING",
-            "TOTAL"
+            "TOTAL",
+            "COST"
         ]
     );
     assert_eq!(
@@ -253,35 +256,35 @@ fn stats_by_account_and_model() {
     assert_eq!(
         block(&out, "claude:default"),
         [
-            "claude-test 8 600 160 90 - 858",
-            "claude-advisor-test 700 0 0 70 - 770",
-            "claude-haiku-test 30 0 0 5 - 35",
-            "total 738 600 160 165 - 1.7K",
+            "claude-test 8 600 160 90 - 858 -",
+            "claude-advisor-test 700 0 0 70 - 770 -",
+            "claude-haiku-test 30 0 0 5 - 35 -",
+            "total 738 600 160 165 - 1.7K -",
         ]
     );
     assert_eq!(
         block(&out, "claude:max"),
-        ["claude-test 7 0 0 7 - 14", "total 7 0 0 7 - 14"]
+        ["claude-test 7 0 0 7 - 14 -", "total 7 0 0 7 - 14 -"]
     );
     assert_eq!(
         block(&out, "claude:team"),
-        ["claude-test 11 0 0 11 - 22", "total 11 0 0 11 - 22"]
+        ["claude-test 11 0 0 11 - 22 -", "total 11 0 0 11 - 22 -"]
     );
     assert_eq!(
         block(&out, "claude:default + claude:max"),
-        ["claude-test 5 0 0 5 - 10", "total 5 0 0 5 - 10"]
+        ["claude-test 5 0 0 5 - 10 -", "total 5 0 0 5 - 10 -"]
     );
     assert_eq!(
         block(&out, "unattributed"),
-        ["claude-test 9 0 0 9 - 18", "total 9 0 0 9 - 18"]
+        ["claude-test 9 0 0 9 - 18 -", "total 9 0 0 9 - 18 -"]
     );
     assert_eq!(
         block(&out, "overall"),
         [
-            "claude-test 40 600 160 122 - 922",
-            "claude-advisor-test 700 0 0 70 - 770",
-            "claude-haiku-test 30 0 0 5 - 35",
-            "total 770 600 160 197 - 1.7K",
+            "claude-test 40 600 160 122 - 922 -",
+            "claude-advisor-test 700 0 0 70 - 770 -",
+            "claude-haiku-test 30 0 0 5 - 35 -",
+            "total 770 600 160 197 - 1.7K -",
         ]
     );
     // Columns align over the whole output.
@@ -291,6 +294,67 @@ fn stats_by_account_and_model() {
         .map(str::len)
         .collect();
     assert!(ends.windows(2).all(|w| w[0] == w[1]), "{out}");
+    // Then what the cost is, and the models without a price.
+    let last: Vec<&str> = out.lines().rev().take(3).collect();
+    assert_eq!(
+        last,
+        [
+            "Not priced: claude-advisor-test, claude-haiku-test, claude-test \
+             (add [prices.\"<model>\"] to config.toml)",
+            "Cost ≈ API list price (prices as of 2026-09-24): an estimate, not a bill.",
+            "",
+        ]
+    );
+}
+
+/// R3, R20: `[prices."<model>"]` in config.toml prices a model remuda has no price for; a
+/// cost below half a cent shows as `<$0.01`.
+#[test]
+fn stats_prices_from_config() {
+    let s = setup();
+    claude_fixtures(&s);
+    let config = s.sb.read_config();
+    s.sb.write_config(&format!(
+        "{config}[prices.\"claude-test\"]\ninput = 1\noutput = 1\ncache_read = 1\n\
+         cache_write_5m = 1\ncache_write_1h = 1\n"
+    ));
+    let out = stats(&s.sb, &[]);
+    // 14 tokens at $1 per million: $0.000014.
+    assert_eq!(
+        block(&out, "claude:max"),
+        [
+            "claude-test 7 0 0 7 - 14 <$0.01",
+            "total 7 0 0 7 - 14 <$0.01"
+        ]
+    );
+    let overall = block(&out, "overall");
+    assert_eq!(overall[0], "claude-test 40 600 160 122 - 922 <$0.01");
+    assert_eq!(overall[3], "total 770 600 160 197 - 1.7K <$0.01+");
+    assert_eq!(
+        out.lines().last(),
+        Some(
+            "Not priced: claude-advisor-test, claude-haiku-test \
+             (add [prices.\"<model>\"] to config.toml)"
+        )
+    );
+}
+
+/// R3: an invalid `[prices]` table fails every command, naming the file.
+#[test]
+fn stats_invalid_prices_fail_naming_the_config() {
+    let s = setup();
+    let config = s.sb.read_config();
+    s.sb.write_config(&format!("{config}[prices.\"x\"]\ninput = -1\noutput = 1\n"));
+    s.sb.remuda()
+        .arg("stats")
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains(
+            s.sb.config_path().display().to_string(),
+        ))
+        .stderr(predicates::str::contains(
+            "[prices.\"x\"]: `input` must be from 0 to 1000000",
+        ));
 }
 
 /// R20: codex rollouts (fixtures of `tests/stats.rs`) in `$HOME/.codex`: repeats, compaction
@@ -367,11 +431,11 @@ fn stats_codex() {
     assert_eq!(labels(&out), ["claude:default", "codex:default", "overall"]);
     assert_eq!(block(&out, "claude:default"), ["no tokens"]);
     let codex_rows = [
-        "gpt-test-a 120 230 - 35 11 385",
-        "gpt-test-b 90 180 - 25 3 295",
-        "gpt-test-d 100 100 - 20 8 220",
-        "gpt-test-c 50 40 - 9 0 99",
-        "total 360 550 - 89 22 999",
+        "gpt-test-a 120 230 - 35 11 385 -",
+        "gpt-test-b 90 180 - 25 3 295 -",
+        "gpt-test-d 100 100 - 20 8 220 -",
+        "gpt-test-c 50 40 - 9 0 99 -",
+        "total 360 550 - 89 22 999 -",
     ];
     assert_eq!(block(&out, "codex:default"), codex_rows);
     assert_eq!(block(&out, "overall"), codex_rows);
@@ -391,7 +455,7 @@ fn stats_filter_by_account() {
         );
         assert_eq!(
             block(&out, "claude:max"),
-            ["claude-test 7 0 0 7 - 14", "total 7 0 0 7 - 14"]
+            ["claude-test 7 0 0 7 - 14 -", "total 7 0 0 7 - 14 -"]
         );
     }
 }
@@ -429,13 +493,16 @@ fn stats_period_today() {
     );
     assert_eq!(
         block(&out, "unattributed"),
-        ["claude-test 1 0 0 1 - 2", "total 1 0 0 1 - 2"]
+        ["claude-test 1 0 0 1 - 2 -", "total 1 0 0 1 - 2 -"]
     );
     assert_eq!(block(&out, "claude:default"), ["no tokens"]);
     let out = stats(&sb, &["--period", "all"]);
     assert_eq!(
         block(&out, "unattributed"),
-        ["claude-test 101 0 0 101 - 202", "total 101 0 0 101 - 202"]
+        [
+            "claude-test 101 0 0 101 - 202 -",
+            "total 101 0 0 101 - 202 -"
+        ]
     );
     let out = stats(&sb, &["--period", "7d"]);
     assert!(out.starts_with("Tokens · last 7 days (since "), "{out}");
@@ -472,7 +539,7 @@ fn stats_runs_no_agent_and_caches() {
     let out = stats(&s.sb, &[]);
     assert_eq!(
         block(&out, "unattributed"),
-        ["claude-test 10 0 0 10 - 20", "total 10 0 0 10 - 20"]
+        ["claude-test 10 0 0 10 - 20 -", "total 10 0 0 10 - 20 -"]
     );
     assert!(s.sb.invocations().is_empty());
 }
@@ -494,7 +561,10 @@ fn stats_warns_when_the_cache_cannot_be_written() {
             .get_output()
             .clone();
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(block(&stdout, "claude:max")[0], "claude-test 7 0 0 7 - 14");
+    assert_eq!(
+        block(&stdout, "claude:max")[0],
+        "claude-test 7 0 0 7 - 14 -"
+    );
 }
 
 /// R5: an account that does not resolve is an error.

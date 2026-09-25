@@ -9,6 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::index::{self, Index};
+use crate::pricing::Prices;
 use crate::provider::{Provider, codex};
 use crate::registry::{self, Account, Registry};
 use crate::{attribution, checks, identity, live, stats, transcript, usage};
@@ -304,9 +305,19 @@ fn refresh_index(deps: &Deps, tx: &Sender<Event>) {
 
 /// Token statistics (R20): the cache brought up to date with progress (the first and last
 /// report, and at most every [`PROGRESS_EVERY`] in between), saved if that changed it, then
-/// the report with attribution from the launch log and `history.jsonl`. Leaving the TUI does
-/// not wait for it: the thread ends with the process, the cache unsaved.
+/// the report with attribution from the launch log and `history.jsonl`, priced with the
+/// prices of `config.toml` as it is now (the built-in ones when it cannot be read, which is
+/// told). Leaving the TUI does not wait for it: the thread ends with the process, the cache
+/// unsaved.
 fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
+    let mut errors: Vec<String> = Vec::new();
+    let (prices, prices_error) = match Registry::load(&deps.config) {
+        Ok(registry) => (registry.prices, None),
+        Err(e) => (
+            Prices::default(),
+            Some(format!("prices: {e:#} (built-in prices used)")),
+        ),
+    };
     let path = deps.state_dir.join("stats.json");
     let mut cache = stats::Cache::load(&path);
     let sources = stats::sources(&deps.accounts, &deps.env);
@@ -317,10 +328,10 @@ fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
             let _ = tx.send(Event::StatsProgress { done, total });
         }
     });
-    let error = cache
-        .save_if_changed(&path, &refreshed)
-        .err()
-        .map(|e| format!("{e:#}"));
+    if let Err(e) = cache.save_if_changed(&path, &refreshed) {
+        errors.push(format!("stats cache: {e:#}"));
+    }
+    errors.extend(prices_error);
     let log = deps.state_dir.join("launches.jsonl");
     let attribution = attribution::collect(&deps.accounts, &deps.env, &log, &[]);
     let report = stats::report(
@@ -328,9 +339,11 @@ fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
         &sources,
         &attribution,
         &deps.accounts,
+        &prices,
         (deps.clock)(),
         &deps.tz,
     );
+    let error = (!errors.is_empty()).then(|| errors.join(" · "));
     let _ = tx.send(Event::Stats { report, error });
 }
 
@@ -470,6 +483,51 @@ mod tests {
         let again = collect(Effect::Stats, &deps, done);
         assert_eq!(again.last(), events.last());
         assert_eq!(fs::metadata(&cache).unwrap().modified().unwrap(), written);
+    }
+
+    /// R20, R3: each computation prices with `config.toml` as it is then; prices that cannot be
+    /// read are told, and the built-in ones used.
+    #[test]
+    fn stats_use_config_prices_and_say_when_they_cannot() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let transcript = dir.path().join("max/projects/-w/s1.jsonl");
+        let mut text = fs::read_to_string(&transcript).unwrap();
+        text.push_str(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-09-24T10:03:00Z\",\
+             \"message\":{\"id\":\"msg_1\",\"model\":\"claude-test\",\"role\":\"assistant\",\
+             \"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":40,\
+             \"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":300}}}\n",
+        );
+        fs::write(&transcript, text).unwrap();
+        let done = |e: &Event| matches!(e, Event::Stats { .. });
+        let cost = |events: &[Event]| {
+            let Some(Event::Stats { report, error }) = events.last() else {
+                panic!("{events:?}")
+            };
+            let all = report.table(stats::Period::All);
+            (all.sections.last().unwrap().models[0].cost, error.clone())
+        };
+
+        fs::write(
+            &deps.config,
+            "[prices.\"claude-test\"]\ninput = 1\noutput = 1\ncache_read = 1\n\
+             cache_write_5m = 1\ncache_write_1h = 1\n",
+        )
+        .unwrap();
+        let (priced, error) = cost(&collect(Effect::Stats, &deps, done));
+        assert_eq!(error, None);
+        assert_eq!((priced.pico_usd, priced.unpriced_tokens), (443_000_000, 0));
+
+        fs::write(&deps.config, "prices = 1\n").unwrap();
+        let (unpriced, error) = cost(&collect(Effect::Stats, &deps, done));
+        let error = error.unwrap();
+        assert!(
+            error.starts_with("prices: ") && error.ends_with("(built-in prices used)"),
+            "{error}"
+        );
+        assert!(error.contains("config.toml"), "{error}");
+        assert_eq!((unpriced.pico_usd, unpriced.unpriced_tokens), (0, 443));
     }
 
     #[test]

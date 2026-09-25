@@ -645,7 +645,15 @@ fn stats(
         );
     }
     let attribution = attribution::collect(&accounts, &ctx.env, &state.join("launches.jsonl"), &[]);
-    let report = stats::report(&cache, &sources, &attribution, &accounts, ctx.now, &ctx.tz);
+    let report = stats::report(
+        &cache,
+        &sources,
+        &attribution,
+        &accounts,
+        &registry.prices,
+        ctx.now,
+        &ctx.tz,
+    );
     print!(
         "{}",
         stats::format(report.table(period), filter.as_deref(), &ctx.tz)

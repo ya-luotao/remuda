@@ -18,7 +18,7 @@ use crate::identity::Identity;
 use crate::index::{Entry, Store};
 use crate::live::{Control, LiveSession, Source};
 use crate::registry::{Account, CLAUDE, CODEX, Home};
-use crate::stats::{ModelRow, Period, Report, Section, Table, Tokens};
+use crate::stats::{self, Cost, ModelRow, Period, Report, Section, Table, Tokens};
 use crate::transcript::{Message, Role};
 use crate::usage::{CachedUsage, LiveResult, LiveUsage, Resets, UsageRow};
 
@@ -3898,18 +3898,36 @@ fn relay_copies_are_hidden_from_history() {
 
 // ---- Stats (R20) ------------------------------------------------------------------
 
+/// A model row whose cache write is all 1-hour, not priced.
 fn model(provider: crate::provider::Provider, name: &str, t: [u64; 5]) -> ModelRow {
-    let [input, cache_read, cache_write, output, reasoning] = t;
+    let [input, cache_read, cache_write_1h, output, reasoning] = t;
+    let tokens = Tokens {
+        input,
+        cache_read,
+        cache_write_5m: 0,
+        cache_write_1h,
+        output,
+        reasoning,
+    };
     ModelRow {
         provider,
         model: name.into(),
-        tokens: Tokens {
-            input,
-            cache_read,
-            cache_write,
-            output,
-            reasoning,
+        tokens,
+        cost: Cost {
+            pico_usd: 0,
+            unpriced_tokens: tokens.total(),
         },
+    }
+}
+
+/// `m` priced at `pico` picodollars.
+fn priced(m: ModelRow, pico: u128) -> ModelRow {
+    ModelRow {
+        cost: Cost {
+            pico_usd: pico,
+            unpriced_tokens: 0,
+        },
+        ..m
     }
 }
 
@@ -3923,7 +3941,10 @@ fn stats_section(accounts: &[&str], models: Vec<ModelRow>) -> Section {
 /// The same sections in every period, but today's has only `default`.
 fn stats_report() -> Report {
     let test = model(CLAUDE, "claude-test", [8, 1_234_567, 160, 90, 0]);
-    let haiku = model(CLAUDE, "claude-haiku-4-5-20251001", [30, 0, 0, 5, 0]);
+    let haiku = priced(
+        model(CLAUDE, "claude-haiku-4-5-20251001", [30, 0, 0, 5, 0]),
+        12_340_000_000_000,
+    );
     let gpt = model(CODEX, "gpt-test", [1500, 200, 0, 30, 12]);
     let sections = vec![
         stats_section(&["claude:default"], vec![test.clone(), haiku.clone()]),
@@ -3951,6 +3972,7 @@ fn stats_report() -> Report {
                     _ => sections.clone(),
                 },
                 overall: overall.clone(),
+                series: vec![],
             })
             .to_vec(),
         files: 42,
@@ -4002,7 +4024,10 @@ fn stats_view_computes_on_first_visit_then_on_r() {
 
     update(&mut app, Event::StatsProgress { done: 3, total: 10 });
     let lines = screen(&app);
-    line_with(&lines, "Tokens · all time (t: period)");
+    line_with(
+        &lines,
+        "Tokens · all time · cost ≈ API list price (t: period)",
+    );
     let (body, _) = line_with(&lines, "reading transcripts 3/10…");
     let (status, _) = line_with(&lines[body + 1..], "reading transcripts 3/10…");
     assert_eq!(body + 1 + status, 22, "and in the status line");
@@ -4037,39 +4062,46 @@ fn stats_view_computes_on_first_visit_then_on_r() {
         &mut app,
         Event::Stats {
             report: stats_report(),
-            error: Some("disk full".into()),
+            error: Some("stats cache: disk full".into()),
         },
     );
+    // The prices' date gives way to the error, which fits at 80 columns.
     let all = text(&app);
-    assert!(all.contains("stats cache: disk full"), "{all}");
+    assert!(
+        all.contains("42 transcripts │ stats cache: disk full"),
+        "{all}"
+    );
+    assert!(!all.contains("prices as of"), "{all}");
     assert!(all.contains("claude-test"), "{all}");
 }
 
 /// R20: every section, bold totals, models with `…` when too long, `-` for counts a provider
-/// does not record, `no tokens` for an empty account, then Overall.
+/// does not record and for a cost not priced, `no tokens` for an empty account, then Overall
+/// and the models not priced. At 80 columns REASONING gives way.
 #[test]
 fn stats_view_shows_sections_models_and_totals() {
     let app = stats_app();
     let lines = screen(&app);
     let rows: Vec<String> = lines[2..].iter().map(|l| squeezed(l)).collect();
     let expected = [
-        "ACCOUNT / MODEL INPUT CACHE READ CACHE WRITE OUTPUT REASONING TOTAL",
-        "default 38 1.2M 160 95 - 1.2M",
-        "claude-test 8 1.2M 160 90 - 1.2M",
-        "claude-haiku-4-5-202… 30 0 0 5 - 35",
+        "ACCOUNT / MODEL INPUT CACHE READ CACHE WRITE OUTPUT TOTAL COST SHARE",
+        "default 38 1.2M 160 95 1.2M $12.34+ ██████",
+        "claude-test 8 1.2M 160 90 1.2M -",
+        "claude-haiku-4… 30 0 0 5 35 $12.34",
         "max no tokens",
         "team no tokens",
-        "codex:work 1.5K 200 - 30 12 1.7K",
-        "gpt-test 1.5K 200 - 30 12 1.7K",
-        "default + max 5 0 0 5 - 10",
-        "claude-test 5 0 0 5 - 10",
-        "unattributed 9 0 0 9 - 18",
-        "claude-test 9 0 0 9 - 18",
+        "codex:work 1.5K 200 - 30 1.7K -",
+        "gpt-test 1.5K 200 - 30 1.7K -",
+        "default + max 5 0 0 5 10 -",
+        "claude-test 5 0 0 5 10 -",
+        "unattributed 9 0 0 9 18 -",
+        "claude-test 9 0 0 9 18 -",
         "",
-        "Overall 1.6K 1.2M 160 139 12 1.2M",
-        "claude-test 22 1.2M 160 104 - 1.2M",
-        "gpt-test 1.5K 200 - 30 12 1.7K",
-        "claude-haiku-4-5-202… 30 0 0 5 - 35",
+        "Overall 1.6K 1.2M 160 139 1.2M $12.34+",
+        "claude-test 22 1.2M 160 104 1.2M -",
+        "gpt-test 1.5K 200 - 30 1.7K -",
+        "claude-haiku-4… 30 0 0 5 35 $12.34",
+        "not priced: claude-test, gpt-test",
     ];
     assert_eq!(rows[..expected.len()], expected, "{}", lines.join("\n"));
     // The numbers line up under their headers.
@@ -4080,7 +4112,7 @@ fn stats_view_shows_sections_models_and_totals() {
         header.find("TOTAL").unwrap() + 5
     );
     let (_, name) = line_with(&lines, "claude-haiku");
-    assert!(name.starts_with("  claude-haiku-4-5-202… "), "{name}");
+    assert!(name.starts_with("  claude-haiku-4… "), "{name}");
 }
 
 /// Where each run of non-blank characters ends, in columns (every character here is one
@@ -4123,7 +4155,8 @@ fn stats_columns_align_in_every_row() {
             error: None,
         },
     );
-    for (width, columns) in [(80, 6), (70, 5), (60, 4), (160, 6)] {
+    // Numeric columns shown (SHARE, a bar, is not one of them).
+    for (width, columns) in [(80, 6), (75, 6), (70, 5), (60, 5), (160, 7)] {
         update(&mut app, Event::Resize(width, 40));
         let lines = screen(&app);
         let header = &lines[2];
@@ -4134,6 +4167,7 @@ fn stats_columns_align_in_every_row() {
             "OUTPUT",
             "REASONING",
             "TOTAL",
+            "COST",
         ]
         .iter()
         .filter_map(|h| {
@@ -4143,13 +4177,15 @@ fn stats_columns_align_in_every_row() {
         })
         .collect();
         assert_eq!(ends.len(), columns, "{width}: {header}");
-        let rows: Vec<&String> = lines[3..]
+        let share = header.find("SHARE").map(|at| header[..at].chars().count());
+        let rows: Vec<String> = lines[3..]
             .iter()
             .filter(|l| !l.trim().is_empty() && !l.contains("no tokens"))
-            .take_while(|l| !l.starts_with(" computed"))
+            .take_while(|l| !l.starts_with(" computed") && !l.contains("not priced"))
+            .map(|l| l.chars().take(share.unwrap_or(usize::MAX)).collect())
             .collect();
         assert_eq!(rows.len(), 16, "{width}: {rows:?}");
-        for row in rows {
+        for row in &rows {
             let cells = token_ends(row);
             assert_eq!(
                 cells[cells.len() - columns..],
@@ -4161,15 +4197,16 @@ fn stats_columns_align_in_every_row() {
     }
 }
 
-/// R20: narrow terminals give up REASONING, then CACHE WRITE, before model names are cut
-/// short; a wide one keeps the numbers next to the names.
+/// R20: narrow terminals give up REASONING, then SHARE, then CACHE WRITE, before model names
+/// are cut short, never COST; a wide one keeps the numbers next to the names.
 #[test]
 fn stats_view_degrades_on_narrow_terminals() {
     let mut app = stats_app();
     for (width, dropped) in [
-        (80, &[][..]),
-        (70, &["REASONING"][..]),
-        (60, &["REASONING", "CACHE WRITE"][..]),
+        (90, &[][..]),
+        (80, &["REASONING"][..]),
+        (75, &["REASONING", "SHARE"][..]),
+        (70, &["REASONING", "SHARE", "CACHE WRITE"][..]),
     ] {
         update(&mut app, Event::Resize(width, 24));
         let lines = screen(&app);
@@ -4181,6 +4218,8 @@ fn stats_view_degrades_on_narrow_terminals() {
             "OUTPUT",
             "REASONING",
             "TOTAL",
+            "COST",
+            "SHARE",
         ] {
             assert_eq!(
                 header.contains(column),
@@ -4220,11 +4259,11 @@ fn t_cycles_the_period_and_p_is_inert_in_stats() {
     assert_eq!(
         titles,
         [
-            "Tokens · all time",
-            "Tokens · today",
-            "Tokens · last 7 days",
-            "Tokens · last 30 days",
-            "Tokens · all time"
+            "Tokens · all time · cost ≈ API list price",
+            "Tokens · today · cost ≈ API list price",
+            "Tokens · last 7 days · cost ≈ API list price",
+            "Tokens · last 30 days · cost ≈ API list price",
+            "Tokens · all time · cost ≈ API list price"
         ]
     );
     assert_eq!(app.stats.period, Period::Today);
@@ -4255,23 +4294,28 @@ fn t_cycles_the_period_and_p_is_inert_in_stats() {
     assert_eq!(app.stats.period, Period::All);
 }
 
-/// R20: movement keys scroll the Stats view within its lines; the title and the column header
-/// stay.
+/// R20: movement keys scroll the Stats view within its lines; the title stays, and the column
+/// header once scrolled past takes the first line's place.
 #[test]
 fn stats_scrolls() {
     let mut app = stats_app();
     update(&mut app, Event::Resize(80, 12));
     let height = render::stats_height(&app);
     let count = render::stats_line_count(&app);
-    assert_eq!((height, count), (7, 16));
+    assert_eq!((height, count), (8, 18));
     let first_row = |app: &App| squeezed(&screen(app)[3]);
-    assert_eq!(first_row(&app), "default 38 1.2M 160 95 - 1.2M");
+    assert_eq!(
+        first_row(&app),
+        "default 38 1.2M 160 95 1.2M $12.34+ ██████"
+    );
     keys(&mut app, &[Key::Char('j'), Key::Down]);
     assert_eq!(app.stats.scroll, 2);
-    assert_eq!(first_row(&app), "claude-haiku-4-5-202… 30 0 0 5 - 35");
+    assert_eq!(first_row(&app), "claude-haiku-4… 30 0 0 5 35 $12.34");
     let lines = screen(&app);
     line_with(&lines, "Tokens · all time");
-    line_with(&lines, "ACCOUNT / MODEL");
+    assert!(lines[2].starts_with("ACCOUNT / MODEL"), "{}", lines[2]);
+    keys(&mut app, &[Key::Char('j')]);
+    line_with(&screen(&app), "ACCOUNT / MODEL");
     keys(&mut app, &[Key::Char('G')]);
     assert_eq!(app.stats.scroll, count - height);
     let lines = screen(&app);
@@ -4296,6 +4340,234 @@ fn stats_scrolls() {
     );
     update(&mut app, Event::Resize(80, 40));
     assert_eq!(app.stats.scroll, 0);
+}
+
+/// A report with the same `sections`, `overall` and `series` in every period.
+fn report_of(sections: Vec<Section>, overall: Vec<ModelRow>, series: Vec<stats::Bucket>) -> Report {
+    Report {
+        tables: Period::ALL
+            .map(|period| Table {
+                period,
+                since: None,
+                sections: sections.clone(),
+                overall: overall.clone(),
+                series: series.clone(),
+            })
+            .to_vec(),
+        files: 1,
+    }
+}
+
+/// `n` buckets a day apart from `start` (UTC) with these costs in dollars and `tokens` each.
+fn daily(start: &str, dollars: &[u128], tokens: u64) -> Vec<stats::Bucket> {
+    let mut at = ts(start);
+    dollars
+        .iter()
+        .map(|&d| {
+            let bucket = stats::Bucket {
+                start: at,
+                tokens: Tokens {
+                    input: tokens,
+                    ..Tokens::default()
+                },
+                cost: Cost {
+                    pico_usd: d * 1_000_000_000_000,
+                    unpriced_tokens: 0,
+                },
+            };
+            at = at
+                .checked_add(jiff::SignedDuration::from_hours(24))
+                .unwrap();
+            bucket
+        })
+        .collect()
+}
+
+/// R20: each model's cost, `-` when not priced, `+` on a total that leaves some out, a share
+/// bar on each section's row by its share of the period's cost, and the models not priced.
+#[test]
+fn stats_view_shows_cost_share_and_unpriced_models() {
+    let mut app = stats_app();
+    let haiku = priced(
+        model(CLAUDE, "claude-small", [30, 0, 0, 5, 0]),
+        30_000_000_000_000,
+    );
+    let test = model(CLAUDE, "claude-test", [8, 0, 0, 9, 0]);
+    let gpt = priced(
+        model(CODEX, "gpt-test", [1500, 200, 0, 30, 12]),
+        10_000_000_000_000,
+    );
+    let report = report_of(
+        vec![
+            stats_section(&["claude:default"], vec![haiku.clone(), test.clone()]),
+            stats_section(&["claude:max"], vec![]),
+            stats_section(&["codex:work"], vec![gpt.clone()]),
+            stats_section(&[], vec![test.clone()]),
+        ],
+        vec![gpt, haiku, test],
+        vec![],
+    );
+    update(
+        &mut app,
+        Event::Stats {
+            report,
+            error: None,
+        },
+    );
+    let lines = screen(&app);
+    let (_, header) = line_with(&lines, "ACCOUNT / MODEL");
+    let cost_end = header.find("COST").unwrap() + 4;
+    let share_at = header.find("SHARE").unwrap();
+    let (_, default) = line_with(&lines, "default ");
+    assert_eq!(default.find("$30.00+").unwrap() + 7, cost_end, "{default}");
+    // 30 of 40 dollars: 36 of 48 eighths.
+    assert_eq!(default[share_at..].trim_end(), "████▌");
+    let (_, work) = line_with(&lines, "codex:work");
+    assert_eq!(work.find("$10.00").unwrap() + 6, cost_end, "{work}");
+    assert_eq!(work[share_at..].trim_end(), "█▌");
+    let (_, unattributed) = line_with(&lines, "unattributed");
+    assert_eq!(squeezed(unattributed), "unattributed 8 0 0 9 17 -");
+    let (at, _) = line_with(&lines, "claude-small");
+    assert_eq!(squeezed(&lines[at]), "claude-small 30 0 0 5 35 $30.00");
+    // Model rows and Overall have no bar.
+    let (overall_at, overall) = line_with(&lines, "Overall");
+    assert_eq!(squeezed(overall), "Overall 1.5K 200 0 44 1.8K $40.00+");
+    for i in [at, at + 1, at + 4, at + 6, overall_at, overall_at + 1] {
+        assert!(!lines[i].contains(['█', '▌']), "{}", lines[i]);
+    }
+    let (note, text) = line_with(&lines, "not priced:");
+    assert_eq!(text.trim(), "not priced: claude-test");
+    assert_eq!(note, overall_at + 4, "last, after Overall");
+}
+
+/// R20: above the table, the period's cost over time: a bar per bucket, scaled to the largest
+/// (labeled), with the first and last bucket's dates; the tokens when nothing is priced; by
+/// week or month when the days do not fit; nothing without timestamps.
+#[test]
+fn stats_chart_draws_the_period_over_time() {
+    let mut app = stats_app();
+    update(&mut app, Event::Resize(80, 40));
+    let priced_overall = vec![priced(
+        model(CLAUDE, "claude-haiku-test", [30, 0, 0, 5, 0]),
+        79_000_000_000_000,
+    )];
+    let week = daily("2026-09-18T00:00:00Z", &[0, 1, 2, 4, 8, 16, 48], 10);
+    let show = |app: &mut App, overall: Vec<ModelRow>, series: Vec<stats::Bucket>| {
+        update(
+            app,
+            Event::Stats {
+                report: report_of(vec![], overall, series),
+                error: None,
+            },
+        );
+    };
+    show(&mut app, priced_overall.clone(), week.clone());
+    keys(&mut app, &[Key::Char('t'), Key::Char('t')]);
+    assert_eq!(app.stats.period, Period::Week);
+    let lines = screen(&app);
+    assert_eq!(lines[2].trim_end(), "Cost per day");
+    // 72 columns for 7 bars: 3 wide, 1 apart, after the 7-column label and the axis.
+    let bar = |row: usize, bucket: usize| -> String {
+        lines[3 + row]
+            .chars()
+            .skip(8 + 4 * bucket)
+            .take(3)
+            .collect()
+    };
+    let label = |line: &str| -> String { line.chars().take(8).collect() };
+    assert_eq!(label(&lines[3]), " $48.00│");
+    for row in 0..6 {
+        assert_eq!(bar(row, 6), "███", "{}", lines.join("\n"));
+        assert_eq!(bar(row, 0), "   ");
+        // $1 of $48 is 1 of 48 eighths.
+        assert_eq!(bar(row, 1), if row == 5 { "▁▁▁" } else { "   " });
+    }
+    // $16 of $48: 16 eighths, two full rows.
+    assert_eq!(
+        (0..6).map(|r| bar(r, 5)).collect::<Vec<_>>(),
+        ["   ", "   ", "   ", "   ", "███", "███"]
+    );
+    assert_eq!(lines[9].trim_end(), format!("       └{}", "─".repeat(28)));
+    assert_eq!(
+        lines[10].trim_end(),
+        format!("{}09-18{}09-24", " ".repeat(8), " ".repeat(17))
+    );
+    assert_eq!(lines[11].trim(), "");
+    assert!(lines[12].starts_with("ACCOUNT / MODEL"), "{}", lines[12]);
+
+    // Nothing priced: the tokens.
+    let unpriced = vec![model(CLAUDE, "claude-test", [30, 0, 0, 5, 0])];
+    let free: Vec<stats::Bucket> = week
+        .iter()
+        .map(|b| stats::Bucket {
+            cost: Cost::default(),
+            ..*b
+        })
+        .collect();
+    show(&mut app, unpriced.clone(), free);
+    let lines = screen(&app);
+    assert_eq!(lines[2].trim_end(), "Tokens per day (nothing priced)");
+    assert_eq!(label(&lines[3]), "     10│");
+
+    // All time, 400 days: by week at 80 columns, by month at 40.
+    keys(&mut app, &[Key::Char('t'), Key::Char('t')]);
+    assert_eq!(app.stats.period, Period::All);
+    show(
+        &mut app,
+        priced_overall,
+        daily("2025-08-21T00:00:00Z", &[1; 400], 10),
+    );
+    assert_eq!(screen(&app)[2].trim_end(), "Cost per week");
+    let lines = screen(&app);
+    let (_, labels) = line_with(&lines, "2025-");
+    assert!(labels.trim_end().ends_with("2026-09-21"), "{labels}");
+    update(&mut app, Event::Resize(40, 40));
+    let lines = screen(&app);
+    assert_eq!(lines[2].trim_end(), "Cost per month");
+    assert!(lines[10].contains("2026-09"), "{}", lines[10]);
+
+    // No timestamps: no chart.
+    update(&mut app, Event::Resize(80, 40));
+    show(&mut app, unpriced, vec![]);
+    let lines = screen(&app);
+    assert!(lines[2].starts_with("ACCOUNT / MODEL"), "{}", lines[2]);
+    assert!(!text(&app).contains(" per "));
+}
+
+/// R20: scrolled past the chart, the column header stays in view in place of the first line.
+#[test]
+fn stats_header_stays_when_scrolled_past_the_chart() {
+    let mut app = stats_app();
+    update(&mut app, Event::Resize(80, 16));
+    let mut report = stats_report();
+    for table in &mut report.tables {
+        table.series = daily("2026-09-24T00:00:00Z", &[1], 10);
+    }
+    update(
+        &mut app,
+        Event::Stats {
+            report,
+            error: None,
+        },
+    );
+    let (body, header_at) = render::stats_lines(&app, 80);
+    assert_eq!(header_at, Some(10));
+    let body: Vec<String> = body.iter().map(|l| squeezed(&l.to_string())).collect();
+    assert_eq!(body[0], "Cost per day");
+    for _ in 0..5 {
+        keys(&mut app, &[Key::Char('j')]);
+    }
+    let lines = screen(&app);
+    assert_eq!(squeezed(&lines[2]), body[5]);
+    assert_eq!(line_with(&lines, "ACCOUNT / MODEL").0, 7, "in its place");
+    for _ in 0..6 {
+        keys(&mut app, &[Key::Char('j')]);
+    }
+    assert_eq!(app.stats.scroll, 11);
+    let lines = screen(&app);
+    assert!(lines[2].starts_with("ACCOUNT / MODEL"), "{}", lines[2]);
+    assert_eq!(squeezed(&lines[3]), body[12]);
+    assert_eq!(body[12], "claude-test 8 1.2M 160 90 1.2M -");
 }
 
 // ---- Private mode (R21) --------------------------------------------------------------------
@@ -4493,7 +4765,21 @@ fn secret_app() -> App {
                                 vec![model(CLAUDE, "claude-test", [9, 0, 0, 9, 0])],
                             ),
                         ],
-                        overall: vec![model(CLAUDE, "claude-test", [22, 1_234_567, 160, 104, 0])],
+                        overall: vec![
+                            model(CLAUDE, "claude-test", [22, 1_234_567, 160, 104, 0]),
+                            priced(
+                                model(CLAUDE, "claude-haiku-test", [1, 0, 0, 1, 0]),
+                                12_340_000_000_000,
+                            ),
+                        ],
+                        series: vec![stats::Bucket {
+                            start: ts(NOW),
+                            tokens: Tokens::default(),
+                            cost: Cost {
+                                pico_usd: 12_340_000_000_000,
+                                unpriced_tokens: 0,
+                            },
+                        }],
                     })
                     .to_vec(),
                 files: 3,
@@ -4920,6 +5206,8 @@ fn private_mode_keeps_numbers_models_and_aliases() {
     let stats = text(&app);
     for shown in [
         "1.2M",
+        "$12.34",
+        "Cost per day",
         "claude-test",
         "gpt-test",
         "account-1",

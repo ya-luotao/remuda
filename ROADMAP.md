@@ -37,6 +37,7 @@ and planned work.
 | 2026-09-24 | Token statistics from transcripts, deduplicated by message id / cumulative total, own cache | The agents record exact usage per request; `message.id` and codex's cumulative total identify a request across repeated records, forks and relay copies. A row per request in `state/stats.json` keeps deduplication exact and needs no time zone; it stays out of `index.json`, which reads only head and tail windows (R20) |
 | 2026-09-24 | Private mode as a redacted snapshot of the TUI state | The screen is drawn from a copy of the state with names aliased and personal fields masked; every field is destructured, so a new one cannot reach the screen before it is decided how it is shown (R21) |
 | 2026-09-24 | Codex live usage and identity through `codex app-server`, only on explicit live queries; `list` keeps `codex login status` | `account/rateLimits/read` and `account/read` are machine-readable and codex reads its own credentials, so `auth.json` stays unread; but starting app-server is like launching Codex (it may refresh a token, uses the network, writes state into the home, takes about 1.5 s), so it runs only when live usage is asked for (R4, R10, R10a) |
+| 2026-09-24 | Cost as an estimate at API list prices: a built-in table with config.toml overrides, exact in picodollars | Most accounts are subscriptions, so list prices are the only comparable figure; a built-in table keeps remuda free of network requests and overrides cover new models and price changes; integer picodollars keep each request's cost exact, so sections add up to overall (R20) |
 
 ## Technology
 
@@ -58,8 +59,8 @@ and planned work.
 - **History**: all sessions in chronological order, fuzzy-searchable by title / cwd / account, with
   attribution.
 - **Preview**: the last few messages of the selected session.
-- **Stats**: tokens per account and model for a period, computed in the background the first time
-  the view opens (R20).
+- **Stats**: tokens per account and model for a period, with an estimated cost and a chart,
+  computed in the background the first time the view opens (R20).
 - **Private mode**: `Ctrl-P` hides names, emails, paths and session content for screenshots (R21).
 - Actions: start a new session in a directory with the selected account; resume the selected
   session (optionally under a different account); set up a new account; remove an account from the
@@ -109,8 +110,6 @@ so such a setup first moves `projects` to per-account stores.
 - Interact with running sessions through `messagingSocketPath`.
 - Relocate homes using `CLAUDE_SECURESTORAGE_CONFIG_DIR` (R2).
 - `--private` for command-line output (R21 covers the TUI only).
-- Cost estimates for the token statistics.
-- A daily chart of token usage.
 
 ## Known issues
 
