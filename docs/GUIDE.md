@@ -64,7 +64,12 @@ subcommands, `--help` or `--version`) with the source's configuration, injected 
 before your own arguments:
 
 - **Instructions:** `CLAUDE.md`, skills, commands and agents, through
-  `--add-dir=$REMUDA_HOME/shared/claude`, whose `.claude` entry is a symlink to the source home.
+  `--add-dir=$REMUDA_HOME/shared/claude`, whose `.claude` directory holds one symlink per item
+  the source home has (`CLAUDE.md`, `skills`, `commands`, `agents`), so a session reaches those
+  four items of the source and not the rest of its home. remuda keeps the links current before
+  each launch; a `.claude` from an earlier version, one link to the whole source home, is
+  migrated in place. Restart a remuda TUI that was started before upgrading: until then it
+  launches members without shared instructions, and says so.
 - **Settings:** the part of the source's `settings.json` that neither the account's own settings
   nor the project's `.claude/settings.json` and `.claude/settings.local.json` define, so the
   shared settings behave like user settings; identical hook entries are not added twice. They are

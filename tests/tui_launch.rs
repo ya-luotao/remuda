@@ -363,6 +363,11 @@ fn tui_launches_get_shared_configuration() {
         ]
     );
     assert_eq!(inv.add_dir_claude_md.as_deref(), Some("1"));
+    assert_eq!(
+        fs::read_link(shared.join(".claude/CLAUDE.md")).unwrap(),
+        source.join("CLAUDE.md"),
+        "the shared directory holds one link per item the source has"
+    );
     assert_eq!(sb.launches()[0]["shared"][0]["option"], json!("--add-dir"));
 
     // A registry that cannot be read now: the launch does not happen.

@@ -396,9 +396,9 @@ appeared in no `history.jsonl`.
 ## R12. Symlinks in homes
 
 - v1 detects symlinks in a home that point elsewhere and displays them as `-> <target>`.
-- v1 does not create, delete, or modify any symlink. Any future write operation that encounters a
-  symlink must either write through it or refuse; it must never replace the symlink with a private
-  copy.
+- v1 does not create, delete, or modify any symlink in a home (the item links remuda keeps under
+  `$REMUDA_HOME/shared/`, R18, are its own). Any future write operation that encounters a symlink
+  must either write through it or refuse; it must never replace the symlink with a private copy.
 - Configuration is shared without symlinks, by injection at launch (R18). Existing symlink layouts
   keep working and are detected so that nothing is injected twice.
 
@@ -587,20 +587,57 @@ by injecting launch options, so nothing is written into any home (R13), and home
 
   | Component | Skipped when | Injection |
   | --- | --- | --- |
-  | Instructions: `CLAUDE.md`, `skills/`, `commands/`, `agents/` | all four resolve to the source's | `--add-dir=$REMUDA_HOME/shared/claude` and `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` in the child environment |
+  | Instructions: `CLAUDE.md`, `skills/`, `commands/`, `agents/` | all four resolve to the source's | `--add-dir=$REMUDA_HOME/shared/claude` (whose `.claude/` holds one link per item of the source's four) and `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` in the child environment |
   | Settings | `settings.json` resolves to the source's | the part of the source's `settings.json` that neither the home nor the project defines, in the single `--settings` |
   | Plugins | `plugins/` resolves to the source's | `--plugin-dir=<install path>` for each plugin enabled in the source's settings |
   | Auto-memory | `projects/` resolves to the source's | `autoMemoryDirectory`, in the single `--settings` |
 
-- **Instructions.** `$REMUDA_HOME/shared/claude/` contains exactly one entry, a symlink `.claude`
-  pointing at the source home; remuda creates or corrects it before a launch that needs it. Basis
-  (verified on 2.1.281): with the environment variable set, `--add-dir=<dir>` loads
+- **Instructions.** `$REMUDA_HOME/shared/claude/.claude` is a directory in which remuda keeps
+  symlinks named `CLAUDE.md`, `skills`, `commands`, and `agents`, each pointing at that item of
+  the source home (`<source home>/<item>`, written from the home's path as registered, not
+  canonicalized; an existing link is compared with it as a path); an item the
+  source does not have (missing, or a dangling link) gets no entry. remuda brings the directory to
+  that state before a launch that needs it, and writes nothing when it already is: a missing link
+  is created, one with another target is replaced atomically (a temporary link in the same
+  directory, renamed into place), and one for an item the source no longer has is removed. An
+  entry named like an item that is not a symlink, or a `.claude` that is neither a directory nor
+  a symlink, is never replaced: nothing is changed, and the launch goes on without shared
+  instructions and says so. Nothing else in `shared/claude/` or in `.claude/` is touched.
+  A `.claude` that is a symlink (the earlier layout: one link to the whole source home) is
+  migrated in place: the directory is built under a temporary name in `shared/claude/`, the link
+  (only a link, never a directory or a file) is removed, and the directory is renamed into place.
+  A directory cannot be renamed over a symlink, so for an instant there is no `.claude`: a
+  remuda launch never misses it (it prepares `.claude` itself before starting claude), but a
+  session already running may not find the shared items if it reads them in that instant. When
+  two remudas migrate at the same time, the one whose rename finds a directory already in place
+  removes its own temporary directory and checks the items of the one in place; a temporary
+  directory is removed on every failure remuda sees. A process killed between removing the link
+  and the rename leaves no `.claude` (and an inert temporary directory, which is not touched)
+  until the next member launch creates it. A remuda from before this layout, still running,
+  refuses the directory ("is not a symlink") and launches without shared instructions, saying
+  so, until it is restarted. Residual, as for `shared/` and `shared/claude/` themselves: the
+  links are written by path, so a process of the same user that replaced `.claude` with a
+  symlink in the instant between remuda's check and its write could redirect that write; remuda
+  never creates such a symlink, and such a process can already write there itself.
+  Basis (verified on 2.1.282): with the environment variable set, `--add-dir=<dir>` loads
   `<dir>/.claude/CLAUDE.md` and the skills, commands, and agents under `<dir>/.claude/` with their
-  plain names, also through a `.claude` symlink; it does not load `<dir>/.claude/settings.json`.
-  Plugins were rejected for this component because plugin items are namespaced (`name:item`), which
-  would rename every agent and skill. Side effects, documented rather than prevented: tools may
-  access that directory like any `--add-dir`, and the variable also loads `CLAUDE.md` from other
-  `--add-dir` directories the user passes.
+  plain names, through per-item symlinks exactly as through a whole-home `.claude` symlink: a
+  skill that is itself a relative symlink inside the source's `skills/` loads, and a nested
+  command `commands/probe/nested.md` loads as `probe:nested`; it does not load
+  `<dir>/.claude/settings.json` (2.1.281). Plugins were rejected for this component because plugin
+  items are namespaced (`name:item`), which would rename every agent and skill. Why per-item links
+  (verified on 2.1.282, `-p`, default permission mode): through a whole-home link,
+  `<dir>/.claude/…` reached every file of the source home (transcripts, a leftover
+  `.credentials.json`), and Read, Grep, and Glob of such paths were refused pending permission
+  ("resolves through a symlink to <source>, which is outside the allowed working directories"),
+  the same as reading the source home directly; through per-item links,
+  `<dir>/.claude/.credentials.json`, `<dir>/.claude/projects/…`, and even
+  `<dir>/.claude/agents/../.credentials.json` do not exist (paths are normalized lexically), and
+  Glob and Grep of `<dir>/.claude` find nothing. claude grants silent access in neither layout;
+  the per-item layout bounds what one approved prompt can expose to the four items instead of the
+  whole source home, and does not depend on that check of claude's. Side effects, documented
+  rather than prevented: tools may access the four items like any `--add-dir`, and the variable
+  also loads `CLAUDE.md` from other `--add-dir` directories the user passes.
 - **Settings.** claude merges settings sources in the order user, project, local, flag, policy
   (lowest to highest; read from the 2.1.281 bundle), and `--settings` is the flag source: injected
   keys win over the home's own `settings.json` and over the project's `.claude/settings.json` and
@@ -986,8 +1023,9 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   new session), and its title names both: `Configuration · <account> · for <directory>`.
 - **The same plan as a launch.** What shared configuration adds (R18) is decided by the very
   step that decides a launch's injection for a new session in that directory, without the
-  launch's writes (the `.claude` link and the settings file), so the pane cannot disagree with a
-  launch. A settings file that would fail the launch (not a JSON object) is shown as a problem.
+  launch's writes (the `.claude` item links and the settings file), so the pane cannot disagree
+  with a launch. A settings file that would fail the launch (not a JSON object) is shown as a
+  problem.
 - **Origins.** Each item is tagged *own* (in the account's home), *shared from <source>*
   (injected at launch, R18), *already the source's* (the home's item, or a plugin's install,
   resolves by realpath to the source's, so nothing is injected for it, R12), or *not shared*

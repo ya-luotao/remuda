@@ -1,7 +1,8 @@
 //! Shared configuration, injected at launch (SPEC R18): a claude account gets the source
 //! account's instructions, settings, enabled plugins and auto-memory location as launch
-//! options. Nothing is written into any home (R13); remuda keeps only the `.claude` symlink in
-//! `$REMUDA_HOME/shared/claude/` and the injected settings in `$REMUDA_HOME/state/settings/`.
+//! options. Nothing is written into any home (R13); remuda keeps only the item links under
+//! `$REMUDA_HOME/shared/claude/.claude/` and the injected settings in
+//! `$REMUDA_HOME/state/settings/`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -284,7 +285,7 @@ pub fn plan(
     Ok(plan)
 }
 
-/// The writes of [`inject`] for `plan` (R18): the `.claude` link next to `config` when
+/// The writes of [`inject`] for `plan` (R18): the `.claude` item links next to `config` when
 /// instructions are injected, and the settings file. What cannot be made is left out of the
 /// launch, with a notice.
 pub fn apply(plan: &Plan, config: &Path) -> Result<Shared> {
@@ -294,7 +295,7 @@ pub fn apply(plan: &Plan, config: &Path) -> Result<Shared> {
     };
     if plan.instructions.needs_injection() {
         let shared_dir = dir(config);
-        match ensure_link(&shared_dir, from) {
+        match ensure_links(&shared_dir, from) {
             Ok(()) => {
                 shared
                     .args
@@ -700,32 +701,175 @@ pub fn instructions(source: &Path, home: &Path) -> Instructions {
     out
 }
 
-/// Makes `<dir>/.claude` a symlink to `source` (R18): created when missing, replaced
-/// atomically when it points elsewhere; nothing else in `dir` is touched, and an entry that is
-/// not a symlink is never replaced.
-pub fn ensure_link(dir: &Path, source: &Path) -> Result<()> {
-    let link = dir.join(".claude");
-    match fs::symlink_metadata(&link) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            if fs::read_link(&link).is_ok_and(|target| target == source) {
-                return Ok(());
+/// Makes `<dir>/.claude` a directory holding exactly one symlink per instruction item the
+/// source has ([`INSTRUCTIONS`]), each pointing at `<source>/<item>` (R18). When it already
+/// is, nothing is written. Inside an existing directory, a missing link is created, one with
+/// another target is replaced atomically, and one for an item the source no longer has is
+/// removed; an entry that is not a symlink is never replaced, and then nothing is changed.
+/// Nothing else in `dir` or in `.claude` is touched. A `.claude` that is a symlink (the
+/// earlier layout, a link to the whole source home) is migrated: the directory is built under
+/// a temporary name in `dir`, the link is removed, and the directory is renamed into place.
+pub fn ensure_links(dir: &Path, source: &Path) -> Result<()> {
+    let root = dir.join(".claude");
+    let old_link = match fs::symlink_metadata(&root) {
+        Ok(meta) if meta.file_type().is_dir() => return fill(&root, source),
+        Ok(meta) if meta.file_type().is_symlink() => true,
+        Ok(_) => bail!(
+            "{} is neither a directory nor a symlink; remuda does not replace it",
+            root.display()
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", root.display())),
+    };
+
+    fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    let staged = Staged::build(dir, source)?;
+    if old_link {
+        // Only a symlink is removed, checked again right before: a concurrent remuda may have
+        // put the directory in place already (then nothing is removed) and a directory or a
+        // file is never removed.
+        match fs::symlink_metadata(&root) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if let Err(e) = fs::remove_file(&root)
+                    && e.kind() != io::ErrorKind::NotFound
+                {
+                    return match fs::symlink_metadata(&root) {
+                        Ok(meta) if meta.file_type().is_dir() => fill(&root, source),
+                        _ => Err(e).with_context(|| format!("cannot remove {}", root.display())),
+                    };
+                }
+            }
+            Ok(_) | Err(_) => {}
+        }
+    }
+    // A directory cannot be renamed over a symlink or a file; over a directory only when it
+    // is empty. On failure, the reason is read from what is there now, not from the errno
+    // (which differs between systems): a directory means another remuda won the race, and
+    // its items are checked instead.
+    match fs::rename(&staged.path, &root) {
+        Ok(()) => {
+            staged.commit();
+            Ok(())
+        }
+        Err(e) => match fs::symlink_metadata(&root) {
+            Ok(meta) if meta.file_type().is_dir() => {
+                drop(staged);
+                fill(&root, source)
+            }
+            _ => {
+                drop(staged);
+                Err(e).with_context(|| format!("cannot create {}", root.display()))
+            }
+        },
+    }
+}
+
+/// The item links of `source` under `root` (an existing `.claude` directory), changed only
+/// where they differ: decided for all four items first, so an entry that is not a symlink
+/// fails before anything is written, and a directory that is already right gets no write.
+fn fill(root: &Path, source: &Path) -> Result<()> {
+    enum Action {
+        Create,
+        Remove,
+    }
+    let mut actions = Vec::new();
+    for item in INSTRUCTIONS {
+        let link = root.join(item);
+        let target = source.join(item);
+        let wanted = fs::metadata(&target).is_ok();
+        match fs::symlink_metadata(&link) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if !wanted {
+                    actions.push((link, target, Action::Remove));
+                } else if fs::read_link(&link).ok().as_deref() != Some(target.as_path()) {
+                    actions.push((link, target, Action::Create));
+                }
+            }
+            Ok(_) => bail!(
+                "{} is not a symlink; remuda does not replace it",
+                link.display()
+            ),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if wanted {
+                    actions.push((link, target, Action::Create));
+                }
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("cannot inspect {}", link.display()));
             }
         }
-        Ok(_) => bail!(
-            "{} is not a symlink; remuda does not replace it",
-            link.display()
-        ),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", link.display())),
     }
-    fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    let tmp = dir.join(format!(".claude.{}.tmp", uuid::Uuid::new_v4().simple()));
-    symlink(source, &tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
-    if let Err(e) = fs::rename(&tmp, &link) {
+    for (link, target, action) in actions {
+        match action {
+            Action::Create => place_link(&target, &link)?,
+            Action::Remove => {
+                // Checked again right before: never anything but a symlink.
+                if fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink())
+                    && let Err(e) = fs::remove_file(&link)
+                    && e.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(e).with_context(|| format!("cannot remove {}", link.display()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A symlink to `target` at `link`, created or replaced atomically: a temporary link in the
+/// same directory, renamed into place.
+fn place_link(target: &Path, link: &Path) -> Result<()> {
+    let name = link.file_name().and_then(|n| n.to_str()).unwrap_or("link");
+    let tmp = link.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    symlink(target, &tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
+    if let Err(e) = fs::rename(&tmp, link) {
         let _ = fs::remove_file(&tmp);
         return Err(e).with_context(|| format!("cannot create {}", link.display()));
     }
     Ok(())
+}
+
+/// A `.claude` directory built under a temporary name, removed again when dropped without
+/// [`Staged::commit`]: every error path after it exists cleans it up.
+struct Staged {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl Staged {
+    /// `<dir>/.claude.<uuid>.tmp` holding a link for each item `source` has.
+    fn build(dir: &Path, source: &Path) -> Result<Staged> {
+        let path = dir.join(format!(".claude.{}.tmp", uuid::Uuid::new_v4().simple()));
+        fs::create_dir(&path).with_context(|| format!("cannot create {}", path.display()))?;
+        let staged = Staged {
+            path,
+            committed: false,
+        };
+        for item in INSTRUCTIONS {
+            let target = source.join(item);
+            if fs::metadata(&target).is_ok() {
+                let link = staged.path.join(item);
+                symlink(&target, &link)
+                    .with_context(|| format!("cannot create {}", link.display()))?;
+            }
+        }
+        Ok(staged)
+    }
+
+    /// The directory has been renamed into place: nothing to remove.
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Only what `build` created: a directory of symlinks, which are unlinked, not
+            // followed.
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 /// Opens `path` for reading only when it is a regular file (symlinks followed): a FIFO or a
@@ -1125,7 +1269,7 @@ fn resolve(base: &Path, p: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     use serde_json::json;
 
@@ -1482,31 +1626,346 @@ mod tests {
         assert!(enabled_plugins(&map(json!({"enabledPlugins": []}))).is_empty());
     }
 
-    /// R18: `.claude` is created, left alone when right, replaced when it points elsewhere,
-    /// and never replaced when it is not a symlink; other entries are not touched.
-    #[test]
-    fn the_shared_link_is_created_and_corrected() {
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("remuda/shared/claude");
-        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
-        ensure_link(&shared, &a).unwrap();
-        assert_eq!(fs::read_link(shared.join(".claude")).unwrap(), a);
-        ensure_link(&shared, &a).unwrap();
-        fs::write(shared.join("other"), "mine").unwrap();
-        ensure_link(&shared, &b).unwrap();
-        assert_eq!(fs::read_link(shared.join(".claude")).unwrap(), b);
-        let mut names: Vec<String> = fs::read_dir(&shared)
+    /// Sorted entry names of a directory.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         names.sort();
-        assert_eq!(names, [".claude", "other"]);
+        names
+    }
 
-        fs::remove_file(shared.join(".claude")).unwrap();
-        fs::create_dir(shared.join(".claude")).unwrap();
-        let e = ensure_link(&shared, &a).unwrap_err().to_string();
-        assert!(e.contains("is not a symlink"), "{e}");
-        assert!(shared.join(".claude").is_dir());
+    /// The item links under `<shared>/.claude`, as `(name, target)`, in item order.
+    fn links(shared: &Path) -> Vec<(&'static str, PathBuf)> {
+        let root = shared.join(".claude");
+        assert!(
+            fs::symlink_metadata(&root).unwrap().file_type().is_dir(),
+            "{} is a directory",
+            root.display()
+        );
+        INSTRUCTIONS
+            .into_iter()
+            .filter_map(|item| {
+                let link = root.join(item);
+                let meta = fs::symlink_metadata(&link).ok()?;
+                assert!(meta.file_type().is_symlink(), "{}", link.display());
+                Some((item, fs::read_link(&link).unwrap()))
+            })
+            .collect()
+    }
+
+    /// Every entry of `dir`, recursively, with its type and link target: a snapshot to prove
+    /// a tree was not touched.
+    fn tree(dir: &Path) -> Vec<(PathBuf, String)> {
+        let mut out = Vec::new();
+        for name in names(dir) {
+            let path = dir.join(&name);
+            let meta = fs::symlink_metadata(&path).unwrap();
+            let kind = if meta.file_type().is_symlink() {
+                format!("-> {}", fs::read_link(&path).unwrap().display())
+            } else if meta.is_dir() {
+                out.extend(tree(&path));
+                "dir".to_string()
+            } else {
+                format!("file {}", meta.len())
+            };
+            out.push((path, kind));
+        }
+        out.sort();
+        out
+    }
+
+    /// A source home with `CLAUDE.md`, `skills` and `agents` (no `commands`), plus a file
+    /// that must never be reachable through the shared directory.
+    fn source_home(root: &Path, name: &str) -> PathBuf {
+        let home = root.join(name);
+        fs::create_dir_all(home.join("skills/review")).unwrap();
+        fs::create_dir_all(home.join("agents")).unwrap();
+        fs::write(home.join("CLAUDE.md"), "be brief").unwrap();
+        fs::write(home.join(".credentials.json"), "secret").unwrap();
+        home
+    }
+
+    /// R18, R13: `.claude` is a directory of one link per item the source has, pointing at
+    /// the source's path as registered; a second call writes nothing at all; the links follow
+    /// the source when it changes, and one for an item the source lost is removed. Other
+    /// entries in `shared/claude` and in `.claude` are never touched.
+    #[test]
+    fn the_item_links_are_created_and_kept_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("remuda/shared/claude");
+        let a = source_home(dir.path(), "a");
+        ensure_links(&shared, &a).unwrap();
+        assert_eq!(
+            links(&shared),
+            [
+                ("CLAUDE.md", a.join("CLAUDE.md")),
+                ("skills", a.join("skills")),
+                ("agents", a.join("agents")),
+            ]
+        );
+        assert_eq!(names(&shared), [".claude"]);
+        assert_eq!(
+            names(&shared.join(".claude")),
+            ["CLAUDE.md", "agents", "skills"]
+        );
+
+        // Already right: no write (same inodes and mtimes, no temporary entry).
+        let stamp = |path: &Path| {
+            let m = fs::symlink_metadata(path).unwrap();
+            (m.ino(), m.modified().unwrap())
+        };
+        let root = shared.join(".claude");
+        let before: Vec<_> = [
+            ".claude",
+            ".claude/CLAUDE.md",
+            ".claude/skills",
+            ".claude/agents",
+        ]
+        .iter()
+        .map(|p| stamp(&shared.join(p)))
+        .collect();
+        std::thread::sleep(Duration::from_millis(20));
+        ensure_links(&shared, &a).unwrap();
+        let after: Vec<_> = [
+            ".claude",
+            ".claude/CLAUDE.md",
+            ".claude/skills",
+            ".claude/agents",
+        ]
+        .iter()
+        .map(|p| stamp(&shared.join(p)))
+        .collect();
+        assert_eq!(before, after);
+        assert_eq!(names(&shared), [".claude"]);
+
+        // Another source: retargeted; an item the new source lacks loses its link, one it has
+        // gains one. Entries remuda does not own stay.
+        fs::write(shared.join("notes"), "mine").unwrap();
+        fs::write(root.join("settings.json"), "{}").unwrap();
+        let b = source_home(dir.path(), "b");
+        fs::remove_dir(b.join("agents")).unwrap();
+        fs::create_dir(b.join("commands")).unwrap();
+        ensure_links(&shared, &b).unwrap();
+        assert_eq!(
+            links(&shared),
+            [
+                ("CLAUDE.md", b.join("CLAUDE.md")),
+                ("skills", b.join("skills")),
+                ("commands", b.join("commands")),
+            ]
+        );
+        assert_eq!(names(&shared), [".claude", "notes"]);
+        assert_eq!(
+            names(&root),
+            ["CLAUDE.md", "commands", "settings.json", "skills"]
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("settings.json")).unwrap(),
+            "{}"
+        );
+        assert_eq!(fs::read_to_string(shared.join("notes")).unwrap(), "mine");
+
+        // A dangling source item counts as absent; the registered path is used, not the
+        // canonical one.
+        fs::remove_file(b.join("CLAUDE.md")).unwrap();
+        symlink("/nowhere", b.join("CLAUDE.md")).unwrap();
+        let via = dir.path().join("via");
+        symlink(&b, &via).unwrap();
+        ensure_links(&shared, &via).unwrap();
+        assert_eq!(
+            links(&shared),
+            [
+                ("skills", via.join("skills")),
+                ("commands", via.join("commands")),
+            ]
+        );
+    }
+
+    /// R18: a `.claude` that is a symlink to the whole source home (the earlier layout) is
+    /// migrated in place to the directory of item links, whatever it pointed at; the source
+    /// home and the other entries of `shared/claude` are untouched, and no temporary
+    /// directory is left behind.
+    #[test]
+    fn the_whole_home_link_is_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("remuda/shared/claude");
+        let a = source_home(dir.path(), "a");
+        for old in [a.clone(), PathBuf::from("/elsewhere")] {
+            let _ = fs::remove_dir_all(shared.join(".claude"));
+            let _ = fs::remove_file(shared.join(".claude"));
+            fs::create_dir_all(&shared).unwrap();
+            symlink(&old, shared.join(".claude")).unwrap();
+            fs::write(shared.join("notes"), "mine").unwrap();
+            let source_before = tree(&a);
+            ensure_links(&shared, &a).unwrap();
+            assert_eq!(
+                links(&shared),
+                [
+                    ("CLAUDE.md", a.join("CLAUDE.md")),
+                    ("skills", a.join("skills")),
+                    ("agents", a.join("agents")),
+                ],
+                "from {}",
+                old.display()
+            );
+            assert_eq!(names(&shared), [".claude", "notes"]);
+            assert_eq!(tree(&a), source_before);
+            assert!(!shared.join(".claude/.credentials.json").exists());
+        }
+    }
+
+    /// R18: an entry that is not a symlink is never replaced: an item inside `.claude` fails
+    /// before anything else is changed, and a `.claude` that is neither a directory nor a
+    /// symlink fails too; an unwritable `shared/claude` fails without leaving anything.
+    #[test]
+    fn entries_that_are_not_links_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("remuda/shared/claude");
+        let a = source_home(dir.path(), "a");
+        let root = shared.join(".claude");
+
+        // A regular file where an item link would go, another item's link wrong: nothing
+        // is created or corrected.
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("CLAUDE.md"), "copied").unwrap();
+        symlink("/old/skills", root.join("skills")).unwrap();
+        let before = tree(&shared);
+        let e = ensure_links(&shared, &a).unwrap_err().to_string();
+        assert!(e.contains("CLAUDE.md is not a symlink"), "{e}");
+        assert_eq!(tree(&shared), before);
+
+        // A directory named like an item.
+        fs::remove_file(root.join("CLAUDE.md")).unwrap();
+        fs::create_dir(root.join("agents")).unwrap();
+        let before = tree(&shared);
+        let e = ensure_links(&shared, &a).unwrap_err().to_string();
+        assert!(e.contains("agents is not a symlink"), "{e}");
+        assert_eq!(tree(&shared), before);
+
+        // `.claude` itself a regular file.
+        fs::remove_dir_all(&root).unwrap();
+        fs::write(&root, "what").unwrap();
+        let e = ensure_links(&shared, &a).unwrap_err().to_string();
+        assert!(
+            e.contains("neither a directory nor a symlink; remuda does not replace it"),
+            "{e}"
+        );
+        assert_eq!(fs::read_to_string(&root).unwrap(), "what");
+        assert_eq!(names(&shared), [".claude"]);
+
+        // `shared/claude` unwritable: the build fails and leaves no temporary directory,
+        // whether `.claude` is missing or the old link.
+        fs::remove_file(&root).unwrap();
+        for old in [None, Some(&a)] {
+            if let Some(old) = old {
+                symlink(old, &root).unwrap();
+            }
+            let before = tree(&shared);
+            fs::set_permissions(&shared, fs::Permissions::from_mode(0o555)).unwrap();
+            let result = ensure_links(&shared, &a);
+            fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+            let e = result.unwrap_err().to_string();
+            assert!(e.contains("cannot create"), "{e}");
+            assert_eq!(tree(&shared), before);
+            let _ = fs::remove_file(&root);
+        }
+    }
+
+    /// R18: launches that migrate the same whole-home link, or create the directory, at the
+    /// same time all succeed and leave one correct directory and no temporary one: the loser
+    /// of the rename removes its own build and checks the winner's items.
+    #[test]
+    fn concurrent_launches_agree_on_the_links() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("remuda/shared/claude");
+        let a = source_home(dir.path(), "a");
+        for round in 0..20 {
+            let _ = fs::remove_dir_all(shared.join(".claude"));
+            fs::create_dir_all(&shared).unwrap();
+            if round % 2 == 0 {
+                symlink(&a, shared.join(".claude")).unwrap();
+            }
+            let barrier = Arc::new(Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let (shared, a, barrier) = (shared.clone(), a.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        ensure_links(&shared, &a)
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join()
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("round {round}: {e:#}"));
+            }
+            assert_eq!(
+                links(&shared),
+                [
+                    ("CLAUDE.md", a.join("CLAUDE.md")),
+                    ("skills", a.join("skills")),
+                    ("agents", a.join("agents")),
+                ],
+                "round {round}"
+            );
+            assert_eq!(names(&shared), [".claude"], "round {round}");
+            assert_eq!(
+                names(&shared.join(".claude")),
+                ["CLAUDE.md", "agents", "skills"],
+                "round {round}"
+            );
+        }
+    }
+
+    /// R18: the staged directory is removed when it is dropped without being renamed into
+    /// place, so no error path after it exists leaves it behind; its links are unlinked, not
+    /// followed.
+    #[test]
+    fn a_staged_directory_is_removed_unless_committed() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        let a = source_home(dir.path(), "a");
+        let source_before = tree(&a);
+        let staged = Staged::build(&shared, &a).unwrap();
+        let path = staged.path.clone();
+        assert!(path.starts_with(&shared) && path.is_dir());
+        assert_eq!(names(&path), ["CLAUDE.md", "agents", "skills"]);
+        drop(staged);
+        assert!(!path.exists());
+        assert_eq!(names(&shared), Vec::<String>::new());
+        assert_eq!(tree(&a), source_before);
+
+        let staged = Staged::build(&shared, &a).unwrap();
+        let path = staged.path.clone();
+        staged.commit();
+        assert!(path.is_dir());
+    }
+
+    /// R18: a process killed between removing the old link and the rename leaves no `.claude`
+    /// and a stale temporary directory; the next launch creates `.claude` and leaves the stale
+    /// directory alone.
+    #[test]
+    fn a_migration_killed_midway_is_completed_by_the_next_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        let a = source_home(dir.path(), "a");
+        let stale = Staged::build(&shared, &a).unwrap();
+        let stale_path = stale.path.clone();
+        stale.commit();
+        let stale_before = tree(&stale_path);
+        assert!(!shared.join(".claude").exists());
+        ensure_links(&shared, &a).unwrap();
+        assert_eq!(
+            names(&shared.join(".claude")),
+            ["CLAUDE.md", "agents", "skills"]
+        );
+        assert_eq!(tree(&stale_path), stale_before);
     }
 
     /// R11, R18: only the items the source has count; an item that resolves to the source's
@@ -1590,8 +2049,8 @@ mod tests {
         assert_eq!(got.env, [(CLAUDE_MD_VAR.to_string(), "1".to_string())]);
         assert_eq!(got.notices, Vec::<String>::new());
         assert_eq!(
-            fs::read_link(shared_dir.join(".claude")).unwrap(),
-            source_home
+            links(&shared_dir),
+            [("CLAUDE.md", source_home.join("CLAUDE.md"))]
         );
         let logged = got.logged();
         assert_eq!(logged[0].option, "--add-dir");

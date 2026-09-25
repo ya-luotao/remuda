@@ -121,6 +121,10 @@ so such a setup first moves `projects` to per-account stores.
   `skills/`, and `commands/` are still opened when they are symlinks pointing outside it, which
   can reveal at most top-level key names or frontmatter. Low risk, since a plugin can already run
   hooks as the user; a follow-up is to confine them the same way.
+- A member that shares some but not all of `CLAUDE.md`, `skills`, `commands`, `agents` with the
+  source through symlinks gets all four through `--add-dir`, so the ones it already shares load
+  twice (R11 warns). A follow-up is to link, per member, only the items it does not share (one
+  link set per combination under `$REMUDA_HOME/shared/claude/`).
 
 ## Open questions
 

@@ -52,6 +52,16 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   and weekly windows show as Session and Week, per-model limits by name, on the same timeline as
   Claude's. The live query also shows a Codex account's email and plan.
 
+### Changed
+
+- Shared instructions (SPEC R18) are exposed through per-item links:
+  `$REMUDA_HOME/shared/claude/.claude` is now a directory holding one symlink each to the source
+  home's `CLAUDE.md`, `skills`, `commands` and `agents` (for the items the source has), instead
+  of one symlink to the whole source home, so a member session's `--add-dir` reaches those four
+  items and not the source's transcripts or credentials. An existing whole-home link is migrated
+  in place at the next member launch; a remuda started before the upgrade and still running
+  launches members without shared instructions (and says so) until it is restarted.
+
 ### Fixed
 
 - TUI: identity and usage results no longer land on another account's row when the account list

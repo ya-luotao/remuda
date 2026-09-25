@@ -132,7 +132,7 @@ Remuda keeps its files under `$REMUDA_HOME`, which defaults to `~/.remuda`:
 $REMUDA_HOME/
 ├── config.toml                    account registry; the single source of truth
 ├── homes/<provider>/<name>/       homes created by `remuda setup`
-├── shared/claude/.claude          symlink to the shared configuration's source home
+├── shared/claude/.claude          links to the source's CLAUDE.md, agents, skills and commands
 └── state/                         caches (index, stats, launch log, shared settings); safe to delete
 ```
 

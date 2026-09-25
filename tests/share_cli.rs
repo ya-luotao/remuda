@@ -3,7 +3,7 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -122,6 +122,56 @@ fn memory_of(source: &Path, root: &Path) -> String {
     format!("{}/projects/{project}/memory", source.display())
 }
 
+/// Sorted entry names of a directory.
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The item links under `<shared>/.claude` (R18), as `(name, target)`, in remuda's item order.
+fn item_links(shared: &Path) -> Vec<(&'static str, PathBuf)> {
+    let root = shared.join(".claude");
+    assert!(
+        fs::symlink_metadata(&root).unwrap().file_type().is_dir(),
+        "{} is a directory",
+        root.display()
+    );
+    ["CLAUDE.md", "skills", "commands", "agents"]
+        .into_iter()
+        .filter_map(|item| {
+            let link = root.join(item);
+            let meta = fs::symlink_metadata(&link).ok()?;
+            assert!(meta.file_type().is_symlink(), "{}", link.display());
+            Some((item, fs::read_link(&link).unwrap()))
+        })
+        .collect()
+}
+
+/// Every entry under `dir`, recursively, with its type and link target: a snapshot to prove a
+/// tree was not touched.
+fn tree(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    for name in names(dir) {
+        let path = dir.join(&name);
+        let meta = fs::symlink_metadata(&path).unwrap();
+        let kind = if meta.file_type().is_symlink() {
+            format!("-> {}", fs::read_link(&path).unwrap().display())
+        } else if meta.is_dir() {
+            out.extend(tree(&path));
+            "dir".to_string()
+        } else {
+            format!("file {}", meta.len())
+        };
+        out.push((path, kind));
+    }
+    out.sort();
+    out
+}
+
 fn injected(inv: &Invocation) -> Vec<&String> {
     inv.args
         .iter()
@@ -163,9 +213,13 @@ fn a_member_session_gets_the_source_configuration_before_its_arguments() {
     assert_eq!(inv.add_dir_claude_md.as_deref(), Some("1"));
     assert_eq!(inv.config_dir.as_deref(), Some(s.max.to_str().unwrap()));
     assert_eq!(
-        fs::read_link(shared_dir.join(".claude")).unwrap(),
-        s.source,
-        "$REMUDA_HOME/shared/claude/.claude -> the source home"
+        item_links(&shared_dir),
+        [
+            ("CLAUDE.md", s.source.join("CLAUDE.md")),
+            ("skills", s.source.join("skills")),
+            ("agents", s.source.join("agents")),
+        ],
+        "$REMUDA_HOME/shared/claude/.claude holds one link per item the source has"
     );
 
     let log = s.sb.launches();
@@ -405,36 +459,113 @@ fn a_settings_file_that_is_not_an_object_fails_the_launch() {
     assert!(!s.sb.launch_log().exists());
 }
 
-/// R18: `$REMUDA_HOME/shared/claude/.claude` is corrected when it points elsewhere; nothing
-/// else there is touched.
+/// R18: a `$REMUDA_HOME/shared/claude/.claude` from before, one symlink to the whole source
+/// home, is migrated by a member's launch to the directory of item links; the source home
+/// and the other entries of `shared/claude` are not touched, and nothing temporary is left.
 #[test]
-fn the_shared_link_is_corrected() {
+fn the_old_whole_home_link_is_migrated() {
     let s = shared();
     let dir = s.shared_dir();
     fs::create_dir_all(&dir).unwrap();
-    symlink("/elsewhere", dir.join(".claude")).unwrap();
+    symlink(&s.source, dir.join(".claude")).unwrap();
     fs::write(dir.join("notes"), "mine").unwrap();
-    s.run(&["max"]);
-    assert_eq!(fs::read_link(dir.join(".claude")).unwrap(), s.source);
+    let source_before = tree(&s.source);
+    let inv = s.run(&["max"]);
+    assert_eq!(inv.args[0], format!("--add-dir={}", dir.display()));
+    assert_eq!(inv.add_dir_claude_md.as_deref(), Some("1"));
+    assert_eq!(
+        item_links(&dir),
+        [
+            ("CLAUDE.md", s.source.join("CLAUDE.md")),
+            ("skills", s.source.join("skills")),
+            ("agents", s.source.join("agents")),
+        ]
+    );
+    assert_eq!(names(&dir), [".claude", "notes"]);
+    assert_eq!(
+        names(&dir.join(".claude")),
+        ["CLAUDE.md", "agents", "skills"]
+    );
     assert_eq!(fs::read_to_string(dir.join("notes")).unwrap(), "mine");
+    assert_eq!(tree(&s.source), source_before);
+    assert!(!dir.join(".claude/settings.json").exists());
+    assert!(!dir.join(".claude/projects").exists());
 }
 
-/// R18: `.claude` that is not a symlink is left alone: the launch goes on without
-/// instructions, and says why.
+/// R18: a link with another target is corrected and a link the source has no item for is
+/// removed, when a member launches; a `.claude` that is already right is not rewritten.
+#[test]
+fn the_item_links_are_corrected() {
+    let s = shared();
+    let root = s.shared_dir().join(".claude");
+    fs::create_dir_all(&root).unwrap();
+    symlink("/elsewhere/CLAUDE.md", root.join("CLAUDE.md")).unwrap();
+    symlink(s.source.join("commands"), root.join("commands")).unwrap();
+    s.run(&["max"]);
+    assert_eq!(
+        item_links(&s.shared_dir()),
+        [
+            ("CLAUDE.md", s.source.join("CLAUDE.md")),
+            ("skills", s.source.join("skills")),
+            ("agents", s.source.join("agents")),
+        ]
+    );
+    let stamp = |name: &str| {
+        let m = fs::symlink_metadata(root.join(name)).unwrap();
+        (m.ino(), m.modified().unwrap())
+    };
+    let before: Vec<_> = ["", "CLAUDE.md", "skills", "agents"]
+        .iter()
+        .map(|n| stamp(n))
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    s.sb.remuda().args(["run", "max"]).assert().success();
+    assert_eq!(s.sb.invocations().len(), 2);
+    let after: Vec<_> = ["", "CLAUDE.md", "skills", "agents"]
+        .iter()
+        .map(|n| stamp(n))
+        .collect();
+    assert_eq!(before, after, "nothing rewritten when already right");
+    assert_eq!(names(&s.shared_dir()), [".claude"]);
+}
+
+/// R18: an entry that is not a symlink is left alone, whether it is an item inside `.claude`
+/// or `.claude` itself: the launch goes on without instructions, and says why.
 #[test]
 fn a_shared_entry_that_is_not_a_link_is_left_alone() {
     let s = shared();
     let dir = s.shared_dir();
-    fs::create_dir_all(dir.join(".claude")).unwrap();
+    let root = dir.join(".claude");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("CLAUDE.md"), "a copy").unwrap();
     s.sb.remuda()
         .args(["run", "max"])
         .assert()
         .success()
-        .stderr(predicate::str::contains("is not a symlink"));
+        .stderr(predicate::str::contains(
+            "CLAUDE.md is not a symlink; remuda does not replace it",
+        ));
     let inv = s.sb.only_invocation();
     assert_eq!(inv.add_dir_claude_md, None);
+    assert!(!inv.args[0].starts_with("--add-dir="), "{:?}", inv.args);
     assert!(settings_of(&inv.args).is_some());
-    assert!(dir.join(".claude").is_dir());
+    assert_eq!(
+        fs::read_to_string(root.join("CLAUDE.md")).unwrap(),
+        "a copy"
+    );
+    assert_eq!(names(&root), ["CLAUDE.md"], "nothing else was created");
+
+    fs::remove_dir_all(&root).unwrap();
+    fs::write(&root, "what").unwrap();
+    s.sb.remuda()
+        .args(["run", "max"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "is neither a directory nor a symlink; remuda does not replace it",
+        ));
+    assert_eq!(fs::read_to_string(&root).unwrap(), "what");
+    assert_eq!(names(&dir), [".claude"]);
 }
 
 fn git(dir: &Path, args: &[&str]) {
