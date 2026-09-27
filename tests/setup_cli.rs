@@ -186,3 +186,26 @@ fn setup_refuses_relative_remuda_home() {
     assert!(!sb.work().join("rel").exists());
     assert!(sb.invocations().is_empty());
 }
+
+/// R3, R14, R23: `setup` refuses, before creating anything, an account that would leave the
+/// registry invalid (a bare name in `[pick]` becoming ambiguous).
+#[test]
+fn setup_refuses_a_name_that_would_leave_the_config_invalid() {
+    let sb = Sandbox::new();
+    let personal = sb.make_claude_home("h/personal");
+    sb.write_config(&format!(
+        "[[account]]\nprovider = \"claude\"\nname = \"personal\"\nhome = \"{}\"\n\n\
+         [pick]\nexclude = [\"personal\"]\n",
+        personal.display()
+    ));
+    let before = sb.read_config();
+    sb.remuda()
+        .args(["setup", "--provider", "codex", "personal"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "adding codex:personal would leave",
+        ));
+    assert_eq!(sb.read_config(), before);
+    assert!(!sb.remuda_home().join("homes/codex/personal").exists());
+}

@@ -1,6 +1,7 @@
-//! Running short, non-interactive agent commands for an account: output captured, stdin
-//! closed (or, for JSON-RPC over stdio, held open until the answers arrived), bounded by a
-//! timeout (R4, R7, R10, R10a).
+//! Running short, non-interactive commands: agent commands for an account, with output
+//! captured, stdin closed (or, for JSON-RPC over stdio, held open until the answers arrived),
+//! bounded by a timeout (R4, R7, R10, R10a); and `curl` for `remuda pick`'s one request, fed its
+//! configuration on stdin (R23).
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -85,9 +86,30 @@ pub fn run_captured_with(
     changes: &[EnvChange],
     timeout: Duration,
 ) -> Outcome {
+    run(program, args, changes, None, timeout)
+}
+
+/// Runs `program args...` with the inherited environment, `stdin` written to its standard input
+/// (on a thread, then closed) and stdout/stderr captured, like [`run_captured`]. For `curl -K -`,
+/// which reads its configuration, and so the request's secrets, from there (R23).
+pub fn run_with_stdin(program: &Path, args: &[&str], stdin: &[u8], timeout: Duration) -> Outcome {
+    run(program, args, &[], Some(stdin), timeout)
+}
+
+fn run(
+    program: &Path,
+    args: &[&str],
+    changes: &[EnvChange],
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+) -> Outcome {
     let mut cmd = Command::new(program);
     cmd.args(args)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for change in changes {
@@ -97,6 +119,15 @@ pub fn run_captured_with(
         Ok(child) => child,
         Err(e) => return Outcome::SpawnFailed(e.to_string()),
     };
+    if let (Some(mut pipe), Some(input)) = (child.stdin.take(), stdin) {
+        // A thread, so that a child that does not read everything cannot block this one; an
+        // error (EPIPE from a child that exited early) shows in its exit status. Dropping the
+        // pipe closes it.
+        let input = input.to_vec();
+        thread::spawn(move || {
+            let _ = pipe.write_all(&input);
+        });
+    }
     let stdout = read_in_background(child.stdout.take());
     let stderr = read_in_background(child.stderr.take());
 
@@ -399,6 +430,20 @@ mod tests {
         let p = script(dir.path(), "s", "cat; echo done");
         let outcome = run_captured(&p, &[], &keep(), Duration::from_secs(10));
         assert_eq!(outcome.success_stdout(), Some("done\n"));
+    }
+
+    /// R23: `run_with_stdin` hands the child its input and closes it, larger than a pipe's
+    /// buffer included, and still times out.
+    #[test]
+    fn writes_stdin_then_closes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = script(dir.path(), "s", "wc -c | tr -d ' '; echo \"$1\"");
+        let input = vec![b'x'; 300_000];
+        let outcome = run_with_stdin(&p, &["arg"], &input, Duration::from_secs(10));
+        assert_eq!(outcome.success_stdout(), Some("300000\narg\n"));
+        let slow = script(dir.path(), "slow", "exec sleep 30");
+        let outcome = run_with_stdin(&slow, &[], b"x", Duration::from_millis(200));
+        assert_eq!(outcome, Outcome::TimedOut);
     }
 
     #[test]

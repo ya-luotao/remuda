@@ -11,11 +11,14 @@ use jiff::tz::TimeZone;
 
 use crate::identity::{self, Identity};
 use crate::index::{self, Index};
+use crate::privacy::Aliases;
 use crate::provider::Provider;
 use crate::registry::{self, Account, Registry};
 use crate::stats::{self, Period};
 use crate::{Env, paths};
-use crate::{attribution, launch, live, probe, relay, setup, text, transcript, tui, usage};
+use crate::{
+    attribution, jev, launch, live, pick, probe, relay, setup, text, transcript, tui, usage,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -96,6 +99,39 @@ enum Command {
         /// Account to continue under: `name` or `claude:name`
         account: String,
     },
+    /// Recommend the account, model and effort to launch now, from usage and `[pick]` in
+    /// config.toml; with TYPESAFE_API_KEY set and notes, TypeSafe's Jev chooses among the feasible
+    /// options
+    ///
+    /// Without a key, `--offline`, or `[pick] notes`, nothing is sent and the rules decide. The
+    /// request carries aliased usage and your notes as written: write accounts in the notes as
+    /// `provider:name` to have them aliased too. `--print-request` shows it without sending.
+    Pick {
+        /// Only this provider's accounts: `claude` or `codex`
+        #[arg(long)]
+        provider: Option<String>,
+        /// Query usage live first (`claude -p /usage`, `codex app-server`); a failed query falls back to the cache
+        #[arg(long)]
+        live: bool,
+        /// Seconds to wait for each account's live query
+        #[arg(long, value_name = "SECONDS", default_value = "90", value_parser = parse_timeout)]
+        timeout: Duration,
+        /// Never contact Jev: the rules decide
+        #[arg(long)]
+        offline: bool,
+        /// Print the recommendation and every candidate as JSON
+        #[arg(long, conflicts_with_all = ["run", "print_request"])]
+        json: bool,
+        /// Print the JSON body Jev would get (without the key) and send nothing
+        #[arg(long, conflicts_with = "run")]
+        print_request: bool,
+        /// Launch the recommendation as `remuda run` does; arguments after `--` go to the agent
+        #[arg(long)]
+        run: bool,
+        /// Arguments for the agent (with --run), after `--`
+        #[arg(last = true, requires = "run", value_name = "ARGS")]
+        args: Vec<String>,
+    },
     /// Launch claude as an account; all arguments after the account go to claude verbatim
     ///
     /// `-h/--help` is not handled here so that `remuda run <account> --help` reaches claude;
@@ -173,7 +209,134 @@ fn dispatch(cli: Cli, ctx: &Context) -> Result<ExitCode> {
         Some(Command::Remove { account }) => remove(&config, &account),
         Some(Command::Run { account, args }) => run_account(&config, account, args, ctx),
         Some(Command::Relay { session, account }) => relay(&config, &session, &account, ctx),
+        Some(Command::Pick {
+            provider,
+            live,
+            timeout,
+            offline,
+            json,
+            print_request,
+            run,
+            args,
+        }) => pick(
+            &config,
+            PickOptions {
+                provider,
+                live: live.then_some(timeout),
+                offline,
+                json,
+                print_request,
+                run,
+                args,
+            },
+            ctx,
+        ),
     }
+}
+
+struct PickOptions {
+    provider: Option<String>,
+    /// `--live`, with its timeout.
+    live: Option<Duration>,
+    offline: bool,
+    json: bool,
+    print_request: bool,
+    run: bool,
+    args: Vec<String>,
+}
+
+/// `remuda pick` (R23): the rules find what is feasible and rank it; Jev chooses among it when
+/// there is a key, notes and a choice to make; the decision is printed, or launched with
+/// `--run` exactly as `remuda run` would. Exits 1 when nothing is feasible.
+fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
+    let registry = Registry::load(config)?;
+    let settings = &registry.pick;
+    let only = o.provider.as_deref().map(parse_provider).transpose()?;
+    let accounts = registry.all(&ctx.env);
+    let claude = claude_program(ctx).ok();
+    let codex = program(ctx, Provider::Codex).ok();
+    let sources = pick::Sources {
+        env: &ctx.env,
+        now: ctx.now,
+        claude: claude.as_deref(),
+        codex: codex.as_deref(),
+        live: o.live,
+        provider: only,
+    };
+    let entries = pick::gather(&accounts, settings, &sources);
+    let candidates = pick::candidates(&entries, settings, ctx.now);
+    let feasible = pick::ranked(&candidates);
+    if feasible.is_empty() {
+        if o.json {
+            let report = pick::to_json(&entries, &candidates, None, settings, ctx.now);
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            print!("{}", pick::format_not_feasible(&entries, &candidates));
+        }
+        eprintln!("remuda: nothing to recommend: no account and model is feasible");
+        return Ok(ExitCode::FAILURE);
+    }
+    // Arguments that cannot start a new session are refused before anything is sent.
+    if o.run {
+        for c in &feasible {
+            let provider = entries[candidates[*c].entry].account.provider;
+            pick::run_args(provider, None, None, &o.args)?;
+        }
+    }
+    let mut aliases = Aliases::default();
+    for account in &accounts {
+        aliases.note(&account.qualified());
+    }
+    let request = jev::request(&entries, &candidates, settings, &aliases, ctx.now, &ctx.tz);
+    let key = ctx.env.get(jev::KEY_VAR).map(String::as_str);
+    let skip = jev::skip_reason(o.offline, key, settings, &request);
+    if o.print_request {
+        println!("{}", request.body);
+        if let Some(reason) = &skip {
+            eprintln!(
+                "remuda: note: this request would not be sent ({})",
+                reason.name()
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let asked = match skip {
+        Some(reason) => pick::Asked::Skipped(reason),
+        None => {
+            let curl = launch::find_on_path("curl", ctx.env.get("PATH").map(String::as_str)).ok();
+            jev::ask(curl.as_deref(), key.unwrap_or_default(), &request)
+        }
+    };
+    let decision = pick::decide(&candidates, &entries, settings, asked)
+        .expect("a feasible candidate was found above");
+    if o.json {
+        let report = pick::to_json(&entries, &candidates, Some(&decision), settings, ctx.now);
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !o.run {
+        print!(
+            "{}",
+            pick::format_text(&entries, &candidates, &decision, settings, ctx.now)
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let chosen = &candidates[decision.chosen];
+    let account = &entries[chosen.entry].account;
+    let (args, notices) = pick::run_args(
+        account.provider,
+        chosen.model.as_deref(),
+        decision.effort.as_deref(),
+        &o.args,
+    )?;
+    eprintln!(
+        "remuda: pick: {}",
+        pick::summary(&entries, &candidates, &decision)
+    );
+    for notice in notices {
+        eprintln!("remuda: {notice}");
+    }
+    exec_as(config, &registry, account, args, ctx)
 }
 
 /// `remuda relay <session> <account>` (R19): the session is looked up in the index (brought up

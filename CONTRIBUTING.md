@@ -51,14 +51,15 @@ cargo run --release --example codex_timing -- [<codex home>]
 
 Every test runs in a sealed sandbox (SPEC R15): a fresh `HOME` and `REMUDA_HOME` in a temporary
 directory, a cleared environment, and a fake `claude` (and fake `codex`) first on `PATH` that
-records its arguments and environment and returns fixtures. Tests never touch your real logins,
-Keychain, homes or sessions, so the suite is safe to run on a machine where you use the agents
-every day.
+records its arguments and environment and returns fixtures. A fake `curl` is always there too,
+so `remuda pick` never reaches the network. Tests never touch your real logins, Keychain, homes
+or sessions, so the suite is safe to run on a machine where you use the agents every day.
 
 When adding tests:
 
 - Use the helpers in `tests/common/` to build the sandbox; never read the real `HOME` or call the
-  real agent.
+  real agent. A test that removes the fake `curl` must also set `PATH` to the sandbox's `bin`
+  alone, or `/usr/bin/curl` is found. A test that sets `TYPESAFE_API_KEY` uses a sentinel value.
 - Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jsonl` and `.claude.json` follow
   the real formats and must be scrubbed of personal data.
 - Reference the SPEC anchor the test covers.

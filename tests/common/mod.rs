@@ -1,8 +1,8 @@
 //! Hermetic test sandbox (SPEC R15).
 //!
 //! Every integration test runs remuda with a cleared environment, a fresh `HOME` and
-//! `REMUDA_HOME`, and a fake `claude` first on `PATH`. The real `claude`, `$HOME`,
-//! `~/.claude*` and the Keychain are never touched.
+//! `REMUDA_HOME`, and a fake `claude` and a fake `curl` first on `PATH`. The real `claude`,
+//! `$HOME`, `~/.claude*`, the Keychain and the network are never touched.
 
 // Each test file compiles its own copy of this module; not every file uses every helper.
 #![allow(dead_code)]
@@ -219,6 +219,49 @@ fi
 exit "${FAKE_CODEX_EXIT:-0}"
 "#;
 
+/// Fake `curl`, always first on `PATH` (R15, R23): `/usr/bin/curl` exists on macOS and Linux,
+/// so without it a test with a key could reach the network. Every invocation appends one
+/// NUL-separated record to `$FAKE_CURL_OUT` (default, for library-level tests: the sandbox's
+/// `curl-out`, with the sandbox's home for fixtures): `@@invocation`, then `arg=<argv[i]>` per
+/// argument; its standard input (curl's `-K -` configuration) goes to `$FAKE_CURL_OUT.stdin`.
+///
+/// Fixtures live in `$HOME`:
+/// - `.fake-jev-exit`: if present, exit with its contents (28 is curl's timeout);
+/// - `.fake-jev.json`: the response body, printed followed by `\n<status>` like
+///   `-w "\n%{http_code}"`, the status from `.fake-jev-status` (default 200); without it, exit
+///   7 like a curl that cannot connect.
+const FAKE_CURL: &str = r#"#!/bin/sh
+if [ -z "${FAKE_CURL_OUT+x}" ]; then
+  FAKE_CURL_OUT="$(dirname "$0")/../curl-out"
+  HOME="$(dirname "$0")/../home"
+fi
+tmp="$FAKE_CURL_OUT.$$.tmp"
+{
+  printf '@@invocation\0'
+  for a in "$@"; do
+    printf 'arg=%s\0' "$a"
+  done
+} > "$tmp"
+cat "$tmp" >> "$FAKE_CURL_OUT"
+rm -f "$tmp"
+cat > "$FAKE_CURL_OUT.stdin"
+if [ -f "$HOME/.fake-jev-exit" ]; then
+  code=$(cat "$HOME/.fake-jev-exit")
+  echo "curl: ($code) fake curl: forced exit" >&2
+  exit "$code"
+fi
+if [ ! -f "$HOME/.fake-jev.json" ]; then
+  echo "curl: (7) Failed to connect to api.typesafe.ai port 443: fake curl has no response" >&2
+  exit 7
+fi
+cat "$HOME/.fake-jev.json"
+status=200
+if [ -f "$HOME/.fake-jev-status" ]; then
+  status=$(cat "$HOME/.fake-jev-status")
+fi
+printf '\n%s' "$status"
+"#;
+
 /// One JSON-RPC line the fake `codex app-server` read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexRpc {
@@ -286,6 +329,7 @@ impl Sandbox {
         // REMUDA_HOME is deliberately not created: remuda must cope with it missing.
         let claude = sb.bin().join("claude");
         write_executable(&claude, FAKE_CLAUDE);
+        write_executable(&sb.bin().join("curl"), FAKE_CURL);
         sb
     }
 
@@ -316,6 +360,78 @@ impl Sandbox {
 
     pub fn codex_out(&self) -> PathBuf {
         self.root().join("codex-out")
+    }
+
+    pub fn curl_out(&self) -> PathBuf {
+        self.root().join("curl-out")
+    }
+
+    /// The body Jev's fake answers with (R23).
+    pub fn set_jev_response(&self, body: &str) {
+        fs::write(self.home().join(".fake-jev.json"), body).expect("write jev fixture");
+    }
+
+    /// The HTTP status of the fake answer (default 200).
+    pub fn set_jev_status(&self, status: u16) {
+        fs::write(self.home().join(".fake-jev-status"), status.to_string())
+            .expect("write jev status fixture");
+    }
+
+    /// Makes the fake curl exit with `code` (28: timed out) instead of answering.
+    pub fn set_curl_exit(&self, code: i32) {
+        fs::write(self.home().join(".fake-jev-exit"), code.to_string())
+            .expect("write curl exit fixture");
+    }
+
+    /// The arguments of every run of the fake curl so far (empty if it never ran).
+    pub fn curl_invocations(&self) -> Vec<Vec<String>> {
+        let bytes = match fs::read(self.curl_out()) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => panic!("read fake curl record: {e}"),
+        };
+        let text = std::str::from_utf8(&bytes).expect("fake curl record is UTF-8");
+        let mut fields: Vec<&str> = text.split('\0').collect();
+        assert_eq!(fields.pop(), Some(""), "record must end with NUL");
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for field in fields {
+            if field == "@@invocation" {
+                out.push(Vec::new());
+            } else {
+                let arg = field.strip_prefix("arg=").expect("arg field");
+                out.last_mut()
+                    .expect("@@invocation first")
+                    .push(arg.to_string());
+            }
+        }
+        out
+    }
+
+    /// What the last run of the fake curl read on its standard input.
+    pub fn curl_stdin(&self) -> String {
+        let path = self.root().join("curl-out.stdin");
+        fs::read_to_string(path).expect("read fake curl stdin")
+    }
+
+    /// The request body the last run of the fake curl was given: its `data-binary` value,
+    /// unquoted as curl unquotes a configuration value.
+    pub fn jev_request_body(&self) -> String {
+        let stdin = self.curl_stdin();
+        let quoted = stdin
+            .lines()
+            .find_map(|l| l.strip_prefix("data-binary = \""))
+            .and_then(|l| l.strip_suffix('"'))
+            .expect("a data-binary line");
+        let mut body = String::new();
+        let mut chars = quoted.chars();
+        while let Some(c) = chars.next() {
+            body.push(if c == '\\' {
+                chars.next().expect("escaped")
+            } else {
+                c
+            });
+        }
+        body
     }
 
     /// Puts the fake `codex` on `PATH` (next to the fake claude): `codex:default` is listed
@@ -425,14 +541,14 @@ impl Sandbox {
         self.remuda_home().join("state").join("launches.jsonl")
     }
 
-    /// PATH with the fake claude first and only system dirs after it.
+    /// PATH with the fake claude and curl first and only system dirs after it.
     pub fn path_var(&self) -> String {
         format!("{}:/usr/bin:/bin", self.bin().display())
     }
 
     /// A remuda command with a cleared environment: only `HOME`, `REMUDA_HOME`, `PATH`,
-    /// `FAKE_CLAUDE_OUT`, `FAKE_CODEX_OUT` and `TZ=UTC` (deterministic times) are set. The cwd is the sandbox
-    /// work dir.
+    /// `FAKE_CLAUDE_OUT`, `FAKE_CODEX_OUT`, `FAKE_CURL_OUT` and `TZ=UTC` (deterministic times) are
+    /// set; `TYPESAFE_API_KEY` is not. The cwd is the sandbox work dir.
     pub fn remuda(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_remuda"));
         cmd.env_clear()
@@ -441,6 +557,7 @@ impl Sandbox {
             .env("PATH", self.path_var())
             .env("FAKE_CLAUDE_OUT", self.claude_out())
             .env("FAKE_CODEX_OUT", self.codex_out())
+            .env("FAKE_CURL_OUT", self.curl_out())
             .env("TZ", "UTC")
             .current_dir(self.work());
         cmd

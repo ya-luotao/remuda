@@ -35,13 +35,18 @@ with one of those directories selected. By design ([SPEC.md](SPEC.md), R2 and R1
 - writes only to `$REMUDA_HOME` (`config.toml`, `state/`, and the empty homes created by
   `remuda setup`), and never into any account home;
 - never moves, renames or deletes a home directory;
-- makes no network requests of its own.
+- makes no network requests of its own, except the one request of `remuda pick` to TypeSafe
+  (`api.typesafe.ai`), made only when `TYPESAFE_API_KEY` is set and `[pick] notes` are written. That
+  request carries aliased usage, the configured models and the notes; the key travels on `curl`'s
+  standard input, never in its arguments.
 
 Any behavior that breaks one of these guarantees is a security issue and should be reported
 privately. Examples include remuda reading or exposing credential material, writing outside
-`$REMUDA_HOME`, launching an agent with a different account's home than the one requested, or
+`$REMUDA_HOME`, launching an agent with a different account's home than the one requested,
 passing untrusted data (such as a session ID from a file) to an agent in a way that is interpreted
-as an option or command.
+as an option or command, a `remuda pick` request that carries more than SPEC R23 allows (a
+credential, an email, an organization, a path, session content, or an account name the notes
+wrote as `provider:name`), or the key showing in a process list, an error message or the output.
 
 Vulnerabilities in Claude Code or Codex themselves are out of scope; report them to their
 respective maintainers.

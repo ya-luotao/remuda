@@ -115,3 +115,69 @@ fn parallel_fake_invocations_do_not_interleave() {
         assert_eq!(inv.args, [i.clone(), long.clone(), format!("end{i}")]);
     }
 }
+
+/// R15, R23: the fake curl is always first on PATH; it records its arguments and standard input
+/// exactly and answers from fixtures, never from the network.
+#[test]
+fn fake_curl_records_argv_and_stdin_and_answers_from_fixtures() {
+    use std::io::Write;
+    let sb = Sandbox::new();
+    assert_eq!(
+        sb.path_var().split(':').next(),
+        Some(sb.bin().to_str().unwrap())
+    );
+    let run = |stdin: &str| {
+        let mut child = std::process::Command::new(sb.bin().join("curl"))
+            .env_clear()
+            .env("HOME", sb.home())
+            .env("FAKE_CURL_OUT", sb.curl_out())
+            .args([
+                "-q",
+                "-w",
+                "\n%{http_code}",
+                "-K",
+                "-",
+                "https://example.invalid/",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run fake curl");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    // No response fixture: like a curl that cannot connect.
+    let out = run("data-binary = \"{\\\"a\\\":\\\"b\\\\\\\\c\\\"}\"\n");
+    assert_eq!(out.status.code(), Some(7));
+    assert_eq!(
+        sb.curl_invocations(),
+        [[
+            "-q",
+            "-w",
+            "\n%{http_code}",
+            "-K",
+            "-",
+            "https://example.invalid/"
+        ]]
+    );
+    assert_eq!(sb.jev_request_body(), "{\"a\":\"b\\\\c\"}");
+
+    sb.set_jev_response("{\"ok\": true}");
+    let out = run("x");
+    assert_eq!(
+        (out.status.code(), &out.stdout[..]),
+        (Some(0), &b"{\"ok\": true}\n200"[..])
+    );
+    assert_eq!(sb.curl_stdin(), "x");
+    sb.set_jev_status(401);
+    assert_eq!(run("").stdout, b"{\"ok\": true}\n401");
+    sb.set_curl_exit(28);
+    assert_eq!(run("").status.code(), Some(28));
+    assert_eq!(sb.curl_invocations().len(), 4);
+}

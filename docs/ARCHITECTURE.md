@@ -24,6 +24,7 @@ commands, and launches them with the right environment and options.
    │  registry   launch · share · relay   index · attribution       │
    │  paths      identity · usage · live  stats · pricing           │
    │  provider   checks · account_config  transcript · probe · text │
+   │  privacy    pick · jev                                         │
    └──────────────────────┬─────────────────────────────────────────┘
           reads │         │ runs            │ writes (R13)
                 ▼         ▼                 ▼
@@ -36,6 +37,8 @@ commands, and launches them with the right environment and options.
    │  rollouts,     │ │  exec on      │   + one relay copy into a
    │  settings)     │ │  launch)      │     target home, on request
    └────────────────┘ └───────────────┘
+                      + curl → api.typesafe.ai:
+                        `pick` only, with a key (R23)
 ```
 
 Three rules shape the whole design and are worth knowing before reading any module:
@@ -62,6 +65,7 @@ Modules are layered: each layer uses the layers below it.
  │  launch · share · relay · setup       accounts: identity · usage · live · │
  │                                                 checks · account_config   │
  │  sessions: attribution                tokens:   stats · pricing           │
+ │  recommendation: pick · jev                                               │
  ├─ reading agents' data ────────────────────────────────────────────────────┤
  │  index · transcript · provider::codex · provider::app_server · probe      │
  ├─ foundation ──────────────────────────────────────────────────────────────┤
@@ -75,7 +79,7 @@ The exceptions, all for a type or a small helper:
   `find_on_path`, used by everything that runs an agent: `probe`, `provider`,
   `provider::app_server`, `identity`, `usage` and `live`.
 - `registry` reads and validates the `[prices]` tables with `pricing::Prices::from_document` (R3,
-  R20).
+  R20), and `[pick]` with `pick::Config::from_document` (R3, R23).
 - `launch` names `relay::Relay` in the launch record; `pricing` prices `stats::Tokens`;
   `provider::codex` lists rollouts with `index::list_rollouts` and checks rate limits with
   `usage::codex_rows`.
@@ -83,13 +87,13 @@ The exceptions, all for a type or a small helper:
 | Module | Responsibility | SPEC |
 | --- | --- | --- |
 | `main.rs` | Parse arguments, capture the process context, call `cli::run` | – |
-| `cli` | Every subcommand; the `run` fast path and `exec`; plain-text output | R5, R6, R14, R14a, R19, R20 |
+| `cli` | Every subcommand; the `run` fast path and `exec`; plain-text output | R5, R6, R14, R14a, R19, R20, R23 |
 | `registry` | `config.toml`: load and validate strictly, resolve `name` / `provider:name`, add, remove, atomic comment-preserving writes; `[share.claude]` and `[prices]` | R1, R3, R14, R14a |
 | `paths` | `$REMUDA_HOME`, `~` expansion, home string checks, the native login's directory | R2, R3 |
 | `provider` | What differs between claude and codex: isolation variable, stores, launch arguments, login | R4 |
 | `provider::codex` | Rollout parsing: head/tail windows, titles from `session_index.jsonl`, preview, cached rate limits | R10, R17 |
 | `provider::app_server` | JSON-RPC client for `codex app-server` (`account/read`, `account/rateLimits/read`) | R4, R10 |
-| `probe` | Run a short agent command with captured output and a timeout (killing the process group); run many in parallel | R4, R10 |
+| `probe` | Run a short agent command with captured output and a timeout (killing the process group); run many in parallel; run `curl` with its configuration on stdin | R4, R10, R23 |
 | `launch` | Classify arguments, inject `--session-id`, set or unset the home variable, the launch log, `exec` and foreground runs | R2, R6, R16, R17 |
 | `share` | Shared configuration: `plan` (reads only) and `apply` (item links, settings file) | R18 |
 | `relay` | Check, copy transcript and checkpoints, and prepare the fork launch; undo the copy on failure | R19 |
@@ -104,7 +108,9 @@ The exceptions, all for a type or a small helper:
 | `stats` | Token counting, deduplication across copies, periods, sections, chart buckets, text table | R20 |
 | `pricing` | Built-in prices and `[prices]` overrides; the cost of one request in picodollars | R20 |
 | `account_config` | What an account's sessions load and where each item comes from | R22 |
-| `privacy` | Account-name aliases, and whole-word aliasing of names in free text | R21 |
+| `pick` | `[pick]`; candidates, windows and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options | R3, R23 |
+| `jev` | The request to Jev (aliased state, Choice and Score questions), `curl` transport, response parsing | R23 |
+| `privacy` | Account-name aliases, and whole-word aliasing of names in free text | R21, R23 |
 | `text` | Terminal text measured in display columns | – |
 | `tui` | Terminal ownership, the event loop, foreground launches | R16 |
 | `tui::app` | All TUI state and the pure `update(app, event) -> effects` | R8, R16, R17, R19–R22 |
@@ -354,3 +360,4 @@ cargo run --release --example codex_timing -- [<codex home>]
 | Add a TUI action | `tui::app` (`Key` → `Effect`), `tui::workers` (the effect), `tui::render`, `tui::privacy` |
 | Add something shown on screen | `tui::app` state, `tui::render`, and its case in `tui::privacy::redacted` |
 | Add a model price | SPEC R20 table and `pricing` |
+| Change what `remuda pick` sends to Jev | SPEC R23, `jev::request` and `jev::state_text`; the privacy test in `tests/pick_cli.rs` |

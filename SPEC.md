@@ -25,6 +25,7 @@ them. By area:
 | Across accounts | [R18](#r18-shared-configuration) shared configuration · [R19](#r19-relay-continuing-a-session-under-another-account) relay |
 | Statistics | [R20](#r20-token-statistics) token statistics and cost |
 | Privacy | [R21](#r21-private-mode-tui) private mode |
+| Recommendation | [R23](#r23-recommendation-pick) `pick` |
 
 How the entries map onto the code is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -91,6 +92,18 @@ switching to a different, logged-out account.
   cache_read = 0.50
   cache_write_5m = 6.25
   cache_write_1h = 10
+
+  [pick]                    # optional: what `remuda pick` may recommend (R23)
+  exclude = ["claude:work"] # never recommended; write accounts as provider:name
+  prefer = ["claude:personal"]  # the rules' last tie-break
+  min_headroom = 10         # percent left required on every window that applies
+  stale_after = 120         # minutes after which cached usage is stale
+  notes = "Keep claude:personal for long refactors."   # sent to Jev (R23)
+
+  [pick.claude]             # also [pick.codex]
+  models = ["claude-opus-5-5", "claude-fable-5-1"]     # in order of preference
+  efforts = ["medium", "high", "xhigh", "max"]         # from low to high
+  default_effort = "high"
   ```
 - Homes created by `setup` live at `$REMUDA_HOME/homes/<provider>/<name>`; homes registered with
   `add` stay where they are.
@@ -101,8 +114,15 @@ switching to a different, logged-out account.
   account whose `home` is not an absolute path, `share` on a codex account, a `[share.claude] from`
   that names no claude account, a `[prices."<model>"]` that is not a table, has a key other than
   `input`, `output`, `cache_read`, `cache_write_5m`, and `cache_write_1h`, lacks `input` or
-  `output`, or has a price that is not a number from 0 to 1,000,000, and similar problems are all
-  reported as errors naming the file; remuda neither guesses nor skips.
+  `output`, or has a price that is not a number from 0 to 1,000,000, a `[pick]` with a key other
+  than those above, an `exclude` or `prefer` entry that does not resolve as in R1, a
+  `min_headroom` that is not an integer from 0 to 100, a `stale_after` that is not a positive
+  integer, `notes` longer than 4000 characters, a model not matching `[A-Za-z0-9._:-]+` or
+  starting with `-`, an effort not matching `[a-z]+`, a duplicate model or effort, a claude model
+  or effort that is a claude subcommand, or a `default_effort` not among `efforts`, and similar
+  problems are all reported as errors naming the file; remuda neither guesses nor skips. A bare
+  name in `[pick]` resolves as in R1, so it becomes an error once another provider has an account
+  of that name: `add` and `setup` refuse such an account (R14), and `provider:name` avoids it.
 - Runtime state (index cache, statistics cache, launch log) lives in `$REMUDA_HOME/state/` and may
   be deleted and rebuilt at any time.
 
@@ -166,14 +186,18 @@ remuda setup [--provider P] <name> [--email E]     create a new home and run the
 remuda remove <account>                            unregister an account; its home is left in
                                                    place (R14a)
 remuda relay <session> <account>                   continue a session under another account (R19)
+remuda pick [--provider P] [--live] [--timeout S]  recommend the account, model and effort to
+       [--offline] [--json | --print-request]      launch now; with --run, launch it (R23)
+       [--run [-- <args>]]
 remuda help [<command>]                            help for remuda or a command
 ```
 
 - There is no shell integration, global routing, or per-directory binding.
 - `run` passes `args` through to the agent unchanged. Because `-h` and `--help` after `run` go to
   the agent too, the help of `run` itself is `remuda help run`.
-- `--provider` is `claude` (the default) or `codex`. `--timeout` is in seconds, per query:
-  `usage --live` defaults to 90, `list` to 15.
+- `--provider` is `claude` (the default) or `codex`; for `pick`, a filter without default.
+  `--timeout` is in seconds, per query: `usage --live` and `pick --live` default to 90, `list` to
+  15.
 
 ## R6. Launch (`run` and launches from the TUI)
 
@@ -393,8 +417,8 @@ appeared in no `history.jsonl`.
 - Codex credits, reset credits, spend control, and upsell data are not shown (R4).
 - A live query does **not** refresh the local cache (verified for claude: `fetchedAtMs` is
   unchanged after consecutive runs); the two sources are displayed separately.
-- remuda makes no network requests of its own and never reads credentials to call the agent's usage
-  endpoint directly.
+- remuda makes no network requests of its own, except the one request of `remuda pick` (R23), and
+  never reads credentials to call the agent's usage endpoint directly.
 - The cache formats are undocumented and parsed on a best-effort basis: unrecognized formats
   degrade to missing rows, and parsing never crashes.
 - `remuda usage [--live]` prints the same information as plain text for direct use from the shell;
@@ -455,7 +479,10 @@ The complete set of remuda's write operations:
 
 remuda never writes credentials, `.claude.json`, the Keychain, transcripts, `history.jsonl`, or
 `*.key` files, never writes into any home directory except for the relay copies above, and never
-makes network requests of its own (live usage is queried by the agent itself; see R10). Network use and writes into a home by an
+makes network requests of its own (live usage is queried by the agent itself; see R10), except the
+one request of `remuda pick` to TypeSafe, made only with `TYPESAFE_API_KEY` set and `[pick]
+notes` written (R23). Network use
+and writes into a home by an
 agent are the agent's own, and happen only in live queries (`claude -p /usage`, `codex app-server`;
 R4, R10) or in the other agent commands remuda runs in an account's environment (`claude auth
 status`, `codex login status`, which creates `tmp/`, a launch, a login).
@@ -467,8 +494,9 @@ status`, `codex login status`, which creates `tmp/`, a launch, a login).
 - The directory must exist. If it does not look like a home for the provider (Claude: neither
   `.claude.json` nor `projects/` is present), remuda warns but registers it anyway.
 - It is an error if the name is already taken, if the same path is already registered under another
-  name, or if another spelling of the same directory (trailing `/`, a symlink, etc.) is already
-  registered.
+  name, if another spelling of the same directory (trailing `/`, a symlink, etc.) is already
+  registered, or if `config.toml` would no longer load with the account (R3: a bare name in
+  `[pick]` that it would make ambiguous). `setup` refuses the same, before it creates the home.
 - Registering the native login's directory (equal to `$HOME/.claude` after normalization) is
   refused: that directory is `default`, and giving it another name would create a separate Keychain
   entry and read `.claude.json` from inside the directory, making it appear logged out.
@@ -482,7 +510,8 @@ status`, `codex login status`, which creates `tmp/`, a launch, a login).
 - The account is named as in R1 (`name` or `provider:name`; a bare name that exists under more than
   one provider is an error listing the candidates).
 - `default` (`claude:default`, `codex:default`) is implicit and cannot be removed: error.
-- Refused while `[share.claude] from` names the account: the registry would no longer load (R3).
+- Refused while `[share.claude] from` or `[pick]` (`exclude`, `prefer`) names the account: the
+  registry would no longer load (R3).
   `from` must be changed or removed first; remuda does not edit it.
 - The removed table's comments go with it: those inside it and the comment lines directly above
   its header. A comment block separated from the header by a blank line is kept (moved before
@@ -500,7 +529,11 @@ that prints its own environment and arguments and returns fixtures for `agents -
 the same, answers `login status`, and acts as `app-server`: it reads JSON-RPC lines from stdin,
 records them, answers `initialize`, `account/read`, and `account/rateLimits/read` from fixtures
 with a notification before each answer, and exits when stdin closes; tests never touch real logins
-or sessions. Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jsonl`, and
+or sessions. A fake `curl` is always first on PATH (`/usr/bin/curl` exists on macOS and Linux):
+it records its arguments and standard input and answers from fixtures (a response body and
+status, or a forced exit such as 28 for a timeout), so tests never reach the network, and
+`TYPESAFE_API_KEY` is set only by tests that use a sentinel key and check it never shows in output
+or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jsonl`, and
 `.claude.json` are derived from real structures and anonymized. In library-level tests where
 `FAKE_CLAUDE_OUT` / `HOME` are not set, the fake claude defaults to paths inside the sandbox.
 
@@ -1140,3 +1173,85 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   descriptions are masked as `•••`; paths (link targets, install and memory directories, the
   directory in the title) are masked as in R21; the source account is shown by its alias;
   problems are free text.
+
+## R23. Recommendation (`pick`)
+
+`remuda pick` recommends which account and model to launch now, and at what effort. Rules decide
+what is feasible and rank it; with a key, TypeSafe's Jev model chooses among the feasible options.
+It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4) or, with
+`--live`, R10's live queries, and writes nothing except, with `--run`, the launch log (R6).
+
+- **Candidates.** Each account R1 lists (`default` included) with each model of its provider's
+  `models`, or with the agent's default (nothing injected) when there are none. Not feasible, each
+  with its reason: excluded; not of `--provider`; claude with neither `oauthAccount` in its
+  `.claude.json` nor a usage cache; codex without `codex` on PATH, or whose `codex login status`
+  says it is not logged in (a status that cannot be read is noted, not blocking); or a window
+  that applies with less than `min_headroom` percent left (default 10).
+- **Windows.** A usage row (R10) without a parenthesized name, or with `(all models)`, applies to
+  every model. `<window> (<name>)` applies to the claude models of that family
+  (`claude-<family>-…`; a bare alias is its own family) and to the codex model with that id,
+  ignoring case; one that matches no configured model is ignored. Without `models`, the agent's
+  default model is unknown: the `default` pair shows its account's per-model windows (in the
+  output, in `--json` as `default_model_windows`, and in the request, marked as applying only if
+  that model is of their family) but is never made infeasible by them. A window whose reset
+  instant has passed counts as 0% used (reset since cached). Headroom is the least percent left over the
+  windows that apply; without usage data a pair is feasible, of unknown headroom. Cached codex
+  usage has no per-model limits (R10): they are shown as unknown.
+- **Staleness.** Cached usage older than `stale_after` minutes (default 120), or of unknown age,
+  is stale; it is marked, and breaks ties (below). Staleness never makes a window feasible: a used
+  percentage only grows until its reset. `--live` queries every candidate account first (R10;
+  `--timeout` per query, default 90); a failed query falls back to the cache, with a note.
+- **Rules.** Feasible pairs rank by: known headroom before unknown; the model's position in
+  `models`; headroom in 10-point bands, higher first (90% left and more is one band); fresh before
+  stale; the binding window's reset, sooner first; `prefer` order; registry order. The rules'
+  effort is `default_effort`, or none.
+- **When Jev is asked.** Only with `TYPESAFE_API_KEY` in remuda's environment, without
+  `--offline`, with `notes`, and with a choice to make (two feasible pairs, or a provider with two
+  or more `efforts` and a feasible pair). Otherwise the rules decide, and the reason is `offline`,
+  `no_key`, `no_notes`, or `single_option`.
+- **The request.** One POST to `https://api.typesafe.ai/v1/systemone` with model `jev-latest`,
+  through `curl` from PATH: `curl -q -sS --proto =https --max-time 10 -X POST -H "Content-Type:
+  application/json" -o - -w "\n%{http_code}" -K - <endpoint>`. The authorization header and the
+  body go in the configuration curl reads on its standard input, never in its arguments; a key
+  holding a quote, a backslash, or a control character is not sent.
+  - Questions: `launch`, a Choice over the feasible pairs (the rules' best 255 when there are
+    more), named `<alias> / <model>` (`default` for the agent's default) and described by the
+    binding window and the data's age, asked only when there are two or more; and
+    `effort_<provider>`, a Score over `efforts`, for each provider with at least two and a
+    feasible pair. The criteria are a JSON object, so their order carries no meaning.
+  - State: plain text with the local weekday and time (no time zone), the rules already applied,
+    each account with a feasible pair under its alias (`<provider>:account-<n>`, numbered per
+    provider in registry order as in R21; `default` stays `default`), its usage (source, age,
+    staleness, and each window that applies with its percentage and time to reset), the models,
+    the notes, and an empty task. In the notes, each qualified name `provider:name` (a whole word)
+    is replaced by its alias; the rest, bare names included, is sent as written. No email,
+    organization, plan, path, working directory, or session content is sent.
+- **Combination.** Jev's pair when its confidence is at least 0.50 (`jev`); else, when the
+  probabilities of one account's pairs add up to at least 0.70, that account with its most
+  probable model (`jev_account`); else the rules' first (`low_confidence`). With one option,
+  `launch` is not asked: the rules keep it (`single_option`) and Jev decides only the effort. The
+  effort is the chosen provider's Score rounded to a level when its confidence is at least 0.50,
+  else `default_effort`; an effort answer that is missing or not a score within its levels costs
+  only the effort (`default_effort`, the problem in `jev.effort_error` and the output). No `curl`,
+  a curl failure or its timeout (10 s), an HTTP status other than 2xx, a response that is not
+  JSON, or a `launch` answer that is missing or names an option not offered: the rules decide
+  (`jev_error`), and the message holds at most 200 characters of the response and never the key.
+- **Output.** The account, model, and effort (and whether the effort is Jev's); what decided and
+  why, with Jev's confidence; the rules' choice when Jev's differs; the binding window and its
+  reset; the data's age; the exclusions; the `remuda run <account> <options>` command; and every pair that is not feasible,
+  with its reason. `--json` prints `account`, `provider`, `model`, `effort`, `decided_by` (`jev`,
+  `jev_account`, `rules`), `reason`, `effort_by` (`jev`, `rules`; null without an effort), `jev`
+  (`model`, `confidence`, `effort_confidence`, `effort_error`, `error`; null when not asked),
+  `command`, and `candidates` (`account`, `model`, `feasible`, `why_not`, `headroom`, `binding`,
+  `resets_at`, `default_model_windows`, `source`, `fetched_at`, `age_seconds`, `stale`,
+  `rules_rank`, `jev_probability`). `--print-request` prints the body a send would use and sends
+  nothing (no key needed). With nothing feasible: the reasons, exit 1.
+- **`--run`.** Launches the recommendation exactly as `remuda run <account> <options> <args>`
+  (R6, R17, R18), `<args>` being those after `--`: claude gets `--model <m> --effort <e>`, codex
+  `-m <m> -c model_reasoning_effort=<e>` (verified: codex 0.156.1 accepts both before a
+  subcommand), before the user's arguments; the launch log records them among its `args`. An
+  option the user's arguments already set (claude `--model`, `--effort`; codex `-m`, `--model`,
+  `-c`/`--config model_reasoning_effort=…`) is not injected, and remuda says so on stderr.
+  Arguments that do not start a new session (R6's classification for claude; `resume` or `fork`
+  first for codex) are refused before anything is sent. `--json` and `--print-request` do not
+  combine with `--run`.

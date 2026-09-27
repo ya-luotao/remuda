@@ -82,6 +82,8 @@ pub struct Registry {
     pub sharing: Sharing,
     /// `[prices."<model>"]` overrides (R3, R20).
     pub prices: crate::pricing::Prices,
+    /// `[pick]`: what `remuda pick` may recommend and how (R3, R23).
+    pub pick: crate::pick::Config,
 }
 
 /// Shared configuration (R18): whose configuration other claude accounts get.
@@ -124,6 +126,7 @@ impl Registry {
         }
         registry.sharing.source = registry.share_source(doc)?;
         registry.prices = crate::pricing::Prices::from_document(doc)?;
+        registry.pick = crate::pick::Config::from_document(doc, &registry)?;
         Ok(registry)
     }
 
@@ -376,19 +379,40 @@ pub fn check_new_name(name: &str) -> Result<()> {
 
 /// Appends `account` to `config` atomically, after [`Registry::check_available`] (R3, R14).
 pub fn register(config: &Path, account: &Account) -> Result<()> {
-    let mut doc = read_document(config)?;
-    Registry::from_document(&doc)
-        .with_context(|| format!("invalid {}", config.display()))?
-        .check_available(account)?;
-    append_account(&mut doc, account)?;
+    let doc = with_account(&read_document(config)?, config, account)?;
     write_atomic(config, doc.to_string().as_bytes())
         .with_context(|| format!("cannot write {}", config.display()))
 }
 
+/// Refuses what [`register`] would refuse, writing nothing: `setup` asks before it creates the
+/// home (R14, R17).
+pub fn check_registrable(config: &Path, account: &Account) -> Result<()> {
+    with_account(&read_document(config)?, config, account).map(|_| ())
+}
+
+/// `doc` with `account` appended, after [`Registry::check_available`]; refused when the result
+/// would not load, as when a bare name in `[pick]` would become ambiguous (R1, R3).
+fn with_account(doc: &DocumentMut, config: &Path, account: &Account) -> Result<DocumentMut> {
+    Registry::from_document(doc)
+        .with_context(|| format!("invalid {}", config.display()))?
+        .check_available(account)?;
+    let mut doc = doc.clone();
+    append_account(&mut doc, account)?;
+    Registry::from_document(&doc).with_context(|| {
+        format!(
+            "adding {} would leave {} invalid",
+            account.qualified(),
+            config.display()
+        )
+    })?;
+    Ok(doc)
+}
+
 /// `remuda remove` (R14a): deletes `account`'s `[[account]]` table from `config`, atomically
 /// and keeping every other comment and unknown key (R3). The home is not touched (R2).
-/// `default` is implicit, and the source of shared configuration cannot go while
-/// `[share.claude] from` names it: the registry would no longer load.
+/// `default` is implicit, and an account cannot go while `[share.claude] from` (its source of
+/// shared configuration) or `[pick]` (`exclude`, `prefer`) names it: the registry would no
+/// longer load.
 pub fn unregister(config: &Path, account: &Account) -> Result<()> {
     let q = account.qualified();
     if account.home == Home::Default {
@@ -1281,6 +1305,62 @@ mod tests {
             )
         );
         assert_eq!(parse(&out).unwrap().accounts, [acc("claude", "max", "/m")]);
+    }
+
+    /// R3, R14, R14a, R23: adding and removing accounts keeps `[pick]` and its comments; its
+    /// names are resolved against the accounts.
+    #[test]
+    fn append_and_remove_preserve_the_pick_table() {
+        let pick = "# how to pick\n[pick]\nexclude = [\"claude:team\"] # the company's\n\
+                    notes = \"\"\"\nkeep claude:max for refactors\n\"\"\"\n\n\
+                    [pick.claude]\nmodels = [\"claude-opus-5-5\"] # first is the default\n";
+        let original = format!(
+            "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n\n\
+             [[account]]\nprovider = \"claude\"\nname = \"team\"\nhome = \"/t\"\n\n{pick}"
+        );
+        let mut doc: DocumentMut = original.parse().unwrap();
+        append_account(&mut doc, &acc("codex", "cx", "/c")).unwrap();
+        let out = doc.to_string();
+        assert!(out.ends_with(pick), "{out}");
+        let reg = parse(&out).unwrap();
+        assert_eq!(reg.pick, parse(&original).unwrap().pick);
+        assert_eq!(reg.pick.exclude, ["claude:team"]);
+        assert_eq!(reg.pick.notes, "keep claude:max for refactors");
+
+        let out = removed(&original, 0);
+        assert!(out.ends_with(pick), "{out}");
+        assert_eq!(parse(&out).unwrap().pick.claude.models, ["claude-opus-5-5"]);
+        // The excluded account itself cannot go while `[pick]` names it: the file would not load.
+        let err = format!("{:#}", parse(&removed(&original, 1)).unwrap_err());
+        assert!(
+            err.contains("[pick]: exclude = \"claude:team\": unknown account"),
+            "{err}"
+        );
+    }
+
+    /// R1, R3, R14: an account whose name would make a bare name in `[pick]` ambiguous is not
+    /// registered; the file is left as it was.
+    #[test]
+    fn register_refuses_what_would_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let text = "[[account]]\nprovider = \"claude\"\nname = \"personal\"\nhome = \"/p\"\n\n\
+                    [pick]\nprefer = [\"personal\"]\n";
+        fs::write(&config, text).unwrap();
+        let codex = acc("codex", "personal", "/c");
+        for err in [
+            register(&config, &codex).unwrap_err(),
+            check_registrable(&config, &codex).unwrap_err(),
+        ] {
+            let err = format!("{err:#}");
+            assert!(
+                err.contains("adding codex:personal would leave") && err.contains("invalid"),
+                "{err}"
+            );
+            assert!(err.contains("exists under several providers"), "{err}");
+        }
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+        register(&config, &acc("codex", "work", "/w")).unwrap();
     }
 
     #[test]

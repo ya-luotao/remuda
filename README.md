@@ -12,7 +12,9 @@ If you have several logins, each with its own usage limits and its own sessions,
 them side by side: see which account has usage left, launch as it, and start, resume, fork or
 hand off sessions in any directory, from one TUI or CLI.
 
-Remuda never touches credentials and makes no network requests of its own.
+Remuda never touches credentials. Its only network request of its own is optional: `remuda pick`
+asks TypeSafe's Jev model for a recommendation when `TYPESAFE_API_KEY` is set and you have written
+notes for it.
 
 ## How it works
 
@@ -57,6 +59,9 @@ holds, and launches the agent with the home selected.
 - **Token statistics and cost.** Input, cache, output and reasoning tokens per account and model,
   counted from the agents' own transcripts, with an estimated cost at API list prices and a chart
   over time.
+- **Which account now.** `remuda pick` recommends the account, model and effort to launch, from
+  every account's limits and your `[pick]` rules; with a TypeSafe key and notes, Jev chooses among
+  what the rules allow. `--run` launches it.
 - **Built for screenshots.** `Ctrl-P` switches the TUI into a private mode that hides names,
   emails, paths and session titles.
 - **Out of your way.** Remuda does not take over your shell: typing `claude` still uses your
@@ -73,6 +78,7 @@ What each provider supports:
 | Usage limits, cached and live | ✓ | ✓ |
 | Session history, search and preview | ✓ | ✓ |
 | Token statistics and estimated cost | ✓ | ✓ |
+| Recommendation of account, model and effort (`pick`) | ✓ | ✓ |
 | Live sessions (attach, logs, stop) | ✓ | – |
 | Relay to another account | ✓ | – |
 | Shared configuration and the configuration pane | ✓ | – |
@@ -83,7 +89,8 @@ confirmation first. ² The login method only; the email and plan appear after a 
 ## Installation
 
 Requires macOS or Linux with `ps` on `PATH`, Rust 1.88 or later, and the `claude` CLI on `PATH`
-(plus `codex` for Codex accounts).
+(plus `codex` for Codex accounts). `remuda pick` also needs `curl` on `PATH` to ask Jev when a key
+is set; without it, the rules decide.
 
 ```sh
 cargo install --git https://github.com/ya-luotao/remuda
@@ -124,6 +131,7 @@ the bare name means `claude:default`, and the Codex one is `codex:default`.
 | `remuda add [--provider <claude\|codex>] <name> <path>` | Register an existing home directory as an account. The provider defaults to `claude`. |
 | `remuda setup [--provider <claude\|codex>] <name> [--email <EMAIL>]` | Create a new home under `$REMUDA_HOME/homes/<provider>/<name>`, register it, and run the agent's login (`claude auth login` or `codex login`). `--email` prefills the Claude login. |
 | `remuda remove <account>` | Unregister an account. Its home and everything in it are left in place, and its path is printed so `remuda add` can register it again. `default` and the source of `[share.claude]` cannot be removed. |
+| `remuda pick [--provider <P>] [--live] [--timeout <SECONDS>] [--offline] [--json\|--print-request] [--run [-- <args>...]]` | Recommend the account, model and effort to launch now. Rules keep only what has at least `min_headroom` percent left on every window that applies (default 10) and rank it; with `TYPESAFE_API_KEY` set and `[pick] notes`, Jev chooses among those options. `--print-request` shows what would be sent, `--offline` never sends, `--run` launches the choice as `remuda run` does. `--timeout` applies to each `--live` query (default 90). Exits 1 when nothing is feasible. See [Recommendations](docs/GUIDE.md#recommendations). |
 | `remuda relay <session> <account>` | Continue a Claude session under another Claude account, in the session's last directory, replacing the `remuda` process. `<session>` is a full session ID from the index. See [Relay](docs/GUIDE.md#relay). |
 | `remuda help [<command>]` | Show help for remuda or a command. |
 
@@ -226,6 +234,15 @@ output = 25
 cache_read = 0.50
 cache_write_5m = 6.25
 cache_write_1h = 10
+
+[pick]                       # optional: what `remuda pick` may recommend
+exclude = ["codex:research"]
+notes = "Keep claude:work for long refactors."   # sent to Jev, with account names aliased
+
+[pick.claude]
+models = ["claude-opus-5-5", "claude-sonnet-5"]  # in order of preference
+efforts = ["medium", "high", "max"]
+default_effort = "high"
 ```
 
 Homes must be absolute paths. The file is validated strictly on load: invalid or duplicate names,
@@ -261,11 +278,17 @@ the specification ([SPEC.md](SPEC.md), R2 and R13):
   (`claude auth status --json`, `codex login status`, `claude -p /usage`, `codex app-server`) and
   non-secret local metadata (the usage cache in `.claude.json`, the rate limits in Codex
   rollouts). Remuda does not read the Keychain, Codex `auth.json` or session `*.key` files.
-- **No network requests of its own.** Live usage is queried by the agent itself, with the
-  account's own login, and only when you ask for it (`remuda usage --live`, `u` in the TUI). A
-  live query starts the agent: `codex app-server` behaves like launching Codex, so it may refresh
-  the account's login token and writes Codex's own state into the home. Cost estimates use
-  prices built into remuda; nothing is fetched.
+- **Network requests of its own: only `remuda pick`, only with a key.** Live usage is queried by
+  the agent itself, with the account's own login, and only when you ask for it (`remuda usage
+  --live`, `u` in the TUI). A live query starts the agent: `codex app-server` behaves like
+  launching Codex, so it may refresh the account's login token and writes Codex's own state into
+  the home. Cost estimates use prices built into remuda; nothing is fetched. `remuda pick` sends
+  one request to TypeSafe (`api.typesafe.ai`) when `TYPESAFE_API_KEY` is set and `[pick] notes`
+  are written: each account's usage under an alias (`claude:account-1`), the models, and your
+  notes as written (write accounts in them as `provider:name` so they are aliased too). It never
+  sends credentials, emails, organizations, paths or session content. `--print-request` shows the
+  request without sending it, `--offline` never sends, and without a key the local rules
+  decide.
 
 ## Status
 
@@ -285,8 +308,8 @@ degrades to missing fields rather than errors.
 
 ## Documentation
 
-- [docs/GUIDE.md](docs/GUIDE.md): TUI details, private mode, shared configuration, relay, account
-  checks and data sources
+- [docs/GUIDE.md](docs/GUIDE.md): TUI details, private mode, shared configuration, relay,
+  recommendations, account checks and data sources
 - [SPEC.md](SPEC.md): behavior specification; the contract that the tests enforce
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the code is organized, with diagrams of the
   launch, relay, indexing and TUI flows

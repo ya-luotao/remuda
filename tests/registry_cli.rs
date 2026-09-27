@@ -460,3 +460,26 @@ fn add_and_remove_keep_price_overrides() {
     assert_eq!(stored(&sb), [row("claude", "max", max.to_str().unwrap())]);
     sb.remuda().arg("stats").assert().success();
 }
+
+/// R1, R3, R14, R23: an account that would make a bare name in `[pick]` ambiguous is refused,
+/// and the registry keeps loading.
+#[test]
+fn add_refuses_a_name_that_would_leave_the_config_invalid() {
+    let sb = Sandbox::new();
+    let personal = sb.make_claude_home("h/personal");
+    let codex = sb.make_codex_home("c/personal");
+    sb.write_config(&format!(
+        "[[account]]\nprovider = \"claude\"\nname = \"personal\"\nhome = \"{}\"\n\n\
+         [pick]\nprefer = [\"personal\"]\n",
+        personal.display()
+    ));
+    assert_add_fails(
+        &sb,
+        &["--provider", "codex", "personal", codex.to_str().unwrap()],
+        "adding codex:personal would leave",
+    );
+    assert_eq!(
+        list_rows(&sb)[1],
+        row("claude", "personal", personal.to_str().unwrap())
+    );
+}

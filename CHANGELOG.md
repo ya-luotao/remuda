@@ -10,6 +10,21 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Added
 
+- Recommendations (SPEC R23): `remuda pick` recommends the account, model and effort to launch
+  now. Rules keep only the pairs with at least `min_headroom` percent left on every usage window
+  that applies (per-model windows included; a reset that has passed frees a window, stale data
+  never does) and rank them; `[pick]` in config.toml sets exclusions, preferences, the models and
+  effort levels to choose from, and notes. With `TYPESAFE_API_KEY` set and notes written, one
+  request asks TypeSafe's Jev model to choose among the feasible options; its answer is taken
+  only when confident, and the rules decide otherwise or on any error. The request carries
+  aliased usage and the notes as written (accounts written as `provider:name` are aliased too),
+  never credentials, emails, organizations, paths or session content; `--print-request` shows it
+  and `--offline` never sends. `--json` prints every candidate; `--run` launches the choice as
+  `remuda run` does, with `--model`/`--effort` (claude) or `-m`/`-c model_reasoning_effort=`
+  (codex) injected. This is remuda's first network request of its own, made only with a key.
+  `remuda add` and `remuda setup` refuse an account that would leave `config.toml` invalid, such
+  as one that makes a bare name in `[pick]` ambiguous; write accounts there as `provider:name`.
+
 - Shared configuration (SPEC R18): with `[share.claude] from = "<account>"`, every other Claude
   account launches with the source account's instructions (`CLAUDE.md`, skills, commands,
   agents), settings, enabled plugins, and auto-memory location, injected as launch options.

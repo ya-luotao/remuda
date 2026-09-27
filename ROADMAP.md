@@ -37,7 +37,9 @@ and planned work.
 | 2026-09-24 | Token statistics from transcripts, deduplicated by message id / cumulative total, own cache | The agents record exact usage per request; `message.id` and codex's cumulative total identify a request across repeated records, forks and relay copies. A row per request in `state/stats.json` keeps deduplication exact and needs no time zone; it stays out of `index.json`, which reads only head and tail windows (R20) |
 | 2026-09-24 | Private mode as a redacted snapshot of the TUI state | The screen is drawn from a copy of the state with names aliased and personal fields masked; every field is destructured, so a new one cannot reach the screen before it is decided how it is shown (R21) |
 | 2026-09-24 | Codex live usage and identity through `codex app-server`, only on explicit live queries; `list` keeps `codex login status` | `account/rateLimits/read` and `account/read` are machine-readable and codex reads its own credentials, so `auth.json` stays unread; but starting app-server is like launching Codex (it may refresh a token, uses the network, writes state into the home, takes about 1.5 s), so it runs only when live usage is asked for (R4, R10, R10a) |
-| 2026-09-24 | Cost as an estimate at API list prices: a built-in table with config.toml overrides, exact in picodollars | Most accounts are subscriptions, so list prices are the only comparable figure; a built-in table keeps remuda free of network requests and overrides cover new models and price changes; integer picodollars keep each request's cost exact, so sections add up to overall (R20) |
+| 2026-09-24 | Cost as an estimate at API list prices: a built-in table with config.toml overrides, exact in picodollars | Most accounts are subscriptions, so list prices are the only comparable figure; a built-in table keeps cost estimates free of network requests and overrides cover new models and price changes; integer picodollars keep each request's cost exact, so sections add up to overall (R20) |
+| 2026-09-27 | `remuda pick`: rules decide what is feasible, Jev chooses among it, taken only when confident | Hard limits are facts remuda can check (headroom on every window that applies, exclusions, logins), so they are never left to a model; what a model adds is weighing the user's free-text notes against headroom, resets and staleness. Jev answers a typed Choice with calibrated probabilities, so its pair is taken from 0.50 confidence, its account from 0.70, and the rules decide otherwise or on any error (R23) |
+| 2026-09-27 | The first network request of remuda's own: only `pick`, only with `TYPESAFE_API_KEY` and notes; through `curl`, the key on its stdin | Without a key or notes nothing is sent and the rules decide; the state is aliased usage and the notes as written, never credentials, emails, organizations, paths or session content, and `--print-request` shows it. `curl` keeps an HTTP and TLS stack out of the binary; the key goes in the configuration curl reads on stdin, so it is never in the process list (R13, R23) |
 
 ## Technology
 
@@ -50,6 +52,8 @@ and planned work.
 - `unicode-normalization`: NFC for home paths and project names (R2, R18); `unicode-width`:
   display columns; `sha2`: settings file names (R18); `uuid`: pre-assigned session IDs (R6);
   `libc`: terminal modes and process groups
+- `curl` (the system's, found on PATH): the one request of `remuda pick` (R23); no HTTP client
+  is linked in
 - The index and statistics caches are single files under `state/`; move to SQLite only if data
   volume requires it
 - A single crate (lib + bin); the modules and how data flows between them are described in
@@ -113,6 +117,9 @@ so such a setup first moves `projects` to per-account stores.
 - Interact with running sessions through `messagingSocketPath`.
 - Relocate homes using `CLAUDE_SECURESTORAGE_CONFIG_DIR` (R2).
 - `--private` for command-line output (R21 covers the TUI only).
+- Task text in `remuda pick` (the state has a `task` slot for it), so the recommendation can
+  weigh what the session is for.
+- A TUI key for `pick`: the recommendation in the Accounts view, and a launch from it.
 
 ## Known issues
 

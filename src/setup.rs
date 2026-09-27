@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::provider::Provider;
-use crate::registry::{self, Account, Home, Registry};
+use crate::registry::{self, Account, Home};
 use crate::{Env, paths};
 
 /// Validates everything `setup` needs before any side effect and returns the new account.
@@ -31,7 +31,7 @@ pub fn plan(config: &Path, provider: Provider, name: &str, env: &Env) -> Result<
         name: name.to_string(),
         home: Home::Path(home.clone()),
     };
-    Registry::load(config)?.check_available(&account)?;
+    registry::check_registrable(config, &account)?;
     if fs::symlink_metadata(&dir).is_ok() {
         bail!("{home} already exists; to register an existing directory use `remuda add`");
     }

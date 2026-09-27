@@ -114,6 +114,60 @@ target account; the original is never modified, and the copy is hidden from the 
 A relay never overwrites anything except its own earlier copy of the same session, and only if
 that copy is unchanged.
 
+## Recommendations
+
+`remuda pick` answers "which account, model and effort should I launch now?" from each account's
+usage (cached, or with `--live` queried first) and the `[pick]` table in `config.toml`:
+
+```toml
+[pick]
+exclude = ["claude:team"]      # never recommended
+prefer = ["claude:max"]        # breaks the last ties
+min_headroom = 10              # percent left required on every window that applies
+stale_after = 120              # minutes after which cached usage is marked stale
+notes = """
+Keep claude:max for long refactors. codex:work is the company's; weekdays only.
+"""
+
+[pick.claude]
+models = ["claude-opus-5-5", "claude-fable-5-1"]   # in order of preference; the first is the default
+efforts = ["medium", "high", "xhigh", "max"]       # from low to high
+default_effort = "high"
+
+[pick.codex]
+models = ["gpt-6-astra"]
+```
+
+- **Rules first.** A pair of account and model is feasible when every window that applies to it
+  has at least `min_headroom` percent left: the general windows, plus the per-model week of its
+  family (`claude-fable-5-1` counts against `Week (Fable)`). Without `models`, remuda does not
+  know the agent's default model: per-model windows are shown (`also`), never counted. Write
+  accounts in `[pick]` as `provider:name`. A window whose reset has passed
+  since the cache was written counts as empty; old data never makes an exhausted window usable.
+  Excluded and logged-out accounts are not feasible. The feasible pairs are ranked by model
+  order, headroom (in 10-point bands), freshness, the sooner reset, `prefer`, and registry order.
+- **Jev, when asked.** With `TYPESAFE_API_KEY` set and `notes` written, and something to choose
+  (two options, or an effort to score), remuda sends one request to TypeSafe's Jev model through `curl` (the key on curl's standard
+  input, never on its command line) and takes its choice when its confidence is at least 0.50,
+  or its most probable account when that account's options add up to 0.70; otherwise, or on any
+  error, the rules decide. With a single option only the effort is asked. The effort comes from
+  Jev's score when it is confident and usable, else from `default_effort`.
+- **What is sent.** Each feasible account under an alias (`claude:account-1`, as in private
+  mode; `default` stays `default`) with its usage windows, the local weekday and time, your models
+  and efforts, and your notes. In the notes, accounts written as `provider:name` are replaced by
+  their aliases; everything else is sent as written, so write accounts that way and keep secrets
+  out of the notes. Credentials, emails, organizations, paths and session content are never sent.
+  `remuda pick --print-request` prints the exact request without sending it; `--offline` never
+  sends.
+- **Output.** The account, model and effort, what decided (and the rules' choice when Jev chose
+  otherwise), the binding window and its reset, how old the data is, the `remuda run` command,
+  and every pair that is not feasible with the reason. `--json` prints the same, with every
+  candidate. With nothing feasible, `pick` lists the reasons and exits 1.
+- **Launching.** `remuda pick --run [-- <args>...]` launches the recommendation as `remuda run`
+  would: claude gets `--model` and `--effort`, codex `-m` and `-c model_reasoning_effort=`,
+  before your arguments; an option your arguments already set is left alone. Arguments that
+  resume or fork a session are refused.
+
 ## Cost estimates
 
 The statistics price each request at the provider's public API list price, built into remuda (as
@@ -164,6 +218,9 @@ shared `projects` store without `cleanupPeriodDays`, and problems with the share
   is shared by several accounts. Each request is also priced at the provider's public API list
   price (built in, as of 2026-09-24), which estimates what the usage would cost on the API; for
   subscription logins it is not a bill. No agent is run and nothing is fetched.
+- **Recommendations** (`remuda pick`) read the same usage and `[pick]`; the only request remuda
+  makes itself goes to TypeSafe, and only with a key and notes (see
+  [Recommendations](#recommendations)).
 - **Attribution:** new Claude sessions get a pre-assigned `--session-id`, and every launch is
   recorded in `state/launches.jsonl`, so each session can be attributed to the account that
   started it.
