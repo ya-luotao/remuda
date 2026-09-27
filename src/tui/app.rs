@@ -16,6 +16,7 @@ use crate::identity::Identity;
 use crate::index::{Entry, Index, Store};
 use crate::launch::{self, Intent};
 use crate::live::{self, Control, LiveId, LiveSession};
+use crate::privacy::Aliases;
 use crate::provider::Provider;
 use crate::registry::{self, Account, CLAUDE, CODEX, Home};
 use crate::relay;
@@ -24,7 +25,6 @@ use crate::stats::{self, Period};
 use crate::transcript::Message;
 use crate::usage::{CachedUsage, LiveResult, LiveUsage, UsageRow};
 
-use super::privacy::Aliases;
 use super::{render, search};
 
 /// Live sessions are re-collected this long after the last collection finished (R7).

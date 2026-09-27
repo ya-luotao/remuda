@@ -65,7 +65,7 @@ Modules are layered: each layer uses the layers below it.
  ├─ reading agents' data ────────────────────────────────────────────────────┤
  │  index · transcript · provider::codex · provider::app_server · probe      │
  ├─ foundation ──────────────────────────────────────────────────────────────┤
- │  registry · provider · paths · text                                       │
+ │  registry · provider · paths · privacy · text                             │
  └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -104,12 +104,13 @@ The exceptions, all for a type or a small helper:
 | `stats` | Token counting, deduplication across copies, periods, sections, chart buckets, text table | R20 |
 | `pricing` | Built-in prices and `[prices]` overrides; the cost of one request in picodollars | R20 |
 | `account_config` | What an account's sessions load and where each item comes from | R22 |
+| `privacy` | Account-name aliases, and whole-word aliasing of names in free text | R21 |
 | `text` | Terminal text measured in display columns | – |
 | `tui` | Terminal ownership, the event loop, foreground launches | R16 |
 | `tui::app` | All TUI state and the pure `update(app, event) -> effects` | R8, R16, R17, R19–R22 |
 | `tui::workers` | Runs each background effect on a thread and sends back events | R7–R11, R20, R22 |
 | `tui::render` | Draws the state; views, overlays, key reference | – |
-| `tui::privacy` | Private mode: the redacted copy of the state that is drawn | R21 |
+| `tui::privacy` | Private mode: the redacted copy of the state that is drawn; aliases from `privacy` | R21 |
 | `tui::timeline` | The shared seven-day reset timeline | R10 |
 | `tui::search` | Fuzzy ranking of History rows | R8 |
 

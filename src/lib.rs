@@ -14,6 +14,7 @@ pub mod launch;
 pub mod live;
 pub mod paths;
 pub mod pricing;
+pub mod privacy;
 pub mod probe;
 pub mod provider;
 pub mod registry;
