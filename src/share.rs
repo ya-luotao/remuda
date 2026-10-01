@@ -1,10 +1,10 @@
 //! Shared configuration, injected at launch (SPEC R18): a claude account gets the source
-//! account's instructions, settings, enabled plugins and auto-memory location as launch
-//! options. Nothing is written into any home (R13); remuda keeps only the item links under
-//! `$REMUDA_HOME/shared/claude/.claude/` and the injected settings in
-//! `$REMUDA_HOME/state/settings/`.
+//! account's instructions, settings, enabled plugins and memory locations as launch
+//! options. Nothing is written into any home (R13); remuda keeps only the item links and the
+//! copies of the source's rules under `$REMUDA_HOME/shared/claude/.claude/` and the injected
+//! settings in `$REMUDA_HOME/state/settings/`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -23,8 +23,20 @@ use crate::registry::{Account, Sharing};
 
 /// With it set, `--add-dir` also loads `CLAUDE.md` from the added directory (R18).
 pub const CLAUDE_MD_VAR: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
-/// The instruction items of a home that `--add-dir=$REMUDA_HOME/shared/claude` shares.
+/// The instruction items of a home that `--add-dir=$REMUDA_HOME/shared/claude` shares through
+/// a link each.
 pub const INSTRUCTIONS: [&str; 4] = ["CLAUDE.md", "skills", "commands", "agents"];
+/// The rules of a home, shared through the same `--add-dir` as copies: claude does not load
+/// rules of an added directory through links (R18).
+pub const RULES: &str = "rules";
+/// Directory levels of `rules/` that are shared.
+pub const MAX_RULES_DEPTH: usize = 16;
+/// Rule files shared at most.
+pub const MAX_RULES: usize = 1000;
+/// Where a home keeps the memory of its user-scope subagents.
+pub const AGENT_MEMORY: &str = "agent-memory";
+/// With it set, claude keeps user-scope agent memory under it instead of the home (R18).
+pub const MEMORY_DIR_VAR: &str = "CLAUDE_CODE_REMOTE_MEMORY_DIR";
 /// The settings key that moves auto-memory.
 pub const MEMORY_KEY: &str = "autoMemoryDirectory";
 /// Roots longer than this many UTF-16 code units are truncated and hashed by claude
@@ -43,6 +55,8 @@ pub struct Shared {
     pub args: Vec<String>,
     /// Variables added to the child's environment.
     pub env: Vec<(String, String)>,
+    /// Variables removed from the child's environment.
+    pub unset: Vec<String>,
     /// One-line messages for the user (stderr for `run`, the status bar in the TUI).
     pub notices: Vec<String>,
 }
@@ -89,11 +103,19 @@ pub struct Plan {
     pub settings_shared: bool,
     pub memory_shared: bool,
     pub plugins_shared: bool,
+    pub agent_memory_shared: bool,
     /// The content of the single `--settings` (authentication removed, `autoMemoryDirectory`
     /// included when remuda adds it); empty: no `--settings`.
     pub settings: Map<String, Value>,
     /// The `autoMemoryDirectory` remuda adds (also in `settings`), if any.
     pub memory: Option<String>,
+    /// The source's home, when [`MEMORY_DIR_VAR`] is set to it: only together with `memory`,
+    /// without which the variable would also move auto-memory.
+    pub agent_memory: Option<PathBuf>,
+    /// remuda's own environment has [`MEMORY_DIR_VAR`] with the source's home as its value: an
+    /// outer remuda launch set it for its own session. It is decided again for this launch and
+    /// removed when not set, never inherited.
+    pub inherited_memory_dir: bool,
     /// Each plugin the source enables, in order, injected as `--plugin-dir` or why not; empty
     /// when the plugins are shared by realpath or not part of the launch.
     pub plugins: Vec<PluginPlan>,
@@ -159,7 +181,15 @@ pub fn plan(
     cwd: Option<&Path>,
     env: &Env,
 ) -> Result<Plan> {
-    let mut plan = Plan::default();
+    let mut plan = Plan {
+        inherited_memory_dir: sharing
+            .source
+            .as_ref()
+            .and_then(|source| source.home_dir(env))
+            .zip(env.get(MEMORY_DIR_VAR))
+            .is_some_and(|(from, value)| Path::new(value) == from),
+        ..Plan::default()
+    };
     let Some(source) = sharing.source_for(account) else {
         return Ok(plan);
     };
@@ -187,6 +217,7 @@ pub fn plan(
     plan.settings_shared = settings_shared;
     plan.memory_shared = memory_shared;
     plan.plugins_shared = plugins_shared;
+    plan.agent_memory_shared = resolves_to(&home.join(AGENT_MEMORY), &from.join(AGENT_MEMORY));
     let plugins_part = !plugins_shared;
     if let Some(option) = user_settings
         && !(settings_shared && memory_shared)
@@ -235,6 +266,11 @@ pub fn plan(
         {
             injected.insert(MEMORY_KEY.to_string(), Value::String(memory.clone()));
             plan.memory = Some(memory);
+            // A variable the user set is kept.
+            let users = env.contains_key(MEMORY_DIR_VAR) && !plan.inherited_memory_dir;
+            if !plan.agent_memory_shared && !users {
+                plan.agent_memory = Some(from.clone());
+            }
         }
         plan.settings = injected;
     }
@@ -285,10 +321,18 @@ pub fn plan(
     Ok(plan)
 }
 
-/// The writes of [`inject`] for `plan` (R18): the `.claude` item links next to `config` when
-/// instructions are injected, and the settings file. What cannot be made is left out of the
-/// launch, with a notice.
+/// The writes of [`inject`] for `plan` (R18): the `.claude` item links and rule copies next to
+/// `config` when instructions are injected, and the settings file. What cannot be made is left
+/// out of the launch, with a notice.
 pub fn apply(plan: &Plan, config: &Path) -> Result<Shared> {
+    let mut shared = apply_source(plan, config)?;
+    if plan.inherited_memory_dir && !shared.env.iter().any(|(k, _)| k == MEMORY_DIR_VAR) {
+        shared.unset.push(MEMORY_DIR_VAR.to_string());
+    }
+    Ok(shared)
+}
+
+fn apply_source(plan: &Plan, config: &Path) -> Result<Shared> {
     let mut shared = Shared::default();
     let Some((name, from)) = &plan.source else {
         return Ok(shared);
@@ -313,7 +357,15 @@ pub fn apply(plan: &Plan, config: &Path) -> Result<Shared> {
     if !plan.settings.is_empty() {
         let json = serde_json::to_string(&Value::Object(plan.settings.clone()))?;
         match write_settings(&settings_dir(config), &json, SystemTime::now()) {
-            Ok(path) => shared.args.push(format!("--settings={}", path.display())),
+            Ok(path) => {
+                shared.args.push(format!("--settings={}", path.display()));
+                // Only with the settings that keep auto-memory where it is.
+                if let Some(dir) = &plan.agent_memory {
+                    shared
+                        .env
+                        .push((MEMORY_DIR_VAR.to_string(), dir.display().to_string()));
+                }
+            }
             Err(e) => shared.notices.push(format!(
                 "settings from {name} are not shared this time: {e:#}"
             )),
@@ -350,7 +402,7 @@ pub fn write_settings(dir: &Path, json: &str, now: SystemTime) -> Result<PathBuf
         .with_context(|| format!("cannot create {}", dir.display()))?;
     // Held until this returns: a file is never pruned between being chosen and being marked
     // used, by this remuda or another.
-    let _lock = SettingsLock::exclusive(dir)?;
+    let _lock = Lock::settings(dir)?;
     if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
         fs::OpenOptions::new()
             .write(true)
@@ -381,12 +433,13 @@ pub fn write_settings(dir: &Path, json: &str, now: SystemTime) -> Result<PathBuf
 /// The lock file of the settings directory: never a settings file, so never pruned.
 pub const SETTINGS_LOCK: &str = ".lock";
 
-/// An exclusive `flock` on `<dir>/.lock` (a regular file, 0600), released when dropped. On a
-/// file system without locking there is no lock, and remuda goes on without it (R18).
-struct SettingsLock(Option<fs::File>);
+/// An exclusive `flock`, released when dropped. On a file system without locking there is no
+/// lock, and remuda goes on without it (R18).
+struct Lock(Option<fs::File>);
 
-impl SettingsLock {
-    fn exclusive(dir: &Path) -> Result<SettingsLock> {
+impl Lock {
+    /// On `<dir>/.lock` (a regular file, 0600) of the settings directory.
+    fn settings(dir: &Path) -> Result<Lock> {
         let path = dir.join(SETTINGS_LOCK);
         let file = fs::OpenOptions::new()
             .read(true)
@@ -396,10 +449,20 @@ impl SettingsLock {
             .mode(0o600)
             .open(&path)
             .with_context(|| format!("cannot open {}", path.display()))?;
+        Lock::on(file, &path)
+    }
+
+    /// On the directory `dir` itself: nothing is created for it.
+    fn directory(dir: &Path) -> Result<Lock> {
+        let file = fs::File::open(dir).with_context(|| format!("cannot open {}", dir.display()))?;
+        Lock::on(file, dir)
+    }
+
+    fn on(file: fs::File, path: &Path) -> Result<Lock> {
         loop {
             // SAFETY: the descriptor is open for the call.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(SettingsLock(Some(file)));
+                return Ok(Lock(Some(file)));
             }
             let e = io::Error::last_os_error();
             let code = e.raw_os_error().unwrap_or(0);
@@ -409,14 +472,14 @@ impl SettingsLock {
             // Not a pattern: EOPNOTSUPP and ENOTSUP are one value on Linux.
             let unsupported = [libc::EBADF, libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP];
             if unsupported.contains(&code) {
-                return Ok(SettingsLock(None));
+                return Ok(Lock(None));
             }
             return Err(e).with_context(|| format!("cannot lock {}", path.display()));
         }
     }
 }
 
-impl Drop for SettingsLock {
+impl Drop for Lock {
     fn drop(&mut self) {
         if let Some(file) = &self.0 {
             // SAFETY: the descriptor is still open; closing it would release the lock anyway.
@@ -687,9 +750,15 @@ impl Instructions {
 
 pub fn instructions(source: &Path, home: &Path) -> Instructions {
     let mut out = Instructions::default();
-    for item in INSTRUCTIONS {
+    for item in items() {
         let from = source.join(item);
-        if !from.exists() {
+        // Rules count only when there is one to share.
+        let has = if item == RULES {
+            !rule_files(&from).is_empty()
+        } else {
+            from.exists()
+        };
+        if !has {
             continue;
         }
         if resolves_to(&home.join(item), &from) {
@@ -701,12 +770,391 @@ pub fn instructions(source: &Path, home: &Path) -> Instructions {
     out
 }
 
-/// Makes `<dir>/.claude` a directory holding exactly one symlink per instruction item the
-/// source has ([`INSTRUCTIONS`]), each pointing at `<source>/<item>` (R18). When it already
-/// is, nothing is written. Inside an existing directory, a missing link is created, one with
-/// another target is replaced atomically, and one for an item the source no longer has is
-/// removed; an entry that is not a symlink is never replaced, and then nothing is changed.
-/// Nothing else in `dir` or in `.claude` is touched. A `.claude` that is a symlink (the
+/// Every instruction item: the linked ones, then the rules.
+pub fn items() -> impl Iterator<Item = &'static str> {
+    INSTRUCTIONS.into_iter().chain([RULES])
+}
+
+/// The rule files of the `rules` directory `dir` (R18): its `**/*.md` regular files down to
+/// [`MAX_RULES_DEPTH`] levels, symlinks followed and a directory reached twice read once, as
+/// paths below `dir`, sorted; the first [`MAX_RULES`] in name order, directory by directory.
+/// Empty when `dir` is not a directory.
+pub fn rule_files(dir: &Path) -> Vec<PathBuf> {
+    fn walk(
+        dir: &Path,
+        rel: &Path,
+        depth: usize,
+        seen: &mut BTreeSet<PathBuf>,
+        out: &mut Vec<PathBuf>,
+    ) {
+        let Ok(real) = fs::canonicalize(dir) else {
+            return;
+        };
+        if !seen.insert(real) {
+            return;
+        }
+        let Ok(listing) = fs::read_dir(dir) else {
+            return;
+        };
+        let mut names: Vec<_> = listing.flatten().map(|entry| entry.file_name()).collect();
+        names.sort();
+        for name in names {
+            if out.len() >= MAX_RULES {
+                return;
+            }
+            let path = dir.join(&name);
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                if depth < MAX_RULES_DEPTH {
+                    walk(&path, &rel.join(&name), depth + 1, seen, out);
+                }
+            } else if meta.is_file() && is_rule_name(&name) {
+                out.push(rel.join(&name));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, Path::new(""), 1, &mut BTreeSet::new(), &mut out);
+    out.sort();
+    out
+}
+
+fn is_rule_name(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes().ends_with(b".md")
+}
+
+/// The rule files of `dir` ([`rule_files`]) whose frontmatter limits them to paths
+/// ([`rule_has_paths`]).
+pub fn scoped_rules(dir: &Path) -> Vec<PathBuf> {
+    rule_files(dir)
+        .into_iter()
+        .filter(|rel| read_regular(&dir.join(rel)).is_ok_and(|bytes| rule_has_paths(&bytes)))
+        .collect()
+}
+
+/// Whether a rule's frontmatter has a top-level `paths:` key. claude does not apply such a
+/// rule when it comes from an added directory (R18), whatever file is read.
+pub fn rule_has_paths(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let mut lines = text.split('\n').map(|l| l.trim_end_matches('\r'));
+    if lines.next().map(str::trim_end) != Some("---") {
+        return false;
+    }
+    let mut paths = false;
+    for line in lines {
+        if matches!(line.trim_end(), "---" | "...") {
+            return paths;
+        }
+        paths |= line.starts_with("paths:");
+    }
+    // A frontmatter that does not end is none.
+    false
+}
+
+/// One change to the copies of the source's rules, by path below `rules`.
+enum RuleStep {
+    /// A copy the source no longer has, or a temporary file a write cut short left behind.
+    Remove(PathBuf),
+    /// A directory in a copy's place that the removals leave without files.
+    Clear(PathBuf),
+    Write {
+        rel: PathBuf,
+        bytes: Vec<u8>,
+    },
+}
+
+/// What makes `<root>/rules` hold a copy of each rule file of `<source>/rules` and no other
+/// file of remuda's (R18), decided without writing: a copy that is missing or differs is
+/// written; a regular `*.md` file there that the source no longer has is removed, and so is a
+/// temporary file of an earlier write. A file or a directory of remuda's that is in the way of
+/// a copy goes first (a rule that became a directory, or the reverse). `rules`, a directory on
+/// the way to a copy, or a copy's place taken by anything else is never replaced: that is an
+/// error. A rule that cannot be read is not shared. Anything else under `<root>/rules` is left
+/// alone.
+fn rules_plan(root: &Path, source: &Path) -> Result<Vec<RuleStep>> {
+    let mirror = root.join(RULES);
+    let from = source.join(RULES);
+    let not_dir = |path: &Path| {
+        anyhow::anyhow!(
+            "{} is not a directory; remuda does not replace it",
+            path.display()
+        )
+    };
+    let exists = match fs::symlink_metadata(&mirror) {
+        Ok(meta) if meta.file_type().is_dir() => true,
+        Ok(_) => return Err(not_dir(&mirror)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", mirror.display())),
+    };
+    let wanted: BTreeMap<PathBuf, Vec<u8>> = rule_files(&from)
+        .into_iter()
+        .filter_map(|rel| Some((read_regular(&from.join(&rel)).ok()?, rel)))
+        .map(|(bytes, rel)| (rel, bytes))
+        .collect();
+    let write = |(rel, bytes)| RuleStep::Write { rel, bytes };
+    if !exists {
+        return Ok(wanted.into_iter().map(write).collect());
+    }
+
+    // The files that stay. A copy is also listed under the name the file system has for it,
+    // which need not be the source's spelling where case is ignored: it is the same file.
+    let id = |rel: &Path| {
+        fs::symlink_metadata(mirror.join(rel))
+            .ok()
+            .filter(|m| m.file_type().is_file())
+            .map(|m| (m.dev(), m.ino()))
+    };
+    let kept: BTreeSet<(u64, u64)> = wanted.keys().filter_map(|rel| id(rel)).collect();
+    let stale: BTreeSet<PathBuf> = rule_copies(&mirror)
+        .into_iter()
+        .filter(|rel| !wanted.contains_key(rel))
+        .filter(|rel| id(rel).is_some_and(|file| !kept.contains(&file)))
+        .collect();
+
+    let mut steps: Vec<RuleStep> = stale.iter().cloned().map(RuleStep::Remove).collect();
+    let mut writes = Vec::new();
+    for (rel, bytes) in wanted {
+        // Each directory on the way is one, or is not there (yet, or once a stale file of
+        // that name is gone).
+        let mut there = true;
+        let mut dir = PathBuf::new();
+        for part in rel.parent().into_iter().flat_map(Path::components) {
+            dir.push(part);
+            let path = mirror.join(&dir);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_dir() => {}
+                Ok(_) if stale.contains(&dir) => there = false,
+                Ok(_) => return Err(not_dir(&path)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => there = false,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot inspect {}", path.display()));
+                }
+            }
+            if !there {
+                break;
+            }
+        }
+        let dest = mirror.join(&rel);
+        let same = there
+            && match fs::symlink_metadata(&dest) {
+                Ok(meta) if meta.file_type().is_file() => {
+                    fs::read(&dest).is_ok_and(|copy| copy == bytes)
+                }
+                Ok(meta) if meta.file_type().is_dir() && clears(&mirror, &rel, &stale) => {
+                    steps.push(RuleStep::Clear(rel.clone()));
+                    false
+                }
+                Ok(_) => bail!(
+                    "{} is not a regular file; remuda does not replace it",
+                    dest.display()
+                ),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot inspect {}", dest.display()));
+                }
+            };
+        if !same {
+            writes.push(write((rel, bytes)));
+        }
+    }
+    steps.extend(writes);
+    Ok(steps)
+}
+
+/// Whether the directory `rel` of the copies holds nothing but files that go (`stale`), in
+/// directories that hold nothing else either.
+fn clears(mirror: &Path, rel: &Path, stale: &BTreeSet<PathBuf>) -> bool {
+    let Ok(listing) = fs::read_dir(mirror.join(rel)) else {
+        return false;
+    };
+    listing.flatten().all(|entry| {
+        let rel = rel.join(entry.file_name());
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => clears(mirror, &rel, stale),
+            Ok(_) => stale.contains(&rel),
+            Err(_) => false,
+        }
+    })
+}
+
+/// The files under the copies directory `dir` that are remuda's, as paths below it: regular
+/// `*.md` files, and the temporary files of [`apply_rules`]. Symlinks are neither followed nor
+/// listed (remuda puts none there).
+fn rule_copies(dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, rel: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(listing) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in listing.flatten() {
+            let name = entry.file_name();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if depth < MAX_RULES_DEPTH {
+                    walk(&dir.join(&name), &rel.join(&name), depth + 1, out);
+                }
+            } else if kind.is_file() && (is_rule_name(&name) || is_temp_name(&name)) {
+                out.push(rel.join(&name));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, Path::new(""), 1, &mut out);
+    out
+}
+
+/// `.<32 hex digits>.tmp`: the name [`apply_rules`] writes a copy under. Not a rule's name, so
+/// claude never loads a copy half written.
+fn is_temp_name(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes()
+        .strip_prefix(b".")
+        .and_then(|rest| rest.strip_suffix(b".tmp"))
+        .is_some_and(|hex| hex.len() == 32 && hex.iter().all(u8::is_ascii_hexdigit))
+}
+
+/// Whether `rules` and every directory of `dir` below it are directories (not links to one);
+/// `false` when one is missing, an error when something else is there.
+fn real_dirs(mirror: &Path, dir: &Path) -> Result<bool> {
+    let mut path = mirror.to_path_buf();
+    for part in std::iter::once(None).chain(dir.components().map(Some)) {
+        if let Some(part) = part {
+            path.push(part);
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => bail!(
+                "{} is not a directory; remuda does not replace it",
+                path.display()
+            ),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", path.display())),
+        }
+    }
+    Ok(true)
+}
+
+/// Carries out [`rules_plan`] under `root`: removals first, then the writes. Every directory
+/// on the way is checked again, or made, one level at a time, never through a link; each copy
+/// is written read-only (mode 0400, so that editing the copy instead of the source's rule
+/// fails) under a temporary name in its directory and renamed into place; a removed copy's
+/// directories go with it when that leaves them empty, `rules` itself included.
+fn apply_rules(root: &Path, steps: Vec<RuleStep>) -> Result<()> {
+    let mirror = root.join(RULES);
+    for step in steps {
+        match step {
+            RuleStep::Remove(rel) => {
+                let dir = rel.parent().unwrap_or(Path::new(""));
+                if !real_dirs(&mirror, dir)? {
+                    continue;
+                }
+                let dest = mirror.join(&rel);
+                // Checked again right before: never anything but a regular file.
+                if fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_file())
+                    && let Err(e) = fs::remove_file(&dest)
+                    && e.kind() != io::ErrorKind::NotFound
+                {
+                    return Err(e).with_context(|| format!("cannot remove {}", dest.display()));
+                }
+                // Fails on a directory that still holds something: it stays.
+                let mut dir = Some(dir);
+                while let Some(d) = dir
+                    && fs::remove_dir(mirror.join(d)).is_ok()
+                {
+                    dir = d.parent();
+                }
+            }
+            RuleStep::Clear(rel) => {
+                if real_dirs(&mirror, &rel)? {
+                    remove_empty_dirs(&mirror.join(&rel))?;
+                }
+            }
+            RuleStep::Write { rel, bytes } => {
+                let dir = make_dirs(&mirror, rel.parent().unwrap_or(Path::new("")))?;
+                let dest = mirror.join(&rel);
+                let tmp = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+                let written = (|| -> io::Result<()> {
+                    let mut file = fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o400)
+                        .open(&tmp)?;
+                    file.write_all(&bytes)?;
+                    fs::rename(&tmp, &dest)
+                })();
+                if let Err(e) = written {
+                    let _ = fs::remove_file(&tmp);
+                    return Err(e).with_context(|| format!("cannot write {}", dest.display()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `rules` and the directories of `dir` below it, each made when missing and never taken
+/// through a link; the last one.
+fn make_dirs(mirror: &Path, dir: &Path) -> Result<PathBuf> {
+    let mut path = mirror.to_path_buf();
+    for part in std::iter::once(None).chain(dir.components().map(Some)) {
+        if let Some(part) = part {
+            path.push(part);
+        }
+        loop {
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_dir() => break,
+                Ok(_) => bail!(
+                    "{} is not a directory; remuda does not replace it",
+                    path.display()
+                ),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::create_dir(&path) {
+                    Ok(()) => break,
+                    // Made in between: looked at again.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("cannot create {}", path.display()));
+                    }
+                },
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot inspect {}", path.display()));
+                }
+            }
+        }
+    }
+    Ok(path)
+}
+
+/// Removes the directory `dir` and the directories in it, none of which holds a file any more;
+/// one that does is an error.
+fn remove_empty_dirs(dir: &Path) -> Result<()> {
+    let listing = match fs::read_dir(dir) {
+        Ok(listing) => listing,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", dir.display())),
+    };
+    for entry in listing.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            remove_empty_dirs(&entry.path())?;
+        }
+    }
+    match fs::remove_dir(dir) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("cannot remove {}", dir.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Makes `<dir>/.claude` a directory holding exactly one symlink per linked instruction item
+/// the source has ([`INSTRUCTIONS`]), each pointing at `<source>/<item>`, and a copy of each of
+/// its rule files under `rules/` ([`rules_plan`]) (R18). When it already is, nothing is
+/// written. Inside an existing directory, a missing link is created, one with another target
+/// is replaced atomically, and one for an item the source no longer has is removed; an entry
+/// that is not a symlink is never replaced, and then nothing is changed. Nothing else in `dir`
+/// or in `.claude` is touched. A `.claude` that is a symlink (the
 /// earlier layout, a link to the whole source home) is migrated: the directory is built under
 /// a temporary name in `dir`, the link is removed, and the directory is renamed into place.
 pub fn ensure_links(dir: &Path, source: &Path) -> Result<()> {
@@ -764,10 +1212,13 @@ pub fn ensure_links(dir: &Path, source: &Path) -> Result<()> {
     }
 }
 
-/// The item links of `source` under `root` (an existing `.claude` directory), changed only
-/// where they differ: decided for all four items first, so an entry that is not a symlink
-/// fails before anything is written, and a directory that is already right gets no write.
+/// The item links and rule copies of `source` under `root` (an existing `.claude` directory),
+/// changed only where they differ: decided for every item first, so an entry remuda does not
+/// replace fails before anything is written, and a directory that is already right gets no
+/// write. A write that fails midway leaves the rest for the next launch. One remuda at a time
+/// (a lock on `root` itself): another's removals never meet this one's writes.
 fn fill(root: &Path, source: &Path) -> Result<()> {
+    let _lock = Lock::directory(root)?;
     enum Action {
         Create,
         Remove,
@@ -799,6 +1250,7 @@ fn fill(root: &Path, source: &Path) -> Result<()> {
             }
         }
     }
+    let rules = rules_plan(root, source)?;
     for (link, target, action) in actions {
         match action {
             Action::Create => place_link(&target, &link)?,
@@ -813,7 +1265,7 @@ fn fill(root: &Path, source: &Path) -> Result<()> {
             }
         }
     }
-    Ok(())
+    apply_rules(root, rules)
 }
 
 /// A symlink to `target` at `link`, created or replaced atomically: a temporary link in the
@@ -837,7 +1289,7 @@ struct Staged {
 }
 
 impl Staged {
-    /// `<dir>/.claude.<uuid>.tmp` holding a link for each item `source` has.
+    /// `<dir>/.claude.<uuid>.tmp` holding a link for each item `source` has, and its rules.
     fn build(dir: &Path, source: &Path) -> Result<Staged> {
         let path = dir.join(format!(".claude.{}.tmp", uuid::Uuid::new_v4().simple()));
         fs::create_dir(&path).with_context(|| format!("cannot create {}", path.display()))?;
@@ -853,6 +1305,7 @@ impl Staged {
                     .with_context(|| format!("cannot create {}", link.display()))?;
             }
         }
+        apply_rules(&staged.path, rules_plan(&staged.path, source)?)?;
         Ok(staged)
     }
 
@@ -865,8 +1318,8 @@ impl Staged {
 impl Drop for Staged {
     fn drop(&mut self) {
         if !self.committed {
-            // Only what `build` created: a directory of symlinks, which are unlinked, not
-            // followed.
+            // Only what `build` created: symlinks, which are unlinked, not followed, and the
+            // rule copies.
             let _ = fs::remove_dir_all(&self.path);
         }
     }
@@ -1996,6 +2449,544 @@ mod tests {
         assert!(!got.needs_injection() && !got.partial(), "{got:?}");
     }
 
+    /// R18: `rules/**/*.md` regular files, symlinks followed, sorted; a link back into the
+    /// tree ends the walk there; other files are not rules.
+    #[test]
+    fn rule_files_are_the_markdown_files_below_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join("rules");
+        assert!(rule_files(&rules).is_empty());
+        fs::create_dir_all(rules.join("sub/deep")).unwrap();
+        fs::write(rules.join("b.md"), "b").unwrap();
+        fs::write(rules.join("notes.txt"), "no").unwrap();
+        fs::write(rules.join("sub/a.md"), "a").unwrap();
+        fs::write(rules.join("sub/deep/c.md"), "c").unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(elsewhere.join("more")).unwrap();
+        fs::write(elsewhere.join("x.md"), "x").unwrap();
+        fs::write(elsewhere.join("more/y.md"), "y").unwrap();
+        symlink(elsewhere.join("x.md"), rules.join("linked.md")).unwrap();
+        symlink(elsewhere.join("more"), rules.join("more")).unwrap();
+        symlink("/nowhere.md", rules.join("gone.md")).unwrap();
+        symlink(&rules, rules.join("sub/loop")).unwrap();
+        fs::create_dir(rules.join("dir.md")).unwrap();
+        assert_eq!(
+            rule_files(&rules),
+            [
+                "b.md",
+                "linked.md",
+                "more/y.md",
+                "sub/a.md",
+                "sub/deep/c.md"
+            ]
+            .map(PathBuf::from)
+        );
+        // A file where `rules` should be is no rules.
+        assert!(rule_files(&rules.join("b.md")).is_empty());
+    }
+
+    /// R18: a rule is limited to paths when its frontmatter has a top-level `paths` key.
+    #[test]
+    fn rules_limited_to_paths() {
+        assert!(rule_has_paths(b"---\npaths:\n  - \"**/*.rs\"\n---\nbody"));
+        assert!(rule_has_paths(
+            b"\xef\xbb\xbf---\r\ndescription: x\r\npaths: [\"a\"]\r\n---\r\n"
+        ));
+        assert!(!rule_has_paths(
+            b"---\ndescription: x\n---\npaths: not frontmatter\n"
+        ));
+        assert!(!rule_has_paths(b"---\n  paths: nested\n---\n"));
+        assert!(!rule_has_paths(b"paths: x\n"));
+        assert!(!rule_has_paths(b"---\npaths: never ends\n"));
+        assert!(!rule_has_paths(b""));
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("always.md"), "always").unwrap();
+        fs::write(dir.path().join("rust.md"), "---\npaths: \"**/*.rs\"\n---\n").unwrap();
+        assert_eq!(scoped_rules(dir.path()), [PathBuf::from("rust.md")]);
+    }
+
+    /// The source's rules for the copy tests: two rules, one nested, one through a link, and
+    /// a file that is not a rule.
+    fn with_rules(home: &Path) {
+        fs::create_dir_all(home.join("rules/lang")).unwrap();
+        fs::write(home.join("rules/style.md"), "be terse").unwrap();
+        fs::write(home.join("rules/lang/rust.md"), "no unwrap").unwrap();
+        fs::write(home.join("rules/README"), "not a rule").unwrap();
+        fs::write(home.join("elsewhere.md"), "linked rule").unwrap();
+        symlink(home.join("elsewhere.md"), home.join("rules/linked.md")).unwrap();
+    }
+
+    /// R18, R13: the source's rules are shared as copies, regular files of mode 0600 in a real
+    /// `rules` directory, also when `.claude` is created or migrated; a second call writes
+    /// nothing; a changed rule is copied again, one the source lost is removed with the
+    /// directories that leaves empty, and `rules` goes when the source has none. What remuda
+    /// did not put there stays.
+    #[test]
+    fn the_rules_are_copied_and_kept_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("remuda/shared/claude");
+        let a = source_home(dir.path(), "a");
+        with_rules(&a);
+        let source_before = tree(&a);
+        ensure_links(&shared, &a).unwrap();
+        let rules = shared.join(".claude/rules");
+        let copies = |rules: &Path| -> Vec<(PathBuf, String)> {
+            rule_copies(rules)
+                .into_iter()
+                .map(|rel| {
+                    let path = rules.join(&rel);
+                    let meta = fs::symlink_metadata(&path).unwrap();
+                    assert!(meta.file_type().is_file(), "{}", path.display());
+                    assert_eq!(meta.mode() & 0o777, 0o400, "{}", path.display());
+                    (rel, fs::read_to_string(&path).unwrap())
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let want = |pairs: &[(&str, &str)]| -> Vec<(PathBuf, String)> {
+            pairs
+                .iter()
+                .map(|(rel, text)| (PathBuf::from(rel), text.to_string()))
+                .collect()
+        };
+        assert!(fs::symlink_metadata(&rules).unwrap().file_type().is_dir());
+        assert_eq!(
+            copies(&rules),
+            want(&[
+                ("lang/rust.md", "no unwrap"),
+                ("linked.md", "linked rule"),
+                ("style.md", "be terse"),
+            ])
+        );
+        assert_eq!(names(&rules), ["lang", "linked.md", "style.md"]);
+        assert_eq!(
+            links(&shared),
+            [
+                ("CLAUDE.md", a.join("CLAUDE.md")),
+                ("skills", a.join("skills")),
+                ("agents", a.join("agents")),
+            ]
+        );
+        assert_eq!(tree(&a), source_before, "the source is only read");
+
+        // Already right: nothing is written.
+        let before = tree(&shared);
+        let stamps = |dir: &Path| -> Vec<_> {
+            tree(dir)
+                .into_iter()
+                .map(|(path, _)| {
+                    let m = fs::symlink_metadata(&path).unwrap();
+                    (path, m.ino(), m.modified().unwrap())
+                })
+                .collect()
+        };
+        let stamped = stamps(&shared);
+        std::thread::sleep(Duration::from_millis(20));
+        ensure_links(&shared, &a).unwrap();
+        assert_eq!(tree(&shared), before);
+        assert_eq!(stamps(&shared), stamped);
+
+        // A changed rule, a new one, and one the source lost (with its directory); entries
+        // remuda did not put there stay, except what looks like a copy or like the temporary
+        // file of a write cut short.
+        fs::write(rules.join("mine.txt"), "kept").unwrap();
+        symlink("/somewhere", rules.join("theirs.md")).unwrap();
+        fs::write(rules.join("stray.md"), "not the source's").unwrap();
+        let leftover = format!(".{}.tmp", uuid::Uuid::new_v4().simple());
+        fs::write(rules.join("lang").join(&leftover), "half").unwrap();
+        fs::write(rules.join(".keep.tmp"), "not remuda's name").unwrap();
+        fs::write(a.join("rules/style.md"), "be very terse").unwrap();
+        fs::write(a.join("rules/new.md"), "new").unwrap();
+        fs::remove_dir_all(a.join("rules/lang")).unwrap();
+        ensure_links(&shared, &a).unwrap();
+        assert_eq!(
+            copies(&rules),
+            want(&[
+                ("linked.md", "linked rule"),
+                ("new.md", "new"),
+                ("style.md", "be very terse"),
+            ])
+        );
+        assert_eq!(
+            names(&rules),
+            [
+                ".keep.tmp",
+                "linked.md",
+                "mine.txt",
+                "new.md",
+                "style.md",
+                "theirs.md"
+            ]
+        );
+        assert_eq!(fs::read_to_string(rules.join("mine.txt")).unwrap(), "kept");
+        fs::remove_file(rules.join(".keep.tmp")).unwrap();
+
+        // No rules in the source any more: the copies go, and `rules` with them once nothing
+        // else is in it.
+        fs::remove_dir_all(a.join("rules")).unwrap();
+        ensure_links(&shared, &a).unwrap();
+        assert_eq!(names(&rules), ["mine.txt", "theirs.md"]);
+        fs::remove_file(rules.join("mine.txt")).unwrap();
+        fs::remove_file(rules.join("theirs.md")).unwrap();
+        with_rules(&a);
+        ensure_links(&shared, &a).unwrap();
+        fs::remove_dir_all(a.join("rules")).unwrap();
+        ensure_links(&shared, &a).unwrap();
+        assert_eq!(
+            names(&shared.join(".claude")),
+            ["CLAUDE.md", "agents", "skills"]
+        );
+
+        // The earlier whole-home link is migrated with the rules in place.
+        with_rules(&a);
+        fs::remove_dir_all(shared.join(".claude")).unwrap();
+        symlink(&a, shared.join(".claude")).unwrap();
+        ensure_links(&shared, &a).unwrap();
+        assert_eq!(copies(&rules).len(), 3);
+        assert_eq!(names(&shared), [".claude"]);
+    }
+
+    /// R18: `rules`, a directory on the way to a copy, or a copy's place that is not what
+    /// remuda would have put there is never replaced, and then nothing is changed, the item
+    /// links included.
+    #[test]
+    fn rule_entries_remuda_did_not_make_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("remuda/shared/claude");
+        let a = source_home(dir.path(), "a");
+        with_rules(&a);
+        let root = shared.join(".claude");
+        let check = |what: &str| {
+            let before = tree(&shared);
+            let e = ensure_links(&shared, &a).unwrap_err().to_string();
+            assert!(e.contains(what), "{e}");
+            assert_eq!(tree(&shared), before);
+        };
+
+        // `rules` a symlink, then a file.
+        fs::create_dir_all(&root).unwrap();
+        symlink(a.join("rules"), root.join("rules")).unwrap();
+        check("rules is not a directory; remuda does not replace it");
+        fs::remove_file(root.join("rules")).unwrap();
+        fs::write(root.join("rules"), "what").unwrap();
+        check("rules is not a directory; remuda does not replace it");
+
+        // A link where a subdirectory would be; a directory that holds something of the
+        // user's, and a link, where a copy would go.
+        fs::remove_file(root.join("rules")).unwrap();
+        fs::create_dir(root.join("rules")).unwrap();
+        symlink(a.join("rules/lang"), root.join("rules/lang")).unwrap();
+        check("lang is not a directory; remuda does not replace it");
+        fs::remove_file(root.join("rules/lang")).unwrap();
+        fs::create_dir(root.join("rules/style.md")).unwrap();
+        fs::write(root.join("rules/style.md/mine.txt"), "kept").unwrap();
+        check("style.md is not a regular file; remuda does not replace it");
+        fs::remove_dir_all(root.join("rules/style.md")).unwrap();
+        symlink(a.join("rules/style.md"), root.join("rules/style.md")).unwrap();
+        check("style.md is not a regular file; remuda does not replace it");
+
+        // Out of the way: everything is made.
+        fs::remove_file(root.join("rules/style.md")).unwrap();
+        ensure_links(&shared, &a).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("rules/style.md")).unwrap(),
+            "be terse"
+        );
+        assert_eq!(links(&shared).len(), 3);
+    }
+
+    /// R18: a rule that becomes a directory of rules, or the reverse, replaces remuda's own
+    /// copy of the other kind; a directory holding anything that is not remuda's stays, and
+    /// that is an error.
+    #[test]
+    fn a_rule_and_a_directory_of_rules_swap_places() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("remuda/shared/claude");
+        let a = source_home(dir.path(), "a");
+        let rules = shared.join(".claude/rules");
+        fs::create_dir_all(a.join("rules/topic.md/deep")).unwrap();
+        fs::write(a.join("rules/topic.md/part.md"), "part").unwrap();
+        fs::write(a.join("rules/topic.md/deep/more.md"), "more").unwrap();
+        ensure_links(&shared, &a).unwrap();
+        assert!(rules.join("topic.md/deep/more.md").is_file());
+
+        // The directory becomes a file.
+        fs::remove_dir_all(a.join("rules/topic.md")).unwrap();
+        fs::write(a.join("rules/topic.md"), "one rule").unwrap();
+        ensure_links(&shared, &a).unwrap();
+        assert_eq!(
+            fs::read_to_string(rules.join("topic.md")).unwrap(),
+            "one rule"
+        );
+        assert_eq!(names(&rules), ["topic.md"]);
+
+        // And back.
+        fs::remove_file(a.join("rules/topic.md")).unwrap();
+        fs::create_dir(a.join("rules/topic.md")).unwrap();
+        fs::write(a.join("rules/topic.md/part.md"), "part").unwrap();
+        ensure_links(&shared, &a).unwrap();
+        assert_eq!(names(&rules.join("topic.md")), ["part.md"]);
+
+        // Something of the user's in the directory: it stays, and nothing changes.
+        fs::write(rules.join("topic.md/mine.txt"), "kept").unwrap();
+        fs::remove_dir_all(a.join("rules/topic.md")).unwrap();
+        fs::write(a.join("rules/topic.md"), "one rule").unwrap();
+        let before = tree(&shared);
+        let e = ensure_links(&shared, &a).unwrap_err().to_string();
+        assert!(e.contains("topic.md is not a regular file"), "{e}");
+        assert_eq!(tree(&shared), before);
+    }
+
+    /// R18: where the file system ignores case, a rule renamed only in case keeps its copy.
+    #[test]
+    fn a_rule_renamed_in_case_only_keeps_its_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Probe"), "").unwrap();
+        if !dir.path().join("probe").exists() {
+            return;
+        }
+        let shared = dir.path().join("remuda/shared/claude");
+        let a = source_home(dir.path(), "a");
+        fs::create_dir(a.join("rules")).unwrap();
+        fs::write(a.join("rules/Style.md"), "be terse").unwrap();
+        ensure_links(&shared, &a).unwrap();
+        fs::rename(a.join("rules/Style.md"), a.join("rules/style.md")).unwrap();
+        ensure_links(&shared, &a).unwrap();
+        let rules = shared.join(".claude/rules");
+        assert_eq!(names(&rules).len(), 1);
+        assert_eq!(
+            fs::read_to_string(rules.join("style.md")).unwrap(),
+            "be terse"
+        );
+    }
+
+    /// R18: at most [`MAX_RULES`] rules are shared, the first in name order.
+    #[test]
+    fn the_number_of_rules_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..MAX_RULES + 5 {
+            fs::write(dir.path().join(format!("r{n:04}.md")), "").unwrap();
+        }
+        let rules = rule_files(dir.path());
+        assert_eq!(rules.len(), MAX_RULES);
+        assert_eq!(rules[0], PathBuf::from("r0000.md"));
+        assert_eq!(rules[MAX_RULES - 1], PathBuf::from("r0999.md"));
+    }
+
+    /// R18: launches at the same time agree on the copies while the source's rules change
+    /// under them: none fails, and the next launch leaves exactly the source's rules.
+    #[test]
+    fn concurrent_launches_agree_on_the_rules() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("remuda/shared/claude");
+        let a = source_home(dir.path(), "a");
+        fs::create_dir_all(a.join("rules/lang")).unwrap();
+        fs::write(a.join("rules/lang/p.md"), "p").unwrap();
+        ensure_links(&shared, &a).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flipper = {
+            let (a, stop) = (a.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let (p, q) = (a.join("rules/lang/p.md"), a.join("rules/lang/q.md"));
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = fs::rename(&p, &q);
+                    let _ = fs::rename(&q, &p);
+                }
+            })
+        };
+        let barrier = Arc::new(Barrier::new(4));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let (shared, a, barrier) = (shared.clone(), a.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for round in 0..300 {
+                        ensure_links(&shared, &a)
+                            .unwrap_or_else(|e| panic!("round {round}: {e:#}"));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().unwrap();
+        ensure_links(&shared, &a).unwrap();
+        assert_eq!(names(&shared.join(".claude/rules/lang")), ["p.md"]);
+        assert_eq!(names(&shared), [".claude"]);
+    }
+
+    /// R18: the variable an outer remuda launch set (the source's home) is decided again, not
+    /// inherited: removed for the source, an opted-out account and a member that gets no
+    /// auto-memory injected, set again for a member that does. A value of the user's own is
+    /// left as it is.
+    #[test]
+    fn an_inherited_memory_variable_is_decided_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (source_home, max, solo) = (root.join("src"), root.join("max"), root.join("solo"));
+        for d in [&source_home, &max, &solo] {
+            fs::create_dir_all(d.join("projects")).unwrap();
+        }
+        let source = named("src", &source_home);
+        let sharing = Sharing {
+            source: Some(source.clone()),
+            opted_out: vec!["claude:solo".into()],
+        };
+        let config = root.join("remuda/config.toml");
+        let inherited: Env = [(
+            MEMORY_DIR_VAR.to_string(),
+            source_home.display().to_string(),
+        )]
+        .into();
+        let run = |account: &Account, args: &[&str], env: &Env| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            inject(&sharing, account, &args, Some(&root), env, &config).unwrap()
+        };
+        let var = |shared: &Shared| shared.env.iter().any(|(k, _)| k == MEMORY_DIR_VAR);
+        let unset = [MEMORY_DIR_VAR.to_string()];
+
+        let got = run(&named("max", &max), &[], &inherited);
+        assert!(var(&got) && got.unset.is_empty(), "{got:?}");
+        for (account, args) in [
+            (&source, &[][..]),
+            (&named("solo", &solo), &[][..]),
+            (&named("max", &max), &["--settings", "/mine.json"][..]),
+        ] {
+            let got = run(account, args, &inherited);
+            assert!(!var(&got), "{got:?}");
+            assert_eq!(got.unset, unset, "{}", account.qualified());
+        }
+
+        // The settings file cannot be written: no variable without it.
+        let blocked = root.join("blocked/config.toml");
+        fs::create_dir_all(root.join("blocked/state")).unwrap();
+        fs::write(root.join("blocked/state/settings"), "in the way").unwrap();
+        for env in [&inherited, &Env::new()] {
+            let got = inject(
+                &sharing,
+                &named("max", &max),
+                &[],
+                Some(&root),
+                env,
+                &blocked,
+            )
+            .unwrap();
+            assert!(!var(&got), "{got:?}");
+            assert_eq!(got.unset.is_empty(), env.is_empty());
+            assert!(got.notices[0].contains("settings from claude:src are not shared"));
+        }
+
+        // The user's own value: neither set nor removed, for anyone.
+        let users: Env = [(MEMORY_DIR_VAR.to_string(), "/theirs".to_string())].into();
+        for account in [&source, &named("max", &max), &named("solo", &solo)] {
+            let got = run(account, &[], &users);
+            assert!(!var(&got) && got.unset.is_empty(), "{got:?}");
+        }
+        // Without a source there is nothing to compare it with.
+        let alone = super::inject(
+            &Sharing::default(),
+            &named("max", &max),
+            &[],
+            Some(&root),
+            &inherited,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(alone, Shared::default());
+    }
+
+    /// R11, R18: the rules are an instruction item only when the source has a rule file, and
+    /// shared when the home's `rules` resolves to the source's.
+    #[test]
+    fn rules_count_as_an_item_when_the_source_has_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, home) = (dir.path().join("source"), dir.path().join("home"));
+        fs::create_dir_all(source.join("rules/empty")).unwrap();
+        fs::write(source.join("rules/README"), "no rule yet").unwrap();
+        fs::write(source.join("CLAUDE.md"), "be brief").unwrap();
+        fs::create_dir_all(&home).unwrap();
+        symlink(source.join("CLAUDE.md"), home.join("CLAUDE.md")).unwrap();
+        let got = instructions(&source, &home);
+        assert!(!got.needs_injection(), "{got:?}");
+
+        fs::write(source.join("rules/style.md"), "be terse").unwrap();
+        let got = instructions(&source, &home);
+        assert_eq!(got.shared, ["CLAUDE.md"]);
+        assert_eq!(got.missing, ["rules"]);
+        assert!(got.partial());
+
+        symlink(source.join("rules"), home.join("rules")).unwrap();
+        let got = instructions(&source, &home);
+        assert_eq!(got.shared, ["CLAUDE.md", "rules"]);
+        assert!(!got.needs_injection());
+    }
+
+    /// R18: the memory of user-scope subagents is redirected to the source's home only
+    /// together with the injected auto-memory location: not when `projects` or `agent-memory`
+    /// is the source's already, when the user passes `--settings`, when a settings file
+    /// chooses the auto-memory location, or when the variable is already set.
+    #[test]
+    fn agent_memory_follows_the_injected_auto_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (source_home, max) = (root.join("src"), root.join("max"));
+        for d in [&source_home, &max] {
+            fs::create_dir_all(d.join("projects")).unwrap();
+        }
+        fs::create_dir_all(source_home.join(AGENT_MEMORY)).unwrap();
+        let sharing = Sharing {
+            source: Some(named("src", &source_home)),
+            opted_out: vec![],
+        };
+        let config = root.join("remuda/config.toml");
+        let account = named("max", &max);
+        let var = |args: &[&str], env: &Env| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let plan = plan(&sharing, &account, &args, Some(&root), env).unwrap();
+            let shared = apply(&plan, &config).unwrap();
+            let var = shared
+                .env
+                .iter()
+                .find(|(k, _)| k == MEMORY_DIR_VAR)
+                .map(|(_, v)| v.clone());
+            assert_eq!(var.is_some(), plan.agent_memory.is_some());
+            assert!(var.is_none() || plan.memory.is_some());
+            var
+        };
+        let env = Env::new();
+        assert_eq!(var(&[], &env), Some(source_home.display().to_string()));
+
+        // The user's own settings: no auto-memory is injected, so no variable either.
+        assert_eq!(var(&["--settings", "/mine.json"], &env), None);
+        assert_eq!(var(&["--setting-sources=user"], &env), None);
+        // Already set by the user.
+        let set: Env = [(MEMORY_DIR_VAR.to_string(), "/theirs".to_string())].into();
+        assert_eq!(var(&[], &set), None);
+        // A settings file chooses the auto-memory location.
+        fs::write(max.join("settings.json"), r#"{"autoMemoryDirectory":"/m"}"#).unwrap();
+        assert_eq!(var(&[], &env), None);
+        fs::remove_file(max.join("settings.json")).unwrap();
+        assert!(var(&[], &env).is_some());
+
+        // `agent-memory` is the source's already.
+        symlink(source_home.join(AGENT_MEMORY), max.join(AGENT_MEMORY)).unwrap();
+        let got = plan(&sharing, &account, &[], Some(&root), &env).unwrap();
+        assert!(got.agent_memory_shared && got.agent_memory.is_none());
+        assert!(got.memory.is_some());
+        fs::remove_file(max.join(AGENT_MEMORY)).unwrap();
+
+        // `projects` is the source's: auto-memory is not injected, nor the variable.
+        fs::remove_dir(max.join("projects")).unwrap();
+        symlink(source_home.join("projects"), max.join("projects")).unwrap();
+        assert_eq!(var(&[], &env), None);
+    }
+
     fn named(name: &str, home: &Path) -> Account {
         Account {
             provider: CLAUDE,
@@ -2046,7 +3037,16 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&file).unwrap(), want);
         assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
-        assert_eq!(got.env, [(CLAUDE_MD_VAR.to_string(), "1".to_string())]);
+        assert_eq!(
+            got.env,
+            [
+                (CLAUDE_MD_VAR.to_string(), "1".to_string()),
+                (
+                    MEMORY_DIR_VAR.to_string(),
+                    source_home.display().to_string()
+                ),
+            ]
+        );
         assert_eq!(got.notices, Vec::<String>::new());
         assert_eq!(
             links(&shared_dir),
@@ -2531,7 +3531,7 @@ mod tests {
     #[test]
     fn the_settings_lock_is_exclusive_and_kept() {
         let dir = tempfile::tempdir().unwrap();
-        let held = SettingsLock::exclusive(dir.path()).unwrap();
+        let held = Lock::settings(dir.path()).unwrap();
         assert!(held.0.is_some());
         let lock = dir.path().join(SETTINGS_LOCK);
         let meta = fs::symlink_metadata(&lock).unwrap();

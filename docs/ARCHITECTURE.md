@@ -94,7 +94,7 @@ The exceptions, all for a type or a small helper:
 | `provider::app_server` | JSON-RPC client for `codex app-server` (`account/read`, `account/rateLimits/read`) | R4, R10 |
 | `probe` | Run a short agent command with captured output and a timeout (killing the process group); run many in parallel; run `curl` with its configuration on stdin | R4, R10, R23 |
 | `launch` | Classify arguments, inject `--session-id`, set or unset the home variable, the launch log, `exec` and foreground runs | R2, R6, R16, R17 |
-| `share` | Shared configuration: `plan` (reads only) and `apply` (item links, settings file) | R18 |
+| `share` | Shared configuration: `plan` (reads only) and `apply` (item links, rule copies, settings file) | R18 |
 | `setup` | Create the new home and register it; the login command | R5, R13, R17 |
 | `identity` | `claude auth status --json`, `.claude.json` fallback, `codex login status`, `account/read` | R10a |
 | `usage` | Cached and live usage for both providers, window labels, severity, reset instants | R10 |
@@ -137,7 +137,8 @@ differ between them (R6, R16, R18).
         ├─ classify(args)  NewSession │ Fork{of} │ Existing{id} │ NotASession
         ├─ share::inject   only for sessions of claude members of [share.claude]
         │     ├─ share::plan   reads settings, plugins, links (no writes)
-        │     └─ share::apply  ensures shared/claude/.claude links, writes state/settings/<sha>.json
+        │     └─ share::apply  ensures shared/claude/.claude links and rule copies,
+        │                      writes state/settings/<sha>.json
         └─ record          LaunchRecord { ts, account, cwd, args, session_id, fork_of, shared }
         │
         ▼
@@ -258,10 +259,13 @@ which is why the pane cannot disagree with a launch.
  CLAUDE.md skills/ commands/ agents/  ──links──► --add-dir=$REMUDA_HOME/shared/claude
                                                    (.claude/{CLAUDE.md,skills,commands,agents})
                                                    + CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1
+ rules/**/*.md  ──copies──────────────────────►   (.claude/rules/**, the same --add-dir)
  settings.json  − home − project − local  ─────► --settings=state/settings/<sha256>.json (0600)
                 − authentication keys              { …source-only keys…, autoMemoryDirectory }
  enabledPlugins + installed_plugins.json  ─────► --plugin-dir=<install path>  (one per plugin)
  projects/<project>/memory  ───────────────────► autoMemoryDirectory (inside the same --settings)
+ agent-memory/  ───────────────────────────────► CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>
+                                                   (only with autoMemoryDirectory)
 ```
 
 Each row is skipped when the member's home already resolves to the source's item by realpath
@@ -273,7 +277,8 @@ Each row is skipped when the member's home already resolves to the source's item
  $REMUDA_HOME/                    (default ~/.remuda)
  ├── config.toml                  registry; written by add / setup / remove      registry
  ├── homes/<provider>/<name>/     empty homes created by setup                   setup
- ├── shared/claude/.claude/       one symlink per shared instruction item        share
+ ├── shared/claude/.claude/       one symlink per shared instruction item,       share
+ │                                copies of the source's rules
  └── state/                       caches and logs; safe to delete
      ├── index.json               session index cache                            index
      ├── stats.json               token statistics cache                         stats

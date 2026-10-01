@@ -77,6 +77,16 @@ before your own arguments:
   each launch; a `.claude` from an earlier version, one link to the whole source home, is
   migrated in place. Restart a remuda TUI that was started before upgrading: until then it
   launches members without shared instructions, and says so.
+- **Rules:** the source's `rules/**/*.md`, through the same `--add-dir`, as read-only copies
+  under `.claude/rules/` there: claude does not load rules of an added directory through
+  symlinks. remuda refreshes the copies before each launch, so change a rule in the source's
+  home, not in the copy. A rule limited to files by `paths` in its frontmatter is not applied
+  this way (claude ignores `paths` there); the Accounts view names such rules. They do apply in
+  a home whose `rules` is a symlink to the source's, which makes sense for a home that links the
+  other instruction items too: one that links some items and gets the rest injected loads the
+  linked ones twice, and the Accounts view says so. A home that already links `CLAUDE.md`,
+  skills, commands and agents to the source therefore needs a `rules` link as well, once the
+  source has rules.
 - **Settings:** the part of the source's `settings.json` that neither the account's own settings
   nor the project's `.claude/settings.json` and `.claude/settings.local.json` define, so the
   shared settings behave like user settings; identical hook entries are not added twice. They are
@@ -88,9 +98,17 @@ before your own arguments:
   account or the project turns it off, or the account has installed it itself.
 - **Auto-memory:** the source's memory directory for the project (found the way claude finds it),
   so every account remembers the same things about it.
+- **Agent memory:** subagents with `memory: user` keep their memory in the source's
+  `agent-memory/`, through `CLAUDE_CODE_REMOTE_MEMORY_DIR` in the session's environment, set only
+  together with the auto-memory location. The variable is not documented by claude, and it also
+  moves the memory of `memory: local` subagents from the project's `.claude/agent-memory-local/`
+  into the source's `projects/<project>/`.
 
 Nothing is written into any account home. Homes that already share part of their configuration
-through symlinks are detected, and that part is not injected again. `share` applies to Claude
+through symlinks are detected, and that part is not injected again. A home that shares `projects`
+with the source through a symlink gets no memory location injected, so its agent memory is shared
+only if `agent-memory` is a symlink too. What an account has for itself is not shared: the MCP
+servers and project trust in its `.claude.json`. `share` applies to Claude
 accounts only, and `from` must name a Claude account; anything else is a load error. The Accounts
 view warns about problems such as a missing source home or a plugin whose install is gone.
 

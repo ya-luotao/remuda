@@ -211,6 +211,7 @@ fn a_member_session_gets_the_source_configuration_before_its_arguments() {
     assert_eq!(inv.args[7], "--session-id");
     assert_eq!(inv.args.len(), 9, "{:?}", inv.args);
     assert_eq!(inv.add_dir_claude_md.as_deref(), Some("1"));
+    assert_eq!(inv.memory_dir.as_deref(), Some(s.source.to_str().unwrap()));
     assert_eq!(inv.config_dir.as_deref(), Some(s.max.to_str().unwrap()));
     assert_eq!(
         item_links(&shared_dir),
@@ -328,7 +329,99 @@ fn a_symlinked_home_gets_nothing() {
     assert_eq!(inv.args[..3], ["-p", "hi", "--session-id"]);
     assert_eq!(inv.args.len(), 4, "{:?}", inv.args);
     assert_eq!(inv.add_dir_claude_md, None);
+    assert_eq!(inv.memory_dir, None);
     assert!(s.sb.launches()[0].get("shared").is_none());
+}
+
+/// R18: the source's rules reach a member as copies under the shared directory, kept current
+/// from launch to launch; a home whose `rules` is the source's gets none injected.
+#[test]
+fn the_sources_rules_are_copied_for_members() {
+    let s = shared();
+    fs::create_dir_all(s.source.join("rules/lang")).unwrap();
+    fs::write(s.source.join("rules/style.md"), "be terse\n").unwrap();
+    fs::write(s.source.join("rules/lang/rust.md"), "no unwrap\n").unwrap();
+    let inv = s.run(&["max"]);
+    let rules = s.shared_dir().join(".claude/rules");
+    assert_eq!(
+        inv.args[0],
+        format!("--add-dir={}", s.shared_dir().display())
+    );
+    assert!(fs::symlink_metadata(&rules).unwrap().file_type().is_dir());
+    for (rule, text) in [("style.md", "be terse\n"), ("lang/rust.md", "no unwrap\n")] {
+        let copy = rules.join(rule);
+        assert!(fs::symlink_metadata(&copy).unwrap().file_type().is_file());
+        assert_eq!(fs::read_to_string(&copy).unwrap(), text);
+    }
+    assert_eq!(item_links(&s.shared_dir()).len(), 3);
+
+    fs::write(s.source.join("rules/style.md"), "be very terse\n").unwrap();
+    fs::remove_dir_all(s.source.join("rules/lang")).unwrap();
+    fs::remove_file(s.sb.claude_out()).unwrap();
+    s.run(&["max"]);
+    assert_eq!(names(&rules), ["style.md"]);
+    assert_eq!(
+        fs::read_to_string(rules.join("style.md")).unwrap(),
+        "be very terse\n"
+    );
+
+    // Every item shared by symlink, the rules included: nothing is injected for them.
+    for item in ["CLAUDE.md", "skills", "agents", "rules"] {
+        symlink(s.source.join(item), s.max.join(item)).unwrap();
+    }
+    fs::remove_file(s.sb.claude_out()).unwrap();
+    let inv = s.run(&["max"]);
+    assert_eq!(inv.add_dir_claude_md, None);
+    assert!(!inv.args[0].starts_with("--add-dir="), "{:?}", inv.args);
+}
+
+/// R18: the memory of user-scope subagents goes to the source's home only where the
+/// auto-memory location is injected too.
+#[test]
+fn agent_memory_is_redirected_with_auto_memory() {
+    let s = shared();
+    let inv = s.run(&["max"]);
+    assert_eq!(inv.memory_dir.as_deref(), Some(s.source.to_str().unwrap()));
+    assert!(
+        !s.source.join("agent-memory").exists(),
+        "nothing is created"
+    );
+
+    // No auto-memory injected: the user's own settings, a shared `projects`, a non-session.
+    for args in [
+        &["max", "--settings", "/my.json"][..],
+        &["max", "auth", "status"],
+    ] {
+        fs::remove_file(s.sb.claude_out()).unwrap();
+        s.sb.remuda().arg("run").args(args).assert().success();
+        assert_eq!(s.sb.only_invocation().memory_dir, None, "{args:?}");
+    }
+    symlink(s.source.join("projects"), s.max.join("projects")).unwrap();
+    fs::remove_file(s.sb.claude_out()).unwrap();
+    assert_eq!(s.run(&["max"]).memory_dir, None);
+
+    // The source and an opted-out account get nothing, not even what an outer remuda session
+    // of a member left in the environment; a value of the user's own passes through.
+    for account in ["default", "solo"] {
+        fs::remove_file(s.sb.claude_out()).unwrap();
+        assert_eq!(s.run(&[account]).memory_dir, None, "{account}");
+        for (value, kept) in [
+            (s.source.to_str().unwrap(), None),
+            ("/theirs", Some("/theirs")),
+        ] {
+            fs::remove_file(s.sb.claude_out()).unwrap();
+            s.sb.remuda()
+                .env("CLAUDE_CODE_REMOTE_MEMORY_DIR", value)
+                .args(["run", account])
+                .assert()
+                .success();
+            assert_eq!(
+                s.sb.only_invocation().memory_dir.as_deref(),
+                kept,
+                "{account}"
+            );
+        }
+    }
 }
 
 /// R18: each component on its own: instructions shared by symlink leave `--add-dir` out;

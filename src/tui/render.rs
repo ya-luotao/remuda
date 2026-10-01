@@ -1169,6 +1169,21 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
         }
         None => out.line("  unknown for this directory", DIM),
     }
+    if let Some(dir) = &v.agent_memory.dir {
+        let agents = match v.agent_memory.files {
+            Some(n) => format!("{n} agents"),
+            None => "not created yet".to_string(),
+        };
+        out.wrapped(
+            "  ",
+            &format!(
+                "subagents (user scope): {} · {} · {agents}",
+                tilde(app, dir),
+                origin_label(&v.agent_memory.origin, src)
+            ),
+            Style::new(),
+        );
+    }
 
     // MCP servers.
     out.heading("MCP servers");

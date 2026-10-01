@@ -49,9 +49,9 @@ holds, and launches the agent with the home selected.
 - **All sessions in one place.** Search the history of every account, preview messages, and
   resume or fork any session. Running Claude sessions are listed too, with attach, logs and stop
   for background ones.
-- **One configuration for all accounts.** Your `CLAUDE.md`, skills, commands, agents, settings,
-  plugins and auto-memory from one account are passed to every other Claude account at launch,
-  with nothing copied into their homes.
+- **One configuration for all accounts.** Your `CLAUDE.md`, skills, commands, agents, rules,
+  settings, plugins and memory from one account are passed to every other Claude account at
+  launch, with nothing copied into their homes.
 - **Checks for silent breakage.** Warnings for an `ANTHROPIC_API_KEY` that overrides every
   login, dangling symlinks, missing or logged-out homes, and similar multi-account pitfalls.
 - **Token statistics and cost.** Input, cache, output and reasoning tokens per account and model,
@@ -194,7 +194,8 @@ Remuda keeps its files under `$REMUDA_HOME`, which defaults to `~/.remuda`:
 $REMUDA_HOME/
 ├── config.toml                    account registry; the single source of truth
 ├── homes/<provider>/<name>/       homes created by `remuda setup`
-├── shared/claude/.claude/         links to the source's CLAUDE.md, agents, skills and commands
+├── shared/claude/.claude/         links to the source's CLAUDE.md, agents, skills and commands;
+│                                  copies of its rules
 └── state/                         caches and logs; safe to delete, rebuilt on the next run
     ├── index.json                 session index
     ├── stats.json                 token statistics
@@ -248,8 +249,8 @@ overrides a model's price or prices one remuda does not know (for Codex, `cache_
 cached-input price).
 
 With `[share.claude]`, every other Claude account launches with the source's instructions,
-settings (without authentication or provider settings), enabled plugins and auto-memory, injected
-as launch options; each account's own settings still take precedence, and `share = false` opts an
+settings (without authentication or provider settings), enabled plugins and memory locations,
+injected as launch options; each account's own settings still take precedence, and `share = false` opts an
 account out. See [Shared configuration](docs/GUIDE.md#shared-configuration) for exactly what is
 passed and how.
 

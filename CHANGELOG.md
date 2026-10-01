@@ -27,7 +27,8 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 - Shared configuration (SPEC R18): with `[share.claude] from = "<account>"`, every other Claude
   account launches with the source account's instructions (`CLAUDE.md`, skills, commands,
-  agents), settings, enabled plugins, and auto-memory location, injected as launch options.
+  agents, rules), settings, enabled plugins, and memory locations (auto-memory and the memory of
+  user-scope subagents), injected as launch options.
   Nothing is written into any home; an account's own settings keep precedence; existing symlink
   layouts are detected so nothing loads twice. Opt an account out with `share = false`.
   Authentication and provider settings are never shared, and shared settings travel to claude as

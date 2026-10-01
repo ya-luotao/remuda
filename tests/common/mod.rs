@@ -25,8 +25,9 @@ use tempfile::TempDir;
 /// Record layout (every field terminated by NUL):
 /// `@@invocation`, `cwd=<physical cwd>`, `ccd=<unset|set:VALUE>` (CLAUDE_CONFIG_DIR),
 /// `css=<unset|set:VALUE>` (CLAUDE_SECURESTORAGE_CONFIG_DIR),
-/// `acm=<unset|set:VALUE>` (CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD, R18), then
-/// `arg=<argv[i]>` per argument.
+/// `acm=<unset|set:VALUE>` (CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD, R18),
+/// `rmd=<unset|set:VALUE>` (CLAUDE_CODE_REMOTE_MEMORY_DIR, R18), then `arg=<argv[i]>` per
+/// argument.
 ///
 /// Fixtures live in `$CLAUDE_CONFIG_DIR/<name>`, or `$HOME/.<name>` when it is unset:
 /// - `fake-sleep`: if present, `exec sleep <its contents>` (simulates a hang);
@@ -70,6 +71,11 @@ if [ -n "${FAKE_CLAUDE_OUT+x}" ]; then
       printf 'acm=set:%s\0' "$CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"
     else
       printf 'acm=unset\0'
+    fi
+    if [ -n "${CLAUDE_CODE_REMOTE_MEMORY_DIR+x}" ]; then
+      printf 'rmd=set:%s\0' "$CLAUDE_CODE_REMOTE_MEMORY_DIR"
+    else
+      printf 'rmd=unset\0'
     fi
     for a in "$@"; do
       printf 'arg=%s\0' "$a"
@@ -293,6 +299,8 @@ pub struct Invocation {
     pub securestorage_dir: Option<String>,
     /// `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` (R18); `None` when unset.
     pub add_dir_claude_md: Option<String>,
+    /// `CLAUDE_CODE_REMOTE_MEMORY_DIR` (R18); `None` when unset.
+    pub memory_dir: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -692,6 +700,7 @@ pub fn parse_invocations(bytes: &[u8]) -> Vec<Invocation> {
         let config_dir = parse_var(iter.next().and_then(|f| f.strip_prefix("ccd=")));
         let securestorage_dir = parse_var(iter.next().and_then(|f| f.strip_prefix("css=")));
         let add_dir_claude_md = parse_var(iter.next().and_then(|f| f.strip_prefix("acm=")));
+        let memory_dir = parse_var(iter.next().and_then(|f| f.strip_prefix("rmd=")));
         let mut args = Vec::new();
         while let Some(f) = iter.peek() {
             if *f == "@@invocation" {
@@ -706,6 +715,7 @@ pub fn parse_invocations(bytes: &[u8]) -> Vec<Invocation> {
             config_dir,
             securestorage_dir,
             add_dir_claude_md,
+            memory_dir,
             args,
         });
     }

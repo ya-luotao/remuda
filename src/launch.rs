@@ -268,6 +268,8 @@ pub struct Launch {
     pub env: EnvChange,
     /// Variables added on top of `env` (shared configuration, R18).
     pub extra_env: Vec<(String, String)>,
+    /// Variables removed from what the child inherits (R18).
+    pub unset_env: Vec<String>,
     /// One-line messages for the user about this launch.
     pub notices: Vec<String>,
     pub record: LaunchRecord,
@@ -362,6 +364,7 @@ pub fn prepare_with(
         args: [shared.args, args].concat(),
         env,
         extra_env: shared.env,
+        unset_env: shared.unset,
         notices: shared.notices,
         record,
     })
@@ -402,6 +405,9 @@ pub fn find_on_path(program: &str, path_var: Option<&str>) -> Result<PathBuf> {
 /// environment plus the plan's changes. Only returns on failure.
 pub fn exec(program: &Path, plan: &Launch) -> io::Error {
     let mut cmd = command(program, &plan.args, &plan.env, None);
+    for name in &plan.unset_env {
+        cmd.env_remove(name);
+    }
     cmd.envs(plan.extra_env.iter().map(|(k, v)| (k, v)));
     cmd.exec()
 }
@@ -513,6 +519,9 @@ pub fn perform(program: &Path, plan: &Launch, cwd: Option<&Path>, log: &Path) ->
         .err()
         .map(|e| format!("cannot write launch log {}: {e:#}", log.display()));
     let mut cmd = command(program, &plan.args, &plan.env, cwd);
+    for name in &plan.unset_env {
+        cmd.env_remove(name);
+    }
     cmd.envs(plan.extra_env.iter().map(|(k, v)| (k, v)));
     let status = foreground(cmd);
     Ran { status, log_error }
@@ -861,6 +870,7 @@ mod tests {
             Ok(Shared {
                 args: args(&["--add-dir=/r/shared/claude", "--settings={\"a\":1}"]),
                 env: vec![("V".into(), "1".into())],
+                unset: vec!["W".into()],
                 notices: vec!["note".into()],
             })
         };
@@ -887,6 +897,7 @@ mod tests {
             ])
         );
         assert_eq!(l.extra_env, [("V".to_string(), "1".to_string())]);
+        assert_eq!(l.unset_env, ["W"]);
         assert_eq!(l.notices, ["note"]);
         assert_eq!(l.record.args, args(&["-p", "hi", "--", "x"]));
         let v = serde_json::to_value(&l.record).unwrap();

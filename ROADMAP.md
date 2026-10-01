@@ -41,6 +41,7 @@ and planned work.
 | 2026-09-27 | `remuda pick`: rules decide what is feasible, Jev chooses among it, taken only when confident | Hard limits are facts remuda can check (headroom on every window that applies, exclusions, logins), so they are never left to a model; what a model adds is weighing the user's free-text notes against headroom, resets and staleness. Jev answers a typed Choice with calibrated probabilities, so its pair is taken from 0.50 confidence, its account from 0.70, and the rules decide otherwise or on any error (R23) |
 | 2026-09-27 | The first network request of remuda's own: only `pick`, only with `TYPESAFE_API_KEY` and notes; through `curl`, the key on its stdin | Without a key or notes nothing is sent and the rules decide; the state is aliased usage and the notes as written, never credentials, emails, organizations, paths or session content, and `--print-request` shows it. `curl` keeps an HTTP and TLS stack out of the binary; the key goes in the configuration curl reads on stdin, so it is never in the process list (R13, R23) |
 | 2026-10-01 | No relay: a session is continued only by an account whose store holds it | A relay copied a transcript and its checkpoints into another account's home, the one case in which remuda wrote into a home; without it the write boundary has no exception (R13). The cost is accepted: a session cannot be moved to another account. This replaces the relay named in the 2026-09-24 decision on sessions; it was removed before any release contained it (R19) |
+| 2026-10-01 | Memory is what accounts share: rules as copies, agent memory through `CLAUDE_CODE_REMOTE_MEMORY_DIR` | With sessions kept per account, what must not diverge is what claude remembers and is told. claude loads rules of an added directory only from regular files, so they are copied under `$REMUDA_HOME/shared` at launch; rules limited to `paths` do not apply that way and are reported. User-scope agent memory has no setting, only an undocumented variable, set only together with the injected auto-memory location because it moves that too. Both stay inside the write boundary (R13, R18) |
 
 ## Technology
 
@@ -98,8 +99,9 @@ session index, and launch / resume / fork (SPEC R4, R10, R10a, R17).
 
 **M2.5 · Shared configuration** — **Implemented; dogfooding pending**
 Sessions stay with the account that created them; configuration is shared by injection at launch
-(SPEC R18): instructions (`CLAUDE.md`, skills, commands, agents) through `--add-dir`, settings and
-the auto-memory location through one `--settings`, and enabled plugins through `--plugin-dir`.
+(SPEC R18): instructions (`CLAUDE.md`, skills, commands, agents, rules) through `--add-dir`,
+settings and the auto-memory location through one `--settings`, enabled plugins through
+`--plugin-dir`, and the memory of user-scope subagents through an environment variable.
 Nothing is written into any home, and existing symlink layouts are detected so nothing loads
 twice.
 It is released as 0.2.0 after it has run on a real multi-account setup. Homes that symlink every
@@ -121,6 +123,10 @@ moves `projects` to per-account stores.
 - Task text in `remuda pick` (the state has a `task` slot for it), so the recommendation can
   weigh what the session is for.
 - A TUI key for `pick`: the recommendation in the Accounts view, and a launch from it.
+- Share user-scope MCP servers (`mcpServers` in the source's `.claude.json`) through
+  `--mcp-config`, with R18's withholding rules applied to their `env` and `headers`. Not done
+  until there is a server to verify it against. Project trust in `.claude.json` cannot be shared
+  without writing into a home (R13).
 
 ## Known issues
 

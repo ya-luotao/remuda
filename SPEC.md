@@ -449,10 +449,13 @@ appeared in no `history.jsonl`.
   shared store).
 - A registered home does not exist, or appears not to be logged in.
 - Shared configuration (R18): the source account does not exist or its home is missing; a home
-  shares some but not all of `CLAUDE.md`, `skills`, `commands`, `agents` with the source through
-  symlinks (those items may load twice); an enabled plugin whose install path does not exist; an
-  `installed_plugins.json` whose format is not recognized; authentication keys in the source's
-  settings that are withheld from members.
+  shares some but not all of `CLAUDE.md`, `skills`, `commands`, `agents`, `rules` with the source
+  through symlinks (those items may load twice); a home that shares `projects` with the source
+  through a symlink but not `agent-memory`, when the source has one (the memory of user-scope
+  subagents is not shared); rules of the source whose frontmatter has `paths`, when some member gets
+  the rules at launch (they are not applied there); an enabled plugin whose install path does not
+  exist; an `installed_plugins.json` whose format is not recognized; authentication keys in the
+  source's settings that are withheld from members.
 
 ## R12. Symlinks in homes
 
@@ -653,12 +656,14 @@ by injecting launch options, so nothing is written into any home (R13), and home
 
   | Component | Skipped when | Injection |
   | --- | --- | --- |
-  | Instructions: `CLAUDE.md`, `skills/`, `commands/`, `agents/` | all four resolve to the source's | `--add-dir=$REMUDA_HOME/shared/claude` (whose `.claude/` holds one link per item of the source's four) and `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` in the child environment |
+  | Instructions: `CLAUDE.md`, `skills/`, `commands/`, `agents/`, `rules/` | every one the source has resolves to the source's | `--add-dir=$REMUDA_HOME/shared/claude` (whose `.claude/` holds one link per item of the source's first four, and copies of its rules) and `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` in the child environment |
   | Settings | `settings.json` resolves to the source's | the part of the source's `settings.json` that neither the home nor the project defines, in the single `--settings` |
   | Plugins | `plugins/` resolves to the source's | `--plugin-dir=<install path>` for each plugin enabled in the source's settings |
   | Auto-memory | `projects/` resolves to the source's | `autoMemoryDirectory`, in the single `--settings` |
+  | Agent memory | `agent-memory/` resolves to the source's, `autoMemoryDirectory` is not injected, or the user set the variable | `CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>` in the child environment |
 
 - **Instructions.** `$REMUDA_HOME/shared/claude/.claude` is a directory in which remuda keeps
+  copies of the source's rules (below) and
   symlinks named `CLAUDE.md`, `skills`, `commands`, and `agents`, each pointing at that item of
   the source home (`<source home>/<item>`, written from the home's path as registered, not
   canonicalized; an existing link is compared with it as a path); an item the
@@ -668,7 +673,8 @@ by injecting launch options, so nothing is written into any home (R13), and home
   directory, renamed into place), and one for an item the source no longer has is removed. An
   entry named like an item that is not a symlink, or a `.claude` that is neither a directory nor
   a symlink, is never replaced: nothing is changed, and the launch goes on without shared
-  instructions and says so. Nothing else in `shared/claude/` or in `.claude/` is touched.
+  instructions and says so. Nothing else in `shared/claude/` or in `.claude/` is touched, apart
+  from `.claude/rules/` (below).
   A `.claude` that is a symlink (the earlier layout: one link to the whole source home) is
   migrated in place: the directory is built under a temporary name in `shared/claude/`, the link
   (only a link, never a directory or a file) is removed, and the directory is renamed into place.
@@ -684,7 +690,9 @@ by injecting launch options, so nothing is written into any home (R13), and home
   so, until it is restarted. Residual, as for `shared/` and `shared/claude/` themselves: the
   links are written by path, so a process of the same user that replaced `.claude` with a
   symlink in the instant between remuda's check and its write could redirect that write; remuda
-  never creates such a symlink, and such a process can already write there itself.
+  never creates such a symlink, and such a process can already write there itself. The same
+  holds for the rule copies and their directories, where the redirected operation could also
+  replace or remove a `*.md` file.
   Basis (verified on 2.1.282): with the environment variable set, `--add-dir=<dir>` loads
   `<dir>/.claude/CLAUDE.md` and the skills, commands, and agents under `<dir>/.claude/` with their
   plain names, through per-item symlinks exactly as through a whole-home `.claude` symlink: a
@@ -704,6 +712,47 @@ by injecting launch options, so nothing is written into any home (R13), and home
   whole source home, and does not depend on that check of claude's. Side effects, documented
   rather than prevented: tools may access the four items like any `--add-dir`, and the variable
   also loads `CLAUDE.md` from other `--add-dir` directories the user passes.
+- **Rules.** The source's rules are its `rules/**/*.md` regular files, down to 16 directory
+  levels, symlinks followed and a directory reached twice read once; at most the first 1000 in
+  name order, directory by directory; a `rules` without such a file is not an item. They are
+  shared as copies, not links: `.claude/rules/` under `$REMUDA_HOME/shared/claude/` is a
+  directory holding a regular file for each rule, at the rule's path below `rules/`. remuda
+  brings it to that state together with the item links, before a launch that needs it, and
+  writes nothing when it already is:
+  - a copy that is missing or whose content differs is written read-only (mode 0400) under a
+    temporary name in its directory (`.<32 hex digits>.tmp`, not a rule's name) and renamed
+    into place; directories are made one level at a time, never through a link;
+  - a regular `*.md` file there that the source no longer has is removed, and so is a temporary
+    file a write cut short left behind, and then the directories that leaves empty, `rules`
+    included. A file reached under another spelling of a rule's name (a file system that
+    ignores case) is that rule's copy and stays;
+  - a rule that became a directory of rules, or the reverse, replaces the copy of the other
+    kind: the removals come first, and a directory in a copy's place goes when they leave it
+    without files;
+  - `rules`, or a directory on the way to a copy, that is not a directory, and a copy's place
+    taken by a link, or by a directory holding anything that is not removed above, are never
+    replaced: as for the item links, nothing is changed, and the launch goes on without shared
+    instructions and says so. Other files and links in that directory are left alone;
+  - a rule that cannot be read is not shared;
+  - one remuda at a time changes `.claude` (an exclusive lock on the directory itself, where
+    the file system has locks), so launches at the same time agree on the copies even while
+    the source's rules change.
+
+  A copy is a snapshot taken at launch, and is the wrong place to change a rule: the source's
+  file is, and the copy is read-only so that an edit to it fails rather than being overwritten
+  at the next launch.
+  Basis (verified on 2.1.286, `-p`): from an added directory, `.claude/rules/**/*.md` loads
+  when it is made of regular files, a hard link included, and a nested directory too; nothing
+  loads through a `rules` that is a symlink, nor through a rule file or a subdirectory that is
+  one. Read from the 2.1.286 bundle: a link out of an added directory's `rules` is followed only
+  with the project's `hasClaudeMdExternalIncludesApproved` in the account's `.claude.json`, a
+  per-project, per-account approval remuda cannot rely on. Known limitation (verified on
+  2.1.286): a rule whose frontmatter has `paths` is not applied from an added directory,
+  whatever file the session reads, in the project or in the added directory; R11 names such
+  rules. A home whose `rules` is a symlink to the source's loads them as its own user rules,
+  `paths` included; like any other item, it gets none injected only when every other item it
+  has not linked is absent from the source (R11's warning about items loading twice applies to
+  `rules` as to the others).
 - **Settings.** claude merges settings sources in the order user, project, local, flag, policy
   (lowest to highest; read from the 2.1.281 bundle), and `--settings` is the flag source: injected
   keys win over the home's own `settings.json` and over the project's `.claude/settings.json` and
@@ -805,6 +854,35 @@ by injecting launch options, so nothing is written into any home (R13), and home
     (**[unverified]** details), so remuda does not inject auto-memory.
   - remuda does not inject `autoMemoryDirectory` if the source, the home, or the project's local
     settings already set it.
+- **Agent memory.** A subagent with `memory: user` keeps its memory in
+  `<home>/agent-memory/<agent>/`. No setting moves it; with `CLAUDE_CODE_REMOTE_MEMORY_DIR=<dir>`
+  in its environment claude keeps it in `<dir>/agent-memory/<agent>/` instead. remuda sets the
+  variable to the source's home, as registered, exactly when it injects `autoMemoryDirectory`
+  and the settings file carrying it was written, unless the home's `agent-memory` resolves to
+  the source's. The condition is not optional: the variable also moves the default auto-memory
+  location, to `<dir>/projects/<project>/memory`, so remuda sets it only where it has itself
+  decided where auto-memory goes. remuda creates nothing: claude makes the directory when a
+  subagent first writes.
+  - **A variable already in remuda's environment.** With the source's home as its value, it was
+    set by an outer remuda launch (a member's session that starts remuda again): it is decided
+    again for this launch, and removed from the child's environment when this launch does not
+    set it, so the source, an opted-out account, or a member that gets no auto-memory injected
+    never inherits it. With any other value it is the user's: remuda neither sets nor removes
+    it. Not covered: a `claude` started inside a member's session without remuda inherits the
+    variable but not the settings, and keeps its memory under the source's home.
+  - Basis (verified on 2.1.286, `-p`, with an agent given by `--agents`, and again through
+    `remuda run`): the agent's `MEMORY.md` and notes were written under
+    `<dir>/agent-memory/<agent>/`, the home got no `agent-memory`, and auto-memory stayed at the
+    injected `autoMemoryDirectory`. The variable is not documented and was made for claude's
+    remote sessions (2.1.286 bundle), so it is the least stable part of R18.
+  - Side effects, documented rather than prevented (2.1.286 bundle): a subagent with
+    `memory: local` keeps its memory in `<dir>/projects/<project>/agent-memory-local/<agent>/`
+    instead of the project's `.claude/agent-memory-local/`, so for such an agent the members
+    and the source, which has no variable, no longer read the same directory; and where claude
+    tidies memory files under `projects/` (`tiny_memory`, `memory/proposals`) it looks under
+    `<dir>/projects/`, the source's store. `memory: project` is not affected.
+  - A member that shares `projects` with the source through a symlink gets no memory injected,
+    so its agent memory is shared only if `agent-memory` is linked too (R11 warns).
 - **Order.** Injected options come before the user's arguments, each in the `--option=value` form,
   so that a variadic option (such as `--add-dir`) cannot consume the user's arguments.
 
@@ -1077,7 +1155,9 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
 - **Instructions.** `CLAUDE.md` (size and lines); `agents/*.md` (top level), by the `name` of
   their frontmatter or else the file name, with its `description`, `model`, `effort`, and
   `tools`; `skills/<dir>/SKILL.md`, by `name` or the directory name, with its `description`;
-  `commands/**/*.md` (at most 4 levels), a subdirectory shown as `dir:name`. Symlinks are
+  `commands/**/*.md` (at most 4 levels), a subdirectory shown as `dir:name`; `rules/**/*.md`
+  (R18), by path without the extension, one whose frontmatter has `paths` marked as limited to
+  paths. Symlinks are
   followed; only regular files are opened; frontmatter is read from a file's first 8 KB; at most
   500 entries are listed per directory.
 - **Synced skills.** `skills/synced/<organization>_<account>/` holds the claude.ai skills of one
@@ -1106,7 +1186,10 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   shared, for the source as withheld from members.
 - **Auto-memory.** The directory a session there uses, `autoMemoryDirectory` as injected, else
   as set by the project's settings, else by the home's, else `<home>/projects/<project>/memory`
-  (R18's project name), and how many `*.md` files it holds.
+  (R18's project name), and how many `*.md` files it holds. And the directory for the memory of
+  user-scope subagents: the source's `agent-memory` where a launch redirects it (R18), else the
+  home's own, marked as already the source's when it resolves there, with the number of agents
+  that have one.
 - **MCP servers.** The names in `mcpServers` of the account's `.claude.json` (user scope) and of
   its `projects` entry for the project, whose key is the project root of R18 (read from the
   2.1.281 bundle). They belong to the account: shared configuration does not include

@@ -842,10 +842,18 @@ impl Redactor<'_> {
             shared_settings,
             withheld,
             memory,
+            agent_memory,
             mcp,
             problems,
         } = view;
-        let Memory { dir, origin, files } = memory;
+        let redact = |memory: &Memory| {
+            let Memory { dir, origin, files } = memory;
+            Memory {
+                dir: dir.as_deref().map(|d| self.path(d)),
+                origin: origin_copy(origin),
+                files: *files,
+            }
+        };
         ConfigView {
             role: match role {
                 ConfigRole::Alone => ConfigRole::Alone,
@@ -876,11 +884,8 @@ impl Redactor<'_> {
             own_settings: summary(own_settings),
             shared_settings: summary(shared_settings),
             withheld: withheld.clone(),
-            memory: Memory {
-                dir: dir.as_deref().map(|d| self.path(d)),
-                origin: origin_copy(origin),
-                files: *files,
-            },
+            memory: redact(memory),
+            agent_memory: redact(agent_memory),
             mcp: {
                 let Mcp { user, project } = mcp;
                 Mcp {

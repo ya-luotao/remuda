@@ -46,6 +46,8 @@ pub struct ConfigView {
     /// Authentication settings of the source (`key` / `env.NAME`), never shared (R18).
     pub withheld: Vec<String>,
     pub memory: Memory,
+    /// Where the memory of user-scope subagents goes; `files` counts the agents that have one.
+    pub agent_memory: Memory,
     pub mcp: Mcp,
     /// What could not be read; first, what would fail a launch.
     pub problems: Vec<String>,
@@ -100,7 +102,7 @@ pub enum Origin {
     Project,
 }
 
-/// `CLAUDE.md`, `agents`, `skills` or `commands` of a home.
+/// `CLAUDE.md`, `agents`, `skills`, `commands` or `rules` of a home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     pub name: &'static str,
@@ -370,7 +372,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
     });
 
     // Instructions: the home's, then the source's that `--add-dir` injects.
-    for name in share::INSTRUCTIONS {
+    for name in share::items() {
         let origin = if plan.instructions.shared.contains(&name) {
             Origin::AlreadySource
         } else {
@@ -383,10 +385,14 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
     if let Some(from) = &from
         && plan.instructions.needs_injection()
     {
-        for name in share::INSTRUCTIONS {
-            if from.join(name).exists()
-                && let Some(item) = instruction(from, name, Origin::Shared)
-            {
+        for name in share::items() {
+            // As a launch counts them: rules only when there is one.
+            let has = if name == share::RULES {
+                !share::rule_files(&from.join(name)).is_empty()
+            } else {
+                from.join(name).exists()
+            };
+            if has && let Some(item) = instruction(from, name, Origin::Shared) {
                 view.instructions.push(item);
             }
         }
@@ -533,6 +539,25 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         dir,
         origin,
     };
+
+    // Agent memory (user scope).
+    // A variable of the user's own decides, as it does for claude.
+    let users = env
+        .get(share::MEMORY_DIR_VAR)
+        .filter(|_| !plan.inherited_memory_dir);
+    let (dir, origin) = match (&plan.agent_memory, users) {
+        (Some(from), _) => (from.join(share::AGENT_MEMORY), Origin::Shared),
+        (None, Some(dir)) => (Path::new(dir).join(share::AGENT_MEMORY), Origin::Own),
+        (None, None) if plan.agent_memory_shared => {
+            (home.join(share::AGENT_MEMORY), Origin::AlreadySource)
+        }
+        (None, None) => (home.join(share::AGENT_MEMORY), Origin::Own),
+    };
+    view.agent_memory = Memory {
+        files: dir.is_dir().then(|| subdirs(&dir)),
+        dir: Some(dir.display().to_string()),
+        origin,
+    };
     view
 }
 
@@ -625,6 +650,7 @@ fn instruction(home: &Path, name: &'static str, origin: Origin) -> Option<Item> 
         _ if !meta.is_dir() => return None,
         "agents" => Content::Entries(list_agents(&path)),
         "skills" => Content::Entries(list_skills(&path)),
+        "rules" => Content::Entries(list_rules(&path)),
         _ => Content::Entries(list_commands(&path)),
     };
     Some(Item {
@@ -810,6 +836,26 @@ fn list_commands(dir: &Path) -> Vec<Entry> {
     walk(dir, "", 1, &mut out);
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// `rules/**/*.md` as claude loads them ([`share::rule_files`]), named by their path without
+/// the extension; one limited to paths says so.
+fn list_rules(dir: &Path) -> Vec<Entry> {
+    share::rule_files(dir)
+        .into_iter()
+        .take(MAX_ENTRIES)
+        .map(|rel| {
+            let path = dir.join(&rel);
+            let scoped = read_regular(&path, Some(FRONTMATTER_BYTES))
+                .is_some_and(|bytes| share::rule_has_paths(&bytes));
+            Entry {
+                name: rel.with_extension("").display().to_string(),
+                description: scoped.then(|| "limited to paths".to_string()),
+                link: link_of(&path),
+                ..Entry::default()
+            }
+        })
+        .collect()
 }
 
 /// `*.md` regular files at the top of `dir`, when it is an absolute directory.
@@ -1575,6 +1621,49 @@ mod tests {
         );
         assert_eq!(view.memory.files, None);
         assert!(!format!("{view:?}").contains("zqsecret"));
+    }
+
+    /// R22: the rules are an instruction item, named by path, those limited to paths marked;
+    /// the memory of user-scope subagents is the source's where a launch redirects it.
+    #[test]
+    fn rules_and_agent_memory_are_shown() {
+        let f = fx();
+        let (src, max, work) = (f.root.join("src"), f.root.join("max"), f.root.join("work"));
+        fs::create_dir_all(&work).unwrap();
+        write(&src.join("rules/style.md"), "be terse\n");
+        write(
+            &src.join("rules/lang/rust.md"),
+            "---\npaths:\n  - \"**/*.rs\"\n---\nno unwrap\n",
+        );
+        write(&src.join("agent-memory/reviewer/MEMORY.md"), "");
+        write(&max.join("rules/own.md"), "mine\n");
+        let source = named("src", &src);
+        let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
+        assert_eq!(names(entries(&view, "rules", Origin::Own)), ["own"]);
+        let shared = entries(&view, "rules", Origin::Shared);
+        assert_eq!(names(shared), ["lang/rust", "style"]);
+        assert_eq!(shared[0].description.as_deref(), Some("limited to paths"));
+        assert_eq!(shared[1].description, None);
+        assert_eq!(
+            view.agent_memory,
+            Memory {
+                dir: Some(src.join("agent-memory").display().to_string()),
+                origin: Origin::Shared,
+                files: Some(1),
+            }
+        );
+
+        // The source itself, and a member whose `agent-memory` is the source's.
+        let view = read(&source, &sharing(&source), Some(&work), &f.env);
+        assert_eq!(view.agent_memory.origin, Origin::Own);
+        assert_eq!(view.agent_memory.files, Some(1));
+        symlink(src.join("agent-memory"), max.join("agent-memory")).unwrap();
+        let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
+        assert_eq!(view.agent_memory.origin, Origin::AlreadySource);
+        assert_eq!(
+            view.agent_memory.dir,
+            Some(max.join("agent-memory").display().to_string())
+        );
     }
 
     /// R22: one row per enabled plugin: the install a session in the directory loads (the most

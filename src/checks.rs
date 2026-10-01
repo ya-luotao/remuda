@@ -90,9 +90,11 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
 
 /// Shared configuration (R11, R18): a source account that is not listed or whose home is
 /// missing; members whose home shares some but not all instruction items with the source
-/// through symlinks (those load twice); authentication keys of the source's settings, which
-/// are withheld; enabled plugins without an install path that exists, and an
-/// `installed_plugins.json` whose format is not recognized.
+/// through symlinks (those load twice); members that share `projects` with the source but not
+/// `agent-memory`; rules of the source limited to paths, which claude ignores where the rules
+/// are injected; authentication keys of the source's settings, which are withheld; enabled
+/// plugins without an install path that exists, and an `installed_plugins.json` whose format
+/// is not recognized.
 pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check> {
     let mut checks = Vec::new();
     let Some(source) = &sharing.source else {
@@ -118,6 +120,7 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
         });
         return checks;
     };
+    let mut rules_injected = false;
     for account in accounts {
         if sharing.source_for(account).is_none() {
             continue;
@@ -146,6 +149,37 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
                      twice (with the injected --add-dir)",
                     items.shared.join(", "),
                     items.missing.join(", ")
+                ),
+            });
+        }
+        rules_injected |= items.missing.contains(&share::RULES);
+        // Agent memory follows auto-memory (R18): it is redirected only where remuda also
+        // injects the auto-memory location, which a shared `projects` rules out.
+        let agent_memory = from.join(share::AGENT_MEMORY);
+        if agent_memory.is_dir()
+            && share::resolves_to(&home.join("projects"), &from.join("projects"))
+            && !share::resolves_to(&home.join(share::AGENT_MEMORY), &agent_memory)
+        {
+            checks.push(Check {
+                account: Some(account.qualified()),
+                message: format!(
+                    "shares projects with {name} through a symlink but not {}: the memory of \
+                     user-scope subagents is not shared with this account",
+                    share::AGENT_MEMORY
+                ),
+            });
+        }
+    }
+    if rules_injected {
+        let scoped = share::scoped_rules(&from.join(share::RULES));
+        if !scoped.is_empty() {
+            let files: Vec<String> = scoped.iter().map(|p| p.display().to_string()).collect();
+            checks.push(Check {
+                account: Some(name.clone()),
+                message: format!(
+                    "rules limited to paths are not applied in accounts that get the rules at \
+                     launch (claude ignores `paths` in an added directory): {}",
+                    files.join(", ")
                 ),
             });
         }
@@ -479,6 +513,72 @@ mod tests {
                 "[share.claude] from names this account, which is not registered"
             )]
         );
+    }
+
+    /// R11, R18: rules limited to paths are named when a member gets the rules at launch,
+    /// not when its `rules` is the source's.
+    #[test]
+    fn rules_limited_to_paths_where_rules_are_injected() {
+        let f = fixture();
+        let native = f.root.join("home/.claude");
+        fs::create_dir_all(native.join("rules/lang")).unwrap();
+        fs::write(native.join("rules/style.md"), "be terse").unwrap();
+        let max = f.root.join("max");
+        fs::create_dir_all(&max).unwrap();
+        let accounts = vec![Account::default_for(CLAUDE), named("max", &max)];
+        let sharing = sharing_from(Account::default_for(CLAUDE));
+        assert_eq!(sharing_checks(&accounts, &f.env, &sharing), []);
+
+        fs::write(
+            native.join("rules/lang/rust.md"),
+            "---\npaths:\n  - \"**/*.rs\"\n---\nno unwrap",
+        )
+        .unwrap();
+        let got = sharing_checks(&accounts, &f.env, &sharing);
+        assert_eq!(
+            messages(&got),
+            [(
+                Some("claude:default"),
+                "rules limited to paths are not applied in accounts that get the rules at launch \
+                 (claude ignores `paths` in an added directory): lang/rust.md"
+            )]
+        );
+        symlink(native.join("rules"), max.join("rules")).unwrap();
+        assert_eq!(sharing_checks(&accounts, &f.env, &sharing), []);
+    }
+
+    /// R11, R18: a member whose `projects` is the source's gets no memory redirected, so the
+    /// source's `agent-memory` is not shared with it unless it is linked too.
+    #[test]
+    fn agent_memory_apart_from_a_shared_projects() {
+        let f = fixture();
+        let native = f.root.join("home/.claude");
+        fs::create_dir_all(native.join("projects")).unwrap();
+        let max = f.root.join("max");
+        fs::create_dir_all(&max).unwrap();
+        symlink(native.join("projects"), max.join("projects")).unwrap();
+        let accounts = vec![Account::default_for(CLAUDE), named("max", &max)];
+        let sharing = sharing_from(Account::default_for(CLAUDE));
+        assert_eq!(sharing_checks(&accounts, &f.env, &sharing), []);
+
+        fs::create_dir_all(native.join("agent-memory/reviewer")).unwrap();
+        let got = sharing_checks(&accounts, &f.env, &sharing);
+        assert_eq!(
+            messages(&got),
+            [(
+                Some("claude:max"),
+                "shares projects with claude:default through a symlink but not agent-memory: \
+                 the memory of user-scope subagents is not shared with this account"
+            )]
+        );
+        symlink(native.join("agent-memory"), max.join("agent-memory")).unwrap();
+        assert_eq!(sharing_checks(&accounts, &f.env, &sharing), []);
+
+        // Its own `projects`: the memory is redirected at launch instead.
+        fs::remove_file(max.join("agent-memory")).unwrap();
+        fs::remove_file(max.join("projects")).unwrap();
+        fs::create_dir(max.join("projects")).unwrap();
+        assert_eq!(sharing_checks(&accounts, &f.env, &sharing), []);
     }
 
     /// R11: a member sharing some instruction items through symlinks but not all; opted-out
