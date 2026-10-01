@@ -1135,10 +1135,9 @@ pub fn report(
 ) -> Report {
     let mut winners: HashMap<u64, Winner<'_>> = HashMap::new();
     for (path, file) in &cache.files {
-        let relay_copy = attribution.is_relay_copy(path);
         for row in &file.rows {
             let candidate = Winner {
-                copy: row.copy || relay_copy,
+                copy: row.copy,
                 ts: row.ts,
                 path,
                 file,

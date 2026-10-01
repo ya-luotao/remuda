@@ -49,8 +49,6 @@ holds, and launches the agent with the home selected.
 - **All sessions in one place.** Search the history of every account, preview messages, and
   resume or fork any session. Running Claude sessions are listed too, with attach, logs and stop
   for background ones.
-- **Relay when an account runs out.** Continue a Claude session under another account: it is
-  copied into that account and forked there, and the original is never modified.
 - **One configuration for all accounts.** Your `CLAUDE.md`, skills, commands, agents, settings,
   plugins and auto-memory from one account are passed to every other Claude account at launch,
   with nothing copied into their homes.
@@ -80,7 +78,6 @@ What each provider supports:
 | Token statistics and estimated cost | ✓ | ✓ |
 | Recommendation of account, model and effort (`pick`) | ✓ | ✓ |
 | Live sessions (attach, logs, stop) | ✓ | – |
-| Relay to another account | ✓ | – |
 | Shared configuration and the configuration pane | ✓ | – |
 
 ¹ Codex has no list of running sessions, so resuming a Codex session in place asks for
@@ -108,7 +105,6 @@ remuda usage                          # usage left on every account (add --live 
 remuda                                # open the TUI: accounts, live sessions, history, stats
 
 remuda run work                       # launch claude as `work`; extra args go to claude unchanged
-remuda relay <session-id> personal    # continue a session under another account
 ```
 
 Codex accounts work the same way: `remuda add --provider codex research ~/.codex-research`, then
@@ -132,7 +128,6 @@ the bare name means `claude:default`, and the Codex one is `codex:default`.
 | `remuda setup [--provider <claude\|codex>] <name> [--email <EMAIL>]` | Create a new home under `$REMUDA_HOME/homes/<provider>/<name>`, register it, and run the agent's login (`claude auth login` or `codex login`). `--email` prefills the Claude login. |
 | `remuda remove <account>` | Unregister an account. Its home and everything in it are left in place, and its path is printed so `remuda add` can register it again. `default` and the source of `[share.claude]` cannot be removed. |
 | `remuda pick [--provider <P>] [--live] [--timeout <SECONDS>] [--offline] [--json\|--print-request] [--run [-- <args>...]]` | Recommend the account, model and effort to launch now. Rules keep only what has at least `min_headroom` percent left on every window that applies (default 10) and rank it; with `TYPESAFE_API_KEY` set and `[pick] notes`, Jev chooses among those options. `--print-request` shows what would be sent, `--offline` never sends, `--run` launches the choice as `remuda run` does. `--timeout` applies to each `--live` query (default 90). Exits 1 when nothing is feasible. See [Recommendations](docs/GUIDE.md#recommendations). |
-| `remuda relay <session> <account>` | Continue a Claude session under another Claude account, in the session's last directory, replacing the `remuda` process. `<session>` is a full session ID from the index. See [Relay](docs/GUIDE.md#relay). |
 | `remuda help [<command>]` | Show help for remuda or a command. |
 
 Account names match `[A-Za-z0-9_-]+`. Because `run` forwards `-h` and `--help` to the agent, use
@@ -173,7 +168,6 @@ Checks ────────────────────────�
 | `g` `G`, `Home` `End`, `PgUp` `PgDn` | First / last row, page up / down |
 | `Enter` | History: resume the selected session (Codex asks for confirmation first). Live: attach to a background session |
 | `f` | Fork the selected session into a new session; the original is left unchanged |
-| `c` | Continue the selected Claude session under another account (relay) |
 | `p`, `Space` | Live and History: expand or collapse the preview. Accounts: show the selected account's configuration (instructions, plugins, settings, auto-memory, MCP servers, and where each comes from); press again to expand it, again to close it. `PgUp` `PgDn` scroll it |
 | `n` | Accounts: start a new session with the selected account |
 | `s` | Accounts: set up a new Claude or Codex account, as `remuda setup` does |
@@ -209,7 +203,7 @@ $REMUDA_HOME/
 ```
 
 Deleting `launches.jsonl` loses the attribution of sessions started through remuda that no
-`history.jsonl` records, and makes relay copies show up in History again.
+`history.jsonl` records.
 
 `config.toml` lists the registered accounts. `remuda add`, `remuda setup` and `remuda remove`
 edit it for you, preserving comments and unknown keys, and it can also be edited by hand:
@@ -270,10 +264,8 @@ the specification ([SPEC.md](SPEC.md), R2 and R13):
 - **Homes are never moved, renamed or deleted.** `remuda add` only records a name and
   `remuda remove` only forgets it; neither moves, copies, creates or deletes anything.
 - **Writes are confined to `$REMUDA_HOME`:** `config.toml`, `state/`, `shared/`, and the empty
-  directories created by `remuda setup`. The one exception is an explicit relay, which copies one
-  transcript and its checkpoints into the target account's `projects/` and `file-history/`.
-  Otherwise remuda never writes into any account home, and it never writes credentials,
-  `.claude.json`, the Keychain, existing transcripts or `history.jsonl`.
+  directories created by `remuda setup`. Remuda never writes into any account home, and it never
+  writes credentials, `.claude.json`, the Keychain, transcripts or `history.jsonl`.
 - **Credentials are never read.** Identity and usage come from the agents' own commands
   (`claude auth status --json`, `codex login status`, `claude -p /usage`, `codex app-server`) and
   non-secret local metadata (the usage cache in `.claude.json`, the rate limits in Codex
@@ -308,11 +300,11 @@ degrades to missing fields rather than errors.
 
 ## Documentation
 
-- [docs/GUIDE.md](docs/GUIDE.md): TUI details, private mode, shared configuration, relay,
+- [docs/GUIDE.md](docs/GUIDE.md): TUI details, private mode, shared configuration,
   recommendations, account checks and data sources
 - [SPEC.md](SPEC.md): behavior specification; the contract that the tests enforce
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): how the code is organized, with diagrams of the
-  launch, relay, indexing and TUI flows
+  launch, indexing and TUI flows
 - [ROADMAP.md](ROADMAP.md): milestones, planned work and open questions
 - [CHANGELOG.md](CHANGELOG.md): release history
 - [CONTRIBUTING.md](CONTRIBUTING.md): development workflow and release process

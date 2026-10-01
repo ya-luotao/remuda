@@ -32,14 +32,15 @@ and planned work.
 | 2026-09-23 | An account is a registered home path, not a conventional directory | The Keychain entry is bound to the home path string (SPEC R2), so existing homes can only be registered in place |
 | 2026-09-23 | Prefer the claude CLI's official output over parsing internal files | `agents --json`, `auth status --json`, and `-p /usage` are CLI interfaces, more stable than undocumented file formats |
 | 2026-09-23 | Pre-assign new session IDs with `--session-id` | The ID is known before launch, so attribution is exact and `run` can exec directly (R6, R9) |
-| 2026-09-24 | Sessions are not shared between accounts; configuration is | Exact attribution, no cross-account cleanup, work and personal sessions stay apart; switching accounts mid-session is covered by relay (R19) |
+| 2026-09-24 | Sessions are not shared between accounts; configuration is | Exact attribution, no cross-account cleanup, work and personal sessions stay apart; switching accounts mid-session was to be covered by relay (R19; removed 2026-10-01, see below) |
 | 2026-09-24 | Share configuration by launch-time injection, not symlinks | No writes into homes (R13), no drift, new accounts share automatically; plugin packaging rejected because it namespaces agent and skill names (R18) |
-| 2026-09-24 | Token statistics from transcripts, deduplicated by message id / cumulative total, own cache | The agents record exact usage per request; `message.id` and codex's cumulative total identify a request across repeated records, forks and relay copies. A row per request in `state/stats.json` keeps deduplication exact and needs no time zone; it stays out of `index.json`, which reads only head and tail windows (R20) |
+| 2026-09-24 | Token statistics from transcripts, deduplicated by message id / cumulative total, own cache | The agents record exact usage per request; `message.id` and codex's cumulative total identify a request across repeated records, forks and copies in other stores. A row per request in `state/stats.json` keeps deduplication exact and needs no time zone; it stays out of `index.json`, which reads only head and tail windows (R20) |
 | 2026-09-24 | Private mode as a redacted snapshot of the TUI state | The screen is drawn from a copy of the state with names aliased and personal fields masked; every field is destructured, so a new one cannot reach the screen before it is decided how it is shown (R21) |
 | 2026-09-24 | Codex live usage and identity through `codex app-server`, only on explicit live queries; `list` keeps `codex login status` | `account/rateLimits/read` and `account/read` are machine-readable and codex reads its own credentials, so `auth.json` stays unread; but starting app-server is like launching Codex (it may refresh a token, uses the network, writes state into the home, takes about 1.5 s), so it runs only when live usage is asked for (R4, R10, R10a) |
 | 2026-09-24 | Cost as an estimate at API list prices: a built-in table with config.toml overrides, exact in picodollars | Most accounts are subscriptions, so list prices are the only comparable figure; a built-in table keeps cost estimates free of network requests and overrides cover new models and price changes; integer picodollars keep each request's cost exact, so sections add up to overall (R20) |
 | 2026-09-27 | `remuda pick`: rules decide what is feasible, Jev chooses among it, taken only when confident | Hard limits are facts remuda can check (headroom on every window that applies, exclusions, logins), so they are never left to a model; what a model adds is weighing the user's free-text notes against headroom, resets and staleness. Jev answers a typed Choice with calibrated probabilities, so its pair is taken from 0.50 confidence, its account from 0.70, and the rules decide otherwise or on any error (R23) |
 | 2026-09-27 | The first network request of remuda's own: only `pick`, only with `TYPESAFE_API_KEY` and notes; through `curl`, the key on its stdin | Without a key or notes nothing is sent and the rules decide; the state is aliased usage and the notes as written, never credentials, emails, organizations, paths or session content, and `--print-request` shows it. `curl` keeps an HTTP and TLS stack out of the binary; the key goes in the configuration curl reads on stdin, so it is never in the process list (R13, R23) |
+| 2026-10-01 | No relay: a session is continued only by an account whose store holds it | A relay copied a transcript and its checkpoints into another account's home, the one case in which remuda wrote into a home; without it the write boundary has no exception (R13). The cost is accepted: a session cannot be moved to another account. This replaces the relay named in the 2026-09-24 decision on sessions; it was removed before any release contained it (R19) |
 
 ## Technology
 
@@ -95,16 +96,16 @@ Codex accounts (`CODEX_HOME`), identity (`codex login status`; email and plan fr
 usage (cached from the rate limits in rollouts, live through `codex app-server`), the rollout
 session index, and launch / resume / fork (SPEC R4, R10, R10a, R17).
 
-**M2.5 · Shared configuration and relay** — **Implemented; dogfooding pending**
+**M2.5 · Shared configuration** — **Implemented; dogfooding pending**
 Sessions stay with the account that created them; configuration is shared by injection at launch
 (SPEC R18): instructions (`CLAUDE.md`, skills, commands, agents) through `--add-dir`, settings and
 the auto-memory location through one `--settings`, and enabled plugins through `--plugin-dir`.
 Nothing is written into any home, and existing symlink layouts are detected so nothing loads
-twice. A relay (SPEC R19) continues a session under another account by copying its transcript and
-checkpoints into the target store and forking it there.
+twice.
 It is released as 0.2.0 after it has run on a real multi-account setup. Homes that symlink every
-component, `projects` included, into the source home get nothing injected and refuse every relay,
-so such a setup first moves `projects` to per-account stores.
+component, `projects` included, into the source home get nothing injected, and their sessions
+are in one shared store rather than with the account that created them, so such a setup first
+moves `projects` to per-account stores.
 
 ## Later, as needed
 

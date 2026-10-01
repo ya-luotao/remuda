@@ -13,7 +13,6 @@ use serde::Serialize;
 use crate::Env;
 use crate::provider::Provider;
 use crate::registry::{Account, Home, Sharing};
-use crate::relay::Relay;
 use crate::share::{self, Injected, Shared};
 
 pub const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
@@ -260,9 +259,6 @@ pub struct LaunchRecord {
     /// absent when nothing was.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub shared: Vec<Injected>,
-    /// What a relay copied before this fork (R19); absent otherwise.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub relay: Option<Relay>,
 }
 
 /// A fully decided launch: what to exec and what to log.
@@ -294,7 +290,7 @@ pub fn prepare(
     .expect("nothing to share cannot fail")
 }
 
-/// The launch path of `remuda run`, the TUI and relay alike (R6, R16, R18, R19): [`prepare`],
+/// The launch path of `remuda run` and the TUI alike (R6, R16, R18): [`prepare`],
 /// plus the shared configuration of `sharing` for session invocations of claude accounts.
 /// `config` is `$REMUDA_HOME/config.toml`.
 #[allow(clippy::too_many_arguments)]
@@ -361,7 +357,6 @@ pub fn prepare_with(
         fork_of,
         injected,
         shared: shared.logged(),
-        relay: None,
     };
     Ok(Launch {
         args: [shared.args, args].concat(),
@@ -404,10 +399,9 @@ pub fn find_on_path(program: &str, path_var: Option<&str>) -> Result<PathBuf> {
 }
 
 /// Replaces the current process with `program` running `plan` under the inherited
-/// environment plus the plan's changes, in `cwd` (`None`: remuda's own). Only returns on
-/// failure.
-pub fn exec(program: &Path, plan: &Launch, cwd: Option<&Path>) -> io::Error {
-    let mut cmd = command(program, &plan.args, &plan.env, cwd);
+/// environment plus the plan's changes. Only returns on failure.
+pub fn exec(program: &Path, plan: &Launch) -> io::Error {
+    let mut cmd = command(program, &plan.args, &plan.env, None);
     cmd.envs(plan.extra_env.iter().map(|(k, v)| (k, v)));
     cmd.exec()
 }
@@ -518,15 +512,10 @@ pub fn perform(program: &Path, plan: &Launch, cwd: Option<&Path>, log: &Path) ->
     let log_error = append_log(log, &plan.record)
         .err()
         .map(|e| format!("cannot write launch log {}: {e:#}", log.display()));
-    let status = run_plan(program, plan, cwd);
-    Ran { status, log_error }
-}
-
-/// Runs `plan` in the foreground like [`perform`], without logging it: the caller did.
-pub fn run_plan(program: &Path, plan: &Launch, cwd: Option<&Path>) -> io::Result<ExitStatus> {
     let mut cmd = command(program, &plan.args, &plan.env, cwd);
     cmd.envs(plan.extra_env.iter().map(|(k, v)| (k, v)));
-    foreground(cmd)
+    let status = foreground(cmd);
+    Ran { status, log_error }
 }
 
 /// Applies `change` on top of the environment `cmd` inherits.
@@ -809,7 +798,6 @@ mod tests {
                 fork_of: None,
                 injected: true,
                 shared: vec![],
-                relay: None,
             }
         );
     }
@@ -1036,7 +1024,6 @@ mod tests {
                 fork_of: None,
                 injected: false,
                 shared: vec![],
-                relay: None,
             }
         );
     }
@@ -1102,7 +1089,6 @@ mod tests {
             fork_of: None,
             injected: false,
             shared: vec![],
-            relay: None,
         };
         append_log(&log, &rec).unwrap();
         append_log(&log, &rec).unwrap();

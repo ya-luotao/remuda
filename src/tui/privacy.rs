@@ -375,8 +375,8 @@ pub fn redacted(app: &App) -> App {
             .iter()
             .map(|(id, p)| (id.clone(), key_path(p)))
             .collect::<HashMap<_, _>>(),
-        attribution_base: attribution_base.redacted(|q| r.alias(q), key_path),
-        attribution: attribution.redacted(|q| r.alias(q), key_path),
+        attribution_base: attribution_base.redacted(|q| r.alias(q)),
+        attribution: attribution.redacted(|q| r.alias(q)),
         attribution_in_flight: *attribution_in_flight,
         live: live.iter().map(|s| r.live_session(s)).collect(),
         live_rows: live_rows.clone(),

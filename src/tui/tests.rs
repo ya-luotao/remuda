@@ -3781,142 +3781,13 @@ fn setup_retry_is_unambiguous() {
     );
 }
 
-// ---- relay (R19) ------------------------------------------------------------------------
-
-fn relay_a(account_name: &str) -> Effect {
-    Effect::Relay {
-        request: request(
-            account_name,
-            &["--resume", A, "--fork-session"],
-            Some(CWD),
-            &format!("continue aaaaaaaa as {account_name}"),
-        ),
-        source: crate::relay::Source {
-            transcript: path(A),
-            store: PathBuf::from("/s"),
-            session_id: A.into(),
-            cwd_last: Some(CWD.into()),
-        },
-    }
-}
-
-/// R16, R19: `c` offers the claude accounts whose store does not hold the transcript, and
-/// the choice copies and forks it in the foreground, with no pre-launch check to wait for.
+/// Ctrl-C quits from a picker too.
 #[test]
-fn c_continues_the_session_under_another_account() {
+fn ctrl_c_quits_from_a_picker() {
     let mut app = history_with(&["max"]);
-    assert_eq!(keys(&mut app, &[Key::Char('c')]), []);
-    let Some(Overlay::Pick(pick)) = &app.overlay else {
-        panic!("{:?}", app.overlay)
-    };
-    assert_eq!(pick.action, super::app::PickFor::Relay);
-    assert_eq!(pick.options, ["claude:team"]);
-    assert!(pick.attributed.is_empty());
-    let text = screen(&app).join("\n");
-    assert!(text.contains("Continue aaaaaaaa as"), "{text}");
-    assert_eq!(keys(&mut app, &[Key::Enter]), [relay_a("team")]);
-    assert_eq!(app.overlay, None);
-    assert_eq!(app.pending, None);
-}
-
-/// Plain `c` is the relay; Ctrl-C still quits, from the picker too.
-#[test]
-fn plain_c_relays_and_ctrl_c_still_quits() {
-    let mut app = history_with(&["max"]);
-    assert_eq!(keys(&mut app, &[Key::Ctrl('c')]), [Effect::Quit]);
-    assert_eq!(keys(&mut app, &[Key::Char('c')]), []);
+    pick(&mut app, PickFor::Resume);
     assert!(matches!(app.overlay, Some(Overlay::Pick(_))));
     assert_eq!(keys(&mut app, &[Key::Ctrl('c')]), [Effect::Quit]);
-}
-
-/// R19: a running session may be continued elsewhere, like a fork; from Live, the copy in
-/// its account's store is the one relayed.
-#[test]
-fn c_in_live_relays_a_running_session() {
-    let mut app = history_with(&["max"]);
-    update(&mut app, Event::Live(vec![live("claude:max", 7, Some(A))]));
-    keys(&mut app, &[Key::Char('2')]);
-    assert_eq!(keys(&mut app, &[Key::Char('c')]), []);
-    assert_eq!(keys(&mut app, &[Key::Enter]), [relay_a("team")]);
-}
-
-/// R19: nothing to relay to when every claude account sees the store; the stores read again
-/// while the picker is open are honored; codex sessions are not relayed.
-#[test]
-fn c_refusals() {
-    let mut app = history_with(&["max"]);
-    let mut shared = stores();
-    shared[0].accounts.push("claude:team".into());
-    shared.remove(1);
-    update(&mut app, Event::Stores(shared.clone()));
-    assert_eq!(keys(&mut app, &[Key::Char('c')]), []);
-    assert_eq!(app.overlay, None);
-    assert_eq!(
-        notice(&app),
-        Some((
-            "every claude account can already find session aaaaaaaa: fork it instead (f)",
-            Level::Warn
-        ))
-    );
-
-    let mut app = history_with(&["max"]);
-    keys(&mut app, &[Key::Char('c')]);
-    update(&mut app, Event::Stores(shared));
-    assert_eq!(keys(&mut app, &[Key::Enter]), []);
-    assert_eq!(
-        notice(&app),
-        Some((
-            "team can already find session aaaaaaaa: fork it instead (f)",
-            Level::Warn
-        ))
-    );
-
-    let mut app = codex_app();
-    while app.selected_entry().unwrap().session_id != C {
-        keys(&mut app, &[Key::Char('j')]);
-    }
-    assert_eq!(keys(&mut app, &[Key::Char('c')]), []);
-    assert_eq!(app.overlay, None);
-    assert_eq!(
-        notice(&app),
-        Some((
-            "session 019c1e08 is a codex session: only claude sessions continue under another \
-             account",
-            Level::Warn
-        ))
-    );
-}
-
-/// R19: a transcript the launch log records as a relay copy is not listed in History.
-#[test]
-fn relay_copies_are_hidden_from_history() {
-    let mut app = history_with(&["max"]);
-    assert_eq!(history_ids(&app), [B, A]);
-    let dir = tempfile::tempdir().unwrap();
-    let log = dir.path().join("launches.jsonl");
-    std::fs::write(
-        &log,
-        format!(
-            "{}\n{}\n",
-            serde_json::json!({"account": "claude:max", "session_id": A}),
-            serde_json::json!({
-                "account": "claude:team", "session_id": "cccccccc-0000-4000-8000-000000000000",
-                "fork_of": B,
-                "relay": {"source": "/t/-w/x.jsonl", "transcript": path(B), "checkpoints": [],
-                          "size": 10, "mtime_ns": 0},
-            })
-        ),
-    )
-    .unwrap();
-    let mut attribution = Attribution::default();
-    attribution.add_launch_log(&log);
-    update(&mut app, Event::Attribution(attribution));
-    assert_eq!(history_ids(&app), [A]);
-    assert_eq!(app.unfiltered_count(), 1);
-    assert_eq!(
-        app.entry_accounts(app.selected_entry().unwrap()),
-        ["claude:max"]
-    );
 }
 
 // ---- Stats (R20) ------------------------------------------------------------------
@@ -4848,19 +4719,12 @@ fn zq_request(what: &str, args: &[&str], account: Account) -> LaunchRequest {
 struct SecretState {
     name: &'static str,
     set: fn(&mut App),
-    /// Shown (in private mode off) at every size, except where `hidden_at_80` says the state
-    /// covers the whole 80×24 screen with text that has nothing personal (the help box).
+    /// Shown (in private mode off) at every size.
     shows: &'static str,
-    hidden_at_80: bool,
 }
 
 fn secret_states() -> Vec<SecretState> {
-    let state = |name, set: fn(&mut App), shows| SecretState {
-        name,
-        set,
-        shows,
-        hidden_at_80: false,
-    };
+    let state = |name, set: fn(&mut App), shows| SecretState { name, set, shows };
     vec![
         state("accounts", |app| drop(keys(app, &[Key::Char('1')])), "zqme"),
         state(
@@ -4966,15 +4830,9 @@ fn secret_states() -> Vec<SecretState> {
             },
             "zqnomatch",
         ),
-        SecretState {
-            name: "help",
-            set: |app| drop(keys(app, &[Key::Char('?')])),
-            shows: "zqalpha",
-            hidden_at_80: true,
-        },
+        state("help", |app| drop(keys(app, &[Key::Char('?')])), "zqalpha"),
         state("pick resume", |app| pick(app, PickFor::Resume), "zqalpha ●"),
         state("pick fork", |app| pick(app, PickFor::Fork), "zqalpha ●"),
-        state("pick relay", |app| pick(app, PickFor::Relay), "zqalpha ●"),
         state(
             "new session form",
             |app| {
@@ -5204,18 +5062,11 @@ fn private_mode_leaks_nothing_anywhere() {
             (state.set)(&mut app);
             let open = text(&app);
             let at = format!("{} at {w}x{h}", state.name);
-            if state.hidden_at_80 && w == 80 {
-                assert!(
-                    !open.to_lowercase().contains("zq"),
-                    "{at}: expected a full-screen box:\n{open}"
-                );
-            } else {
-                assert!(
-                    open.contains(state.shows),
-                    "{at}: shows no {:?} when not private:\n{open}",
-                    state.shows
-                );
-            }
+            assert!(
+                open.contains(state.shows),
+                "{at}: shows no {:?} when not private:\n{open}",
+                state.shows
+            );
             assert!(!open.contains("PRIVATE"), "{at}:\n{open}");
 
             app.private = true;

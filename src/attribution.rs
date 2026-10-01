@@ -13,15 +13,12 @@ use crate::index::{Entry, Store};
 use crate::live::LiveSession;
 use crate::provider::Provider;
 use crate::registry::{Account, CLAUDE};
-use crate::relay;
 use crate::transcript::complete_lines;
 
-/// `session_id -> {provider:name}`, and the relay copies the launch log records.
+/// `session_id -> {provider:name}`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Attribution {
     map: BTreeMap<String, BTreeSet<String>>,
-    /// Transcripts copied by a relay (R19): hidden from History, attributed to nobody.
-    relay_copies: BTreeSet<PathBuf>,
 }
 
 impl Attribution {
@@ -51,38 +48,24 @@ impl Attribution {
 
     /// Every account name any session is attributed to.
     pub fn names(&self) -> impl Iterator<Item = &str> {
-        let Attribution {
-            map,
-            relay_copies: _,
-        } = self;
+        let Attribution { map } = self;
         map.values().flatten().map(String::as_str)
     }
 
-    /// The same attribution with each account name through `name` and each relay copy's path
-    /// through `path` (private mode, R21). Every field is named: a new one does not compile
-    /// until it is decided what private mode does with it.
-    pub fn redacted(
-        &self,
-        name: impl Fn(&str) -> String,
-        path: impl Fn(&Path) -> PathBuf,
-    ) -> Attribution {
-        let Attribution { map, relay_copies } = self;
+    /// The same attribution with each account name through `name` (private mode, R21). Every
+    /// field is named: a new one does not compile until it is decided what private mode does
+    /// with it.
+    pub fn redacted(&self, name: impl Fn(&str) -> String) -> Attribution {
+        let Attribution { map } = self;
         Attribution {
             map: map
                 .iter()
                 .map(|(session, names)| (session.clone(), names.iter().map(|n| name(n)).collect()))
                 .collect(),
-            relay_copies: relay_copies.iter().map(|p| path(p)).collect(),
         }
     }
 
-    /// Whether the transcript at `path` is a relay's copy (R19).
-    pub fn is_relay_copy(&self, path: &Path) -> bool {
-        self.relay_copies.contains(path)
-    }
-
-    /// Adds `$REMUDA_HOME/state/launches.jsonl`: lines with a non-null `session_id`, and the
-    /// relay copies (R19). Lines from before relays and shared configuration parse alike.
+    /// Adds `$REMUDA_HOME/state/launches.jsonl`: lines with a non-null `session_id`.
     pub fn add_launch_log(&mut self, path: &Path) {
         #[derive(Deserialize)]
         struct Launch {
@@ -96,9 +79,6 @@ impl Attribution {
             }) = serde_json::from_slice(line)
             {
                 self.add(&id, &account);
-            }
-            if let Some(copy) = relay::copy_in(line) {
-                self.relay_copies.insert(copy);
             }
         });
     }

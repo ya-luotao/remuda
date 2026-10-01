@@ -22,7 +22,7 @@ them. By area:
 | Commands and launching | [R5](#r5-commands) commands · [R6](#r6-launch-run-and-launches-from-the-tui) launch · [R14](#r14-add-name-path) `add` · [R14a](#r14a-remove-account) `remove` · [R16](#r16-tui-actions) TUI actions · [R17](#r17-codex) Codex |
 | Sessions | [R7](#r7-running-sessions) running sessions · [R8](#r8-session-index) session index · [R9](#r9-session-attribution) attribution |
 | Accounts view | [R10](#r10-usage) usage · [R10a](#r10a-identity) identity · [R11](#r11-checks-in-the-accounts-view) checks · [R22](#r22-account-configuration-tui) account configuration |
-| Across accounts | [R18](#r18-shared-configuration) shared configuration · [R19](#r19-relay-continuing-a-session-under-another-account) relay |
+| Across accounts | [R18](#r18-shared-configuration) shared configuration |
 | Statistics | [R20](#r20-token-statistics) token statistics and cost |
 | Privacy | [R21](#r21-private-mode-tui) private mode |
 | Recommendation | [R23](#r23-recommendation-pick) `pick` |
@@ -33,8 +33,7 @@ How the entries map onto the code is described in [docs/ARCHITECTURE.md](docs/AR
 
 - **Provider**: an agent CLI. `claude` is fully supported. `codex` supports accounts, identity,
   usage, the session index, token statistics, launch, resume, and fork; running sessions (R7),
-  relay (R19), shared configuration (R18), and the configuration pane (R22) are claude-only (R4,
-  R17).
+  shared configuration (R18), and the configuration pane (R22) are claude-only (R4, R17).
 - **Account**: `(provider, name, home)`. `home` is the provider's isolation directory, or the
   special value `default`.
 - `name` matches `[A-Za-z0-9_-]+` and is unique within a provider. On the command line an account
@@ -185,7 +184,6 @@ remuda setup [--provider P] <name> [--email E]     create a new home and run the
                                                    (`claude auth login`, `codex login`; R17)
 remuda remove <account>                            unregister an account; its home is left in
                                                    place (R14a)
-remuda relay <session> <account>                   continue a session under another account (R19)
 remuda pick [--provider P] [--live] [--timeout S]  recommend the account, model and effort to
        [--offline] [--json | --print-request]      launch now; with --run, launch it (R23)
        [--run [-- <args>]]
@@ -470,15 +468,11 @@ appeared in no `history.jsonl`.
 The complete set of remuda's write operations:
 
 - `$REMUDA_HOME/config.toml`, `$REMUDA_HOME/state/**`, `$REMUDA_HOME/shared/**` (R18)
-- On an explicit relay (R19), and only then: a copy of one transcript into
-  `<target home>/projects/<dir>/` and of its checkpoint files into
-  `<target home>/file-history/<id>/`, creating those directories if needed. A relay never
-  overwrites or deletes anything that remuda did not create in an earlier relay.
 - `$REMUDA_HOME/homes/<provider>/<name>/` created by `setup` (an empty directory; login is performed
   by `claude auth login` itself, optionally with `--email` prefilled)
 
 remuda never writes credentials, `.claude.json`, the Keychain, transcripts, `history.jsonl`, or
-`*.key` files, never writes into any home directory except for the relay copies above, and never
+`*.key` files, never writes into any home directory, and never
 makes network requests of its own (live usage is queried by the agent itself; see R10), except the
 one request of `remuda pick` to TypeSafe, made only with `TYPESAFE_API_KEY` set and `[pick]
 notes` written (R23). Network use
@@ -556,10 +550,9 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
   - The object resumed is **the selected row** (its transcript path), not a fresh lookup by session
     ID: the same ID may appear in two stores.
   - Refused when the selected account's `projects` store (realpath) differs from the store holding
-    the transcript: that account cannot find the session.
+    the transcript: that account cannot find the session, and remuda does not copy sessions
+    between stores (R19).
   - The cwd is `cwd_last` (R6); an error is reported if the directory does not exist.
-  - `c`: continue under another account (relay, R19): a picker of the other claude accounts, then
-    the relay and a foreground launch.
   - `f`: fork (`--resume <id> --fork-session`, injecting a new ID per R6). A fork only reads the
     original session and writes under a new ID, so it is allowed even for a running session.
   - A background session that is no longer running is resumed from History as an ordinary
@@ -792,7 +785,7 @@ by injecting launch options, so nothing is written into any home (R13), and home
   `<home>/projects/<project>/memory/`. remuda points it at the source's copy:
   `<source home>/projects/<project>/memory`, and must compute `<project>` exactly as claude does
   (read from the 2.1.281 bundle and checked against the path claude reports):
-  - The start directory is the launch cwd (for a resume or relay, `cwd_last`), made absolute,
+  - The start directory is the launch cwd (for a resume, `cwd_last`), made absolute,
     canonicalized (realpath), and NFC-normalized, as claude does with its own cwd.
   - The project root is found as claude finds it, without running git (read from the 2.1.281
     bundle): walk up from the start directory to the first directory containing a `.git` entry
@@ -825,60 +818,13 @@ by injecting launch options, so nothing is written into any home (R13), and home
 - `run` stays a fast path (R6): injection reads a handful of settings files and
   `installed_plugins.json`, runs no subprocess, and scans no sessions.
 
-## R19. Relay: continuing a session under another account
+## R19. Relay (removed)
 
-A relay continues a session under an account whose `projects` store does not contain it (verified
-on 2.1.281: `--resume <id>` in another home fails with "No conversation found"). The original
-session is never modified: the relay forks it, and the fork belongs to the target account, so
-every session still belongs to exactly one account.
-
-- **Entry points.** `remuda relay <session> <account>` (`<session>` is a full session ID from the
-  index) and `c` in History / Live (R16). Claude sessions only.
-- **Refused** when the target is not a claude account, when the target's `projects` store (realpath)
-  already holds the transcript (use a fork instead), when the transcript's `cwd_last` does not
-  exist (R6), or when the session or target account cannot be resolved.
-- **Copy.**
-  1. The selected transcript (R16: the row, not a lookup by ID) is copied to
-     `<target home>/projects/<dir>/<id>.jsonl`, where `<dir>` is the name of the directory holding
-     the transcript in its store. The copy ends at the last complete line, so a transcript being
-     written (a running session) never yields a partial record; a transcript with no complete line
-     is refused.
-  2. The checkpoints in `file-history/<id>/` are copied from every home whose `projects` resolves
-     to the transcript's store (a session may have run under several homes sharing a store), as
-     a union: checkpoint files are content-addressed and immutable, so a name found in two homes is
-     the same file. Missing checkpoints are not an error.
-  Basis (verified on 2.1.281): a fork copies the checkpoints of `file-history/<id>/` to the new ID;
-  without them the fork works but `/rewind` cannot reach points before the fork.
-- **Order and failure.** Checkpoints are copied first and the transcript is placed last. If anything
-  after placing the transcript fails before claude starts (writing the launch log, handing over
-  the terminal), remuda removes the transcript copy it just placed (its own file) and reports the
-  error; the launch does not proceed without its log record.
-- **Overwrite rules.** Copies are written to a temporary name and renamed into place. An existing
-  destination transcript is replaced only if the launch log records it as an earlier relay copy
-  and its size and mtime still equal the recorded ones; otherwise the relay is refused.
-  Checkpoint files are immutable (`<hash>@v<n>`): existing ones are kept, missing ones are copied.
-- **Sequence.**
-
-  ```text
-  source store (read only)                    target account's home
-  file-history/<id>/*        ── (a) copy ─►  file-history/<id>/*
-  (union over the homes sharing that store)
-  projects/<dir>/<id>.jsonl  ── (b) copy ─►  projects/<dir>/<id>.jsonl   (the relay copy)
-                                             (c) launch log record (fork_of, relay)
-                                             (d) claude --resume <id> --fork-session
-                                                        --session-id <new>        in cwd_last
-                                                   └─► projects/<dir>/<new>.jsonl (the target's)
-  ```
-
-  A failure in (c), or before claude starts in (d), removes the copy made in (b).
-- **Launch.** Under the target account, in `cwd_last`, with R18 injection:
-  `claude --resume <id> --fork-session --session-id <new uuid>`. The launch log records `fork_of`
-  and a `relay` object: the source transcript path, the copied paths, and the copy's size and
-  mtime.
-- **Index.** A transcript recorded as a relay copy is hidden from History and is not attributed to
-  the target account; the original row keeps its attribution. If `state/` is deleted (R3), copies
-  reappear as the same ID in two stores, which R16 already handles.
-- A relay is allowed while the session is running, like a fork (R16).
+Removed on 2026-10-01, before any release contained it (ROADMAP, design decisions). A relay
+continued a session under another account by copying its transcript and checkpoints into that
+account's home and forking it there; it was the one case in which remuda wrote into a home (R13).
+A session is now continued only by an account whose `projects` store holds it (R16). The number
+stays reserved so that the entries after it keep theirs.
 
 ## R20. Token statistics
 
@@ -941,13 +887,13 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
 - **Copies count once.** A fork holds its parent's history: claude copies the parent's records
   with their `message.id` and timestamp and marks them `forkedFrom`; a codex fork may replay the
   parent's `token_count` events with the fork's timestamps and the parent's cumulative totals; a
-  relay (R19) copies a transcript whole. So each claude message is counted once across all stores
-  by its `message.id`, and each codex request once across all rollouts by its
+  transcript may also have been copied whole into another store by hand. So each claude message
+  is counted once across all stores by its `message.id`, and each codex request once across all rollouts by its
   `total_token_usage`. In the corpus, 2,360 of the 2,362 totals found in more than one rollout
   came from forks; the other two were the first requests of unrelated `codex exec` runs with
   identical usage, which are counted once (a known limitation). The copy that counts is, in
-  order: one not known to be a copy (a `forkedFrom` record, or a transcript the launch log records
-  as a relay copy, R19), the one with the earliest timestamp, the one whose path sorts first.
+  order: one not known to be a copy (a `forkedFrom` record), the one with the earliest timestamp,
+  the one whose path sorts first.
 - **Accounts.** A message counts for the session of the transcript whose copy counts. A claude
   session's accounts are those of R9 without running sessions (the launch log and
   `history.jsonl`); a codex rollout's are the accounts of its home (R17). A session attributed to

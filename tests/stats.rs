@@ -455,14 +455,13 @@ fn a_forked_copy_counts_for_the_original() {
     assert_eq!(of(&table.overall, "claude-test"), toks(10, 300, 100, 47, 0));
 }
 
-/// R20, R19: a relay's copy of a transcript in another store counts once, for the original.
-/// Both copies are the same session, so which one counts only shows in the ranking: a
-/// launch-log relay copy loses to any other copy, then the earliest timestamp wins, then the
-/// path that sorts first.
+/// R20: the same transcript in two stores counts once. Both copies are the same session, so
+/// which one counts only shows in the ranking: the earliest timestamp wins, then the path
+/// that sorts first.
 #[test]
-fn a_relay_copy_counts_for_the_original() {
+fn a_transcript_in_two_stores_counts_once() {
     let mut f = Fixture::new();
-    // `<root>/a-team` sorts before `<root>/home`: the copy would win a tie on the path.
+    // `<root>/a-team` sorts before `<root>/home`: the copy wins a tie on the path.
     let team = f.root.join("a-team");
     fs::create_dir_all(team.join("projects")).unwrap();
     f.accounts.push(Account {
@@ -471,7 +470,7 @@ fn a_relay_copy_counts_for_the_original() {
         home: Home::Path(team.display().to_string()),
     });
     let text = [msg_a1_records().concat(), msg_a2()].concat();
-    let original = f.write(&format!("{S_A}.jsonl"), &text);
+    f.write(&format!("{S_A}.jsonl"), &text);
     let copy = write_file(&team.join(format!("projects/-w-proj/{S_A}.jsonl")), &text);
     f.attribute(S_A, "claude:default");
     let table = f.all();
@@ -485,46 +484,26 @@ fn a_relay_copy_counts_for_the_original() {
 
     // Which copy counts, made visible: give each a session of its own, as if the copy were
     // another session holding the same messages.
-    let rank = |f: &Fixture, relay: bool| {
-        let mut cache = f.cache.clone();
-        cache.files.get_mut(&copy).unwrap().session_id = "copy".into();
-        let log = f.root.join("launches.jsonl");
-        let line = json!({"ts": "2026-09-20T10:10:00Z", "account": "claude:team",
-            "session_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-            "relay": {"source": original, "transcript": copy, "checkpoints": [],
-                      "size": 1, "mtime_ns": 1}});
-        fs::write(
-            &log,
-            if relay {
-                format!("{line}\n")
-            } else {
-                String::new()
-            },
-        )
-        .unwrap();
-        let mut attribution = Attribution::default();
-        attribution.add_launch_log(&log);
-        attribution.add(S_A, "claude:default");
-        attribution.add("copy", "claude:team");
-        assert_eq!(attribution.is_relay_copy(&copy), relay);
-        let report = stats::report(
-            &cache,
-            &f.sources(),
-            &attribution,
-            &f.accounts,
-            &f.prices,
-            f.now,
-            &f.tz,
-        );
-        let table = report.table(Period::All);
+    let mut cache = f.cache.clone();
+    cache.files.get_mut(&copy).unwrap().session_id = "copy".into();
+    let mut attribution = Attribution::default();
+    attribution.add(S_A, "claude:default");
+    attribution.add("copy", "claude:team");
+    let report = stats::report(
+        &cache,
+        &f.sources(),
+        &attribution,
+        &f.accounts,
+        &f.prices,
+        f.now,
+        &f.tz,
+    );
+    let table = report.table(Period::All);
+    assert_eq!(
         (
             section(table, &["claude:default"]).total(),
             section(table, &["claude:team"]).total(),
-        )
-    };
-    assert_eq!(rank(&f, true), (A1_A2, Tokens::default()));
-    assert_eq!(
-        rank(&f, false),
+        ),
         (Tokens::default(), A1_A2),
         "a tie goes to the path that sorts first"
     );

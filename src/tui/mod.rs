@@ -1,4 +1,4 @@
-//! The TUI (SPEC R5, R7-R11, R16, R19-R22): accounts with usage, reset timeline and
+//! The TUI (SPEC R5, R7-R11, R16, R20-R22): accounts with usage, reset timeline and
 //! configuration, live sessions, session history with search and preview, token statistics,
 //! private mode, and launching the agents from them.
 //!
@@ -37,7 +37,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::provider::Provider;
 use crate::registry::{Account, Registry};
-use crate::{Env, launch, paths, relay, setup};
+use crate::{Env, launch, paths, setup};
 
 use app::{App, Effect, Event, Exit, Key, LaunchRequest, Mode};
 
@@ -319,15 +319,6 @@ fn event_loop(
                         let size = terminal.size()?;
                         let _ = tx.send(Event::Resize(size.width, size.height));
                     }
-                    Effect::Relay { request, source } => {
-                        let (request, what) = for_screen(&app, request);
-                        let mut event = relay_in_foreground(terminal, &deps, request, &source)?;
-                        restore_what(&mut event, what);
-                        // Results come back through the queue, after this batch.
-                        let _ = tx.send(event);
-                        let size = terminal.size()?;
-                        let _ = tx.send(Event::Resize(size.width, size.height));
-                    }
                     Effect::Setup {
                         provider,
                         name,
@@ -413,24 +404,7 @@ pub fn launch_in_foreground(
     deps: &Deps,
     request: LaunchRequest,
 ) -> Result<Event> {
-    let (result, warnings) = run_launch(screen, deps, &request, None)?;
-    Ok(Event::Launched {
-        request,
-        result,
-        warnings,
-    })
-}
-
-/// A relay (R19): `source` is copied into the store of the request's account (refused
-/// before anything is written when it must be), then its fork runs like
-/// [`launch_in_foreground`]. The TUI steps aside only once the copy is done.
-pub fn relay_in_foreground(
-    screen: &mut impl Screen,
-    deps: &Deps,
-    request: LaunchRequest,
-    source: &relay::Source,
-) -> Result<Event> {
-    let (result, warnings) = run_launch(screen, deps, &request, Some(source))?;
+    let (result, warnings) = run_launch(screen, deps, &request)?;
     Ok(Event::Launched {
         request,
         result,
@@ -442,7 +416,6 @@ fn run_launch(
     screen: &mut impl Screen,
     deps: &Deps,
     request: &LaunchRequest,
-    relay: Option<&relay::Source>,
 ) -> Result<(Result<Exit, String>, Vec<String>)> {
     let provider = request.account.provider;
     let Some(program) = deps.program(provider) else {
@@ -451,29 +424,17 @@ fn run_launch(
     };
     let cwd = request.cwd.as_deref().or(deps.cwd.as_deref());
     // The registry as it is now, for its shared configuration (R18).
-    let log = deps.state_dir.join("launches.jsonl");
-    let ts = (deps.clock)().to_string();
-    let planned = Registry::load(&deps.config).and_then(|registry| match relay {
-        None => launch::plan(
+    let planned = Registry::load(&deps.config).and_then(|registry| {
+        launch::plan(
             &request.account,
             request.args.clone(),
             cwd,
-            ts,
+            (deps.clock)().to_string(),
             || uuid::Uuid::new_v4().to_string(),
             &registry.sharing,
             &deps.env,
             &deps.config,
-        ),
-        Some(source) => relay::prepare(
-            source,
-            &request.account,
-            &registry.all(&deps.env),
-            &registry.sharing,
-            &deps.env,
-            &log,
-            &deps.config,
-            ts,
-        ),
+        )
     });
     let plan = match planned {
         Ok(plan) => plan,
@@ -481,43 +442,18 @@ fn run_launch(
     };
     let mut warnings = launch::env_warnings(&deps.env);
     warnings.extend(plan.notices.iter().cloned());
-    // A relay copy is only ever left with its record, and only for a claude that starts (R19):
-    // its log line is written before the terminal is handed over, and anything that stops the
-    // launch from here on removes the copy.
-    let relayed = plan.record.relay.as_ref();
-    let undo = |e: String| match relayed {
-        Some(relay) => format!("{e}; {}", relay::discarded(relay)),
-        None => e,
-    };
-    if relayed.is_some()
-        && let Err(e) = launch::append_log(&log, &plan.record)
-    {
-        let e = format!("cannot write launch log {}: {e:#}", log.display());
-        return Ok((Err(undo(e)), warnings));
-    }
+    let log = deps.state_dir.join("launches.jsonl");
     if let Err(e) = screen.suspend() {
         let _ = screen.resume();
-        return Ok((
-            Err(undo(format!("cannot hand the terminal over: {e}"))),
-            warnings,
-        ));
+        return Ok((Err(format!("cannot hand the terminal over: {e}")), warnings));
     }
     println!("{}", launch_line(&request.what, cwd, deps.private));
-    let ran = match relayed {
-        Some(_) => launch::Ran {
-            status: launch::run_plan(program, &plan, cwd),
-            log_error: None,
-        },
-        None => launch::perform(program, &plan, cwd, &log),
-    };
+    let ran = launch::perform(program, &plan, cwd, &log);
     screen
         .resume()
         .with_context(|| format!("cannot take the terminal back after {}", provider.program()))?;
     warnings.extend(ran.log_error);
-    Ok((
-        ran.status.map(exit_of).map_err(|e| undo(e.to_string())),
-        warnings,
-    ))
+    Ok((ran.status.map(exit_of).map_err(|e| e.to_string()), warnings))
 }
 
 /// `remuda setup --provider <p> <name>` from the TUI (R5, R16, R17): the same checks and steps

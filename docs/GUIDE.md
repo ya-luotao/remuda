@@ -16,8 +16,12 @@ exits without launching anything.
 
 Resuming a Claude session that is still running elsewhere is refused, because two processes
 writing the same session would overwrite each other. Codex has no source of running sessions, so
-resuming a Codex session in place always asks for confirmation. Forks and relays only read the
-original session, so they are allowed while it runs.
+resuming a Codex session in place always asks for confirmation. A fork only reads the original
+session, so it is allowed while it runs.
+
+A Claude session can be resumed or forked only by an account whose `projects` directory holds
+its transcript: usually the account that created it, or any of the accounts whose `projects`
+are symlinks to the same directory. Remuda does not copy sessions between accounts.
 
 The Stats view computes the statistics in the background the first time it opens, with the
 reading progress in the status line, and again on each `r`; the first computation reads every
@@ -102,17 +106,6 @@ already the source's (a symlink), or not shared, with the reason. What is shared
 same step that prepares a launch, so the pane and a launch always agree. Settings are shown by
 key names and counts only; no values. Synced claude.ai skills are shown for the account's own
 login only. Press `p` again to give the pane the whole screen, and `Esc` to step back.
-
-## Relay
-
-`remuda relay <session> <account>`, or `c` in the TUI, continues a Claude session under an account
-whose session store does not have it, for example when the session's own account has run out of
-usage. Remuda copies the transcript (up to its last complete record) and its checkpoints into the
-target account's store, then runs `claude --resume <id> --fork-session` there, in the session's
-last directory and with the shared configuration. The fork is a new session that belongs to the
-target account; the original is never modified, and the copy is hidden from the session history.
-A relay never overwrites anything except its own earlier copy of the same session, and only if
-that copy is unchanged.
 
 ## Recommendations
 
@@ -214,8 +207,8 @@ shared `projects` store without `cleanupPeriodDays`, and problems with the share
 - **Live sessions** come from `claude agents --json`. They are not available for Codex, because
   Codex exposes no machine-readable list of running sessions.
 - **Token statistics** are counted from the agents' own transcripts. Each request counts once,
-  even when a message is written in several records, a session is forked or relayed, or a store
-  is shared by several accounts. Each request is also priced at the provider's public API list
+  even when a message is written in several records, a session is forked, or a store is shared
+  by several accounts. Each request is also priced at the provider's public API list
   price (built in, as of 2026-09-24), which estimates what the usage would cost on the API; for
   subscription logins it is not a bill. No agent is run and nothing is fetched.
 - **Recommendations** (`remuda pick`) read the same usage and `[pick]`; the only request remuda

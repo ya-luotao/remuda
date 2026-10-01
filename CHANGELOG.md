@@ -38,9 +38,6 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   values), auto-memory directory and MCP server names, each marked as the account's own, shared
   from the shared-configuration source, already the source's, or not shared, for a session in
   remuda's directory. It reads only, and uses the same plan as a launch's shared configuration.
-- Relay (SPEC R19): `remuda relay <session> <account>` and `c` in the TUI continue a session under
-  another account by copying its transcript and checkpoints into the target store and forking it
-  there. The original session is never modified.
 - `remuda remove <account>` unregisters an account (SPEC R14a). The home directory is left in
   place, and its path is printed so it can be registered again; `default` and the source of
   shared configuration cannot be removed. `D` in the TUI's Accounts view does the same after
@@ -48,8 +45,8 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 - Token statistics (SPEC R20): `remuda stats [<account>] [--period today|7d|30d|all]` and the
   TUI's Stats view (`4`; `t` cycles the period) show input, cache read, cache write, output and
   reasoning tokens per account and model, counted from Claude transcripts (subagents and advisor
-  calls included) and Codex rollouts. Each request counts once across repeated records, forks,
-  relay copies and shared stores; a session attributed to several accounts is counted once, for
+  calls included) and Codex rollouts. Each request counts once across repeated records, forks
+  and shared stores; a session attributed to several accounts is counted once, for
   those accounts together. The counts are cached in `state/stats.json`; the first run reads every
   transcript whole.
 - Estimated cost in the token statistics (SPEC R20): a COST column in `remuda stats` and the Stats

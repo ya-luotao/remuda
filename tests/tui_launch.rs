@@ -327,6 +327,30 @@ fn tui_launch_without_claude_does_not_suspend() {
     );
 }
 
+/// R16: when the terminal cannot be handed over, nothing is logged or run.
+#[test]
+fn tui_launch_that_cannot_suspend_runs_nothing() {
+    let sb = Sandbox::new();
+    let request = LaunchRequest {
+        account: named("max", "/p/max"),
+        args: vec![],
+        cwd: None,
+        what: "new session as max".into(),
+    };
+    let mut screen = FakeScreen {
+        fail_suspend: true,
+        ..FakeScreen::default()
+    };
+    let event = tui::launch_in_foreground(&mut screen, &deps(&sb), request).unwrap();
+    let Err(e) = exit_of(&event) else {
+        panic!("{event:?}")
+    };
+    assert!(e.contains("cannot hand the terminal over"), "{e}");
+    assert_eq!(screen.calls, ["suspend", "resume"]);
+    assert!(sb.invocations().is_empty());
+    assert!(!sb.launch_log().exists());
+}
+
 /// R16, R18: the TUI launches through the same path as `run`: shared configuration from the
 /// registry as it is at launch goes before the arguments, and its notices come back as
 /// warnings.
@@ -386,114 +410,6 @@ fn tui_launches_get_shared_configuration() {
     };
     assert!(e.contains("names no claude account"), "{e}");
     assert_eq!(sb.invocations().len(), 1);
-}
-
-/// R16, R19: `c` in the TUI copies the selected row's transcript into the target's store and
-/// forks it there in the foreground; the TUI steps aside only after the copy. A file at the
-/// destination that remuda did not copy is refused before anything is written or run.
-#[test]
-fn tui_relay_copies_then_forks() {
-    const ID: &str = "766560c5-74e6-45f5-89fd-d92926b14898";
-    let sb = Sandbox::new();
-    let max = sb.make_claude_home("max");
-    let team = sb.make_claude_home("team");
-    sb.register(&[("max", &max), ("team", &team)]);
-    let dir = project(&sb).canonicalize().unwrap();
-    let project_dir = max.join("projects/-w");
-    fs::create_dir_all(&project_dir).unwrap();
-    let transcript = project_dir.join(format!("{ID}.jsonl"));
-    fs::write(&transcript, "{\"a\":1}\n{\"b\":").unwrap();
-    let source = remuda::relay::Source {
-        transcript: transcript.canonicalize().unwrap(),
-        store: max.join("projects").canonicalize().unwrap(),
-        session_id: ID.into(),
-        cwd_last: Some(dir.display().to_string()),
-    };
-    let team_account = named("team", team.to_str().unwrap());
-    let request = LaunchRequest {
-        account: team_account.clone(),
-        args: Provider::Claude.resume_args(ID, &dir, true),
-        cwd: Some(dir.clone()),
-        what: "continue 766560c5 as team".into(),
-    };
-    let mut deps = deps(&sb);
-    deps.accounts = vec![named("max", max.to_str().unwrap()), team_account];
-
-    // Someone else's file where the copy would go.
-    let dest = team.join("projects/-w").join(format!("{ID}.jsonl"));
-    fs::create_dir_all(dest.parent().unwrap()).unwrap();
-    fs::write(&dest, "theirs\n").unwrap();
-    let mut screen = FakeScreen::default();
-    let event = tui::relay_in_foreground(&mut screen, &deps, request.clone(), &source).unwrap();
-    assert!(
-        screen.calls.is_empty(),
-        "refused before the TUI steps aside"
-    );
-    let Err(e) = exit_of(&event) else {
-        panic!("{event:?}")
-    };
-    assert!(e.contains("remuda does not overwrite it"), "{e}");
-    assert_eq!(fs::read_to_string(&dest).unwrap(), "theirs\n");
-    assert!(sb.invocations().is_empty());
-
-    fs::remove_file(&dest).unwrap();
-    // R19: the terminal cannot be handed over: the copy just placed is removed.
-    let mut screen = FakeScreen {
-        fail_suspend: true,
-        ..FakeScreen::default()
-    };
-    let event = tui::relay_in_foreground(&mut screen, &deps, request.clone(), &source).unwrap();
-    let Err(e) = exit_of(&event) else {
-        panic!("{event:?}")
-    };
-    assert!(
-        e.contains("cannot hand the terminal over") && e.contains("the relay copy was removed"),
-        "{e}"
-    );
-    assert!(!dest.exists());
-    assert!(sb.invocations().is_empty());
-    // The launch cannot be logged: removed before the TUI steps aside.
-    let log_path = sb.launch_log();
-    let logged_before = fs::read_to_string(&log_path).unwrap();
-    fs::remove_file(&log_path).unwrap();
-    fs::create_dir(&log_path).unwrap();
-    let mut screen = FakeScreen::default();
-    let event = tui::relay_in_foreground(&mut screen, &deps, request.clone(), &source).unwrap();
-    assert!(screen.calls.is_empty());
-    let Err(e) = exit_of(&event) else {
-        panic!("{event:?}")
-    };
-    assert!(
-        e.contains("cannot write launch log") && e.contains("the relay copy was removed"),
-        "{e}"
-    );
-    assert!(!dest.exists());
-    fs::remove_dir(&log_path).unwrap();
-    fs::write(&log_path, logged_before).unwrap();
-
-    let mut screen = FakeScreen::default();
-    let event = tui::relay_in_foreground(&mut screen, &deps, request, &source).unwrap();
-    assert_eq!(exit_of(&event), &Ok(Exit::Code(0)));
-    assert_eq!(screen.calls, ["suspend", "resume"]);
-    assert_eq!(fs::read_to_string(&dest).unwrap(), "{\"a\":1}\n");
-    let inv = sb.only_invocation();
-    assert_eq!(inv.cwd, dir);
-    assert_eq!(inv.config_dir.as_deref(), Some(team.to_str().unwrap()));
-    assert_eq!(
-        inv.args[..4],
-        ["--resume", ID, "--fork-session", "--session-id"]
-    );
-    // The failed attempts left their log lines (the one that could not be handed over);
-    // the last line is this launch, logged once.
-    let log = sb.launches();
-    let last = log.last().unwrap();
-    assert_eq!(last["fork_of"], json!(ID));
-    assert_eq!(last["session_id"], json!(inv.args[4]));
-    assert_eq!(
-        last["relay"]["transcript"],
-        json!(dest.canonicalize().unwrap())
-    );
-    assert_eq!(log.len(), 2);
 }
 
 /// R18: a directory typed into the TUI's new-session form is made real before it names the

@@ -182,6 +182,27 @@ fn lists_sessions_newest_first_with_accounts_title_and_cwd() {
     assert_eq!(sb.invocations().len(), 3);
 }
 
+/// R16: the same session ID in two stores is two rows, each with the session's accounts.
+#[test]
+fn a_session_id_in_two_stores_is_listed_twice() {
+    let Setup {
+        sb,
+        max,
+        team,
+        native_projects,
+    } = setup();
+    let text = user("same session", "/w/a", &ts(1));
+    transcript(&native_projects, S_A, &text);
+    transcript(&team.join("projects"), S_A, &text);
+    history(&max.join("history.jsonl"), &[S_A]);
+    let (rows, _) = sessions(&sb, &[]);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for r in &rows {
+        assert_eq!(r["ACCOUNTS"], "claude:max");
+        assert_eq!(r["TITLE"], "same session");
+    }
+}
+
 #[test]
 fn limit_keeps_the_newest() {
     let Setup {

@@ -362,7 +362,7 @@ fn hints(app: &App) -> String {
     } else if app.history.searching && app.view == View::History {
         "type to filter · ↑/↓: move · enter: keep filter · esc: clear"
     } else if app.preview.expanded && app.view != View::Accounts {
-        "j/k/pgup/pgdn: scroll · esc/p: back · enter: resume · f: fork · c: continue as…"
+        "j/k/pgup/pgdn: scroll · esc/p: back · enter: resume · f: fork"
     } else if app.view == View::Accounts && app.config.expanded {
         "j/k/pgup/pgdn: scroll · p: close · esc: back · r: refresh"
     } else if app.view == View::Accounts && app.config.open {
@@ -373,12 +373,9 @@ fn hints(app: &App) -> String {
                 "n: new session · p: config · s: set up · D: remove · u: live usage · r: refresh"
             }
             View::Live => {
-                "enter: attach · f: fork · c: continue as… · p: preview · l: logs · x: stop · \
-                 D: rm · a: stopped"
+                "enter: attach · f: fork · p: preview · l: logs · x: stop · D: rm · a: stopped"
             }
-            View::History => {
-                "enter: resume · f: fork · c: continue as… · p: preview · /: search · a: show all"
-            }
+            View::History => "enter: resume · f: fork · p: preview · /: search · a: show all",
             View::Stats => "t: period · j/k: scroll · r: refresh",
         }
     };
@@ -1670,10 +1667,6 @@ pub const KEYS: &[(&str, &str)] = &[
         "fork the selected session (a new id; the original stays as it is)",
     ),
     (
-        "c",
-        "continue a claude session under another account (copied into its store, then forked)",
-    ),
-    (
         "p / space",
         "expand the preview · accounts: show the account's configuration, then expand it",
     ),
@@ -2118,7 +2111,6 @@ fn pick_box(app: &App, pick: &Pick, f: &mut Frame, area: Rect) {
     let verb = match pick.action {
         PickFor::Resume => "Resume",
         PickFor::Fork => "Fork",
-        PickFor::Relay => "Continue",
     };
     let title = format!("{verb} {} as…", short_id(&pick.session_id));
     let name_w = pick
@@ -2153,13 +2145,10 @@ fn pick_box(app: &App, pick: &Pick, f: &mut Frame, area: Rect) {
             ];
             // The registry may have changed while the picker is open (R17).
             let registered = app.accounts.iter().any(|a| a.account.qualified() == *q);
-            // A relay goes to another store by design: that is not a problem there.
-            let problem = if !registered {
-                Some("no longer registered")
-            } else if pick.action == PickFor::Relay {
-                None
-            } else {
+            let problem = if registered {
                 app.store_problem(q, &pick.path)
+            } else {
+                Some("no longer registered")
             };
             if let Some(problem) = problem {
                 spans.push(Span::styled(format!("  {problem}"), DIM));

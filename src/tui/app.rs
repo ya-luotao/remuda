@@ -19,7 +19,6 @@ use crate::live::{self, Control, LiveId, LiveSession};
 use crate::privacy::Aliases;
 use crate::provider::Provider;
 use crate::registry::{self, Account, CLAUDE, CODEX, Home};
-use crate::relay;
 use crate::setup;
 use crate::stats::{self, Period};
 use crate::transcript::Message;
@@ -282,12 +281,6 @@ pub enum Effect {
     RolloutWritten(PathBuf),
     /// Suspend the TUI, run claude in the foreground and wait (R16).
     Launch(LaunchRequest),
-    /// Copy `source` into the request's account's store, then launch its fork there like
-    /// [`Effect::Launch`] (R19).
-    Relay {
-        request: LaunchRequest,
-        source: relay::Source,
-    },
     /// [`Mode::PickForRun`]: this account was chosen; the TUI exits.
     Pick(Account),
     /// `claude logs <short_id>` under the account's environment, captured.
@@ -465,8 +458,6 @@ impl Form {
 pub enum PickFor {
     Resume,
     Fork,
-    /// Continue it under an account whose store does not hold it (R19).
-    Relay,
 }
 
 /// The accounts are `provider:name`, not rows of [`App::accounts`]: rows move when the
@@ -479,8 +470,7 @@ pub struct Pick {
     pub action: PickFor,
     /// Accounts of the session's provider only. Claude: the accounts that can see the
     /// transcript's store first, then the rest; the session's own accounts first within each.
-    /// Codex: the accounts sharing the rollout's store (R17). Relay: the claude accounts whose
-    /// store does not hold the transcript (R19).
+    /// Codex: the accounts sharing the rollout's store (R17).
     pub options: Vec<String>,
     /// The accounts the session is attributed to.
     pub attributed: Vec<String>,
@@ -775,9 +765,9 @@ impl App {
             .count()
     }
 
-    /// Shown in History: not noise (unless "show all"), and never a relay's copy (R8, R19).
+    /// Shown in History: not noise, unless "show all" (R8).
     fn in_history(&self, entry: &Entry) -> bool {
-        (self.history.show_all || !is_noise(entry)) && !self.attribution.is_relay_copy(&entry.path)
+        self.history.show_all || !is_noise(entry)
     }
 
     /// `r`: everything except live usage, skipping what is already running (per-account
@@ -1181,14 +1171,8 @@ impl App {
             }
             Key::Enter if self.view == View::History => self.act_on_entry(false, fx),
             Key::Char('f') if self.view == View::History => self.act_on_entry(true, fx),
-            Key::Char('c') if self.view == View::History => {
-                if let Some(path) = self.selected_entry().map(|e| e.path.clone()) {
-                    self.relay(&path);
-                }
-            }
             Key::Enter if self.view == View::Live => self.live_enter(fx),
             Key::Char('f') if self.view == View::Live => self.live_fork(fx),
-            Key::Char('c') if self.view == View::Live => self.live_relay(),
             Key::Char('a') if self.view == View::Live => {
                 self.live_show_inactive = !self.live_show_inactive;
                 let selected = self.selected_live().map(LiveSession::key);
@@ -1395,15 +1379,9 @@ impl App {
                     let (path, action) = (pick.path.clone(), pick.action);
                     let chosen = pick.options.get(pick.selected).cloned();
                     self.overlay = None;
-                    match (chosen, action) {
-                        (Some(qualified), PickFor::Relay) => {
-                            self.relay_picked(&path, &qualified, fx);
-                        }
-                        (Some(qualified), action) => {
-                            let fork = action == PickFor::Fork;
-                            self.resume_picked(&path, fork, &qualified, fx);
-                        }
-                        (None, _) => {}
+                    if let Some(qualified) = chosen {
+                        let fork = action == PickFor::Fork;
+                        self.resume_picked(&path, fork, &qualified, fx);
                     }
                 }
                 _ => {}
@@ -2037,133 +2015,6 @@ impl App {
         fx.push(Effect::CheckLaunch { check, request });
     }
 
-    /// `c` in Live: relay the selected session's transcript (R19).
-    fn live_relay(&mut self) {
-        let Some(session) = self.selected_live().cloned() else {
-            return;
-        };
-        let Some(id) = session.session_id.clone() else {
-            self.notify(Level::Warn, "this session's id is unknown");
-            return;
-        };
-        match self.transcript_for_live(&session) {
-            Some(path) => self.relay(&path),
-            None => {
-                let text = format!("session {} is not indexed yet", short_id(&id));
-                self.notify(Level::Warn, text);
-            }
-        }
-    }
-
-    /// `c`: continue the claude transcript at `path` under another account (R19): a picker of
-    /// the claude accounts whose store does not hold it. Allowed while it runs, like a fork.
-    fn relay(&mut self, path: &Path) {
-        let Some(entry) = self.index.entries.get(path) else {
-            return;
-        };
-        let (session_id, has_cwd) = (entry.session_id.clone(), entry.cwd_last.is_some());
-        let short = short_id(&session_id);
-        if entry.provider != CLAUDE {
-            let text = format!(
-                "session {short} is a {} session: only claude sessions continue under another \
-                 account",
-                entry.provider
-            );
-            self.notify(Level::Warn, text);
-            return;
-        }
-        if !self.check_session_id(&session_id, CLAUDE) {
-            return;
-        }
-        if !has_cwd {
-            let text = format!("session {short} has no recorded directory to continue in");
-            self.notify(Level::Error, text);
-            return;
-        }
-        if self.stores.is_none() {
-            self.notify(
-                Level::Warn,
-                "still reading the transcript stores; try again in a moment",
-            );
-            return;
-        }
-        let owners = self.attribution.accounts(&session_id);
-        let options: Vec<String> = self
-            .accounts
-            .iter()
-            .filter(|a| a.account.provider == CLAUDE)
-            .map(|a| a.account.qualified())
-            .filter(|q| self.store_problem(q, path).is_some())
-            .collect();
-        if options.is_empty() {
-            let text = format!(
-                "every claude account can already find session {short}: fork it instead (f)"
-            );
-            self.notify(Level::Warn, text);
-            return;
-        }
-        let attributed = options
-            .iter()
-            .filter(|q| owners.contains(&q.as_str()))
-            .cloned()
-            .collect();
-        self.open(Overlay::Pick(Pick {
-            path: path.to_path_buf(),
-            session_id,
-            action: PickFor::Relay,
-            options,
-            attributed,
-            selected: 0,
-        }));
-    }
-
-    /// The relay picker's choice, resolved by name: the copy and the fork happen in the
-    /// foreground (R19); the event loop refuses what the stores and the file system say it must.
-    fn relay_picked(&mut self, path: &Path, qualified: &str, fx: &mut Vec<Effect>) {
-        let Some(account) = self.account_named(qualified) else {
-            let text = format!("{} is no longer registered", short_account(qualified));
-            self.notify(Level::Error, text);
-            return;
-        };
-        let Some(entry) = self.index.entries.get(path) else {
-            return;
-        };
-        let (session_id, store, cwd) = (
-            entry.session_id.clone(),
-            entry.store.clone(),
-            entry.cwd_last.clone(),
-        );
-        let (name, short) = (display_name(&account), short_id(&session_id));
-        if account.provider != CLAUDE {
-            let text =
-                format!("{name} is not a claude account: it cannot continue session {short}");
-            self.notify(Level::Error, text);
-            return;
-        }
-        // The stores may have been read again while the picker was open.
-        if self.store_problem(qualified, path).is_none() {
-            let text = format!("{name} can already find session {short}: fork it instead (f)");
-            self.notify(Level::Warn, text);
-            return;
-        }
-        let Some(dir) = cwd.clone().map(PathBuf::from) else {
-            return;
-        };
-        let request = LaunchRequest {
-            args: CLAUDE.resume_args(&session_id, &dir, true),
-            what: format!("continue {short} as {name}"),
-            account,
-            cwd: Some(dir),
-        };
-        let source = relay::Source {
-            transcript: path.to_path_buf(),
-            store,
-            session_id,
-            cwd_last: cwd,
-        };
-        self.foreground(Effect::Relay { request, source }, fx);
-    }
-
     /// Makes `request` the pending launch under a new check number, returned.
     fn next_check(&mut self, request: &LaunchRequest) -> u64 {
         self.launch_checks += 1;
@@ -2583,8 +2434,10 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             app.attribution_base = base;
             app.attribution_in_flight = false;
             app.merge_attribution();
-            // Accounts are searched, and relay copies are hidden (R19).
-            app.rebuild_history();
+            // Accounts are searched.
+            if !app.history.query.is_empty() {
+                app.rebuild_history();
+            }
             if std::mem::take(&mut app.attribution_again) {
                 app.attribution_in_flight = true;
                 fx.push(Effect::Attribution);
