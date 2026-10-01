@@ -28,17 +28,22 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 - Shared configuration (SPEC R18): with `[share.claude] from = "<account>"`, every other Claude
   account launches with the source account's instructions (`CLAUDE.md`, skills, commands,
   agents, rules), settings, enabled plugins, and memory locations (auto-memory and the memory of
-  user-scope subagents), injected as launch options.
-  Nothing is written into any home; an account's own settings keep precedence; existing symlink
-  layouts are detected so nothing loads twice. Opt an account out with `share = false`.
+  user-scope subagents), injected as launch options. Sessions stay with the account that created
+  them. Nothing is written into any home; an account's own settings keep precedence; existing
+  symlink layouts are detected so nothing loads twice. Opt an account out with `share = false`.
   Authentication and provider settings are never shared, and shared settings travel to claude as
-  a private (0600) file rather than on the command line.
-- Account configuration in the TUI (SPEC R22): `p` or Space in the Accounts view shows the
-  selected Claude account's instructions (`CLAUDE.md`, agents with model, effort and tools,
-  skills, commands), plugins and what each adds, a settings summary (key names and counts, never
-  values), auto-memory directory and MCP server names, each marked as the account's own, shared
-  from the shared-configuration source, already the source's, or not shared, for a session in
-  remuda's directory. It reads only, and uses the same plan as a launch's shared configuration.
+  a private (0600) file rather than on the command line. Rules are shared as read-only copies
+  under `$REMUDA_HOME/shared`, refreshed at each launch; a rule limited to files by `paths` is
+  not applied that way, and the Accounts view names such rules. The memory of user-scope
+  subagents is redirected through `CLAUDE_CODE_REMOTE_MEMORY_DIR`, which claude does not
+  document, and only together with the auto-memory location.
+- Account configuration in the TUI (SPEC R22): `p` or Space in the Accounts view shows the selected
+  Claude account's instructions (`CLAUDE.md`, agents with model, effort and tools, skills, commands,
+  rules), plugins and what each adds, a settings summary (key names and counts, never values), the
+  auto-memory and subagent memory directories and MCP server names, each marked as the account's
+  own, shared from the shared-configuration source, already the source's, or not shared, for a
+  session in remuda's directory. It reads only, and uses the same plan as a launch's shared
+  configuration.
 - `remuda remove <account>` unregisters an account (SPEC R14a). The home directory is left in
   place, and its path is printed so it can be registered again; `default` and the source of
   shared configuration cannot be removed. `D` in the TUI's Accounts view does the same after

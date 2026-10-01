@@ -52,8 +52,9 @@ Windows, `Ctrl-P` opens Quick Open; add `workbench.action.quickOpen` to
 
 ## Shared configuration
 
-Sessions stay with the account that created them, but configuration can be shared. Name the
-account whose configuration the others get, typically `default` (whose home is `~/.claude`):
+Sessions stay with the account that created them, but configuration and memory can be shared.
+Name the account whose configuration the others get, typically `default` (whose home is
+`~/.claude`):
 
 ```toml
 [share.claude]
@@ -117,9 +118,9 @@ view warns about problems such as a missing source home or a plugin whose instal
 `p` in the Accounts view shows what the selected Claude account's sessions load, for a new
 session in the directory remuda was started in: its `CLAUDE.md`, agents (with their model,
 effort and tools), skills (with those turned off by `skillOverrides`, and overrides that name
-no skill), commands, plugins with what each adds (agents, skills, commands, hooks, MCP
-servers), a summary of its settings, its auto-memory directory, and the names of its MCP
-servers. Each item is marked as the account's own, shared from the source of `[share.claude]`,
+no skill), commands, rules (those limited to paths marked), plugins with what each adds (agents,
+skills, commands, hooks, MCP servers), a summary of its settings, its auto-memory directory, the
+directory for the memory of user-scope subagents, and the names of its MCP servers. Each item is marked as the account's own, shared from the source of `[share.claude]`,
 already the source's (a symlink), or not shared, with the reason. What is shared comes from the
 same step that prepares a launch, so the pane and a launch always agree. Settings are shown by
 key names and counts only; no values. Synced claude.ai skills are shown for the account's own
@@ -213,7 +214,10 @@ search.
 
 The Accounts view warns about conditions that silently break multi-account setups: an
 `ANTHROPIC_API_KEY` that overrides every login, dangling symlinks, missing or logged-out homes, a
-shared `projects` store without `cleanupPeriodDays`, and problems with the shared configuration.
+shared `projects` store without `cleanupPeriodDays`, and problems with the shared configuration:
+a missing source home, a plugin whose install is gone, instruction items that would load twice,
+rules limited to `paths` that are not applied where the rules are injected, and a home that
+shares `projects` with the source but not `agent-memory`.
 
 ## Data sources
 

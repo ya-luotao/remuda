@@ -9,8 +9,9 @@
 Remuda is a multi-account and session manager for
 [Claude Code](https://github.com/anthropics/claude-code) and [Codex](https://github.com/openai/codex).
 If you have several logins, each with its own usage limits and its own sessions, remuda shows
-them side by side: see which account has usage left, launch as it, and start, resume, fork or
-hand off sessions in any directory, from one TUI or CLI.
+them side by side: see which account has usage left, launch as it, and start, resume or fork
+sessions in any directory, from one TUI or CLI. The accounts can share one configuration and one
+memory, while each keeps its own sessions.
 
 Remuda never touches credentials. Its only network request of its own is optional: `remuda pick`
 asks TypeSafe's Jev model for a recommendation when `TYPESAFE_API_KEY` is set and you have written
@@ -47,11 +48,12 @@ holds, and launches the agent with the home selected.
 - **Launch as any account.** `remuda run <account>` starts the agent with that account's home.
   Each launch is logged, so every session can be attributed to the account that started it.
 - **All sessions in one place.** Search the history of every account, preview messages, and
-  resume or fork any session. Running Claude sessions are listed too, with attach, logs and stop
-  for background ones.
-- **One configuration for all accounts.** Your `CLAUDE.md`, skills, commands, agents, rules,
-  settings, plugins and memory from one account are passed to every other Claude account at
-  launch, with nothing copied into their homes.
+  resume or fork a session under an account that holds it. Running Claude sessions are listed
+  too, with attach, logs and stop for background ones.
+- **One configuration and one memory for all accounts.** Your `CLAUDE.md`, rules, skills,
+  commands, agents, settings and plugins from one account are passed to every other Claude
+  account at launch, and they all keep auto-memory and subagent memory in that account's home.
+  Sessions stay with the account that created them, and nothing is written into any home.
 - **Checks for silent breakage.** Warnings for an `ANTHROPIC_API_KEY` that overrides every
   login, dangling symlinks, missing or logged-out homes, and similar multi-account pitfalls.
 - **Token statistics and cost.** Input, cache, output and reasoning tokens per account and model,
@@ -78,7 +80,7 @@ What each provider supports:
 | Token statistics and estimated cost | ✓ | ✓ |
 | Recommendation of account, model and effort (`pick`) | ✓ | ✓ |
 | Live sessions (attach, logs, stop) | ✓ | – |
-| Shared configuration and the configuration pane | ✓ | – |
+| Shared configuration and memory; the configuration pane | ✓ | – |
 
 ¹ Codex has no list of running sessions, so resuming a Codex session in place asks for
 confirmation first. ² The login method only; the email and plan appear after a live usage query.
@@ -168,7 +170,7 @@ Checks ────────────────────────�
 | `g` `G`, `Home` `End`, `PgUp` `PgDn` | First / last row, page up / down |
 | `Enter` | History: resume the selected session (Codex asks for confirmation first). Live: attach to a background session |
 | `f` | Fork the selected session into a new session; the original is left unchanged |
-| `p`, `Space` | Live and History: expand or collapse the preview. Accounts: show the selected account's configuration (instructions, plugins, settings, auto-memory, MCP servers, and where each comes from); press again to expand it, again to close it. `PgUp` `PgDn` scroll it |
+| `p`, `Space` | Live and History: expand or collapse the preview. Accounts: show the selected account's configuration (instructions, plugins, settings, memory, MCP servers, and where each comes from); press again to expand it, again to close it. `PgUp` `PgDn` scroll it |
 | `n` | Accounts: start a new session with the selected account |
 | `s` | Accounts: set up a new Claude or Codex account, as `remuda setup` does |
 | `l` | Live: show a background session's logs in the preview |
@@ -248,11 +250,14 @@ Costs in the statistics use prices built into remuda (as of 2026-09-24); `[price
 overrides a model's price or prices one remuda does not know (for Codex, `cache_read` is the
 cached-input price).
 
-With `[share.claude]`, every other Claude account launches with the source's instructions,
-settings (without authentication or provider settings), enabled plugins and memory locations,
-injected as launch options; each account's own settings still take precedence, and `share = false` opts an
-account out. See [Shared configuration](docs/GUIDE.md#shared-configuration) for exactly what is
-passed and how.
+With `[share.claude]`, every other Claude account launches with the source's instructions
+(`CLAUDE.md`, skills, commands, agents and rules), settings (without authentication or provider
+settings), enabled plugins and memory locations (auto-memory and the memory of user-scope
+subagents), injected as launch options. Each account's own settings still take precedence, and
+`share = false` opts an account out. Sessions are not shared: a session is resumed by an account
+whose `projects` directory holds it. An account's MCP servers and project trust, kept in its
+`.claude.json`, are not shared either. See
+[Shared configuration](docs/GUIDE.md#shared-configuration) for exactly what is passed and how.
 
 ## Safety guarantees
 

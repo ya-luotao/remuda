@@ -1152,14 +1152,13 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   source, has `share = false`, or whose source home is missing says so once instead of listing
   the source's items. A symlink shows as `-> <target>`; one whose target does not exist, as
   broken.
-- **Instructions.** `CLAUDE.md` (size and lines); `agents/*.md` (top level), by the `name` of
-  their frontmatter or else the file name, with its `description`, `model`, `effort`, and
-  `tools`; `skills/<dir>/SKILL.md`, by `name` or the directory name, with its `description`;
-  `commands/**/*.md` (at most 4 levels), a subdirectory shown as `dir:name`; `rules/**/*.md`
-  (R18), by path without the extension, one whose frontmatter has `paths` marked as limited to
-  paths. Symlinks are
-  followed; only regular files are opened; frontmatter is read from a file's first 8 KB; at most
-  500 entries are listed per directory.
+- **Instructions.** `CLAUDE.md` (size and lines); `agents/*.md` (top level), by the `name` of their
+  frontmatter or else the file name, with its `description`, `model`, `effort`, and `tools`;
+  `skills/<dir>/SKILL.md`, by `name` or the directory name, with its `description`;
+  `commands/**/*.md` (at most 4 levels), a subdirectory shown as `dir:name`; `rules/**/*.md` (R18),
+  by path without the extension, one whose frontmatter has `paths` marked as limited to paths.
+  Symlinks are followed; only regular files are opened; frontmatter is read from a file's first 8
+  KB; at most 500 entries are listed per directory.
 - **Synced skills.** `skills/synced/<organization>_<account>/` holds the claude.ai skills of one
   login, and a `skills` directory shared by several homes holds every login's buckets. The pane
   lists only the bucket named by `oauthAccount.organizationUuid` and `accountUuid` in the
