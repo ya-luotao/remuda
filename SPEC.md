@@ -125,6 +125,15 @@ switching to a different, logged-out account.
   of that name: `add` and `setup` refuse such an account (R14), and `provider:name` avoids it.
 - Runtime state (index cache, statistics cache, launch log) lives in `$REMUDA_HOME/state/` and may
   be deleted and rebuilt at any time.
+- Runtime state is the user's alone: the launch log holds the arguments of every launch, prompts
+  among them (R6), and the caches hold titles and directories. `state/` is created with mode
+  0700 and its files with mode 0600. A `state/` or a launch log from before that the group or
+  others could access is tightened by the next write there, and a cache is always replaced by a
+  file of mode 0600; nothing is ever loosened. No mode is changed through a symlink: a `state`
+  that is a symlink is written through and the directory it points at keeps its mode (the files
+  remuda writes in it are still 0600), and a file in `state/` that is a symlink is written
+  through and the file it points at keeps its mode. `config.toml` keeps the mode it has; a new
+  one gets the default mode (the umask's).
 
 ## R4. Provider contract
 
@@ -194,7 +203,10 @@ remuda help [<command>]                            help for remuda or a command
 ```
 
 - There is no shell integration, global routing, or per-directory binding.
-- `run` passes `args` through to the agent unchanged. Because `-h` and `--help` after `run` go to
+- `run` passes `args` through to the agent unchanged: every token after the account, in order,
+  a `--` included, also one right after the account (`remuda run work -- -x` gives the agent
+  `-- -x`). Only a `--` before the account is remuda's own (`remuda run -- -x`, for a
+  registered account whose name starts with `-`). Because `-h` and `--help` after `run` go to
   the agent too, the help of `run` itself is `remuda help run`.
 - `--provider` is `claude` (the default) or `codex`; for `pick`, a filter without default.
   `--timeout` is in seconds, per query: `usage --live` and `pick --live` default to 90, `list` to
@@ -218,7 +230,10 @@ remuda help [<command>]                            help for remuda or a command
   - arguments with resume, continue, or attach semantics: `--resume` / `-r`, `--continue` / `-c`,
     `--session-id`, `--teleport`, `--from-pr`, `--cloud`;
   - `--help` / `-h`, `--version` / `-v`.
-  When in doubt, nothing is injected.
+  When in doubt, nothing is injected. A `--` in the arguments changes none of this: what follows
+  it is classified like what precedes it (`-- --resume <id>` is passed through without
+  injection). The injected `--session-id <uuid>` goes after the user's arguments, or right
+  before their first `--` when there is one, so that it stays an option.
 
   ```text
   claude arguments
@@ -263,8 +278,10 @@ remuda help [<command>]                            help for remuda or a command
 - Shared configuration (R18) is injected into session invocations only, using the classification
   above: any subcommand name, `--help` / `-h`, or `--version` / `-v` means "not a session". New
   sessions, resumes, continues, forks, and `-p` runs are sessions.
-- Launch log `state/launches.jsonl`: one line per launch, containing time, account, cwd, args, and
-  session ID (or unknown).
+- Launch log `state/launches.jsonl`: one line per launch, containing time, account, home, cwd,
+  args, and session ID (or unknown). `args` are the user's arguments as the agent got them,
+  without what remuda injected: a prompt given on the command line is in the log, which is why
+  the log is readable by the user alone (R3).
 - **[unverified]**: whether variables inherited when launching from within a claude session, such
   as `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, and `CLAUDE_CODE_MESSAGING_*`, affect the child claude;
   if they do, define a list of variables to strip.
@@ -507,7 +524,15 @@ appeared in no `history.jsonl`.
 
 The complete set of remuda's write operations:
 
-- `$REMUDA_HOME/config.toml`, `$REMUDA_HOME/state/**`, `$REMUDA_HOME/shared/**` (R18)
+- `$REMUDA_HOME/config.toml`, `$REMUDA_HOME/state/**`, `$REMUDA_HOME/shared/**` (R18).
+  Where the user put a symlink: a `config.toml`, a `state`, or a file in `state/` that is a
+  symlink is written through (R3); where it points, remuda touches only its own files (the
+  registry, the caches, the launch log, the settings files of R18), and changes no mode.
+  Below `shared`, remuda also replaces and removes links and rule copies, so it writes there
+  only below real directories: a `shared` or `shared/claude` that is a symlink, or that exists
+  and is not a directory, is refused before anything is created, replaced, or removed, and the
+  launch goes on without shared instructions (R18). What remains is the instant between that
+  check and the write (R18).
 - `$REMUDA_HOME/homes/<provider>/<name>/` created by `setup`: the directory itself and, for a
   claude account that is a member of `[share.claude]`, the symlinks of R18 in it, made once,
   while the directory is still empty, before the account is registered and logged in (login is
@@ -800,7 +825,11 @@ not see the sessions in the source's store (R11, R16).
   directory, renamed into place), and one for an item the source no longer has is removed. An
   entry named like an item that is not a symlink, or a `.claude` that is neither a directory nor
   a symlink, is never replaced: nothing is changed, and the launch goes on without shared
-  instructions and says so. Nothing else in `shared/claude/` or in `.claude/` is touched, apart
+  instructions and says so. `shared` and `shared/claude` are directories of remuda's own, made
+  when missing: one that is a symlink, or that exists and is not a directory, is treated the same
+  way, checked before anything else: nothing is created, replaced, or removed below it (so
+  nothing where a link points), and the launch goes on without shared instructions and says so.
+  Nothing else in `shared/claude/` or in `.claude/` is touched, apart
   from `.claude/rules/` (below).
   A `.claude` that is a symlink (the earlier layout: one link to the whole source home) is
   migrated in place: the directory is built under a temporary name in `shared/claude/`, the link
@@ -814,8 +843,9 @@ not see the sessions in the source's store (R11, R16).
   and the rename leaves no `.claude` (and an inert temporary directory, which is not touched)
   until the next member launch creates it. A remuda from before this layout, still running,
   refuses the directory ("is not a symlink") and launches without shared instructions, saying
-  so, until it is restarted. Residual, as for `shared/` and `shared/claude/` themselves: the
-  links are written by path, so a process of the same user that replaced `.claude` with a
+  so, until it is restarted. Residual: a `shared`, `shared/claude`, or `.claude` that is a
+  symlink when remuda looks is refused (or, for `.claude`, migrated), but the checks and the
+  writes are by path, so a process of the same user that replaced one of them with a
   symlink in the instant between remuda's check and its write could redirect that write; remuda
   never creates such a symlink, and such a process can already write there itself. The same
   holds for the rule copies and their directories, where the redirected operation could also

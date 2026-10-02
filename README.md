@@ -200,14 +200,20 @@ $REMUDA_HOME/
 ├── homes/<provider>/<name>/       homes created by `remuda setup`
 ├── shared/claude/.claude/         links to the source's CLAUDE.md, agents, skills and commands;
 │                                  copies of its rules
-└── state/                         caches and logs; safe to delete, rebuilt on the next run
-    ├── index.json                 session index
-    ├── stats.json                 token statistics
-    ├── launches.jsonl             one line per launch: account, directory, session ID
+└── state/                         caches and logs (mode 0700); safe to delete, rebuilt on the
+    │                              next run
+    ├── index.json                 session index (mode 0600)
+    ├── stats.json                 token statistics (mode 0600)
+    ├── launches.jsonl             one line per launch: time, account, home, directory,
+    │                              arguments, session ID (mode 0600)
     └── settings/                  shared settings passed to members (mode 0600)
 ```
 
-Deleting `launches.jsonl` loses the attribution of sessions started through remuda that no
+`launches.jsonl` records the arguments of each launch as you typed them, so a prompt given on
+the command line (`remuda run work -p "..."`) is in it. That is why `state/` and its files are
+readable by you alone; a `state/` or a log that an earlier version left readable by others is
+tightened the next time remuda writes there, except through a symlink, whose target keeps its
+mode. Deleting `launches.jsonl` loses the attribution of sessions started through remuda that no
 `history.jsonl` records.
 
 `config.toml` lists the registered accounts. `remuda add`, `remuda setup` and `remuda remove`

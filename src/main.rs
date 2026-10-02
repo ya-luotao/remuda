@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
@@ -5,8 +6,10 @@ use clap::Parser;
 use remuda::cli::{self, Cli, Context};
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let cli = Cli::parse_from(&args);
     let ctx = Context {
+        args,
         env: std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
             .collect(),

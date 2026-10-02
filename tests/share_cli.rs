@@ -172,6 +172,23 @@ fn tree(dir: &Path) -> Vec<(PathBuf, String)> {
     out
 }
 
+/// [`tree`] with each entry's mode and each file's bytes: a snapshot to prove a tree is the
+/// same byte for byte.
+fn snapshot(dir: &Path) -> Vec<(PathBuf, String, u32, Vec<u8>)> {
+    tree(dir)
+        .into_iter()
+        .map(|(path, kind)| {
+            let mode = fs::symlink_metadata(&path).unwrap().mode() & 0o7777;
+            let bytes = if kind.starts_with("file") {
+                fs::read(&path).unwrap()
+            } else {
+                Vec::new()
+            };
+            (path, kind, mode, bytes)
+        })
+        .collect()
+}
+
 fn injected(inv: &Invocation) -> Vec<&String> {
     inv.args
         .iter()
@@ -659,6 +676,69 @@ fn a_shared_entry_that_is_not_a_link_is_left_alone() {
         ));
     assert_eq!(fs::read_to_string(&root).unwrap(), "what");
     assert_eq!(names(&dir), [".claude"]);
+}
+
+/// R13, R18: a `shared` or `shared/claude` that is a symlink is not written through. Nothing is
+/// created, replaced or removed where it points (not the links, not the rule copies, not a
+/// `*.md` file there the source does not have); the launch goes on without shared instructions
+/// and says why; the rest is still shared.
+#[test]
+fn a_symlinked_shared_directory_is_not_written_through() {
+    for (level, populated) in [
+        ("shared", true),
+        ("shared/claude", true),
+        ("shared", false),
+        ("shared/claude", false),
+    ] {
+        let s = shared();
+        fs::create_dir_all(s.source.join("rules")).unwrap();
+        fs::write(s.source.join("rules/style.md"), "be terse\n").unwrap();
+        let outside = s.sb.root().join("outside");
+        fs::create_dir(&outside).unwrap();
+        if populated {
+            // What `shared/claude/.claude` is through the link: the user's own files, among
+            // them what remuda would correct or remove in a directory of its own.
+            let root = match level {
+                "shared" => outside.join("claude/.claude"),
+                _ => outside.join(".claude"),
+            };
+            fs::create_dir_all(root.join("rules/keep")).unwrap();
+            fs::write(root.join("rules/mine.md"), "mine\n").unwrap();
+            fs::write(root.join("rules/style.md"), "my own style\n").unwrap();
+            fs::write(root.join("rules/keep/deep.md"), "deep\n").unwrap();
+            fs::write(root.join("rules/notes.txt"), "notes\n").unwrap();
+            symlink("/old/skills", root.join("skills")).unwrap();
+            symlink("/old/commands", root.join("commands")).unwrap();
+        }
+        let link = s.sb.remuda_home().join(level);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&outside, &link).unwrap();
+        let before = snapshot(&outside);
+
+        s.sb.remuda()
+            .args(["run", "max", "-p", "hi"])
+            .assert()
+            .success()
+            .stderr(
+                predicate::str::contains("instructions from claude:default are not shared").and(
+                    predicate::str::contains(format!(
+                        "{} is a symlink; remuda does not write through it",
+                        link.display()
+                    )),
+                ),
+            );
+        let inv = s.sb.only_invocation();
+        let case = format!("{level}, populated: {populated}: {:?}", inv.args);
+        assert!(
+            !inv.args.iter().any(|a| a.starts_with("--add-dir")),
+            "{case}"
+        );
+        assert_eq!(inv.add_dir_claude_md, None, "{case}");
+        assert!(settings_of(&inv.args).is_some(), "{case}");
+        assert_eq!(inv.args[inv.args.len() - 4..][..2], ["-p", "hi"], "{case}");
+        assert_eq!(snapshot(&outside), before, "{case}");
+        assert_eq!(fs::read_link(&link).unwrap(), outside, "{case}");
+    }
 }
 
 fn git(dir: &Path, args: &[&str]) {

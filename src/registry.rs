@@ -3,6 +3,7 @@
 use std::fmt;
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -635,9 +636,63 @@ fn read_document(config: &Path) -> Result<DocumentMut> {
 /// Replaces `path` via a temp file in the same directory plus `rename` (R3). A symlinked
 /// `path` is written through, never replaced by a regular file; existing permissions are kept.
 pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
-    let target = match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)?,
-        _ => path.to_path_buf(),
+    replace(path, contents, false)
+}
+
+/// [`write_atomic`] for a file of `$REMUDA_HOME/state` (R3): its directory is made or
+/// tightened by [`private_dir`], and the file is readable and writable by the user alone
+/// (mode 0600) from the moment it is created, whatever the mode of the one it replaces. Only a
+/// `path` that is a symlink keeps the mode of the file it points at.
+pub(crate) fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        private_dir(dir)?;
+    }
+    replace(path, contents, true)
+}
+
+/// Makes `dir` (`$REMUDA_HOME/state`) with mode 0700 or, where it is a directory already,
+/// takes away what the group and others may do with it (R3). A `dir` that is a symlink is used
+/// as it is: the directory it points at is where the user put it, and keeps its mode. What is
+/// above `dir` is created as needed, with the default mode.
+pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
+    if let Some(above) = dir.parent() {
+        fs::create_dir_all(above)?;
+    }
+    match fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    // Opened without following a symlink and changed through the descriptor: never the
+    // directory a link points at. What is not a directory fails where it is written to.
+    if let Ok(open) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+    {
+        tighten(&open, 0o700);
+    }
+    Ok(())
+}
+
+/// Takes away every permission of an open file or directory of remuda's that is not in `keep`
+/// (R3); nothing is ever added. Failing to is not an error: what is written there is still
+/// written.
+pub(crate) fn tighten(file: &fs::File, keep: u32) {
+    if let Ok(meta) = file.metadata() {
+        let mode = meta.permissions().mode() & 0o7777;
+        if mode & !keep != 0 {
+            let _ = file.set_permissions(fs::Permissions::from_mode(mode & keep));
+        }
+    }
+}
+
+fn replace(path: &Path, contents: &[u8], private: bool) -> Result<()> {
+    let link = fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    let target = if link {
+        fs::canonicalize(path)?
+    } else {
+        path.to_path_buf()
     };
     let dir = target
         .parent()
@@ -653,11 +708,15 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     ));
 
     let result = (|| -> Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        if let Ok(meta) = fs::metadata(&target) {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        if private {
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        if (!private || link)
+            && let Ok(meta) = fs::metadata(&target)
+        {
             file.set_permissions(meta.permissions())?;
         }
         file.write_all(contents)?;
@@ -1371,5 +1430,99 @@ mod tests {
             parse(&doc.to_string()).unwrap().accounts,
             [acc("claude", "max", "/m")]
         );
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn chmod(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// R3: a file of `state/` is written with mode 0600 in a directory of mode 0700, whatever
+    /// they were before; `config.toml` keeps the mode it has.
+    #[test]
+    fn state_files_are_the_users_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("remuda");
+        let state = home.join("state");
+        let file = state.join("index.json");
+        write_private(&file, b"one").unwrap();
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(&file), 0o600);
+
+        chmod(&state, 0o755);
+        chmod(&file, 0o644);
+        write_private(&file, b"two").unwrap();
+        assert_eq!(mode(&state), 0o700);
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(fs::read(&file).unwrap(), b"two");
+        assert_eq!(entries(&state), ["index.json"], "no temporary file is left");
+
+        // Tightened, never loosened.
+        chmod(&state, 0o2770);
+        private_dir(&state).unwrap();
+        assert_eq!(mode(&state), 0o700);
+        chmod(&state, 0o500);
+        private_dir(&state).unwrap();
+        assert_eq!(mode(&state), 0o500);
+        chmod(&state, 0o700);
+
+        let config = home.join("config.toml");
+        fs::write(&config, "").unwrap();
+        chmod(&config, 0o640);
+        chmod(&home, 0o755);
+        write_atomic(&config, b"# kept\n").unwrap();
+        assert_eq!(mode(&config), 0o640);
+        assert_eq!(mode(&home), 0o755);
+    }
+
+    /// R3: no mode is changed through a symlink: a `state` that is one keeps its target's (a
+    /// file written in it is private all the same), and a file that is one keeps its target's.
+    /// Both are written through, and stay links.
+    #[test]
+    fn state_modes_are_not_changed_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("remuda");
+        fs::create_dir(&home).unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        chmod(&outside, 0o755);
+        fs::write(outside.join("index.json"), "old").unwrap();
+        chmod(&outside.join("index.json"), 0o644);
+        let state = home.join("state");
+        std::os::unix::fs::symlink(&outside, &state).unwrap();
+        for file in ["index.json", "stats.json"] {
+            write_private(&state.join(file), b"new").unwrap();
+            assert_eq!(fs::read(outside.join(file)).unwrap(), b"new");
+            assert_eq!(mode(&outside.join(file)), 0o600, "{file}");
+        }
+        assert_eq!(mode(&outside), 0o755);
+        assert_eq!(fs::read_link(&state).unwrap(), outside);
+
+        fs::remove_file(&state).unwrap();
+        fs::create_dir(&state).unwrap();
+        chmod(&state, 0o755);
+        let target = outside.join("elsewhere.json");
+        fs::write(&target, "old").unwrap();
+        chmod(&target, 0o644);
+        let link = state.join("stats.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        write_private(&link, b"new").unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(mode(&target), 0o644);
+        assert_eq!(mode(&outside), 0o755);
+        assert_eq!(mode(&state), 0o700);
     }
 }

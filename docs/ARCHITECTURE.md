@@ -51,10 +51,10 @@ Three rules shape the whole design and are worth knowing before reading any modu
   before the login (R12, R18); nothing is written into a home after that, or into a home
   registered with `add`. `setup` reaches that directory without following a symlink below
   `$REMUDA_HOME`, and writes into it through its descriptor.
-- **The library never reads the process environment.** `main.rs` captures the environment, the
-  current directory, the clock, the time zone and whether the standard streams are terminals into
-  a `cli::Context` once, and everything below receives an `Env` snapshot. This is what makes the
-  sealed test sandbox (R15) possible.
+- **The library never reads the process environment.** `main.rs` captures the command line, the
+  environment, the current directory, the clock, the time zone and whether the standard streams
+  are terminals into a `cli::Context` once, and everything below receives an `Env` snapshot.
+  This is what makes the sealed test sandbox (R15) possible.
 
 ## Module map
 
@@ -131,6 +131,9 @@ differ between them (R6, R16, R18).
  remuda run work -p "hi"
         │
         ▼
+ cli::run_arguments(argv)     the account, then every token after it as typed (R5): clap
+        │                     would drop a `--` right after the account
+        ▼
  Registry::load(config.toml) ── resolve "work" ──► Account { claude, work, home }
         │
         ▼
@@ -145,7 +148,8 @@ differ between them (R6, R16, R18).
         └─ record          LaunchRecord { ts, account, cwd, args, session_id, fork_of, shared }
         │
         ▼
- append_log(state/launches.jsonl)      the session ID is on disk before the agent starts
+ append_log(state/launches.jsonl)      the session ID is on disk before the agent starts;
+        │                              state/ is 0700 and the log 0600 (R3)
         │
         ▼
  exec(claude, [shared options…] + [user args with --session-id <uuid>])
@@ -314,8 +318,10 @@ Sessions have no row: they are shared only through the `projects` link.
  ├── homes/<provider>/<name>/     homes created by setup: empty, or holding      setup
  │                                the links to the source's home (R18)
  ├── shared/claude/.claude/       one symlink per shared instruction item,       share
- │                                copies of the source's rules
- └── state/                       caches and logs; safe to delete
+ │                                copies of the source's rules; never written
+ │                                through a shared or shared/claude symlink
+ └── state/                       caches and logs (0700, files 0600; R3); safe
+     │                            to delete
      ├── index.json               session index cache                            index
      ├── stats.json               token statistics cache                         stats
      ├── launches.jsonl           one line per launch (append-only)              launch

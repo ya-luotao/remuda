@@ -4,7 +4,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use common::transcripts::*;
@@ -260,6 +260,31 @@ fn empty_when_there_are_no_transcripts() {
         String::from_utf8(out.stdout).unwrap(),
         "TIME  ACCOUNTS  TITLE  CWD\n"
     );
+}
+
+/// R3: the index cache holds titles and directories: it is written readable by the user alone,
+/// in a `state/` that is, also over a cache and a directory from before that others could read.
+#[test]
+fn the_index_cache_is_private() {
+    let mode = |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777;
+    let Setup {
+        sb,
+        native_projects,
+        ..
+    } = setup();
+    transcript(&native_projects, S_A, &user("cached", "/w", &ts(1)));
+    let state = sb.remuda_home().join("state");
+    let cache = state.join("index.json");
+    sessions(&sb, &[]);
+    assert_eq!(mode(&state), 0o700);
+    assert_eq!(mode(&cache), 0o600);
+
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o644)).unwrap();
+    let (rows, _) = sessions(&sb, &[]);
+    assert_eq!(rows[0]["TITLE"], "cached");
+    assert_eq!(mode(&state), 0o700);
+    assert_eq!(mode(&cache), 0o600);
 }
 
 #[test]

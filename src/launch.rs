@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::Env;
 use crate::provider::Provider;
-use crate::registry::{Account, Home, Sharing};
+use crate::registry::{self, Account, Home, Sharing};
 use crate::share::{self, Injected, Shared};
 
 pub const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
@@ -370,15 +370,30 @@ pub fn prepare_with(
     })
 }
 
-/// Appends one JSON line to the launch log, creating its directory.
+/// Appends one JSON line to the launch log. The log holds the arguments as typed, prompts among
+/// them, so it is the user's alone (R3): its directory is made or tightened by
+/// [`registry::private_dir`], the log is created with mode 0600, and one from before is
+/// tightened to that. A log that is a symlink is written through, and the file it points at
+/// keeps its mode.
 pub fn append_log(log: &Path, record: &LaunchRecord) -> Result<()> {
     if let Some(dir) = log.parent() {
-        fs::create_dir_all(dir)?;
+        registry::private_dir(dir)?;
     }
     let mut line = serde_json::to_string(record)?;
     line.push('\n');
     // One write on an O_APPEND file: concurrent launches do not interleave lines.
-    let mut file = fs::OpenOptions::new().create(true).append(true).open(log)?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(log)?;
+    // Tightened only as the regular file at `log` itself, which the open file is checked to be.
+    if let (Ok(at), Ok(open)) = (fs::symlink_metadata(log), file.metadata())
+        && at.file_type().is_file()
+        && (at.dev(), at.ino()) == (open.dev(), open.ino())
+    {
+        registry::tighten(&file, 0o600);
+    }
     file.write_all(line.as_bytes())?;
     Ok(())
 }

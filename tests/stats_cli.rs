@@ -4,7 +4,7 @@ mod common;
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use common::Sandbox;
@@ -542,6 +542,31 @@ fn stats_runs_no_agent_and_caches() {
         ["claude-test 10 0 0 10 - 20 -", "total 10 0 0 10 - 20 -"]
     );
     assert!(s.sb.invocations().is_empty());
+}
+
+/// R3: the statistics cache is written readable by the user alone, in a `state/` that is, also
+/// over a cache and a directory from before that others could read.
+#[test]
+fn the_statistics_cache_is_private() {
+    let mode = |path: &Path| fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777;
+    let s = setup();
+    claude_fixtures(&s);
+    let state = s.sb.remuda_home().join("state");
+    let cache = state.join("stats.json");
+    let first = stats(&s.sb, &[]);
+    assert_eq!(mode(&state), 0o700);
+    assert_eq!(mode(&cache), 0o600);
+
+    // Written again once a transcript grew.
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o644)).unwrap();
+    append(
+        &s.native.join(format!("-w-proj/{S_U}.jsonl")),
+        &message(S_U, "msg_u2", cl::usage(1, 1, 0, 0)),
+    );
+    assert_ne!(stats(&s.sb, &[]), first);
+    assert_eq!(mode(&state), 0o700);
+    assert_eq!(mode(&cache), 0o600);
 }
 
 /// R3, R20: a cache that cannot be written is a warning; the statistics are still printed.

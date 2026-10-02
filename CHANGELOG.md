@@ -124,6 +124,25 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 - TUI: identity and usage results no longer land on another account's row when the account list
   changes while a query runs.
+- `remuda run <account> -- ...` passes the `--` right after the account to the agent, like every
+  other argument (SPEC R5). It used to be dropped, so `remuda run work -- "-1 is not valid"`
+  gave the agent the prompt as an option, and `remuda run work -- --resume abc` became
+  `--resume abc`. A `--` before the account (`remuda run -- -x`) is still remuda's.
+
+### Security
+
+- The launch log and the caches are readable by the user alone (SPEC R3). `state/launches.jsonl`
+  records the arguments of every launch, prompts given on the command line among them, and was
+  created with the default mode (usually 0644, in a 0755 `state/`), like `index.json` and
+  `stats.json`. `state/` is now created with mode 0700 and its files with mode 0600; a `state/`,
+  a log, or a cache from before is tightened the next time remuda writes there. No mode is
+  changed through a symlink: a `state` or a file in it that is one is written through and its
+  target keeps its mode.
+- A `$REMUDA_HOME/shared` or `shared/claude` that is a symlink is no longer written through
+  (SPEC R13, R18). A member's launch used to create the item links and rule copies where the
+  link pointed, and remove the `*.md` files under `.claude/rules/` there that the source does
+  not have. It now leaves that directory alone and launches without shared instructions, saying
+  so.
 
 ## [0.1.0] - 2026-09-24
 

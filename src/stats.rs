@@ -218,9 +218,10 @@ impl Cache {
         }
     }
 
-    /// Writes the cache atomically.
+    /// Writes the cache atomically, as a file of `$REMUDA_HOME/state`: readable by the user
+    /// alone, in a directory made or tightened to be (R3).
     pub fn save(&self, path: &Path) -> Result<()> {
-        registry::write_atomic(path, &serde_json::to_vec(self)?)
+        registry::write_private(path, &serde_json::to_vec(self)?)
     }
 
     /// After [`refresh`] reported `refreshed`: writes the cache unless the refresh changed

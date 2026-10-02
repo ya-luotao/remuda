@@ -78,6 +78,49 @@ fn run_passes_double_dash_verbatim() {
     assert_eq!(sb.only_invocation().args, ["--resume", "abc", "--", "-x"]);
 }
 
+/// R5: the `--` right after the account is the agent's too, like every token after the account.
+#[test]
+fn run_keeps_a_double_dash_right_after_the_account() {
+    for args in [
+        &["--", "--resume", "abc"][..],
+        &["--", "--resume", "abc", "--", "-x"],
+        &["--", "agents"],
+        &["--", "--", "-c"],
+    ] {
+        let sb = sandbox_with_max();
+        sb.remuda()
+            .args(["run", "max"])
+            .args(args)
+            .assert()
+            .success();
+        assert_eq!(sb.only_invocation().args, strings(args));
+    }
+}
+
+/// R5, R6: a prompt that starts with `-` stays behind its `--`, and the injected
+/// `--session-id` goes before that terminator.
+#[test]
+fn run_keeps_the_double_dash_before_a_prompt_and_injects_before_it() {
+    for (args, before) in [
+        (&["--", "-1 is not valid"][..], 0),
+        (&["--"], 0),
+        (&["-p", "hi", "--", "extra"], 2),
+    ] {
+        let sb = sandbox_with_max();
+        sb.remuda()
+            .args(["run", "max"])
+            .args(args)
+            .assert()
+            .success();
+        let got = sb.only_invocation().args;
+        assert_eq!(got.len(), args.len() + 2, "{got:?}");
+        assert_eq!(got[..before], args[..before], "{got:?}");
+        assert_eq!(got[before], "--session-id", "{got:?}");
+        uuid::Uuid::parse_str(&got[before + 1]).expect("injected id is a UUID");
+        assert_eq!(got[before + 2..], args[before..], "{got:?}");
+    }
+}
+
 #[test]
 fn run_passes_subcommand_verbatim() {
     let sb = sandbox_with_max();
@@ -280,6 +323,24 @@ fn run_a_registered_account_whose_name_starts_with_a_dash() {
     assert_eq!(inv.config_dir.as_deref(), Some("/p/x"));
 }
 
+/// R5: only the `--` before the account is remuda's; one after it goes to the agent.
+#[test]
+fn run_takes_only_the_double_dash_before_the_account() {
+    let sb = Sandbox::new();
+    sb.write_config("[[account]]\nprovider = \"claude\"\nname = \"-x\"\nhome = \"/p/x\"\n");
+    for (args, expected) in [
+        (
+            &["run", "--", "-x", "--", "--resume", "abc"][..],
+            &["--", "--resume", "abc"][..],
+        ),
+        (&["run", "-x", "--", "-c"], &["--", "-c"]),
+        (&["run", "--", "default", "--", "-c"], &["--", "-c"]),
+    ] {
+        sb.remuda().args(args).assert().success();
+        assert_eq!(sb.invocations().last().unwrap().args, expected, "{args:?}");
+    }
+}
+
 // --- codex (R1, R17) -----------------------------------------------------------------------
 
 /// R1: with codex around (`~/.codex` and `codex` on PATH, so `codex:default` exists), a bare
@@ -314,4 +375,17 @@ fn run_codex_default_removes_codex_home() {
     assert_eq!(inv.codex_home, None);
     assert_eq!(inv.args, ["resume", "--last", "-p"]);
     assert!(sb.invocations().is_empty(), "claude did not run");
+}
+
+/// R5, R17: codex gets the `--` right after the account as well.
+#[test]
+fn run_codex_keeps_a_double_dash_right_after_the_account() {
+    let sb = sandbox_with_max();
+    sb.install_codex();
+    sb.remuda()
+        .args(["run", "codex:default", "--", "-not an option"])
+        .assert()
+        .success();
+    let [inv] = sb.codex_invocations().try_into().unwrap();
+    assert_eq!(inv.args, ["--", "-not an option"]);
 }

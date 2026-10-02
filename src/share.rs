@@ -1175,7 +1175,12 @@ fn remove_empty_dirs(dir: &Path) -> Result<()> {
 /// or in `.claude` is touched. A `.claude` that is a symlink (the
 /// earlier layout, a link to the whole source home) is migrated: the directory is built under
 /// a temporary name in `dir`, the link is removed, and the directory is renamed into place.
+///
+/// `dir` is `$REMUDA_HOME/shared/claude`. It and `shared` are remuda's own directories, made
+/// when missing; one that is a symlink, or anything else, fails before anything is written
+/// ([`own_dirs`]).
 pub fn ensure_links(dir: &Path, source: &Path) -> Result<()> {
+    own_dirs(dir)?;
     let root = dir.join(".claude");
     let old_link = match fs::symlink_metadata(&root) {
         Ok(meta) if meta.file_type().is_dir() => return fill(&root, source),
@@ -1188,7 +1193,6 @@ pub fn ensure_links(dir: &Path, source: &Path) -> Result<()> {
         Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", root.display())),
     };
 
-    fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let staged = Staged::build(dir, source)?;
     if old_link {
         // Only a symlink is removed, checked again right before: a concurrent remuda may have
@@ -1228,6 +1232,45 @@ pub fn ensure_links(dir: &Path, source: &Path) -> Result<()> {
             }
         },
     }
+}
+
+/// `dir` (`shared/claude`) and the directory it is in (`shared`), each a directory, made when
+/// missing (R13, R18). One that is a symlink is an error, like one that is anything else:
+/// every write below it, and the removal of rule copies the source no longer has, would
+/// happen where the link points. What is above `shared` is `$REMUDA_HOME`, the user's path:
+/// taken as given, and created as needed.
+fn own_dirs(dir: &Path) -> Result<()> {
+    let shared = dir.parent();
+    if let Some(home) = shared.and_then(Path::parent) {
+        fs::create_dir_all(home).with_context(|| format!("cannot create {}", home.display()))?;
+    }
+    for path in shared.into_iter().chain([dir]) {
+        loop {
+            match fs::symlink_metadata(path) {
+                Ok(meta) if meta.file_type().is_dir() => break,
+                Ok(meta) if meta.file_type().is_symlink() => bail!(
+                    "{} is a symlink; remuda does not write through it",
+                    path.display()
+                ),
+                Ok(_) => bail!(
+                    "{} is not a directory; remuda does not replace it",
+                    path.display()
+                ),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::create_dir(path) {
+                    Ok(()) => break,
+                    // Made in between: looked at again.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("cannot create {}", path.display()));
+                    }
+                },
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot inspect {}", path.display()));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The item links and rule copies of `source` under `root` (an existing `.claude` directory),
@@ -2341,6 +2384,66 @@ mod tests {
             assert!(e.contains("cannot create"), "{e}");
             assert_eq!(tree(&shared), before);
             let _ = fs::remove_file(&root);
+        }
+    }
+
+    /// R13, R18: `shared` and `shared/claude` are remuda's own directories. One that is a
+    /// symlink (to a directory holding the user's files, to an empty one, or to nothing) or a
+    /// file is refused before anything is written, where it points or next to it.
+    #[test]
+    fn a_shared_directory_that_is_not_one_is_not_written_through() {
+        for level in ["shared", "shared/claude"] {
+            let dir = tempfile::tempdir().unwrap();
+            let shared = dir.path().join("remuda/shared/claude");
+            let at = dir.path().join("remuda").join(level);
+            let a = source_home(dir.path(), "a");
+            with_rules(&a);
+            let outside = dir.path().join("outside");
+            let root = match level {
+                "shared" => outside.join("claude/.claude"),
+                _ => outside.join(".claude"),
+            };
+            fs::create_dir_all(root.join("rules")).unwrap();
+            fs::write(root.join("rules/mine.md"), "mine").unwrap();
+            symlink("/old/skills", root.join("skills")).unwrap();
+            let empty = dir.path().join("empty");
+            fs::create_dir(&empty).unwrap();
+            fs::create_dir_all(at.parent().unwrap()).unwrap();
+
+            for target in [&outside, &empty, &dir.path().join("missing")] {
+                symlink(target, &at).unwrap();
+                let before = tree(dir.path());
+                let e = ensure_links(&shared, &a).unwrap_err().to_string();
+                assert_eq!(
+                    e,
+                    format!(
+                        "{} is a symlink; remuda does not write through it",
+                        at.display()
+                    )
+                );
+                assert_eq!(tree(dir.path()), before, "{level} -> {}", target.display());
+                assert_eq!(fs::read(root.join("rules/mine.md")).unwrap(), b"mine");
+                fs::remove_file(&at).unwrap();
+            }
+
+            fs::write(&at, "a file").unwrap();
+            let before = tree(dir.path());
+            let e = ensure_links(&shared, &a).unwrap_err().to_string();
+            assert!(
+                e.ends_with(&format!(
+                    "{level} is not a directory; remuda does not replace it"
+                )),
+                "{e}"
+            );
+            assert_eq!(tree(dir.path()), before);
+
+            // Missing: made, as before.
+            fs::remove_file(&at).unwrap();
+            ensure_links(&shared, &a).unwrap();
+            assert_eq!(links(&shared).len(), 3);
+            for path in [&at, &shared] {
+                assert!(fs::symlink_metadata(path).unwrap().file_type().is_dir());
+            }
         }
     }
 

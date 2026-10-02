@@ -1,5 +1,6 @@
 //! Command-line surface (SPEC R5).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -126,7 +127,9 @@ enum Command {
     /// Launch claude as an account; all arguments after the account go to claude verbatim
     ///
     /// `-h/--help` is not handled here so that `remuda run <account> --help` reaches claude;
-    /// use `remuda help run`.
+    /// use `remuda help run`. A `--` after the account goes to claude like any other argument.
+    // What is launched is cut from the command line as typed (`run_arguments`): clap drops a
+    // `--` right after the account. These fields check the arguments and describe them.
     #[command(disable_help_flag = true)]
     Run {
         /// Account: `name` or `provider:name` (`default` is the native login). Without it the
@@ -143,6 +146,9 @@ enum Command {
 /// Process context captured by `main`: the only place that reads the real environment,
 /// the clock, the system time zone and whether the standard streams are terminals.
 pub struct Context {
+    /// The command line as typed, the program's name first: `run` cuts the agent's arguments
+    /// from it (R5).
+    pub args: Vec<OsString>,
     pub env: Env,
     pub cwd: Option<PathBuf>,
     pub now: Timestamp,
@@ -198,7 +204,14 @@ fn dispatch(cli: Cli, ctx: &Context) -> Result<ExitCode> {
             email,
         }) => setup(&config, parse_provider(&provider)?, &name, email, ctx),
         Some(Command::Remove { account }) => remove(&config, &account),
-        Some(Command::Run { account, args }) => run_account(&config, account, args, ctx),
+        Some(Command::Run { account, args }) => {
+            let typed = run_arguments(&ctx.args);
+            // clap read `run` from this command line, so it is one: `run` comes first, since
+            // remuda has no global options.
+            debug_assert!(typed.is_some(), "`run` is not the first argument");
+            let (account, args) = typed.unwrap_or((account, args));
+            run_account(&config, account, args, ctx)
+        }
         Some(Command::Pick {
             provider,
             live,
@@ -327,6 +340,28 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
         eprintln!("remuda: {notice}");
     }
     exec_as(config, &registry, account, args, ctx)
+}
+
+/// The account and the agent's arguments of `remuda run`, cut from the command line as typed
+/// (R5): every token after the account is the agent's, a `--` right after the account
+/// included, which clap takes for its own terminator and drops. Only a `--` before the account
+/// is remuda's (`remuda run -- -x`: a registered account whose name starts with `-`). `None`
+/// when `argv` is not a `run` command line in UTF-8, which clap does not accept as one either.
+fn run_arguments(argv: &[OsString]) -> Option<(Option<String>, Vec<String>)> {
+    let [_, command, rest @ ..] = argv else {
+        return None;
+    };
+    if command != "run" {
+        return None;
+    }
+    let rest: Vec<String> = rest
+        .iter()
+        .map(|a| a.to_str().map(str::to_string))
+        .collect::<Option<_>>()?;
+    let mut rest = rest.into_iter().peekable();
+    rest.next_if(|a| a == "--");
+    let account = rest.next();
+    Some((account, rest.collect()))
 }
 
 /// `remuda run`: a fast path that reads only `config.toml` and then execs claude (R6).
@@ -893,6 +928,49 @@ mod tests {
     fn table_aligns_by_display_width() {
         let out = table(&[&["TITLE", "CWD"], &["日本語", "/a"], &["abc", "/b"]]);
         assert_eq!(out, "TITLE   CWD\n日本語  /a\nabc     /b\n");
+    }
+
+    /// R5: everything after the account is the agent's; only a `--` before it is dropped.
+    #[test]
+    fn run_arguments_are_cut_after_the_account() {
+        let cut = |argv: &[&str]| {
+            let argv: Vec<OsString> = argv.iter().map(OsString::from).collect();
+            run_arguments(&argv)
+        };
+        let some = |account: Option<&str>, args: &[&str]| {
+            Some((
+                account.map(str::to_string),
+                args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            ))
+        };
+        assert_eq!(cut(&["remuda", "run"]), some(None, &[]));
+        assert_eq!(cut(&["remuda", "run", "--"]), some(None, &[]));
+        assert_eq!(cut(&["remuda", "run", "work"]), some(Some("work"), &[]));
+        assert_eq!(
+            cut(&["remuda", "run", "work", "--", "--resume", "abc"]),
+            some(Some("work"), &["--", "--resume", "abc"])
+        );
+        assert_eq!(
+            cut(&["remuda", "run", "work", "-p", "", "--", "x", "--"]),
+            some(Some("work"), &["-p", "", "--", "x", "--"])
+        );
+        assert_eq!(
+            cut(&["remuda", "run", "--", "-x", "--", "-y"]),
+            some(Some("-x"), &["--", "-y"])
+        );
+        assert_eq!(
+            cut(&["remuda", "run", "--resume", "abc"]),
+            some(Some("--resume"), &["abc"])
+        );
+        assert_eq!(cut(&["remuda", "run", "--", "--"]), some(Some("--"), &[]));
+        // Not a `run` command line, or not UTF-8: clap's reading stands.
+        assert_eq!(cut(&["remuda", "list"]), None);
+        assert_eq!(cut(&["remuda"]), None);
+        assert_eq!(cut(&[]), None);
+        use std::os::unix::ffi::OsStringExt;
+        let argv = ["remuda", "run", "work"].map(OsString::from);
+        let argv = [&argv[..], &[OsString::from_vec(vec![0xff])]].concat();
+        assert_eq!(run_arguments(&argv), None);
     }
 
     fn progress(tty: bool) -> IndexingProgress {
