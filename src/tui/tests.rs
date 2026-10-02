@@ -8,8 +8,8 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
 use super::app::{
-    App, Confirm, Effect, Event, Exit, Form, FormKind, Key, LaunchRequest, Level, Mode, Notice,
-    Overlay, Pick, PickFor, ResumeCodex, View, update,
+    App, Confirm, Effect, Event, Exit, Form, FormKind, Key, LaunchRequest, Level, Marked, Mode,
+    Notice, Overlay, Pick, PickFor, ResumeCodex, View, update,
 };
 use super::render;
 use crate::attribution::Attribution;
@@ -756,7 +756,7 @@ fn answer(app: &mut App, request: LaunchRequest, error: Option<String>) -> Vec<E
         Event::LaunchChecked {
             check,
             request,
-            error,
+            error: error.map(Marked::from),
         },
     )
 }
@@ -1870,7 +1870,7 @@ fn session_name_dash_dash() {
         keys(&mut app, &[Key::Tab]);
         type_str(&mut app, name);
         assert_eq!(keys(&mut app, &[Key::Enter]), [], "{name}");
-        let error = form(&app).error.clone().unwrap_or_default();
+        let error = form(&app).error.as_deref().unwrap_or_default();
         assert!(error.contains("choose another name"), "{name}: {error}");
     }
     // Dashes inside a name are fine.
@@ -1932,7 +1932,7 @@ fn setup_form_validates_like_remuda_setup() {
         clear_field(&mut app);
         type_str(&mut app, name);
         assert_eq!(keys(&mut app, &[Key::Enter]), [], "{name}");
-        let got = form(&app).error.clone().unwrap_or_default();
+        let got = form(&app).error.as_deref().unwrap_or_default();
         assert!(got.contains(error), "{name}: {got}");
     }
     clear_field(&mut app);
@@ -4912,9 +4912,8 @@ fn secret_states() -> Vec<SecretState> {
                 keys(app, &[Key::Tab]);
                 type_str(app, "zqnew@zqmail.example");
                 if let Some(Overlay::Form(form)) = &mut app.overlay {
-                    form.error = Some(format!(
-                        "zqnew: {ZQ_HOME}/.remuda/homes/claude/zqnew exists"
-                    ));
+                    form.error =
+                        Some(format!("zqnew: {ZQ_HOME}/.remuda/homes/claude/zqnew exists").into());
                 }
             },
             "zqnew",
@@ -4969,7 +4968,8 @@ fn secret_states() -> Vec<SecretState> {
                 app.notice = Some(Notice {
                     text: format!(
                         "cannot use {ZQ_CWD} or /tmp/zqscratch/x: zqalpha, zqme@zqmail.example"
-                    ),
+                    )
+                    .into(),
                     level: Level::Error,
                 });
             },
@@ -5081,7 +5081,8 @@ fn secret_states() -> Vec<SecretState> {
                         "zqalpha cannot find session aaaaaaaa: its projects store is \
                          {ZQ_HOME}/.zqhomes/zqalpha/projects, the transcript is in {ZQ_STORE}; \
                          link {ZQ_HOME}/.zqhomes/zqalpha/projects to that store to share sessions"
-                    ),
+                    )
+                    .into(),
                     level: Level::Error,
                 });
             },
@@ -5108,7 +5109,8 @@ fn secret_states() -> Vec<SecretState> {
                 keys(app, &[Key::Char('1')]);
                 app.home = Some(format!("{ZQ_HOME}/"));
                 app.notice = Some(Notice {
-                    text: format!("cannot use {ZQ_HOME}/zqother/x or home:{ZQ_HOME}/zqelse/y"),
+                    text: format!("cannot use {ZQ_HOME}/zqother/x or home:{ZQ_HOME}/zqelse/y")
+                        .into(),
                     level: Level::Warn,
                 });
             },
@@ -5120,7 +5122,7 @@ fn secret_states() -> Vec<SecretState> {
                 keys(app, &[Key::Char('1')]);
                 app.home = Some("/Users/zq".into());
                 app.notice = Some(Notice {
-                    text: format!("cannot use {ZQ_HOME}/zqproj"),
+                    text: format!("cannot use {ZQ_HOME}/zqproj").into(),
                     level: Level::Warn,
                 });
             },
@@ -5145,6 +5147,117 @@ fn secret_states() -> Vec<SecretState> {
             "index error",
             |app| drop(keys(app, &[Key::Char('1')])),
             "index cache: zqalpha",
+        ),
+        state(
+            "directory with brackets refused in the form",
+            |app| {
+                keys(app, &[Key::Char('1'), Key::Char('j'), Key::Char('n')]);
+                clear_field(app);
+                type_str(
+                    app,
+                    &format!("{ZQ_HOME}/Dropbox (zqPersonal)/zqclients/zqacme"),
+                );
+                let fx = keys(app, &[Key::Enter]);
+                let [Effect::CheckLaunch { check, request }] = fx.as_slice() else {
+                    panic!("{fx:?}")
+                };
+                // As the pre-launch check answers.
+                let dir = request.cwd.clone().expect("a directory");
+                update(
+                    app,
+                    Event::LaunchChecked {
+                        check: *check,
+                        request: request.clone(),
+                        error: Some(
+                            Marked::default()
+                                .path(dir.display())
+                                .text(" does not exist"),
+                        ),
+                    },
+                );
+            },
+            "(zqPersonal)/zqclients/zqacme does not",
+        ),
+        state(
+            "path with a quote, from elsewhere",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                app.notice = Some(Notice {
+                    text: "/Volumes/zqBob's Disk/zqsecret-client/repo does not exist".into(),
+                    level: Level::Error,
+                });
+            },
+            "'s Disk/zqsecret-client/repo",
+        ),
+        state(
+            "path with a comma, from elsewhere",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                app.notice = Some(Notice {
+                    text: format!("cannot open {ZQ_HOME}/zqa, zqb/zqprojects: denied").into(),
+                    level: Level::Error,
+                });
+            },
+            ", zqb/zqprojects",
+        ),
+        state(
+            "relative path, from elsewhere",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                app.notice = Some(Notice {
+                    text: "cannot read ./zqrelative/zqsecret/dir: permission denied".into(),
+                    level: Level::Error,
+                });
+            },
+            "./zqrelative/zqsecret/dir",
+        ),
+        state(
+            "account name typed with a blank before it",
+            |app| {
+                keys(app, &[Key::Char('1'), Key::Char('s')]);
+                type_str(app, " zqacme client");
+                assert_eq!(keys(app, &[Key::Enter]), []);
+            },
+            "\"zqacme client\"",
+        ),
+        state(
+            "session name typed with a blank before it",
+            |app| {
+                keys(
+                    app,
+                    &[Key::Char('1'), Key::Char('j'), Key::Char('n'), Key::Tab],
+                );
+                type_str(app, " --zqname ");
+                assert_eq!(keys(app, &[Key::Enter]), []);
+            },
+            "\"--zqname\"",
+        ),
+        state(
+            "account name typed with a quote in it",
+            |app| {
+                keys(app, &[Key::Char('1'), Key::Char('s')]);
+                type_str(app, "zq\"acme");
+                assert_eq!(keys(app, &[Key::Enter]), []);
+            },
+            "zq\\\"acme",
+        ),
+        state(
+            "account removed",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                let account = Account {
+                    home: Home::Path(format!("{ZQ_HOME}/zq homes (old)/zqalpha, zqb")),
+                    ..zq_account(CLAUDE, "zqalpha")
+                };
+                update(
+                    app,
+                    Event::AccountRemoved {
+                        account,
+                        result: Ok(()),
+                    },
+                );
+            },
+            "removed zqalpha; its home",
         ),
     ]
 }
@@ -5191,6 +5304,190 @@ fn private_mode_leaks_nothing_anywhere() {
             assert!(private.contains("PRIVATE"), "{at}:\n{private}");
         }
     }
+}
+
+/// What private mode shows of the notice.
+fn private_notice(app: &App) -> String {
+    let copy = super::privacy::redacted(app);
+    copy.notice.expect("a notice").text.as_str().to_string()
+}
+
+/// R21: a path remuda itself puts in a form's error or in a notice is masked whole, whatever
+/// characters it holds, and what is said after it stays.
+#[test]
+fn private_mode_masks_remudas_own_paths_whole() {
+    let dir = format!("{ZQ_HOME}/Dropbox (zqPersonal)/zq, clients/Bob's \"zq\": acme; x");
+    let mut app = secret_app();
+    update(&mut app, Event::Resize(160, 40));
+    keys(&mut app, &[Key::Char('1'), Key::Char('j'), Key::Char('n')]);
+    clear_field(&mut app);
+    type_str(&mut app, &dir);
+    let fx = keys(&mut app, &[Key::Enter]);
+    let [Effect::CheckLaunch { check, request }] = fx.as_slice() else {
+        panic!("{fx:?}")
+    };
+    let refused = Marked::default().path(&dir).text(" does not exist");
+    let checked = Event::LaunchChecked {
+        check: *check,
+        request: request.clone(),
+        error: Some(refused.clone()),
+    };
+    // In the form that asked.
+    update(&mut app, checked.clone());
+    assert_eq!(form(&app).error.as_ref(), Some(&refused));
+    app.private = true;
+    let all = text(&app);
+    assert!(all.contains("~/•••/•••/••• does not exist"), "{all}");
+    for leak in ["zq", "Dropbox", "Personal", "clients", "Bob", "acme"] {
+        assert!(!all.contains(leak), "{leak}:\n{all}");
+    }
+    // As a notice, when no form asked.
+    app.overlay = None;
+    app.pending = Some((*check, request.clone()));
+    update(&mut app, checked);
+    assert_eq!(
+        private_notice(&app),
+        "new session as account-1: ~/•••/•••/••• does not exist"
+    );
+
+    // An account's home, when the account is removed.
+    let account = Account {
+        home: Home::Path(format!("{ZQ_HOME}/zq homes (old)/zqalpha, zqb")),
+        ..zq_account(CLAUDE, "zqalpha")
+    };
+    let result = Ok(());
+    update(&mut app, Event::AccountRemoved { account, result });
+    assert_eq!(
+        private_notice(&app),
+        "removed account-1; its home ~/•••/••• was left in place"
+    );
+
+    // The stores of a resume refused for another store (R16), told by `resume_as`.
+    let mut app = history_with(&["team", "max"]);
+    let mut stores = stores();
+    stores[1].path = PathBuf::from("/Users/you/Team's, (old): x/projects");
+    update(&mut app, Event::Stores(stores));
+    keys(&mut app, &[Key::Enter, Key::Char('j'), Key::Char('j')]);
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "team cannot find session aaaaaaaa: its projects store is \
+             /Users/you/Team's, (old): x/projects, the transcript is in /s; link \
+             /h/team/projects to that store to share sessions",
+            Level::Error
+        ))
+    );
+    assert_eq!(
+        private_notice(&app),
+        "account-2 cannot find session aaaaaaaa: its projects store is ~/•••/•••, the \
+         transcript is in /•••; link /•••/•••/••• to that store to share sessions"
+    );
+}
+
+/// R21: a message from elsewhere hides its own line from its first path on, and nothing of
+/// the messages around it: the launch it belongs to, the warnings after it.
+#[test]
+fn private_mode_masks_a_message_from_elsewhere_alone() {
+    let mut app = secret_app();
+    update(
+        &mut app,
+        Event::Launched {
+            request: zq_request("new session as zqalpha", &[], zq_account(CLAUDE, "zqalpha")),
+            result: Err(format!(
+                "cannot run {ZQ_HOME}/zq bin (old)/claude: No such file or directory"
+            )),
+            warnings: vec![
+                "cannot write the launch log /zqstate/launches.jsonl: disk full".into(),
+                "warning: claude:zqalpha reads 2 settings of claude:default".into(),
+            ],
+        },
+    );
+    assert_eq!(
+        private_notice(&app),
+        "new session as account-1: cannot run claude: cannot run ~/•••/••• · cannot write \
+         the launch log /•••/••• · warning: claude:account-1 reads 2 settings of claude:default"
+    );
+    // A slash command is not a path (the rest of its line stays), a path after it is.
+    app.notice = Some(Notice {
+        text: "zqalpha: /rewind finds no backup; see /memory or ./zqdir/x for more".into(),
+        level: Level::Warn,
+    });
+    assert_eq!(
+        private_notice(&app),
+        "account-1: /rewind finds no backup; see /memory or •••/•••/•••"
+    );
+}
+
+/// R21: what is typed in the open form is masked in its error with or without the blanks
+/// around it (the form reads it without them), and as the error quotes it.
+#[test]
+fn private_mode_masks_typed_values_as_the_form_reads_them() {
+    let error = |app: &App| {
+        let copy = super::privacy::redacted(app);
+        form(&copy).error.as_deref().unwrap_or_default().to_string()
+    };
+    // An account name.
+    let mut app = secret_app();
+    keys(&mut app, &[Key::Char('1'), Key::Char('s')]);
+    type_str(&mut app, " zqacme client ");
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(
+        form(&app).error.as_deref(),
+        Some("invalid account name: invalid name \"zqacme client\": must match [A-Za-z0-9_-]+")
+    );
+    assert_eq!(
+        error(&app),
+        "invalid account name: invalid name \"•••\": must match [A-Za-z0-9_-]+"
+    );
+    // One with a quote in it, which the error escapes.
+    clear_field(&mut app);
+    type_str(&mut app, " zq\"acme");
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert!(
+        form(&app).error.as_deref().unwrap().contains("zq\\\"acme"),
+        "{:?}",
+        form(&app).error
+    );
+    assert_eq!(
+        error(&app),
+        "invalid account name: invalid name \"•••\": must match [A-Za-z0-9_-]+"
+    );
+    // An email (no error quotes one today: put there directly, and without an `@`, which
+    // would be masked anyway).
+    if let Some(Overlay::Form(form)) = &mut app.overlay {
+        form.fields[1].value = "  zqme at zqmail ".into();
+        form.error = Some("cannot log zqme at zqmail in".into());
+    }
+    assert_eq!(error(&app), "cannot log •••@••• in");
+
+    // A session name, and a directory that is not absolute.
+    let mut app = secret_app();
+    keys(
+        &mut app,
+        &[Key::Char('1'), Key::Char('j'), Key::Char('n'), Key::Tab],
+    );
+    type_str(&mut app, "  --zqname ");
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert!(
+        form(&app)
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("\"--zqname\""),
+        "{:?}",
+        form(&app).error
+    );
+    assert_eq!(
+        error(&app),
+        "a session name cannot start with `-` (claude would read \"•••\" as an option); choose \
+         another name"
+    );
+    if let Some(Overlay::Form(form)) = &mut app.overlay {
+        form.fields[0].value = "  zqrelative dir ".into();
+        form.error = Some("cannot use zqrelative dir here, nor   zqrelative dir .".into());
+    }
+    assert_eq!(error(&app), "cannot use ••• here, nor •••.");
 }
 
 /// R21: what private mode leaves: numbers, model names, plans, aliases, `default`, masks.

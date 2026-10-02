@@ -274,7 +274,7 @@ fn status_line(app: &App) -> Line<'static> {
             Level::Warn => WARN,
             Level::Error => CRIT,
         };
-        return Line::styled(format!(" {}", notice.text), style);
+        return Line::styled(format!(" {}", notice.text.as_str()), style);
     }
     if let Some((_, request)) = &app.pending {
         let what = match request.resumes() {

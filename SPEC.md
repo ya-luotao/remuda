@@ -308,7 +308,11 @@ remuda help [<command>]                            help for remuda or a command
 - Background sessions are operated on by short ID: `claude attach <id>`, `claude logs <id>`,
   `claude stop <id>`, `claude rm <id>`. remuda only invokes these commands and does not reimplement
   them. `logs` emits raw terminal sequences (ANSI), which must be stripped or converted before
-  display.
+  display. The conversion is bounded, so that no output can exhaust memory: only the last 4 MB of
+  the output are read (the text then says first how much was left out), and they are drawn on a
+  screen of at most 1000 columns, 100,000 rows, and 2,000,000 cells. A cursor position past an
+  edge is at the edge, a character past the last column is dropped, and beyond the last row or
+  the cells the earliest rows are dropped: a long log keeps its end.
 - Unknown fields are ignored; an unknown `status` is displayed as-is.
 
 ## R8. Session index
@@ -1279,12 +1283,26 @@ status and hint lines, notices, the help box) shows:
   session logs, search text, and the descriptions in the configuration pane (R22) are shown as
   `•••`.
 - **Free text** (notices, errors, check messages, the description of a pending launch): account
-  names are replaced by their aliases, as whole words; emails, organization names, live session
-  names, the search text, and the values typed in the open form are masked; text in `“…”` is
-  masked; each path is masked, from a `/` or `~/` that begins a word, or from wherever a path the
-  TUI knows (`$HOME`, a home, a store, the directory remuda started in, a typed directory) occurs
-  as whole components, to the next `: `, `, `, `; `, quote, or bracket, or to the end; and each
-  word with an `@` is masked.
+  names are replaced by their aliases, as whole words (ASCII letters, digits, `_`, and `-` make a
+  word, so a name right next to CJK text or full-width punctuation is replaced too); emails,
+  organization names, live session names, the search text, and the values typed in the open form
+  (as typed, without the blanks around them, and as an error quotes them) are masked; text in
+  `“…”` is masked; and each word with an `@` is masked. Paths in it are masked in two ways:
+  - A path remuda itself puts in a notice or in a form's error (a launch directory, a store, a
+    home) is masked whole, as a path above, whatever characters it holds; what the message says
+    after it stays.
+  - In any other text (an agent's output, an error of the system, a check message), where a path
+    ends cannot be told: a path may hold blanks, `: `, `, `, quotes, and brackets. So each line is
+    masked from its first path to its end, as one path. A path starts in the first word that
+    holds a `/`: at the `/` or `~/` itself when it begins the word or follows a quote, a bracket,
+    `=`, or `:` in it; otherwise after the last quote, bracket, or `=` in the word, or at its
+    start, and the rest is a relative path (`./a/b`, `a/b`, `key=a/b`). This may hide what
+    follows a path on its line (the reason of an error, say), and never shows part of one. A word that is one `/` and a name, without a second `/` (`/login`,
+    `/rewind`, `/tmp`), is not a path: it is as likely a slash command, and a top-level directory
+    says little. The first component of a path with a blank in it (`/My Disk/x`) is such a word,
+    and shows.
+  - A notice made of several messages (the result of a launch and each of its warnings) is
+    masked message by message: what one hides does not reach the next.
 
 Numbers (usage percentages, reset times, token counts, costs, and the Stats chart), model names,
 plans, login methods, providers, session IDs, pids, and times stay visible, and so do the names
@@ -1427,8 +1445,12 @@ It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4)
     each account with a feasible pair under its alias (`<provider>:account-<n>`, numbered per
     provider in registry order as in R21; `default` stays `default`), its usage (source, age,
     staleness, and each window that applies with its percentage and time to reset), the models,
-    the notes, and an empty task. In the notes, each qualified name `provider:name` (a whole word)
-    is replaced by its alias; the rest, bare names included, is sent as written. No email,
+    the notes, and an empty task. In the notes, each qualified name is replaced by its alias: a
+    provider, `:`, and the longest run of name characters (`[A-Za-z0-9_-]`) after it, wherever
+    the character before it is not an ASCII letter or digit (so also right after CJK text, `-`,
+    or `_`, and before full-width punctuation). A name that is not registered gets the next
+    alias of its provider, in the order the notes name them; `claude:max2` and `claude:max_` are
+    such names, not `claude:max`. The rest, bare names included, is sent as written. No email,
     organization, plan, path, working directory, or session content is sent.
 - **Combination.** Jev's pair when its confidence is at least 0.50 (`jev`); else, when the
   probabilities of one account's pairs add up to at least 0.70, that account with its most

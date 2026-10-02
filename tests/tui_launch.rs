@@ -935,7 +935,7 @@ fn check_launch_events(
                 error,
             } => {
                 assert_eq!(r, request);
-                return (before, error);
+                return (before, error.map(|e| e.as_str().to_string()));
             }
             other => before.push(other),
         }

@@ -27,7 +27,7 @@ use crate::usage::{CachedUsage, Resets, UsageRow};
 
 use super::app::{
     AccountState, App, ConfigPane, Confirm, Field, Form, FormKind, History, LaunchRequest, Logs,
-    Mask, Notice, Overlay, Pick, Preview, ResumeCodex, StatsState,
+    Marked, Mask, Notice, Overlay, Pick, Preview, ResumeCodex, StatsState,
 };
 
 /// What masked text shows.
@@ -81,9 +81,6 @@ pub struct Scrubber {
     home: Option<String>,
     /// Exact text and what it becomes, longest first.
     secrets: Vec<(String, String)>,
-    /// Paths the app knows (`$HOME`, homes, stores, the start directory, a typed directory):
-    /// a path starts wherever one of them does, not only at the start of a word.
-    paths: Vec<String>,
     /// Account names (qualified, then bare) and their aliases, longest first within each.
     names: Vec<(String, String)>,
 }
@@ -97,22 +94,11 @@ impl Scrubber {
         let home = app.home.clone();
         let mut secrets: Vec<(String, String)> = Vec::new();
         let mut secret = |text: &str, shown: String| {
-            if text.chars().count() >= MIN_SECRET {
+            if text.trim().chars().count() >= MIN_SECRET {
                 secrets.push((text.to_string(), shown));
             }
         };
-        let mut paths: Vec<String> = Vec::new();
-        let mut path = |p: &str| {
-            let p = p.trim_end_matches('/');
-            if p.len() >= MIN_SECRET && p.starts_with('/') {
-                paths.push(p.to_string());
-            }
-        };
-        path(home.as_deref().unwrap_or_default());
         for a in &app.accounts {
-            if let Home::Path(p) = &a.account.home {
-                path(p);
-            }
             if let Some(Identity::LoggedIn { email, org, .. }) = &a.identity {
                 if let Some(e) = email {
                     secret(e, MASKED_EMAIL.to_string());
@@ -127,26 +113,24 @@ impl Scrubber {
                 secret(name, MASK.to_string());
             }
         }
-        for store in app.stores.iter().flatten() {
-            path(&store.path.to_string_lossy());
-        }
-        if let Some(cwd) = &app.cwd {
-            path(&cwd.to_string_lossy());
-        }
         secret(&app.history.query, MASK.to_string());
         if let Some(Overlay::Form(form)) = &app.overlay {
             for field in &form.fields {
-                match field.mask {
-                    Mask::Path => path(&field.value),
-                    Mask::Text | Mask::Email => {
-                        secret(&field.value, masked_value(field, home.as_deref()));
-                    }
-                    Mask::Plain => {}
+                if field.mask == Mask::Plain {
+                    continue;
+                }
+                // As typed, and as the form reads it (without the blanks around it); each also
+                // as an error quotes it (`{:?}`).
+                let shown = masked_value(field, home.as_deref());
+                for value in [field.value.as_str(), field.value.trim()] {
+                    secret(value, shown.clone());
+                    let quoted = format!("{value:?}");
+                    secret(&quoted[1..quoted.len() - 1], shown.clone());
                 }
             }
         }
-        secrets.sort_by_key(|(text, _)| std::cmp::Reverse(text.len()));
-        paths.sort_by_key(|p| std::cmp::Reverse(p.len()));
+        secrets.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.cmp(b)));
+        secrets.dedup();
 
         let mut qualified: Vec<(String, String)> = Vec::new();
         let mut bare: Vec<(String, String)> = Vec::new();
@@ -169,14 +153,14 @@ impl Scrubber {
         Scrubber {
             home,
             secrets,
-            paths,
             names: qualified,
         }
     }
 
     /// `text` with, in order: `“…”` masked; the app's secrets (emails, organizations, live
-    /// session names, typed values, the search) masked; each path masked; each word with an
-    /// `@` masked; account names replaced by their aliases, as whole words.
+    /// session names, typed values, the search) masked; each line masked from its first path
+    /// on; each word with an `@` masked; account names replaced by their aliases, as whole
+    /// words.
     pub fn text(&self, text: &str) -> String {
         let mut out = mask_quoted(text);
         for (secret, shown) in &self.secrets {
@@ -187,46 +171,79 @@ impl Scrubber {
         alias_words(&out, &self.names)
     }
 
-    /// Each path, to the next `: `, `, `, `; `, quote, bracket, or the end: from a `/` or `~/`
-    /// that begins a word, or from wherever a path the app knows starts, as a whole component
-    /// (`$HOME` = `/Users/you` does not start one in `/Users/yours`).
-    fn mask_paths(&self, text: &str) -> String {
-        const OPENERS: [char; 6] = ['(', '[', '"', '\'', '“', '='];
-        const STOPS: [&str; 9] = [": ", ", ", "; ", "\"", "'", "”", ")", "]", "\n"];
-        let component_ends = |after: &str| {
-            after
-                .chars()
-                .next()
-                .is_none_or(|c| c == '/' || c.is_whitespace() || ":,;\"'”)]".contains(c))
-        };
-        let mut out = String::new();
-        let mut rest = text;
-        let mut prev: Option<char> = None;
-        while let Some(c) = rest.chars().next() {
-            let begins = prev.is_none_or(|p| p.is_whitespace() || OPENERS.contains(&p))
-                && (c == '/' || rest.starts_with("~/"));
-            let known = self
-                .paths
-                .iter()
-                .any(|p| rest.strip_prefix(p.as_str()).is_some_and(&component_ends));
-            if begins || known {
-                let end = STOPS
-                    .iter()
-                    .filter_map(|s| rest.find(s))
-                    .min()
-                    .unwrap_or(rest.len());
-                let (path, after) = rest.split_at(end);
-                out.push_str(&mask_path(path, self.home.as_deref()));
-                prev = path.chars().next_back();
-                rest = after;
-                continue;
-            }
-            out.push(c);
-            prev = Some(c);
-            rest = &rest[c.len_utf8()..];
+    /// `marked` piece by piece: a path whole, as a path; any other piece as [`Scrubber::text`],
+    /// on its own.
+    pub fn marked(&self, marked: &Marked) -> Marked {
+        let mut out = Marked::default();
+        for (piece, path) in marked.pieces() {
+            out = if path {
+                out.path(mask_path(piece, self.home.as_deref()))
+            } else {
+                out.text(self.text(piece))
+            };
         }
         out
     }
+
+    /// Each line from its first path to its end, as one path. Where a path ends cannot be told
+    /// (one may hold blanks, `: `, `, `, quotes and brackets), so the rest of the line is taken
+    /// for it: that may hide what follows a path, never show a part of one.
+    fn mask_paths(&self, text: &str) -> String {
+        let mut out = String::new();
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            let start = path_start(line).unwrap_or(line.len());
+            out.push_str(&line[..start]);
+            out.push_str(&mask_path(&line[start..], self.home.as_deref()));
+        }
+        out
+    }
+}
+
+/// Where the first path of `line` starts: in its first word that holds a `/` (`/a/b`, `~/a`,
+/// `./a/b`, `a/b`). At the `/` or `~/` itself when it begins the word or follows a quote, a
+/// bracket, `=` or `:` in it (`home:/Users/you` keeps `home:`); otherwise the word is a
+/// relative path, from its start or from after the last quote, bracket or `=` before the `/`.
+/// A `/` with a name and no second `/` in the word (`/login`, `/tmp`) is not a path: a slash
+/// command as likely, and a top-level directory says little; the line is looked through
+/// further.
+fn path_start(line: &str) -> Option<usize> {
+    const OPENERS: [char; 6] = ['(', '[', '"', '\'', '“', '='];
+    let mut from = 0;
+    while let Some(slash) = line[from..].find('/').map(|i| from + i) {
+        let word = line[..slash]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let end = line[slash..]
+            .find(char::is_whitespace)
+            .map_or(line.len(), |i| slash + i);
+        let before = &line[word..slash];
+        let (before, root) = match before.strip_suffix('~') {
+            Some(before) => (before, slash - 1),
+            None => (before, slash),
+        };
+        if before
+            .chars()
+            .next_back()
+            .is_some_and(|c| c != ':' && !OPENERS.contains(&c))
+        {
+            let opener = before
+                .char_indices()
+                .rev()
+                .find(|(_, c)| OPENERS.contains(c))
+                .map_or(0, |(i, c)| i + c.len_utf8());
+            return Some(word + opener);
+        }
+        if root < slash || line[slash + 1..end].contains('/') {
+            return Some(root);
+        }
+        from = end;
+    }
+    None
 }
 
 /// Text between `“` and `”` (or the end) as [`MASK`].
@@ -726,7 +743,7 @@ impl Redactor<'_> {
     fn notice(&self, notice: &Notice) -> Notice {
         let Notice { text, level } = notice;
         Notice {
-            text: self.scrub.text(text),
+            text: self.scrub.marked(text),
             level: *level,
         }
     }
@@ -774,7 +791,7 @@ impl Redactor<'_> {
                         })
                         .collect(),
                     focus: *focus,
-                    error: self.scrub_opt(error),
+                    error: error.as_ref().map(|e| self.scrub.marked(e)),
                 })
             }
             Overlay::Confirm(confirm) => {
@@ -1186,7 +1203,6 @@ mod tests {
                 .iter()
                 .map(|(a, b)| (a.to_string(), b.to_string()))
                 .collect(),
-            paths: vec!["/Users/you".into()],
             names: Vec::new(),
         };
         let mut qualified: Vec<(String, String)> = Vec::new();
@@ -1219,17 +1235,9 @@ mod tests {
         );
         // Exact secrets.
         assert_eq!(s.text("org Acme Corp: fix index"), "org •••: •••");
-        // Paths, up to `: `, `, `, a quote or a bracket.
-        assert_eq!(
-            s.text("/Users/you/a b/c does not exist: max"),
-            "~/•••/•••: account-1"
-        );
-        assert_eq!(
-            s.text("cannot use (/tmp/x), \"~/y/z\" or [/a/b]; x=/c"),
-            "cannot use (/•••/•••), \"~/•••/•••\" or [/•••/•••]; x=/•••"
-        );
-        // A `/` inside a word is not a path.
-        assert_eq!(s.text("claude/codex and and/or"), "claude/codex and and/or");
+        // A path, and with it the rest of its line.
+        assert_eq!(s.text("max: /Users/you/a b/c"), "account-1: ~/•••/•••");
+        assert_eq!(s.text("/Users/you/a b/c does not exist: max"), "~/•••/•••");
         // Emails.
         assert_eq!(
             s.text("logged in as (me@x.com) ok"),
@@ -1241,26 +1249,151 @@ mod tests {
             "account-1, account-2, claude:account-1, codex:account-1, account-1: maximum \
              claude:default default"
         );
+        // A name ends where an ASCII letter, a digit, `_` or `-` does not follow.
+        assert_eq!(
+            s.text("把max留给maxi（work）"),
+            "把account-1留给account-2（account-1）"
+        );
     }
 
-    /// A known path starts a path anywhere, but only as whole components: `$HOME` is not a
-    /// prefix of a sibling (`/Users/yours`), and a trailing `/` in it changes nothing.
+    /// R21: where a path ends in text remuda did not write cannot be told, so the line is
+    /// masked from where its first path starts: nothing of a path with blanks, brackets,
+    /// quotes, `, ` or `: ` in it shows, and neither does a relative one.
     #[test]
-    fn scrubber_masks_known_paths_at_component_boundaries() {
-        let mut s = scrubber(&["claude:max"], &[]);
+    fn scrubber_masks_a_line_from_its_first_path() {
+        let s = scrubber(&["claude:max"], &[]);
+        for (text, masked) in [
+            (
+                "/Users/you/Dropbox (Personal)/clients/acme does not exist",
+                "~/•••/•••/•••",
+            ),
+            (
+                "/Volumes/Bob's Disk/secret-client/repo does not exist",
+                "/•••/•••/•••/•••",
+            ),
+            (
+                "max cannot find session 766560c5: its projects store is /Users/you/a, b/projects, \
+                 the transcript is in /Users/you/x/projects",
+                "account-1 cannot find session 766560c5: its projects store is \
+                 ~/•••/•••/•••/•••/•••/•••",
+            ),
+            (
+                "cannot open /srv/a: b/c; d/e \"f\"/g [h]/i: permission denied",
+                "cannot open /•••/•••/•••/•••/•••/•••",
+            ),
+            (
+                "cannot use (/tmp/x), \"~/y/z\" or [/a/b]; x=/c",
+                "cannot use (/•••/•••/•••/•••/•••/•••/•••",
+            ),
+            // Relative paths: any word with a `/`.
+            (
+                "cannot read ./relative/secret/dir: permission denied",
+                "cannot read •••/•••/•••/•••",
+            ),
+            ("see a/b/c for details", "see •••/•••/•••"),
+            ("claude/codex and and/or", "•••/•••/•••"),
+            ("at home~/x y", "at •••/•••"),
+            // What is before the path in its word stays when it ends with a quote, a bracket,
+            // `=` or `:`; a relative path starts after the last quote, bracket or `=`.
+            ("home:/Users/you/secret/x: gone", "home:~/•••/•••"),
+            ("x:/Users/yours/secret", "x:/•••/•••/•••"),
+            ("key=/Users/you", "key=~"),
+            ("key=rel/dir (x)", "key=•••/•••"),
+            ("in (./a/b) or c", "in (•••/•••/•••"),
+            ("say \"~/y z\" ok", "say \"~/•••"),
+            ("say “~/y z” ok", "say “•••” ok"),
+            // Only to the end of the line.
+            (
+                "cannot run /x/y: no\nexit 1 for max\n\nin ~/z",
+                "cannot run /•••/•••\nexit 1 for account-1\n\nin ~/•••",
+            ),
+        ] {
+            assert_eq!(s.text(text), masked, "{text}");
+        }
+    }
+
+    /// R21: a word that is one `/` and a name (`/login`, `/rewind`, `/tmp`) is a slash command
+    /// as likely as a path, and a top-level directory says little: it is not a path, and the
+    /// line is looked through further.
+    #[test]
+    fn scrubber_leaves_a_lone_top_level_name() {
+        let s = scrubber(&["claude:max"], &[]);
+        for text in [
+            "ANTHROPIC_API_KEY is set: it overrides every account's /login",
+            "run `claude -p /usage` again, or /memory, as max did not",
+            "not file-history: /rewind does not find the file backups; link it too",
+            "see (/memory), \"/tmp\", [/var] and x=/opt; home:/Users too",
+            "/ is the root",
+        ] {
+            assert_eq!(s.text(text), text.replace("max", "account-1"), "{text}");
+        }
+        // A path further on the line still starts one.
         assert_eq!(
-            s.text("home:/Users/you/secret/x: gone"),
-            "home:~/•••/•••: gone"
+            s.text("/rewind finds nothing for max; link it too (ln -s /Users/you/a b/c d)"),
+            "/rewind finds nothing for account-1; link it too (ln -s ~/•••/•••"
         );
-        assert_eq!(s.text("key=/Users/you"), "key=~");
+        assert_eq!(s.text("/login then /a/b: c"), "/login then /•••/•••");
+        assert_eq!(s.text("/login then x/y z"), "/login then •••/•••");
+        // With a second `/`, or from `~`, it is a path.
+        assert_eq!(s.text("in /tmp/ or"), "in /•••/•••");
+        assert_eq!(s.text("in ~/x or"), "in ~/•••");
+        assert_eq!(s.text("in (/tmp/x) or"), "in (/•••/•••");
+        // The first component of a path that holds a blank is such a word: it shows.
+        assert_eq!(s.text("no /My Disk/secret here"), "no /My •••/•••");
+    }
+
+    /// `$HOME` shows as `~` only as whole components, and a trailing `/` in it changes nothing.
+    #[test]
+    fn scrubber_shows_home_only_at_component_boundaries() {
+        let mut s = scrubber(&["claude:max"], &[]);
         assert_eq!(s.text("see /Users/yours/secret"), "see /•••/•••/•••");
-        assert_eq!(s.text("x:/Users/yours/secret"), "x:/Users/yours/secret");
         s.home = Some("/Users/you/".into());
         assert_eq!(s.text("see /Users/you/other/x"), "see ~/•••/•••");
         s.home = Some("/Users/yo".into());
-        s.paths = vec!["/Users/yo".into()];
         assert_eq!(s.text("see /Users/you/proj"), "see /•••/•••/•••");
-        assert_eq!(s.text("x:/Users/you/proj"), "x:/Users/you/proj");
+        assert_eq!(s.text("x:/Users/you/proj"), "x:/•••/•••/•••");
+    }
+
+    /// R21: text remuda put together is masked piece by piece: a path whole, as a path,
+    /// whatever characters it holds, and what follows it stays; a message from elsewhere
+    /// hides its own line's end only.
+    #[test]
+    fn scrubber_masks_marked_text_piece_by_piece() {
+        let s = scrubber(&["claude:max"], &[]);
+        let said = Marked::from("max cannot find session 766560c5: its projects store is ")
+            .path("/Users/you/a, b/projects")
+            .text(", the transcript is in ")
+            .path("/Users/you/Dropbox (Personal)/Bob's \"x\": y; z/projects")
+            .text("; link ")
+            .path("relative dir/projects")
+            .text(" to that store to share sessions");
+        let masked = s.marked(&said);
+        assert_eq!(
+            masked.as_str(),
+            "account-1 cannot find session 766560c5: its projects store is ~/•••/•••, the \
+             transcript is in ~/•••/•••/•••; link •••/••• to that store to share sessions"
+        );
+        assert_eq!(masked.pieces().filter(|(_, path)| *path).count(), 3);
+        // A message from elsewhere is a piece of its own.
+        let said = Marked::from("new session as max: ")
+            .text("cannot run claude: /opt/secret bin/claude: no such file")
+            .text(" · ")
+            .text("warning: max reads 2 settings");
+        assert_eq!(
+            s.marked(&said).as_str(),
+            "new session as account-1: cannot run claude: /•••/•••/••• · warning: account-1 \
+             reads 2 settings"
+        );
+        assert_eq!(s.marked(&Marked::default()), Marked::default());
+        assert_eq!(
+            Marked::from("a")
+                .text("")
+                .path("")
+                .text("b")
+                .pieces()
+                .count(),
+            2
+        );
     }
 
     #[test]

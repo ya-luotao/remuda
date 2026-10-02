@@ -17,7 +17,8 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   effort levels to choose from, and notes. With `TYPESAFE_API_KEY` set and notes written, one
   request asks TypeSafe's Jev model to choose among the feasible options; its answer is taken
   only when confident, and the rules decide otherwise or on any error. The request carries
-  aliased usage and the notes as written (accounts written as `provider:name` are aliased too),
+  aliased usage and the notes as written (accounts written as `provider:name` are aliased too,
+  registered or not),
   never credentials, emails, organizations, paths or session content; `--print-request` shows it
   and `--offline` never sends. `--json` prints every candidate; `--run` launches the choice as
   `remuda run` does, with `--model`/`--effort` (claude) or `-m`/`-c model_reasoning_effort=`
@@ -92,7 +93,9 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   again.
 - Private mode in the TUI (SPEC R21): `Ctrl-P`, anywhere, hides account names (shown as aliases),
   emails, organizations, paths, session titles, previews, logs and typed text, for screenshots.
-  Numbers, model names and session IDs stay visible.
+  Numbers, model names and session IDs stay visible. In a message that comes from elsewhere (an
+  agent's output, a system error, a check message), the line is hidden from its first path to
+  its end.
 - Codex usage limits (SPEC R10): `remuda usage` reads the newest rate limits Codex recorded in the
   account's rollouts; `--live` and `u` in the TUI query them through `codex app-server`. Five-hour
   and weekly windows show as Session and Week, per-model limits by name, on the same timeline as
@@ -128,6 +131,11 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   other argument (SPEC R5). It used to be dropped, so `remuda run work -- "-1 is not valid"`
   gave the agent the prompt as an option, and `remuda run work -- --resume abc` became
   `--resume abc`. A `--` before the account (`remuda run -- -x`) is still remuda's.
+- TUI: the logs of a background session (`l` in Live) can no longer take remuda down. A cursor
+  position with a huge parameter in the output of `claude logs` (20 bytes are enough) made
+  remuda ask for terabytes of memory and abort, leaving the terminal in raw mode. The output is
+  now drawn on a bounded screen (1000 columns, 100,000 rows, 2,000,000 cells; the earliest rows
+  are dropped beyond), and only its last 4 MB are read (SPEC R7).
 
 ### Security
 

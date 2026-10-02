@@ -382,6 +382,8 @@ fn check_short_id(id: &str) -> Result<(), String> {
 
 /// `claude logs <id>` usually answers at once; it is given this long.
 pub const LOGS_TIMEOUT: Duration = Duration::from_secs(15);
+/// How far back the output of `claude logs` is shown: its last 4 MB.
+const LOGS_TAIL: usize = 4 << 20;
 
 /// What remuda does to a background session besides attaching (R7, R16).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,7 +407,8 @@ impl Control {
 
 /// `claude logs <short_id>` under the account's environment, as plain text; a malformed id
 /// is refused without running anything (the raw output
-/// is terminal bytes: see [`text::terminal_text`]). `Err` says why it failed.
+/// is terminal bytes: see [`text::terminal_text`]). Only the end of a long output is shown
+/// (`LOGS_TAIL`), and the text says so first. `Err` says why it failed.
 pub fn logs(
     claude: &Path,
     account: &Account,
@@ -416,9 +419,33 @@ pub fn logs(
     let change = launch::env_change(account);
     let outcome = probe::run_captured(claude, &["logs", short_id], &change, timeout);
     match outcome.success_stdout() {
-        Some(out) => Ok(text::terminal_text(out)),
+        Some(out) => Ok(tail_text(out, LOGS_TAIL)),
         None => Err(failure(&outcome, timeout)),
     }
+}
+
+/// The last `max` bytes of `raw` terminal output as plain text, from the start of a line when
+/// one starts soon (so that no escape sequence is cut in two); how much was left out comes
+/// first, on a line of its own, added after the conversion: nothing in the output erases it.
+fn tail_text(raw: &str, max: usize) -> String {
+    /// How far a line's start is looked for.
+    const NEAR: usize = 4096;
+    if raw.len() <= max {
+        return text::terminal_text(raw);
+    }
+    let mut start = raw.len() - max;
+    while !raw.is_char_boundary(start) {
+        start += 1;
+    }
+    let near = &raw.as_bytes()[start..raw.len().min(start + NEAR)];
+    if let Some(line) = near.iter().position(|b| *b == b'\n') {
+        start += line + 1;
+    }
+    format!(
+        "[{} bytes of earlier output not shown]\n{}",
+        text::human_count(start as u64),
+        text::terminal_text(&raw[start..])
+    )
 }
 
 /// `claude stop|rm <short_id>` under the account's environment; its output (trimmed), or
@@ -463,6 +490,33 @@ mod tests {
 
     use super::*;
     use crate::registry::CLAUDE;
+
+    /// R7: only the end of a long `claude logs` output is converted, from a line's start, and
+    /// the text says what was left out, whatever the output then clears.
+    #[test]
+    fn long_logs_show_their_end() {
+        assert_eq!(tail_text("one\r\ntwo\r\n", 10), "one\ntwo");
+        assert_eq!(
+            tail_text("zero\r\none\r\ntwo\r\n", 10),
+            "[11 bytes of earlier output not shown]\ntwo"
+        );
+        // No line starts in the tail: cut where it begins, at a character.
+        assert_eq!(
+            tail_text("日本語テキスト", 7),
+            "[15 bytes of earlier output not shown]\nスト"
+        );
+        // The output clears the screen: the first line stays.
+        assert_eq!(
+            tail_text("old frame\r\nolder\r\n\u{1b}[2J\u{1b}[Hnew", 12),
+            "[18 bytes of earlier output not shown]\nnew"
+        );
+        // The real limit: 4096 bytes and a line more than fit.
+        let long = format!("{}\r\nlast", "x".repeat(LOGS_TAIL + 4096));
+        let shown = tail_text(&long, LOGS_TAIL);
+        assert_eq!(shown.lines().count(), 3, "{}", &shown[..60]);
+        assert!(shown.starts_with("[4.1K bytes of earlier output not shown]\n"));
+        assert!(shown.ends_with("\nlast"));
+    }
 
     fn session(account: &str, pid: Option<u32>, source: Source) -> LiveSession {
         LiveSession {

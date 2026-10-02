@@ -400,6 +400,28 @@ fn a_running_pids_unreadable_session_file_makes_the_account_unknown() {
 
 // --- background session commands (R7, R16) ----------------------------------------------
 
+/// A cursor parameter of any size is only a cursor at the edge of a bounded screen: once,
+/// these 20 bytes asked for 240 TB, and remuda was aborted with the terminal left raw.
+#[test]
+fn logs_with_a_huge_cursor_parameter_stay_small() {
+    let sb = Sandbox::new();
+    let max = sb.make_claude_home("p/max");
+    fs::write(max.join("fake-logs.txt"), "\u{1b}[9999999999999;1Hx").unwrap();
+    let claude = sb.bin().join("claude");
+    let logs = live::logs(
+        &claude,
+        &named("max", &max),
+        "766560c5",
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    assert!(
+        logs.ends_with("\nx") && logs.len() <= 100_000,
+        "{}",
+        logs.len()
+    );
+}
+
 #[test]
 fn logs_stop_and_rm_run_under_the_accounts_environment() {
     let sb = Sandbox::new();
