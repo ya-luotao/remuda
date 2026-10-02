@@ -664,7 +664,9 @@ pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
         Err(e) => return Err(e),
     }
     // Opened without following a symlink and changed through the descriptor: never the
-    // directory a link points at. What is not a directory fails where it is written to.
+    // directory a link points at. What is not a directory fails where it is written to. A
+    // directory that cannot be tightened (another user's) is used as it is: its mode does not
+    // give away the contents of the files in it, which are 0600 or not written (R3).
     if let Ok(open) = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
@@ -676,8 +678,8 @@ pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Takes away every permission of an open file or directory of remuda's that is not in `keep`
-/// (R3); nothing is ever added. Failing to is not an error: what is written there is still
-/// written.
+/// (R3); nothing is ever added. Failing to is not an error here: a caller that must not write
+/// into what stayed open to others looks at the mode afterwards (the launch log does).
 pub(crate) fn tighten(file: &fs::File, keep: u32) {
     if let Ok(meta) = file.metadata() {
         let mode = meta.permissions().mode() & 0o7777;

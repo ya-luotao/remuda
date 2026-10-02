@@ -374,7 +374,11 @@ pub fn prepare_with(
 /// them, so it is the user's alone (R3): its directory is made or tightened by
 /// [`registry::private_dir`], the log is created with mode 0600, and one from before is
 /// tightened to that. A log that is a symlink is written through, and the file it points at
-/// keeps its mode.
+/// keeps its mode. Nothing is appended to a log the group or others can still access after
+/// that ([`refuse_shared`]): that is an error, like a log that cannot be written.
+///
+/// The directory is tightened as far as it can be and is not checked again: its mode does
+/// not give away what is in a file of mode 0600.
 pub fn append_log(log: &Path, record: &LaunchRecord) -> Result<()> {
     if let Some(dir) = log.parent() {
         registry::private_dir(dir)?;
@@ -394,7 +398,24 @@ pub fn append_log(log: &Path, record: &LaunchRecord) -> Result<()> {
     {
         registry::tighten(&file, 0o600);
     }
+    refuse_shared(&file, log)?;
     file.write_all(line.as_bytes())?;
+    Ok(())
+}
+
+/// Fails when the open launch log is a regular file the group or others have any access to:
+/// one that could not be tightened (it belongs to another user), or the target of a symlink,
+/// which keeps its mode (R3). Read from the open file, so it is the file the line would go to.
+fn refuse_shared(file: &fs::File, log: &Path) -> Result<()> {
+    let meta = file.metadata()?;
+    let mode = meta.mode() & 0o7777;
+    if meta.file_type().is_file() && mode & 0o077 != 0 {
+        bail!(
+            "{} can be accessed by the group or others (mode {mode:04o}) and was not made \
+             private; nothing was appended",
+            log.display()
+        );
+    }
     Ok(())
 }
 
@@ -1099,6 +1120,33 @@ mod tests {
             assert_eq!(l.record.fork_of, None);
             assert!(!l.record.injected);
         }
+    }
+
+    /// R3: a log that stayed open to the group or others after the attempt to tighten it (as
+    /// another user's file does: the mode cannot be changed) is refused, by the mode of the
+    /// open file; one that is the user's alone, or that is not a regular file, is not.
+    #[test]
+    fn a_log_that_is_not_private_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.jsonl");
+        fs::write(&log, "").unwrap();
+        let open = || fs::OpenOptions::new().append(true).open(&log).unwrap();
+        for mode in [0o666, 0o644, 0o640, 0o602, 0o610] {
+            fs::set_permissions(&log, fs::Permissions::from_mode(mode)).unwrap();
+            let e = refuse_shared(&open(), &log).unwrap_err().to_string();
+            assert_eq!(
+                e,
+                format!(
+                    "{} can be accessed by the group or others (mode {mode:04o}) and was not \
+                     made private; nothing was appended",
+                    log.display()
+                )
+            );
+        }
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).unwrap();
+        refuse_shared(&open(), &log).unwrap();
+        let null = fs::OpenOptions::new().append(true).open("/dev/null");
+        refuse_shared(&null.unwrap(), Path::new("/dev/null")).unwrap();
     }
 
     #[test]

@@ -319,11 +319,11 @@ fn a_linked_state_directory_and_a_linked_log_keep_their_modes() {
     assert_eq!(mode(&outside), 0o755);
     assert_eq!(mode(&outside.join("launches.jsonl")), 0o600);
 
-    // The log is a link.
+    // The log is a link, to a file that is the user's alone.
     let sb = sandbox_with_max();
     let target = sb.root().join("elsewhere.jsonl");
     fs::write(&target, "").unwrap();
-    chmod(&target, 0o644);
+    chmod(&target, 0o600);
     let state = sb.remuda_home().join("state");
     fs::create_dir(&state).unwrap();
     chmod(&state, 0o755);
@@ -334,9 +334,45 @@ fn a_linked_state_directory_and_a_linked_log_keep_their_modes() {
         .success()
         .stderr("");
     assert_eq!(fs::read_link(sb.launch_log()).unwrap(), target);
-    assert_eq!(mode(&target), 0o644);
+    assert_eq!(mode(&target), 0o600);
     assert_eq!(mode(&state), 0o700);
     assert_eq!(sb.launches().len(), 1);
+}
+
+/// R3: nothing is appended to a log the group or others can still access. A log that is a
+/// symlink keeps its target's mode, so one whose target others can read gets no line: the
+/// prompt stays out of it, the launch goes on, and the warning says why.
+#[test]
+fn a_log_others_can_access_gets_no_line() {
+    for wide in [0o644, 0o640, 0o604, 0o620] {
+        let sb = sandbox_with_max();
+        let target = sb.root().join("elsewhere.jsonl");
+        fs::write(&target, "{\"session_id\":\"old\"}\n").unwrap();
+        chmod(&target, wide);
+        fs::create_dir(sb.remuda_home().join("state")).unwrap();
+        symlink(&target, sb.launch_log()).unwrap();
+        sb.remuda()
+            .args(["run", "max", "-p", "a secret prompt"])
+            .assert()
+            .success()
+            .stderr(
+                predicate::str::starts_with("remuda: warning: cannot write launch log ").and(
+                    predicate::str::contains(format!(
+                        "{} can be accessed by the group or others (mode {wide:04o}) and was \
+                         not made private; nothing was appended",
+                        sb.launch_log().display()
+                    )),
+                ),
+            );
+        assert_eq!(sb.only_invocation().args[..2], ["-p", "a secret prompt"]);
+        assert_eq!(fs::read_link(sb.launch_log()).unwrap(), target);
+        assert_eq!(mode(&target), wide, "{wide:o}");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "{\"session_id\":\"old\"}\n",
+            "{wide:o}"
+        );
+    }
 }
 
 #[test]

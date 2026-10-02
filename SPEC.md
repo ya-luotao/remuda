@@ -129,11 +129,21 @@ switching to a different, logged-out account.
   among them (R6), and the caches hold titles and directories. `state/` is created with mode
   0700 and its files with mode 0600. A `state/` or a launch log from before that the group or
   others could access is tightened by the next write there, and a cache is always replaced by a
-  file of mode 0600; nothing is ever loosened. No mode is changed through a symlink: a `state`
-  that is a symlink is written through and the directory it points at keeps its mode (the files
-  remuda writes in it are still 0600), and a file in `state/` that is a symlink is written
-  through and the file it points at keeps its mode. `config.toml` keeps the mode it has; a new
+  file of mode 0600; nothing is ever loosened. Two modes are left as the user has them: that of
+  the directory a `state` symlink points at, and that of the file a symlink in `state/` points
+  at; both are written through. The regular files remuda owns by name in a directory reached
+  through a `state` symlink (the caches, the launch log) are its own all the same: created
+  with mode 0600, and the log tightened to it. `config.toml` keeps the mode it has; a new
   one gets the default mode (the umask's).
+- Nothing is appended to a launch log that the group or others can still access (any
+  permission bit of theirs) once remuda has tried to tighten it: a log remuda cannot change
+  the mode of (it belongs to another user), or a log that is a symlink to such a file, whose
+  mode remuda does not change. The mode is read from the open file right before the line
+  would be written. This is a launch log that cannot be written: a warning naming the file
+  and its mode, the launch goes on (R6), and the session is attributed as R9 does without a
+  record. Tightening `state/` itself is best effort and stops no write: a directory's mode
+  does not give away the contents of a file in it, and those files are 0600, or, for the log,
+  not written.
 
 ## R4. Provider contract
 
@@ -531,7 +541,12 @@ The complete set of remuda's write operations:
 - `$REMUDA_HOME/config.toml`, `$REMUDA_HOME/state/**`, `$REMUDA_HOME/shared/**` (R18).
   Where the user put a symlink: a `config.toml`, a `state`, or a file in `state/` that is a
   symlink is written through (R3); where it points, remuda touches only its own files (the
-  registry, the caches, the launch log, the settings files of R18), and changes no mode.
+  registry, the caches, the launch log, the settings files of R18). Modes there (R3): the
+  directory a `state` symlink points at keeps its mode, and so does the file that a
+  `config.toml` or a file in `state/` that is itself a symlink points at; a regular file
+  remuda owns by name in a directory reached through a `state` symlink is still created with
+  mode 0600, and the launch log there tightened to it. A launch log that is a symlink to a
+  file others can access is not appended to (R3).
   Below `shared`, remuda also replaces and removes links and rule copies, so it writes there
   only below real directories: a `shared` or `shared/claude` that is a symlink, or that exists
   and is not a directory, is refused before anything is created, replaced, or removed, and the

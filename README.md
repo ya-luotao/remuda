@@ -213,7 +213,9 @@ $REMUDA_HOME/
 the command line (`remuda run work -p "..."`) is in it. That is why `state/` and its files are
 readable by you alone; a `state/` or a log that an earlier version left readable by others is
 tightened the next time remuda writes there, except through a symlink, whose target keeps its
-mode. Deleting `launches.jsonl` loses the attribution of sessions started through remuda that no
+mode. remuda does not append to a log that others can still access after that (a symlink to
+such a file, or a file whose mode it cannot change): it warns and launches anyway. Deleting
+`launches.jsonl` loses the attribution of sessions started through remuda that no
 `history.jsonl` records.
 
 `config.toml` lists the registered accounts. `remuda add`, `remuda setup` and `remuda remove`
