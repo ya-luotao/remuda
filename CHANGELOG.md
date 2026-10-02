@@ -146,7 +146,8 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   a log, or a cache from before is tightened the next time remuda writes there. A `state` or
   a file in it that is a symlink is written through and its target keeps its mode. A launch
   log that the group or others can still access after that (a symlink to such a file, or a
-  file whose mode remuda cannot change) is not appended to: remuda warns and launches anyway.
+  file whose mode remuda cannot change), or that is not a regular file (a FIFO would hand the
+  line to its reader), is not appended to: remuda warns and launches anyway.
 - A `$REMUDA_HOME/shared` or `shared/claude` that is a symlink is no longer written through
   (SPEC R13, R18). A member's launch used to create the item links and rule copies where the
   link pointed, and remove the `*.md` files under `.claude/rules/` there that the source does

@@ -374,8 +374,10 @@ pub fn prepare_with(
 /// them, so it is the user's alone (R3): its directory is made or tightened by
 /// [`registry::private_dir`], the log is created with mode 0600, and one from before is
 /// tightened to that. A log that is a symlink is written through, and the file it points at
-/// keeps its mode. Nothing is appended to a log the group or others can still access after
-/// that ([`refuse_shared`]): that is an error, like a log that cannot be written.
+/// keeps its mode. Nothing is appended to a log that is not a regular file, or that the group
+/// or others can still access after that ([`refuse_shared`]): that is an error, like a log that
+/// cannot be written. The log is opened without blocking, so a FIFO in its place fails or is
+/// refused instead of holding up the launch.
 ///
 /// The directory is tightened as far as it can be and is not checked again: its mode does
 /// not give away what is in a file of mode 0600.
@@ -390,6 +392,7 @@ pub fn append_log(log: &Path, record: &LaunchRecord) -> Result<()> {
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_NONBLOCK)
         .open(log)?;
     // Tightened only as the regular file at `log` itself, which the open file is checked to be.
     if let (Ok(at), Ok(open)) = (fs::symlink_metadata(log), file.metadata())
@@ -403,13 +406,20 @@ pub fn append_log(log: &Path, record: &LaunchRecord) -> Result<()> {
     Ok(())
 }
 
-/// Fails when the open launch log is a regular file the group or others have any access to:
-/// one that could not be tightened (it belongs to another user), or the target of a symlink,
-/// which keeps its mode (R3). Read from the open file, so it is the file the line would go to.
+/// Fails when the open launch log is not a regular file (a FIFO, a socket or a device would
+/// pass the line to whoever reads it), or is one the group or others have any access to: one
+/// that could not be tightened (it belongs to another user), or the target of a symlink, which
+/// keeps its mode (R3). Read from the open file, so it is the file the line would go to.
 fn refuse_shared(file: &fs::File, log: &Path) -> Result<()> {
     let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        bail!(
+            "{} is not a regular file; nothing was appended",
+            log.display()
+        );
+    }
     let mode = meta.mode() & 0o7777;
-    if meta.file_type().is_file() && mode & 0o077 != 0 {
+    if mode & 0o077 != 0 {
         bail!(
             "{} can be accessed by the group or others (mode {mode:04o}) and was not made \
              private; nothing was appended",
@@ -573,6 +583,11 @@ pub(crate) fn apply_env(cmd: &mut Command, change: &EnvChange) {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CString;
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::Duration;
+
     use super::*;
     use crate::registry::{CLAUDE, CODEX};
 
@@ -1146,7 +1161,50 @@ mod tests {
         fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).unwrap();
         refuse_shared(&open(), &log).unwrap();
         let null = fs::OpenOptions::new().append(true).open("/dev/null");
-        refuse_shared(&null.unwrap(), Path::new("/dev/null")).unwrap();
+        let e = refuse_shared(&null.unwrap(), Path::new("/dev/null")).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "/dev/null is not a regular file; nothing was appended"
+        );
+    }
+
+    /// R3: a FIFO in the log's place gets no line, with a reader (who would get the prompt)
+    /// or without one (whose open would block the launch).
+    #[test]
+    fn a_fifo_in_the_logs_place_gets_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("state").join("launches.jsonl");
+        fs::create_dir(log.parent().unwrap()).unwrap();
+        let path = CString::new(log.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o666) }, 0);
+        let rec = LaunchRecord {
+            ts: "2026-09-24T00:00:00Z".into(),
+            account: "claude:max".into(),
+            home: "/p/max/".into(),
+            cwd: Some("/w".into()),
+            args: args(&["-p", "a secret prompt"]),
+            session_id: None,
+            fork_of: None,
+            injected: false,
+            shared: vec![],
+        };
+
+        // No reader: the open fails at once instead of blocking.
+        let started = std::time::Instant::now();
+        assert!(append_log(&log, &rec).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        // A reader: the open succeeds, the FIFO is refused, the reader gets nothing.
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&log)
+            .unwrap();
+        let e = append_log(&log, &rec).unwrap_err().to_string();
+        assert!(e.contains("is not a regular file"), "{e}");
+        let mut got = Vec::new();
+        let _ = (&reader).read_to_end(&mut got);
+        assert!(got.is_empty(), "{}", String::from_utf8_lossy(&got));
     }
 
     #[test]

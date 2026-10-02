@@ -138,8 +138,11 @@ switching to a different, logged-out account.
 - Nothing is appended to a launch log that the group or others can still access (any
   permission bit of theirs) once remuda has tried to tighten it: a log remuda cannot change
   the mode of (it belongs to another user), or a log that is a symlink to such a file, whose
-  mode remuda does not change. The mode is read from the open file right before the line
-  would be written. This is a launch log that cannot be written: a warning naming the file
+  mode remuda does not change. Nor is anything appended to a launch log that is not a regular
+  file (a FIFO, a socket, or a device would hand the line to whoever reads it); the log is
+  opened without blocking, so a FIFO in its place does not hold up the launch. The type and
+  the mode are read from the open file right before the line would be written. This is a
+  launch log that cannot be written: a warning naming the file
   and its mode, the launch goes on (R6), and the session is attributed as R9 does without a
   record. Tightening `state/` itself is best effort and stops no write: a directory's mode
   does not give away the contents of a file in it, and those files are 0600, or, for the log,
@@ -546,7 +549,7 @@ The complete set of remuda's write operations:
   `config.toml` or a file in `state/` that is itself a symlink points at; a regular file
   remuda owns by name in a directory reached through a `state` symlink is still created with
   mode 0600, and the launch log there tightened to it. A launch log that is a symlink to a
-  file others can access is not appended to (R3).
+  file others can access, or that is not a regular file, is not appended to (R3).
   Below `shared`, remuda also replaces and removes links and rule copies, so it writes there
   only below real directories: a `shared` or `shared/claude` that is a symlink, or that exists
   and is not a directory, is refused before anything is created, replaced, or removed, and the
