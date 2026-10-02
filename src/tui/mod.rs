@@ -457,10 +457,10 @@ fn run_launch(
 }
 
 /// `remuda setup --provider <p> <name>` from the TUI (R5, R16, R17): the same checks and steps
-/// as the command line, with the login (`claude auth login`, `codex login`) in the foreground
-/// while the TUI is suspended. Nothing is created when a check fails or the terminal cannot be
-/// handed over; a failed login keeps the registration. Like a launch, only a failure to take
-/// the terminal back is an error.
+/// as the command line, the links of a member's home included (R18), with the login
+/// (`claude auth login`, `codex login`) in the foreground while the TUI is suspended. Nothing
+/// is created when a check fails or the terminal cannot be handed over; a failed login keeps
+/// the registration. Like a launch, only a failure to take the terminal back is an error.
 pub fn setup_in_foreground(
     screen: &mut impl Screen,
     deps: &Deps,
@@ -468,11 +468,12 @@ pub fn setup_in_foreground(
     name: &str,
     email: Option<String>,
 ) -> Result<Event> {
-    let result = run_setup(screen, deps, provider, name, email)?;
+    let (result, links) = run_setup(screen, deps, provider, name, email)?;
     Ok(Event::SetupDone {
         provider,
         name: name.to_string(),
         result,
+        links,
     })
 }
 
@@ -482,36 +483,51 @@ fn run_setup(
     provider: Provider,
     name: &str,
     email: Option<String>,
-) -> Result<Result<Exit, String>> {
+) -> Result<(Result<Exit, String>, Vec<setup::Note>)> {
     let checked = || -> Result<_, String> {
-        let account =
+        let plan =
             setup::plan(&deps.config, provider, name, &deps.env).map_err(|e| format!("{e:#}"))?;
         let program = deps
             .program(provider)
             .ok_or_else(|| format!("`{}` not found on PATH", provider.program()))?;
         let args = provider.login_args(email)?;
-        let change = launch::env_change(&account);
-        Ok((account, program, args, change))
+        let change = launch::env_change(&plan.account);
+        Ok((plan, program, args, change))
     };
-    let (account, program, args, change) = match checked() {
+    let (plan, program, args, change) = match checked() {
         Ok(checked) => checked,
-        Err(e) => return Ok(Err(e)),
+        Err(e) => return Ok((Err(e), Vec::new())),
     };
     if let Err(e) = screen.suspend() {
         let _ = screen.resume();
-        return Ok(Err(format!("cannot hand the terminal over: {e}")));
+        return Ok((
+            Err(format!("cannot hand the terminal over: {e}")),
+            Vec::new(),
+        ));
     }
     let login = setup::login_command(provider);
-    let status = match setup::create_and_register(&deps.config, &account) {
+    let mut links = Vec::new();
+    let status = match setup::create_and_register(&deps.config, &plan) {
         Err(e) => Err(format!("{e:#}")),
-        Ok(()) => {
+        Ok(linked) => {
+            // The notice after the login: the source and the items, no paths (R21).
+            links = setup::link_notes(&plan, linked.as_ref(), false);
             if deps.private {
-                println!("remuda: registered a new account; running `{login}`");
+                let linked = match linked.map_or(0, |l| l.linked.len()) {
+                    0 => String::new(),
+                    1 => " with 1 shared link".to_string(),
+                    n => format!(" with {n} shared links"),
+                };
+                println!("remuda: registered a new account{linked}; running `{login}`");
             } else {
+                for note in setup::link_notes(&plan, linked.as_ref(), true) {
+                    let warning = if note.warning { "warning: " } else { "" };
+                    println!("remuda: {warning}{}", note.text);
+                }
                 println!(
                     "remuda: registered {} at {}; running `{login}`",
-                    account.qualified(),
-                    account.home
+                    plan.account.qualified(),
+                    plan.account.home
                 );
             }
             launch::run_foreground(program, &args, &change, None)
@@ -522,7 +538,7 @@ fn run_setup(
     screen
         .resume()
         .with_context(|| format!("cannot take the terminal back after `{login}`"))?;
-    Ok(status)
+    Ok((status, links))
 }
 
 fn exit_of(status: ExitStatus) -> Exit {

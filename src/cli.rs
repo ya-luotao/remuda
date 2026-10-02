@@ -73,7 +73,8 @@ enum Command {
         #[arg(long, value_name = "PERIOD", default_value = "all", value_parser = parse_period)]
         period: Period,
     },
-    /// Create a new home under $REMUDA_HOME/homes/<provider>/<name>, register it and log in
+    /// Create a new home under $REMUDA_HOME/homes/<provider>/<name>, register it and log in;
+    /// with [share.claude], a claude home is first linked to the source's
     Setup {
         /// Agent provider: `claude` (logs in with `claude auth login`) or `codex` (`codex login`)
         #[arg(long, default_value = "claude")]
@@ -709,8 +710,9 @@ fn stats(
 }
 
 /// `remuda setup`: every check (including finding the agent and its login arguments) happens
-/// before the directory is created. A failed login keeps the registration; the exit code is
-/// the agent's.
+/// before the directory is created. A claude home of a `[share.claude]` member is linked to
+/// the source's before the login (R18). A failed login keeps the registration; the exit code
+/// is the agent's.
 fn setup(
     config: &Path,
     provider: Provider,
@@ -718,11 +720,16 @@ fn setup(
     email: Option<String>,
     ctx: &Context,
 ) -> Result<ExitCode> {
-    let account = setup::plan(config, provider, name, &ctx.env)?;
+    let plan = setup::plan(config, provider, name, &ctx.env)?;
+    let account = &plan.account;
     let program = program(ctx, provider)?;
     let args = provider.login_args(email).map_err(anyhow::Error::msg)?;
-    let change = launch::env_change(&account);
-    setup::create_and_register(config, &account)?;
+    let change = launch::env_change(account);
+    let linked = setup::create_and_register(config, &plan)?;
+    for note in setup::link_notes(&plan, linked.as_ref(), true) {
+        let warning = if note.warning { "warning: " } else { "" };
+        eprintln!("remuda: {warning}{}", note.text);
+    }
     let login = setup::login_command(provider);
     eprintln!(
         "remuda: registered {} at {}; running `{login}`",

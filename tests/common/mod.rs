@@ -43,6 +43,12 @@ use tempfile::TempDir;
 /// - if `fake-auth-after.json` exists, only the first `auth status` call of that account gets
 ///   `fake-auth.json`; later calls get `fake-auth-after.json` (simulates an identity change).
 ///
+/// `auth login` with `CLAUDE_CONFIG_DIR` set also appends what it finds at that moment to
+/// `$FAKE_CLAUDE_OUT.login` (R18: a new home is linked and registered before the login runs):
+/// `@@login`, `ccd=<CLAUDE_CONFIG_DIR>`, `reg=<1|0>` (whether `../../../config.toml`, the
+/// registry of a home made by `setup`, has `home = "<CLAUDE_CONFIG_DIR>"`), then per entry of
+/// the directory `lnk=<name><TAB><target>` for a symlink and `ent=<name>` for anything else.
+///
 /// Anything else exits `${FAKE_CLAUDE_EXIT:-0}`.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 # Library-level tests run claude with the test process's environment, which has no
@@ -83,6 +89,27 @@ if [ -n "${FAKE_CLAUDE_OUT+x}" ]; then
   } > "$tmp"
   cat "$tmp" >> "$FAKE_CLAUDE_OUT"
   rm -f "$tmp"
+  if [ "$1" = auth ] && [ "$2" = login ] && [ -n "${CLAUDE_CONFIG_DIR+x}" ]; then
+    tmp="$FAKE_CLAUDE_OUT.login.$$.tmp"
+    {
+      printf '@@login\0'
+      printf 'ccd=%s\0' "$CLAUDE_CONFIG_DIR"
+      if grep -F -q "home = \"$CLAUDE_CONFIG_DIR\"" "$CLAUDE_CONFIG_DIR/../../../config.toml" 2>/dev/null; then
+        printf 'reg=1\0'
+      else
+        printf 'reg=0\0'
+      fi
+      for f in "$CLAUDE_CONFIG_DIR"/* "$CLAUDE_CONFIG_DIR"/.[!.]*; do
+        if [ -L "$f" ]; then
+          printf 'lnk=%s\t%s\0' "${f##*/}" "$(readlink "$f")"
+        elif [ -e "$f" ]; then
+          printf 'ent=%s\0' "${f##*/}"
+        fi
+      done
+    } > "$tmp"
+    cat "$tmp" >> "$FAKE_CLAUDE_OUT.login"
+    rm -f "$tmp"
+  fi
 fi
 if [ -n "${CLAUDE_CONFIG_DIR+x}" ]; then
   fixtures="$CLAUDE_CONFIG_DIR/"
@@ -302,6 +329,17 @@ pub struct Invocation {
     /// `CLAUDE_CODE_REMOTE_MEMORY_DIR` (R18); `None` when unset.
     pub memory_dir: Option<String>,
     pub args: Vec<String>,
+}
+
+/// What the fake `claude auth login` found in its home when it ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Login {
+    /// `CLAUDE_CONFIG_DIR`.
+    pub config_dir: String,
+    /// Whether the registry already had the home.
+    pub registered: bool,
+    /// The home's entries in name order: `(name, target)`, the target of a symlink.
+    pub entries: Vec<(String, Option<String>)>,
 }
 
 /// Writes an executable file through a `sh` child, so this process never holds a write
@@ -653,6 +691,47 @@ impl Sandbox {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => panic!("read fake claude record: {e}"),
         }
+    }
+
+    /// Every `auth login` of the fake claude that had a home, in order (empty if none ran).
+    pub fn logins(&self) -> Vec<Login> {
+        let mut path = self.claude_out().into_os_string();
+        path.push(".login");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => panic!("read fake claude logins: {e}"),
+        };
+        let text = std::str::from_utf8(&bytes).expect("login record is UTF-8");
+        let mut fields: Vec<&str> = text.split('\0').collect();
+        assert_eq!(fields.pop(), Some(""), "record must end with NUL");
+        let mut out: Vec<Login> = Vec::new();
+        let mut iter = fields.into_iter();
+        while let Some(field) = iter.next() {
+            if field == "@@login" {
+                let config_dir = iter.next().and_then(|f| f.strip_prefix("ccd="));
+                let registered = iter.next().and_then(|f| f.strip_prefix("reg="));
+                out.push(Login {
+                    config_dir: config_dir.expect("ccd field").to_string(),
+                    registered: registered.expect("reg field") == "1",
+                    entries: Vec::new(),
+                });
+                continue;
+            }
+            let entry = match (field.strip_prefix("lnk="), field.strip_prefix("ent=")) {
+                (Some(link), _) => {
+                    let (name, target) = link.split_once('\t').expect("name<TAB>target");
+                    (name.to_string(), Some(target.to_string()))
+                }
+                (None, Some(name)) => (name.to_string(), None),
+                (None, None) => panic!("unexpected login field {field:?}"),
+            };
+            out.last_mut().expect("@@login first").entries.push(entry);
+        }
+        for login in &mut out {
+            login.entries.sort();
+        }
+        out
     }
 
     /// The single invocation of the fake claude; panics if there were zero or several.

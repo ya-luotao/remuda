@@ -105,7 +105,8 @@ switching to a different, logged-out account.
   default_effort = "high"
   ```
 - Homes created by `setup` live at `$REMUDA_HOME/homes/<provider>/<name>`; homes registered with
-  `add` stay where they are.
+  `add` stay where they are. `homes` and `homes/<provider>` are real directories: `setup`
+  creates them as needed and refuses one that is a symlink or not a directory (R13).
 - Writes are atomic (temporary file + rename) and preserve the user's comments and unknown keys
   (the comments of an account that `remove` deletes go with it, R14a). If `config.toml` is a
   symlink, writes go through the symlink.
@@ -180,8 +181,10 @@ remuda sessions [--limit N]                        recent sessions: time, accoun
 remuda stats [<account>] [--period P]              tokens and estimated cost per account and
                                                    model (R20)
 remuda add [--provider P] <name> <path>            register an existing home directory (R14, R17)
-remuda setup [--provider P] <name> [--email E]     create a new home and run the agent's login
-                                                   (`claude auth login`, `codex login`; R17)
+remuda setup [--provider P] <name> [--email E]     create a new home, link it to the source of
+                                                   shared configuration if there is one (R18),
+                                                   and run the agent's login (`claude auth login`,
+                                                   `codex login`; R17)
 remuda remove <account>                            unregister an account; its home is left in
                                                    place (R14a)
 remuda pick [--provider P] [--live] [--timeout S]  recommend the account, model and effort to
@@ -455,27 +458,73 @@ appeared in no `history.jsonl`.
   subagents is not shared); rules of the source whose frontmatter has `paths`, when some member gets
   the rules at launch (they are not applied there); an enabled plugin whose install path does not
   exist; an `installed_plugins.json` whose format is not recognized; authentication keys in the
-  source's settings that are withheld from members.
+  source's settings that are withheld from the settings injected at launch (said of the
+  accounts that get their settings that way when some member links `settings.json` instead,
+  and not said when every member does).
+- The links of a member's home (R18), for members only (an account with `share = false` and the
+  source are not checked):
+  - `.claude.json`, `history.jsonl`, or `sessions` is a symlink that resolves to the same item
+    of another registered account, the source included: warning, with what breaks. This is
+    checked for every member whose home exists, also when the source's home is missing (the
+    checks below need the source's home). A shared
+    `.claude.json` mixes up the two logins (claude does not fetch the account's profile again
+    within 24 hours); a shared `history.jsonl` takes the attribution from the sessions of a
+    shared store (R9); a shared `sessions` makes running sessions impossible to tell apart by
+    account (R7).
+  - The home shares `projects` with the source but not `file-history`, when the source has one:
+    after resuming another account's session, `/rewind` does not find its file backups. The
+    message says how to link it.
+  - The home does not share `projects` with the source, when the source has one: the account
+    does not see the sessions of the source's store and cannot resume them (R16). This is a
+    notice that the account is not sharing sessions, not an error: the injected memory
+    locations (R18) still apply. The message says to link `projects`.
+  - The source's `installed_plugins.json` records an `installPath` under `<home>/plugins/` (the
+    home's path as registered) while the home's `plugins` resolves to the source's: that link
+    cannot be removed without breaking those plugins for every account. The message gives
+    their number. Nothing is reported when the file is not recognized (reported above).
+  - The home's `settings.json` resolves to the source's, and the source's settings have keys
+    that R18 never injects (authentication): warning that this account reads them through the
+    link, naming the keys, never their values (each session launch says it too, R18). The
+    message says to remove the link, so that the rest is injected, or to move those settings
+    out of the source's `settings.json`.
+  The messages about items shared in part (`CLAUDE.md` and the other instruction items,
+  `agent-memory`) suggest linking the rest.
 
 ## R12. Symlinks in homes
 
 - remuda detects symlinks in a home that point elsewhere and displays them as `-> <target>`.
-- remuda does not create, delete, or modify any symlink in a home (the item links remuda keeps under
-  `$REMUDA_HOME/shared/`, R18, are its own). Any future write operation that encounters a symlink
-  must either write through it or refuse; it must never replace the symlink with a private copy.
-- Configuration is shared without symlinks, by injection at launch (R18). Existing symlink layouts
-  keep working and are detected so that nothing is injected twice.
+- remuda does not create, delete, or modify any symlink in a home, with one exception: the links
+  `setup` makes in the home it has just created, before the first login (R18). (The item links
+  remuda keeps under `$REMUDA_HOME/shared/`, R18, are its own.) Any future write operation that
+  encounters a symlink must either write through it or refuse; it must never replace the symlink
+  with a private copy.
+- Accounts share one session store and their configuration through symlinks in their homes:
+  `setup` makes them in a home it creates, and the user makes them in any other home (R18). What
+  a member's home does not link is injected at launch instead, as a fallback (R18); what it
+  links is detected so that nothing is injected twice.
 
 ## R13. Write boundary
 
 The complete set of remuda's write operations:
 
 - `$REMUDA_HOME/config.toml`, `$REMUDA_HOME/state/**`, `$REMUDA_HOME/shared/**` (R18)
-- `$REMUDA_HOME/homes/<provider>/<name>/` created by `setup` (an empty directory; login is performed
-  by `claude auth login` itself, optionally with `--email` prefilled)
+- `$REMUDA_HOME/homes/<provider>/<name>/` created by `setup`: the directory itself and, for a
+  claude account that is a member of `[share.claude]`, the symlinks of R18 in it, made once,
+  while the directory is still empty, before the account is registered and logged in (login is
+  performed by `claude auth login` itself, optionally with `--email` prefilled). `setup` never
+  writes through a symlink below `$REMUDA_HOME`: `$REMUDA_HOME` is opened as given (the path
+  is the user's, a symlink or not), and `homes`, `homes/<provider>`, and the new home are each
+  opened relative to the directory above, without following a symlink. A `homes` or
+  `homes/<provider>` that exists and is a symlink or not a directory is an error, found before
+  anything is created and again when it is opened: `setup` then creates nothing, registers
+  nothing, and runs no login. A missing level is created. The new home's mode is set, and its
+  links are made, through the descriptor of the directory `setup` created, not through its
+  path.
 
 remuda never writes credentials, `.claude.json`, the Keychain, transcripts, `history.jsonl`, or
-`*.key` files, never writes into any home directory, and never
+`*.key` files, and never writes into any home directory: not into a home registered with `add`,
+not into the native login's, and not into a home `setup` created, apart from those links at
+that one moment. It never
 makes network requests of its own (live usage is queried by the agent itself; see R10), except the
 one request of `remuda pick` to TypeSafe, made only with `TYPESAFE_API_KEY` set and `[pick]
 notes` written (R23). Network use
@@ -554,7 +603,9 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
     ID: the same ID may appear in two stores.
   - Refused when the selected account's `projects` store (realpath) differs from the store holding
     the transcript: that account cannot find the session, and remuda does not copy sessions
-    between stores (R19).
+    between stores (R13; a relay that did was removed, R19). Accounts that link `projects` to
+    one store can each resume its sessions (R18); the message says to link the account's
+    `projects`.
   - The cwd is `cwd_last` (R6); an error is reported if the directory does not exist.
   - `f`: fork (`--resume <id> --fork-session`, injecting a new ID per R6). A fork only reads the
     original session and writes under a new ID, so it is allowed even for a running session.
@@ -592,7 +643,8 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
 ## R17. Codex
 
 - Accounts: `remuda add --provider codex <name> <path>`, `remuda setup --provider codex <name>` (the
-  new home is at `$REMUDA_HOME/homes/codex/<name>`, and login uses `codex login`). The implicit
+  new home is at `$REMUDA_HOME/homes/codex/<name>`, it is created empty (the links of R18 are
+  claude's), and login uses `codex login`). The implicit
   `codex:default` is listed only when `~/.codex` exists or `codex` is on PATH.
 - `run codex:<name> [args]`: sets or removes `CODEX_HOME` (same rules as R6), execs `codex`, passes
   arguments through unchanged, and **injects no** session ID (codex has no such option). The launch
@@ -640,9 +692,16 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
 
 ## R18. Shared configuration
 
-Sessions stay with the account that created them; only configuration is shared. remuda shares it
-by injecting launch options, so nothing is written into any home (R13), and homes created by
-`setup` get the shared configuration without any setup of their own.
+Accounts share one session store and their configuration through symlinks in the member's home,
+each pointing at that item of the source's home: `setup` makes them in a home it creates (R5,
+below), and the user makes them in any other home. The login stays per account: the
+credentials, `.claude.json`, `history.jsonl`, and `sessions` are never linked. A linked
+`settings.json` is the source's file, shared whole, authentication settings in it included
+(**Never injected: authentication**, below). Injection at
+launch fills in what a member's home does not link, and is skipped for each component the home
+already shares; it writes nothing into any home (R13). It is the fallback for a home without
+the links, and it cannot share sessions: an account whose `projects` is not the source's does
+not see the sessions in the source's store (R11, R16).
 
 - **Source.** `[share.claude] from = "<account>"` in `config.toml` names the account whose home is
   the source of shared configuration (typically `default`, whose home is `~/.claude`). Without this
@@ -650,7 +709,75 @@ by injecting launch options, so nothing is written into any home (R13), and home
 - **Members.** Every other claude account, unless it sets `share = false`. The source account itself
   gets no injection. Codex accounts are not affected; `share` on a codex account is a load error
   (R3).
-- **When.** Only for session invocations (R6), from `run` and from the TUI alike.
+- **Links made by `setup`.** For a new claude account that will be a member (`[share.claude]`
+  is set: a new account has no `share = false` and cannot be the source), `setup` makes
+  symlinks in the home it has just created, after creating the directory and before registering
+  the account and running the login:
+  - One link for each item of this list that the source's home has, in this order: `projects`,
+    `file-history`, `settings.json`, `CLAUDE.md`, `skills`, `commands`, `agents`, `hooks`,
+    `plugins`, `rules`, `agent-memory`, `output-styles`, `keybindings.json`. An item the source
+    does not have (missing, or a dangling link) gets no link and is listed on stderr; R11
+    reports the ones that matter once the source has them.
+  - `settings.json` is linked only when it sets no authentication at that moment. A home
+    that links it reads all of it, so `setup` reads the source's `settings.json` first, and
+    when it has any key that injection withholds (**Never injected: authentication**, below:
+    the same rules), or cannot be read as a JSON object, it is not linked. `setup` says so,
+    naming the keys, never their values. The other items are linked as usual, and the account
+    gets the source's settings by injection, without the authentication. This is a default
+    for the new home, checked once, and not a boundary: a linked `settings.json` stays the
+    source's file, so authentication settings added to it later are read by every home that
+    links it. remuda says so then (below) but does not prevent it.
+  - A home that shares `projects` and has no `settings.json` of its own (the source's was not
+    linked, or the source had none) has no `cleanupPeriodDays` where R11 looks for one:
+    `setup` says so.
+  - Never linked, whatever the source has: `.claude.json` (the login's identity and the
+    account's caches), `history.jsonl` (attribution, R9), `sessions` (running sessions, R7),
+    `remote-settings.json` and `policy-limits.json` (what an organization sets for its
+    accounts), and everything else that is not in the list.
+  - A link is `<home>/<item>` and points at `<source home>/<item>`: an absolute path, written
+    from the source home's path as registered (`$HOME/.claude` for `default`), not
+    canonicalized, as for the item links under `$REMUDA_HOME/shared/` below.
+  - Only in the directory this `setup` created (R13): the home is made with `mkdirat` below
+    `homes/<provider>`, which fails where the name exists, and opened without following a
+    symlink; the links are made with `symlinkat` through that descriptor, and before the first
+    one remuda reads the directory through the same descriptor and requires it to be empty.
+    Otherwise nothing is linked, the account is not registered, no login runs, and the
+    directory is left as it is (R2). `symlinkat` fails where a name exists: nothing is ever
+    replaced or removed.
+  - A link that cannot be made is reported on stderr. The links already made stay, the
+    remaining ones are still made, and the account is registered and logged in as usual:
+    nothing is rolled back.
+  - Once: remuda never adds, changes, or removes a link in that home afterwards, and never
+    makes one in a home registered with `add` or in the native login's. What such a home does
+    not link is reported (R11) and injected at launch (below).
+  - When the source's home is not a directory, nothing is linked and `setup` says so. Without
+    `[share.claude]`, and for codex, the home is created empty.
+  - `setup` reports what it linked on stderr; from the TUI, the notice after the login gives
+    the number of links and the item names, without paths (R21); the line printed before the
+    login in private mode gives the number only.
+  - Residual: none by path below `$REMUDA_HOME`. A symlink at `homes` or `homes/<provider>` is
+    refused, and the links go into the directory remuda created even if a process of the same
+    user moves or replaces it meanwhile: a directory swapped in at the home's path gets
+    nothing. What remains is `$REMUDA_HOME` itself, opened as the path the user gave; a
+    directory another process puts at the home's name in the instant between its creation and
+    its opening, which is linked only if it is empty; and the source's items, whose existence
+    and settings are read by path a moment before each link is made.
+
+  Basis (read from the 2.1.286 bundle, not verified by experiment unless stated): every path of
+  a home derives from `CLAUDE_CONFIG_DIR`; no variable moves `projects` or `history.jsonl`
+  alone, so a session store can be shared only through a symlink.
+  `CLAUDE_SECURESTORAGE_CONFIG_DIR` (R2) moves the credentials only, not `.claude.json`, whose
+  `oauthAccount` claude does not fetch again within 24 hours: two accounts on one
+  `.claude.json` would send one account's organization with the other's token. claude writes
+  the user's `settings.json` and `.claude.json` through a symlink, without replacing it.
+  `file-history` holds the file backups of `/rewind` by session ID, read from the home of the
+  account that resumes. The layout with `projects`, `settings.json`, `CLAUDE.md`, `skills`,
+  `commands`, `agents`, `hooks`, and `plugins` linked is the one observed in daily use
+  (2.1.286); the other five links are not. A plugin installed from a member's home is recorded
+  in the shared `installed_plugins.json` with an `installPath` through that home's `plugins`
+  link (observed), which then cannot be removed (R11).
+- **When.** Injection happens only for session invocations (R6), from `run` and from the TUI
+  alike.
 - **What is injected**, component by component. A component is skipped for a home that already
   shares it with the source, detected by comparing realpaths (existing symlink layouts, R12):
 
@@ -778,8 +905,24 @@ by injecting launch options, so nothing is written into any home (R13), and home
   files are treated as absent. If the user's arguments contain `--setting-sources`, remuda injects
   no settings and no auto-memory and says so on stderr, as for `--settings`.
 - **Never injected: authentication.** Settings that choose credentials, provider, endpoint, or
-  organization are removed from the injected settings, whatever the home defines, so a member never
-  authenticates or bills as the source, and no secret of the source reaches a member's tools:
+  organization are removed from the injected settings, whatever the home defines: remuda never
+  injects them, so a member that gets its settings at launch does not authenticate or bill as
+  the source through them, and none of them reaches that member's tools. This is a property of
+  injection only. A member whose `settings.json` is a symlink to the source's reads the file
+  whole, these settings included, as its own user settings. `setup` does not make that link
+  when the source's settings have any of these at that moment (above). When the source's
+  settings have them and a member's `settings.json` resolves to the source's, remuda says so
+  and does not prevent it: R11 warns in the accounts view, and each session launch of that
+  member (R6, from `run` and from the TUI alike) gives a warning on stderr, or among the TUI
+  launch's warnings, naming the settings and never their values: `warning: <account> reads
+  the authentication settings of <source> through its settings.json link: <keys>`. For this
+  the source's `settings.json` is read even when the home shares every component; a file that
+  cannot be read is not reported there (R11 reports it) and does not fail the launch.
+  The credentials of a login are not settings: they are in the Keychain, or in the home's
+  `.credentials.json`, which is never linked. Settings that should apply to one account only,
+  authentication among them, belong outside the source's `settings.json`: in a home that does
+  not link it (an account that gets its settings by injection, or one with `share = false`).
+  The settings concerned:
   - the keys `apiKeyHelper`, `proxyAuthHelper`, `otelHeadersHelper`, `awsAuthRefresh`,
     `awsCredentialExport`, `gcpAuthRefresh`, `forceLoginMethod`, `forceLoginOrgUUID`;
   - in `env`, names are matched case-insensitively and withheld if any rule matches:
@@ -1147,8 +1290,9 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
 - **Origins.** Each item is tagged *own* (in the account's home), *shared from <source>*
   (injected at launch, R18), *already the source's* (the home's item, or a plugin's install,
   resolves by realpath to the source's, so nothing is injected for it, R12), or *not shared*
-  with the reason (authentication, turned off by the home or the project, installed by the home
-  itself, no user install, an unrecognized `installed_plugins.json`). An account that is the
+  with the reason (authentication where settings are injected, turned off by the home or the
+  project, installed by the home itself, no user install, an unrecognized
+  `installed_plugins.json`). An account that is the
   source, has `share = false`, or whose source home is missing says so once instead of listing
   the source's items. A symlink shows as `-> <target>`; one whose target does not exist, as
   broken.
@@ -1181,8 +1325,10 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
 - **Settings.** The home's `settings.json` and the injected part of the source's, each
   summarized as: model; permission rule counts (allow, ask, deny); hook events with the number of
   hooks of each; `env` names; whether a status line is set; the names of other keys. The
-  source's settings withheld as authentication (R18) are listed by name: for a member as not
-  shared, for the source as withheld from members.
+  source's authentication settings (R18) are listed by name: for a member that gets settings
+  at launch as not shared; for a member whose `settings.json` resolves to the source's as
+  read through the link, since nothing is withheld there (R11 warns); for the source as
+  withheld from injected settings.
 - **Auto-memory.** The directory a session there uses, `autoMemoryDirectory` as injected, else
   as set by the project's settings, else by the home's, else `<home>/projects/<project>/memory`
   (R18's project name), and how many `*.md` files it holds. And the directory for the memory of

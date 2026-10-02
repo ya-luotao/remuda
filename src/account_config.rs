@@ -43,7 +43,9 @@ pub struct ConfigView {
     pub own_settings: Summary,
     /// The injected part of the source's settings, without `autoMemoryDirectory`.
     pub shared_settings: Summary,
-    /// Authentication settings of the source (`key` / `env.NAME`), never shared (R18).
+    /// Authentication settings of the source (`key` / `env.NAME`): never injected (R18). A
+    /// member whose `settings.json` is the source's (`settings_origin`) reads them through
+    /// that link instead, and they are shown as such.
     pub withheld: Vec<String>,
     pub memory: Memory,
     /// Where the memory of user-scope subagents goes; `files` counts the agents that have one.
@@ -328,7 +330,8 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
     injected.remove(MEMORY_KEY);
     view.shared_settings = Summary::of(&injected);
 
-    // Withheld authentication.
+    // The source's authentication: withheld from what is injected, read by a home that links
+    // the file.
     view.withheld = match &view.role {
         Role::Member { .. } => sharing
             .source
@@ -1848,6 +1851,33 @@ mod tests {
         assert_eq!(view.plugins.len(), 1, "{:?}", view.plugins);
         assert_eq!(view.plugins[0].origin, Origin::AlreadySource);
         assert_eq!(view.plugins[0].path.as_ref(), Some(&through));
+    }
+
+    /// R18, R22: a member whose `settings.json` is a symlink to the source's gets no settings
+    /// injected and reads the file whole: the source's authentication settings are listed
+    /// for it, with the origin that says they are not withheld there.
+    #[test]
+    fn a_member_that_links_settings_reads_the_sources_authentication() {
+        let f = fx();
+        let (src, max) = (f.root.join("src"), f.root.join("max"));
+        write(
+            &src.join("settings.json"),
+            &json!({"model": "opus", "apiKeyHelper": "/bin/key",
+                    "env": {"ANTHROPIC_API_KEY": "zqsecret"}})
+            .to_string(),
+        );
+        fs::create_dir_all(&max).unwrap();
+        symlink(src.join("settings.json"), max.join("settings.json")).unwrap();
+        let source = named("src", &src);
+        let view = read(&named("max", &max), &sharing(&source), None, &f.env);
+        assert_eq!(view.settings_origin, Origin::AlreadySource);
+        assert!(
+            view.shared_settings.is_empty(),
+            "{:?}",
+            view.shared_settings
+        );
+        assert_eq!(view.withheld, ["apiKeyHelper", "env.ANTHROPIC_API_KEY"]);
+        assert_eq!(view.own_settings.model.as_deref(), Some("opus"));
     }
 
     /// R18, R22: the source (its authentication listed as withheld), an opted-out account and

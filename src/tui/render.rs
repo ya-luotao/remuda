@@ -1142,11 +1142,15 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
         summary_lines(&v.shared_settings, out);
     }
     if !v.withheld.is_empty() {
-        let prefix = match v.role {
-            ConfigRole::Source => "  withheld from members (authentication): ",
-            _ => "  not shared (authentication): ",
+        let (prefix, style) = match v.role {
+            ConfigRole::Source => ("  withheld from injected settings (authentication): ", DIM),
+            // The home's `settings.json` is the source's: it reads all of it (R11 warns).
+            _ if v.settings_origin == Origin::AlreadySource => {
+                ("  read through the link (authentication): ", WARN)
+            }
+            _ => ("  not shared (authentication): ", DIM),
         };
-        out.wrapped(prefix, &v.withheld.join(", "), DIM);
+        out.wrapped(prefix, &v.withheld.join(", "), style);
     }
 
     // Auto-memory.

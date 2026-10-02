@@ -25,13 +25,41 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   `remuda add` and `remuda setup` refuse an account that would leave `config.toml` invalid, such
   as one that makes a bare name in `[pick]` ambiguous; write accounts there as `provider:name`.
 
-- Shared configuration (SPEC R18): with `[share.claude] from = "<account>"`, every other Claude
+- A shared session store and configuration (SPEC R18): with `[share.claude] from =
+  "<account>"`, `remuda setup` links a new Claude account's home to the source's before the
+  login: `projects` and `file-history`, `settings.json`, `CLAUDE.md`, `skills`, `commands`,
+  `agents`, `hooks`, `plugins`, `rules`, `agent-memory`, `output-styles` and `keybindings.json`,
+  one symlink for each the source has. Any linked account can then resume any session, and the
+  configuration cannot diverge. The login stays per account: `.claude.json`, `history.jsonl`,
+  `sessions`, `remote-settings.json` and `policy-limits.json` are never linked. The links are
+  made once, in the directory `setup` has just created and while it is empty; nothing is
+  replaced or removed, a link that fails is reported without stopping the setup, and a home
+  registered with `remuda add` is never touched. `s` in the TUI does the same. A source
+  `settings.json` that sets authentication or provider settings (`apiKeyHelper`,
+  `env.ANTHROPIC_API_KEY`, `forceLoginOrgUUID`, …), or that cannot be read, when the account is
+  set up is not linked: that account gets the settings injected at launch, without them. A
+  linked `settings.json` is shared whole, so such settings added to it later are read by every
+  account that links it; remuda warns about it but does not prevent it. `setup` creates the
+  home without following a symlink below `$REMUDA_HOME`, and refuses a `homes` or
+  `homes/<provider>` that is one.
+- Checks for the links of a member's home in the Accounts view (SPEC R11): `.claude.json`,
+  `history.jsonl` or `sessions` that is a symlink to another account's; a home that does not
+  share `projects` with the source (it does not see or resume the sessions there); a home that
+  shares `projects` but not `file-history`; a `plugins` link that installed plugins are
+  recorded through and that must therefore stay; a `settings.json` linked to the source's
+  while the source's sets authentication settings, which that account then reads. The
+  messages say which link to make or remove.
+- A warning at every session launch of an account whose `settings.json` is linked to the
+  source's while the source's sets authentication settings (SPEC R18), from `remuda run` and
+  the TUI alike, naming the settings and never their values.
+- Shared configuration by injection (SPEC R18), the fallback for a home that does not link an
+  item: with `[share.claude] from = "<account>"`, every other Claude
   account launches with the source account's instructions (`CLAUDE.md`, skills, commands,
   agents, rules), settings, enabled plugins, and memory locations (auto-memory and the memory of
-  user-scope subagents), injected as launch options. Sessions stay with the account that created
-  them. Nothing is written into any home; an account's own settings keep precedence; existing
-  symlink layouts are detected so nothing loads twice. Opt an account out with `share = false`.
-  Authentication and provider settings are never shared, and shared settings travel to claude as
+  user-scope subagents), injected as launch options. Sessions cannot be injected. Injection
+  writes nothing into any home; an account's own settings keep precedence; what a home links
+  is detected so nothing loads twice. Opt an account out with `share = false`.
+  Authentication and provider settings are never injected, and shared settings travel to claude as
   a private (0600) file rather than on the command line. Rules are shared as read-only copies
   under `$REMUDA_HOME/shared`, refreshed at each launch; a rule limited to files by `paths` is
   not applied that way, and the Accounts view names such rules. The memory of user-scope
@@ -75,6 +103,15 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Changed
 
+- Direction: accounts share one session store and their configuration through symlinks, and
+  only the login state stays per account (ROADMAP, 2026-10-03). Launch-time injection, until
+  now the way configuration was shared, is the fallback for a home without the links and is
+  not extended. **Write boundary:** `remuda setup` used to create an empty home; with
+  `[share.claude]` set it now also makes the links above in that new, empty directory, the one
+  case in which remuda writes inside a home (SPEC R12, R13). Without `[share.claude]`, and for
+  Codex, the home is created empty as before.
+- When an account cannot find a session to resume, the message says which `projects` to link
+  (SPEC R16).
 - Shared instructions (SPEC R18) are exposed through per-item links:
   `$REMUDA_HOME/shared/claude/.claude` is now a directory holding one symlink each to the source
   home's `CLAUDE.md`, `skills`, `commands` and `agents` (for the items the source has), instead

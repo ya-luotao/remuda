@@ -1,8 +1,12 @@
 //! Shared configuration, injected at launch (SPEC R18): a claude account gets the source
 //! account's instructions, settings, enabled plugins and memory locations as launch
-//! options. Nothing is written into any home (R13); remuda keeps only the item links and the
-//! copies of the source's rules under `$REMUDA_HOME/shared/claude/.claude/` and the injected
-//! settings in `$REMUDA_HOME/state/settings/`.
+//! options. This is the fallback: accounts share one session store and their configuration
+//! through symlinks in the member's home (made by `setup`, [`crate::setup`], or by the user),
+//! and each component a home links that way is skipped here; only what it does not link is
+//! injected, and sessions cannot be. Nothing is written into any home (R13); remuda keeps
+//! only the item links and the copies of the source's rules under
+//! `$REMUDA_HOME/shared/claude/.claude/` and the injected settings in
+//! `$REMUDA_HOME/state/settings/`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -218,6 +222,20 @@ pub fn plan(
     plan.memory_shared = memory_shared;
     plan.plugins_shared = plugins_shared;
     plan.agent_memory_shared = resolves_to(&home.join(AGENT_MEMORY), &from.join(AGENT_MEMORY));
+    // A home that links the source's `settings.json` reads all of it: authentication is
+    // withheld only from injected settings, so its sessions are told (R11 says it too). A file
+    // that cannot be read says nothing here: R11 reports it.
+    if settings_shared && let Ok(settings) = read_settings(&from.join("settings.json")) {
+        let keys = withheld(&settings);
+        if !keys.is_empty() {
+            plan.notices.push(format!(
+                "warning: {} reads the authentication settings of {name} through its \
+                 settings.json link: {}",
+                account.qualified(),
+                keys.join(", ")
+            ));
+        }
+    }
     let plugins_part = !plugins_shared;
     if let Some(option) = user_settings
         && !(settings_shared && memory_shared)
@@ -228,8 +246,8 @@ pub fn plan(
     }
     let settings_part = !settings_shared && user_settings.is_none();
     let memory_part = !memory_shared && user_settings.is_none();
-    // Before any settings file is read: a launch that shares everything by symlink does not
-    // fail on a malformed one.
+    // Before any settings file is read for injection: a launch that shares everything by
+    // symlink does not fail on a malformed one (the read above ignores it).
     if !(settings_part || memory_part || plugins_part) {
         return Ok(plan);
     }
@@ -2993,6 +3011,58 @@ mod tests {
             name: name.into(),
             home: Home::Path(home.display().to_string()),
         }
+    }
+
+    /// R11, R18: a member whose `settings.json` is the source's reads all of it, so a session
+    /// of it is told which authentication settings it reads that way, by name; never their
+    /// values, and nothing when there are none or the file cannot be read.
+    #[test]
+    fn a_linked_settings_file_with_authentication_is_named_at_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (source_home, max, team) = (root.join("src"), root.join("max"), root.join("team"));
+        for d in [&source_home, &max, &team] {
+            fs::create_dir_all(d.join("projects")).unwrap();
+        }
+        fs::create_dir_all(source_home.join("plugins")).unwrap();
+        let settings = source_home.join("settings.json");
+        fs::write(&settings, r#"{"model": "opus"}"#).unwrap();
+        // `max` links everything the source has: nothing is injected, and before this no file
+        // was read.
+        fs::remove_dir(max.join("projects")).unwrap();
+        for item in ["settings.json", "projects", "plugins"] {
+            symlink(source_home.join(item), max.join(item)).unwrap();
+        }
+        let sharing = Sharing {
+            source: Some(named("src", &source_home)),
+            opted_out: vec![],
+        };
+        let env = Env::new();
+        let notices = |home: &Path, name: &str| {
+            plan(&sharing, &named(name, home), &[], None, &env)
+                .unwrap()
+                .notices
+        };
+        assert_eq!(notices(&max, "max"), Vec::<String>::new());
+
+        fs::write(
+            &settings,
+            r#"{"model": "opus", "apiKeyHelper": "/k",
+                "env": {"ANTHROPIC_API_KEY": "sk-zz", "EDITOR": "vi"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            notices(&max, "max"),
+            [
+                "warning: claude:max reads the authentication settings of claude:src through its \
+              settings.json link: apiKeyHelper, env.ANTHROPIC_API_KEY"
+            ]
+        );
+        // `team` gets its settings injected, without them: nothing to say.
+        assert_eq!(notices(&team, "team"), Vec::<String>::new());
+        // A file that cannot be read is R11's to report, and a fully linked home still starts.
+        fs::write(&settings, "[]").unwrap();
+        assert_eq!(notices(&max, "max"), Vec::<String>::new());
     }
 
     /// R18: members get the injection, in `--option=value` form; the source, an opted-out

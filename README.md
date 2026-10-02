@@ -20,8 +20,9 @@ notes for it.
 ## How it works
 
 An account is a name for an agent home directory: the directory where that login keeps its
-credentials, sessions and settings. Remuda keeps the names in one registry, reads what each home
-holds, and launches the agent with the home selected.
+credentials, sessions and settings (Claude accounts can share the last two through symlinks to
+one home). Remuda keeps the names in one registry, reads what each home holds, and launches the
+agent with the home selected.
 
 ```text
      remuda run work         remuda  (TUI)          remuda usage · sessions · stats
@@ -36,7 +37,7 @@ holds, and launches the agent with the home selected.
   CLAUDE_CONFIG_DIR unset     CLAUDE_CONFIG_DIR=           CODEX_HOME=
   (~/.claude, native login)   ~/.claude-work               ~/.codex-research
        │                           │                            │
-       └──── each home keeps its own login, sessions and usage limits ────┘
+       └───────── each home keeps its own login and usage limits ─────────┘
              remuda reads them and launches the agent in them;
              it never moves, rewrites or logs in to them itself
 ```
@@ -50,10 +51,11 @@ holds, and launches the agent with the home selected.
 - **All sessions in one place.** Search the history of every account, preview messages, and
   resume or fork a session under an account that holds it. Running Claude sessions are listed
   too, with attach, logs and stop for background ones.
-- **One configuration and one memory for all accounts.** Your `CLAUDE.md`, rules, skills,
-  commands, agents, settings and plugins from one account are passed to every other Claude
-  account at launch, and they all keep auto-memory and subagent memory in that account's home.
-  Sessions stay with the account that created them, and nothing is written into any home.
+- **One session store, one configuration and one memory for all accounts.** A new Claude
+  account's home is linked to one account's sessions, `CLAUDE.md`, rules, skills, commands,
+  agents, settings and plugins, so any account can resume any session and nothing diverges;
+  only the login stays per account. A home that is not linked gets the configuration and the
+  memory locations passed at launch instead.
 - **Checks for silent breakage.** Warnings for an `ANTHROPIC_API_KEY` that overrides every
   login, dangling symlinks, missing or logged-out homes, and similar multi-account pitfalls.
 - **Token statistics and cost.** Input, cache, output and reasoning tokens per account and model,
@@ -80,7 +82,7 @@ What each provider supports:
 | Token statistics and estimated cost | ✓ | ✓ |
 | Recommendation of account, model and effort (`pick`) | ✓ | ✓ |
 | Live sessions (attach, logs, stop) | ✓ | – |
-| Shared configuration and memory; the configuration pane | ✓ | – |
+| Shared session store, configuration and memory; the configuration pane | ✓ | – |
 
 ¹ Codex has no list of running sessions, so resuming a Codex session in place asks for
 confirmation first. ² The login method only; the email and plan appear after a live usage query.
@@ -127,7 +129,7 @@ the bare name means `claude:default`, and the Codex one is `codex:default`.
 | `remuda sessions [--limit <N>]` | Print the newest sessions: time, attributed accounts, title and working directory (default 30). |
 | `remuda stats [<account>] [--period today\|7d\|30d\|all]` | Print tokens per account and model for a period (default `all`); with an account, only the sections that include it. The first run reads every transcript whole, which can take tens of seconds on a large history; later runs read only what changed. Shows each model's estimated cost (≈ API list price, prices built in as of 2026-09-24; an estimate, not a bill). |
 | `remuda add [--provider <claude\|codex>] <name> <path>` | Register an existing home directory as an account. The provider defaults to `claude`. |
-| `remuda setup [--provider <claude\|codex>] <name> [--email <EMAIL>]` | Create a new home under `$REMUDA_HOME/homes/<provider>/<name>`, register it, and run the agent's login (`claude auth login` or `codex login`). `--email` prefills the Claude login. |
+| `remuda setup [--provider <claude\|codex>] <name> [--email <EMAIL>]` | Create a new home under `$REMUDA_HOME/homes/<provider>/<name>`, register it, and run the agent's login (`claude auth login` or `codex login`). With `[share.claude]`, a new Claude home is first linked to the source's session store and configuration. `--email` prefills the Claude login. |
 | `remuda remove <account>` | Unregister an account. Its home and everything in it are left in place, and its path is printed so `remuda add` can register it again. `default` and the source of `[share.claude]` cannot be removed. |
 | `remuda pick [--provider <P>] [--live] [--timeout <SECONDS>] [--offline] [--json\|--print-request] [--run [-- <args>...]]` | Recommend the account, model and effort to launch now. Rules keep only what has at least `min_headroom` percent left on every window that applies (default 10) and rank it; with `TYPESAFE_API_KEY` set and `[pick] notes`, Jev chooses among those options. `--print-request` shows what would be sent, `--offline` never sends, `--run` launches the choice as `remuda run` does. `--timeout` applies to each `--live` query (default 90). Exits 1 when nothing is feasible. See [Recommendations](docs/GUIDE.md#recommendations). |
 | `remuda help [<command>]` | Show help for remuda or a command. |
@@ -250,14 +252,28 @@ Costs in the statistics use prices built into remuda (as of 2026-09-24); `[price
 overrides a model's price or prices one remuda does not know (for Codex, `cache_read` is the
 cached-input price).
 
-With `[share.claude]`, every other Claude account launches with the source's instructions
-(`CLAUDE.md`, skills, commands, agents and rules), settings (without authentication or provider
-settings), enabled plugins and memory locations (auto-memory and the memory of user-scope
-subagents), injected as launch options. Each account's own settings still take precedence, and
-`share = false` opts an account out. Sessions are not shared: a session is resumed by an account
-whose `projects` directory holds it. An account's MCP servers and project trust, kept in its
-`.claude.json`, are not shared either. See
-[Shared configuration](docs/GUIDE.md#shared-configuration) for exactly what is passed and how.
+With `[share.claude]`, the other Claude accounts share the source's session store and
+configuration through symlinks in their homes: `projects` and `file-history`, `settings.json`,
+`CLAUDE.md`, skills, commands, agents, hooks, plugins, rules, agent memory, output styles and
+key bindings. `remuda setup` makes the links in the home it creates, for the items the source
+has; in a home registered with `remuda add` you make them, and the Accounts view says which are
+missing. Any linked account can then resume any session. The login stays per account:
+`.claude.json` (with its MCP servers and project trust), `history.jsonl` and `sessions` are
+never linked. When the account is set up, a source `settings.json` that sets authentication
+(`apiKeyHelper`, `env.ANTHROPIC_API_KEY` and the like) is not linked either: that account
+gets the settings at launch instead, without them. A linked `settings.json` is shared whole,
+so authentication you add to it later is read by every account that links it; remuda warns
+about that in the Accounts view and at each launch, so keep such settings out of the shared
+file.
+
+A home without the links still launches with the source's instructions (`CLAUDE.md`, skills,
+commands, agents and rules), settings (without authentication or provider settings), enabled
+plugins and memory locations (auto-memory and the memory of user-scope subagents), injected as
+launch options; what a home links is not injected again. Sessions cannot be injected: such an
+account resumes only the sessions in its own `projects` directory. Each account's own settings
+still take precedence, and `share = false` opts an account out. See
+[Shared configuration](docs/GUIDE.md#shared-configuration) for the layout and for exactly what
+is passed and how.
 
 ## Safety guarantees
 
@@ -269,9 +285,21 @@ the specification ([SPEC.md](SPEC.md), R2 and R13):
   never rewrites, canonicalizes or adds or removes a trailing slash from a registered home.
 - **Homes are never moved, renamed or deleted.** `remuda add` only records a name and
   `remuda remove` only forgets it; neither moves, copies, creates or deletes anything.
-- **Writes are confined to `$REMUDA_HOME`:** `config.toml`, `state/`, `shared/`, and the empty
-  directories created by `remuda setup`. Remuda never writes into any account home, and it never
-  writes credentials, `.claude.json`, the Keychain, transcripts or `history.jsonl`.
+- **Writes are confined to `$REMUDA_HOME`:** `config.toml`, `state/`, `shared/`, and the
+  directories created by `remuda setup`. The one thing remuda writes inside a home is the set
+  of symlinks `remuda setup` makes in the directory it has just created, while it is still
+  empty and before the login, when `[share.claude]` is set; after that, and in every home
+  registered with `remuda add`, it writes nothing. `remuda setup` does not create a home
+  through a symlink: `homes` and `homes/<provider>` under `$REMUDA_HOME` must be real
+  directories, or it stops before creating anything. It never writes credentials,
+  `.claude.json`, the Keychain, transcripts or `history.jsonl`.
+- **Authentication settings are never injected.** Settings that choose credentials, a
+  provider, an endpoint or an organization are removed from what remuda injects at launch, and
+  `remuda setup` does not link a `settings.json` that sets them when it creates a home. A
+  linked `settings.json` is the source's file, shared whole: such settings added to it later
+  reach every account that links it. Remuda warns about that, naming the settings but never
+  their values; it does not prevent it. Login credentials are not settings (they are in the
+  Keychain, or in the home's `.credentials.json`) and are never linked.
 - **Credentials are never read.** Identity and usage come from the agents' own commands
   (`claude auth status --json`, `codex login status`, `claude -p /usage`, `codex app-server`) and
   non-secret local metadata (the usage cache in `.claude.json`, the rate limits in Codex

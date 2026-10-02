@@ -177,11 +177,13 @@ pub enum Event {
         path: PathBuf,
         at: Option<Timestamp>,
     },
-    /// A setup from the TUI ended: the login's exit, or why it did not get there.
+    /// A setup from the TUI ended: the login's exit, or why it did not get there, and what
+    /// there is to say about the links of the new home (R18).
     SetupDone {
         provider: Provider,
         name: String,
         result: Result<Exit, String>,
+        links: Vec<setup::Note>,
     },
     /// A foreground launch ended: claude's exit, or why it could not run.
     Launched {
@@ -1583,9 +1585,15 @@ impl App {
         self.clamp_lists();
     }
 
-    fn on_setup_done(&mut self, provider: Provider, name: &str, result: Result<Exit, String>) {
+    fn on_setup_done(
+        &mut self,
+        provider: Provider,
+        name: &str,
+        result: Result<Exit, String>,
+        links: Vec<setup::Note>,
+    ) {
         let login = setup::login_command(provider);
-        let (level, text) = match result {
+        let (mut level, text) = match result {
             Ok(Exit::Code(0)) => (Level::Info, format!("{login} exited 0")),
             Ok(exit) => {
                 let how = match exit {
@@ -1606,7 +1614,15 @@ impl App {
             }
             Err(e) => (Level::Error, e),
         };
-        self.notify_after_child(level, format!("set up {name}: {text}"));
+        if level == Level::Info && links.iter().any(|note| note.warning) {
+            level = Level::Warn;
+        }
+        let mut text = format!("set up {name}: {text}");
+        for note in links {
+            text.push_str(" · ");
+            text.push_str(&note.text);
+        }
+        self.notify_after_child(level, text);
     }
 
     /// `l`: `claude logs` of the selected background session into the preview area.
@@ -1989,9 +2005,14 @@ impl App {
                 return;
             }
             Some(store) if store.path != entry_store => {
+                // Accounts that link `projects` to one store can each resume its sessions (R18).
+                let own = match &account.home {
+                    Home::Path(home) => format!("{home}/projects"),
+                    Home::Default => "~/.claude/projects".to_string(),
+                };
                 let text = format!(
                     "{name} cannot find session {short}: its projects store is {}, \
-                     the transcript is in {}",
+                     the transcript is in {}; link {own} to that store to share sessions",
                     store.path.display(),
                     entry_store.display()
                 );
@@ -2593,8 +2614,9 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             provider,
             name,
             result,
+            links,
         } => {
-            app.on_setup_done(provider, &name, result);
+            app.on_setup_done(provider, &name, result, links);
             // Like after a launch: only a collection started now makes the live list current.
             if app.live_in_flight {
                 app.live_again = true;

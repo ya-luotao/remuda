@@ -351,6 +351,46 @@ fn tui_launch_that_cannot_suspend_runs_nothing() {
     assert!(!sb.launch_log().exists());
 }
 
+/// R11, R16, R18: the authentication a member reads through a linked `settings.json` is
+/// named for a launch from the TUI as for `run`, among the launch's warnings.
+#[test]
+fn tui_launches_name_authentication_read_through_a_link() {
+    let sb = Sandbox::new();
+    let source = sb.home().join(".claude");
+    fs::create_dir_all(source.join("projects")).unwrap();
+    fs::write(
+        source.join("settings.json"),
+        r#"{"forceLoginOrgUUID": "zz-org", "model": "opus"}"#,
+    )
+    .unwrap();
+    let max = sb.root().join("max");
+    fs::create_dir_all(&max).unwrap();
+    for item in ["settings.json", "projects"] {
+        std::os::unix::fs::symlink(source.join(item), max.join(item)).unwrap();
+    }
+    sb.write_config(&format!(
+        "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{}\"\n\
+         [share.claude]\nfrom = \"default\"\n",
+        max.display()
+    ));
+    let account = named("max", max.to_str().unwrap());
+    let event = tui_launch(&sb, &account, &["-p", "hi"], Some(&project(&sb)));
+    let Event::Launched {
+        warnings, result, ..
+    } = &event
+    else {
+        panic!("{event:?}")
+    };
+    assert_eq!(result, &Ok(Exit::Code(0)));
+    assert_eq!(
+        warnings,
+        &[
+            "warning: claude:max reads the authentication settings of claude:default through its \
+           settings.json link: forceLoginOrgUUID"
+        ]
+    );
+}
+
 /// R16, R18: the TUI launches through the same path as `run`: shared configuration from the
 /// registry as it is at launch goes before the arguments, and its notices come back as
 /// warnings.
@@ -589,7 +629,8 @@ fn tui_codex_setup_runs_codex_login_in_the_new_home() {
         Event::SetupDone {
             provider: Provider::Codex,
             name: "work".into(),
-            result: Ok(Exit::Code(0))
+            result: Ok(Exit::Code(0)),
+            links: Vec::new(),
         }
     );
     let home = sb.remuda_home().join("homes/codex/work");
@@ -641,7 +682,8 @@ fn tui_setup_creates_registers_and_logs_in_in_the_foreground() {
         Event::SetupDone {
             provider: Provider::Claude,
             name: "work".into(),
-            result: Ok(Exit::Code(0))
+            result: Ok(Exit::Code(0)),
+            links: Vec::new(),
         }
     );
     assert_eq!(screen.calls, ["suspend", "resume"]);
@@ -658,6 +700,73 @@ fn tui_setup_creates_registers_and_logs_in_in_the_foreground() {
     );
     assert_eq!(inv.config_dir.as_deref(), Some(home.to_str().unwrap()));
     assert!(!sb.launch_log().exists(), "setup is not a session launch");
+}
+
+/// R18: a setup from the TUI links a member's home like `remuda setup`, and its event carries
+/// what to say about it, without paths (R21).
+#[test]
+fn tui_setup_links_a_members_home() {
+    let sb = Sandbox::new();
+    let source = sb.home().join(".claude");
+    fs::create_dir_all(source.join("projects")).unwrap();
+    fs::write(source.join("settings.json"), "{}").unwrap();
+    fs::write(source.join(".claude.json"), "{}").unwrap();
+    sb.write_config("[share.claude]\nfrom = \"default\"\n");
+    for (name, private) in [("work", false), ("other", true)] {
+        let deps = Deps {
+            env: [
+                ("HOME".to_string(), sb.home().display().to_string()),
+                (
+                    "REMUDA_HOME".to_string(),
+                    sb.remuda_home().display().to_string(),
+                ),
+            ]
+            .into(),
+            private,
+            ..deps(&sb)
+        };
+        let mut screen = FakeScreen::default();
+        let event =
+            tui::setup_in_foreground(&mut screen, &deps, Provider::Claude, name, None).unwrap();
+        let note = |text: &str| remuda::setup::Note {
+            warning: false,
+            text: text.into(),
+        };
+        assert_eq!(
+            event,
+            Event::SetupDone {
+                provider: Provider::Claude,
+                name: name.into(),
+                result: Ok(Exit::Code(0)),
+                links: vec![
+                    note("linked 2 items to claude:default: projects, settings.json"),
+                    note(
+                        "not linked (claude:default has none): file-history, CLAUDE.md, skills, \
+                         commands, agents, hooks, plugins, rules, agent-memory, output-styles, \
+                         keybindings.json"
+                    ),
+                ],
+            }
+        );
+        let home = sb.remuda_home().join("homes/claude").join(name);
+        for item in ["projects", "settings.json"] {
+            assert_eq!(fs::read_link(home.join(item)).unwrap(), source.join(item));
+        }
+        assert_eq!(fs::read_dir(&home).unwrap().count(), 2);
+        // Linked and registered before the login ran: what the login found.
+        let login = sb.logins().pop().unwrap();
+        assert_eq!(login.config_dir, home.to_str().unwrap());
+        assert!(login.registered, "{name}: registered before the login");
+        let found = |item: &str| {
+            let target = source.join(item).to_str().unwrap().to_string();
+            (item.to_string(), Some(target))
+        };
+        assert_eq!(login.entries, [found("projects"), found("settings.json")]);
+    }
+    assert_eq!(sb.logins().len(), 2);
+    assert_eq!(stored_names(&sb), ["default", "work", "other"]);
+    let logins: Vec<Vec<String>> = sb.invocations().into_iter().map(|i| i.args).collect();
+    assert_eq!(logins, [["auth", "login"], ["auth", "login"]]);
 }
 
 #[test]

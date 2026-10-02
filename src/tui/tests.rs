@@ -1038,7 +1038,8 @@ fn several_or_no_accounts_open_the_account_picker() {
     assert_eq!(
         notice(&app),
         Some((
-            "team cannot find session aaaaaaaa: its projects store is /t, the transcript is in /s",
+            "team cannot find session aaaaaaaa: its projects store is /t, the transcript is in \
+             /s; link /h/team/projects to that store to share sessions",
             Level::Error
         ))
     );
@@ -1499,6 +1500,7 @@ fn check_answer_queued_during_a_setup_is_applied_after_it() {
             provider: CLAUDE,
             name: "newacct".into(),
             result: Ok(Exit::Code(0)),
+            links: Vec::new(),
         },
     );
     assert_eq!(fx, [Effect::Live]);
@@ -2074,6 +2076,7 @@ fn a_finished_setup_reloads_accounts_and_identities() {
             provider: CLAUDE,
             name: "work".into(),
             result: Ok(Exit::Code(0)),
+            links: Vec::new(),
         },
     );
     assert_eq!(
@@ -2086,6 +2089,7 @@ fn a_finished_setup_reloads_accounts_and_identities() {
             provider: CLAUDE,
             name: "x".into(),
             result: Err("/r/homes/claude/x already exists".into()),
+            links: Vec::new(),
         },
     );
     assert_eq!(
@@ -3480,6 +3484,7 @@ fn a_finished_codex_setup_names_codex_login() {
             provider: CODEX,
             name: "solo".into(),
             result: Ok(Exit::Code(1)),
+            links: Vec::new(),
         },
     );
     assert_eq!(
@@ -3755,6 +3760,60 @@ fn codex_prompt_account_gone_before_yes() {
     );
 }
 
+/// R18, R21: the notice of a finished setup says what the new home was linked to, without
+/// paths; a link that failed makes it a warning.
+#[test]
+fn a_finished_setup_names_the_links() {
+    let note = |warning, text: &str| crate::setup::Note {
+        warning,
+        text: text.into(),
+    };
+    let mut app = codex_app();
+    update(
+        &mut app,
+        Event::SetupDone {
+            provider: CLAUDE,
+            name: "work".into(),
+            result: Ok(Exit::Code(0)),
+            links: vec![
+                note(
+                    false,
+                    "linked 2 items to claude:default: projects, CLAUDE.md",
+                ),
+                note(false, "not linked (claude:default has none): rules"),
+            ],
+        },
+    );
+    assert_eq!(
+        notice(&app),
+        Some((
+            "set up work: claude auth login exited 0 · linked 2 items to claude:default: \
+             projects, CLAUDE.md · not linked (claude:default has none): rules",
+            Level::Info
+        ))
+    );
+    update(
+        &mut app,
+        Event::SetupDone {
+            provider: CLAUDE,
+            name: "work".into(),
+            result: Ok(Exit::Code(0)),
+            links: vec![note(
+                true,
+                "could not link to claude:default: skills (File exists (os error 17))",
+            )],
+        },
+    );
+    assert_eq!(
+        notice(&app),
+        Some((
+            "set up work: claude auth login exited 0 · could not link to claude:default: \
+             skills (File exists (os error 17))",
+            Level::Warn
+        ))
+    );
+}
+
 /// With `codex:work` registered, a bare `work` is ambiguous: the retry names
 /// `claude:work`.
 #[test]
@@ -3769,6 +3828,7 @@ fn setup_retry_is_unambiguous() {
             provider: CLAUDE,
             name: "work".into(),
             result: Ok(Exit::Code(1)),
+            links: Vec::new(),
         },
     );
     assert_eq!(
@@ -4984,10 +5044,63 @@ fn secret_states() -> Vec<SecretState> {
                         result: Err(format!(
                             "{ZQ_HOME}/.remuda/homes/claude/zqnew already exists"
                         )),
+                        links: Vec::new(),
                     },
                 );
             },
             "set up zqnew",
+        ),
+        state(
+            "setup linked",
+            |app| {
+                keys(app, &[Key::Char('1'), Key::Char('s')]);
+                type_str(app, "zqnew");
+                keys(app, &[Key::Enter]);
+                update(
+                    app,
+                    Event::SetupDone {
+                        provider: CLAUDE,
+                        name: "zqnew".into(),
+                        result: Ok(Exit::Code(0)),
+                        links: vec![crate::setup::Note {
+                            warning: false,
+                            text: "linked 2 items to claude:zqalpha: projects, CLAUDE.md".into(),
+                        }],
+                    },
+                );
+            },
+            "linked 2 items to claude:zqalpha",
+        ),
+        state(
+            "resume refused for another store",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                // The text of `resume_as` for an account whose `projects` is its own (R16).
+                app.notice = Some(Notice {
+                    text: format!(
+                        "zqalpha cannot find session aaaaaaaa: its projects store is \
+                         {ZQ_HOME}/.zqhomes/zqalpha/projects, the transcript is in {ZQ_STORE}; \
+                         link {ZQ_HOME}/.zqhomes/zqalpha/projects to that store to share sessions"
+                    ),
+                    level: Level::Error,
+                });
+            },
+            "zqalpha cannot find session",
+        ),
+        state(
+            "authentication read through a link",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                // A launch's warning from shared configuration (R18).
+                app.notice = Some(Notice {
+                    text: "new session as zqalpha: claude exited 0 · warning: claude:zqalpha \
+                           reads the authentication settings of claude:default through its \
+                           settings.json link: apiKeyHelper"
+                        .into(),
+                    level: Level::Warn,
+                });
+            },
+            "warning: claude:zqalpha reads",
         ),
         state(
             "home with a trailing slash",
@@ -5583,6 +5696,38 @@ fn the_pane_sits_below_the_table_or_beside_the_view() {
     ] {
         assert!(body.contains(shown), "{shown}:\n{body}");
     }
+}
+
+/// R18, R22: the source's authentication settings are "not shared" only where settings are
+/// injected. A member whose `settings.json` is the source's reads them through the link, and
+/// the source's own pane says where they are withheld.
+#[test]
+fn the_pane_says_who_reads_the_sources_authentication() {
+    use crate::account_config::{Origin, Role};
+    let mut app = app();
+    keys(&mut app, &[Key::Char('j'), Key::Char('p')]);
+    let linked = crate::account_config::ConfigView {
+        settings_origin: Origin::AlreadySource,
+        ..config_view()
+    };
+    answer_config(&mut app, "max", linked);
+    let body = config_text(&app, 200);
+    assert!(
+        body.contains("read through the link (authentication): env.ANTHROPIC_API_KEY"),
+        "{body}"
+    );
+    assert!(!body.contains("not shared (authentication)"), "{body}");
+
+    let source = crate::account_config::ConfigView {
+        role: Role::Source,
+        ..config_view()
+    };
+    answer_config(&mut app, "max", source);
+    let body = config_text(&app, 200);
+    assert!(
+        body.contains("withheld from injected settings (authentication): env.ANTHROPIC_API_KEY"),
+        "{body}"
+    );
 }
 
 /// R22: `PgUp` / `PgDn` scroll the open pane while `j` / `k` move the selection (the pane then

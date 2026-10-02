@@ -1,7 +1,7 @@
 # remuda roadmap
 
-**Status:** v0.1.0. Milestones M0–M3 are complete; M2.5 is implemented and awaits dogfooding
-before release.
+**Status:** v0.1.0. Milestones M0–M3 and M2.5 are complete; M2.5 goes out with 0.2.0, which is
+not released yet.
 
 remuda is a multi-account and session manager for coding agents (Claude Code and Codex). Its
 behavior contract is [SPEC.md](SPEC.md); this document records the design principles, decisions,
@@ -42,6 +42,8 @@ and planned work.
 | 2026-09-27 | The first network request of remuda's own: only `pick`, only with `TYPESAFE_API_KEY` and notes; through `curl`, the key on its stdin | Without a key or notes nothing is sent and the rules decide; the state is aliased usage and the notes as written, never credentials, emails, organizations, paths or session content, and `--print-request` shows it. `curl` keeps an HTTP and TLS stack out of the binary; the key goes in the configuration curl reads on stdin, so it is never in the process list (R13, R23) |
 | 2026-10-01 | No relay: a session is continued only by an account whose store holds it | A relay copied a transcript and its checkpoints into another account's home, the one case in which remuda wrote into a home; without it the write boundary has no exception (R13). The cost is accepted: a session cannot be moved to another account. This replaces the relay named in the 2026-09-24 decision on sessions; it was removed before any release contained it (R19) |
 | 2026-10-01 | Memory is what accounts share: rules as copies, agent memory through `CLAUDE_CODE_REMOTE_MEMORY_DIR` | With sessions kept per account, what must not diverge is what claude remembers and is told. claude loads rules of an added directory only from regular files, so they are copied under `$REMUDA_HOME/shared` at launch; rules limited to `paths` do not apply that way and are reported. User-scope agent memory has no setting, only an undocumented variable, set only together with the injected auto-memory location because it moves that too. Both stay inside the write boundary (R13, R18) |
+| 2026-10-03 | Accounts share one session store and configuration through symlinks; only login state stays per account | Any account can then resume any session, and configuration cannot diverge between accounts. This replaces the 2026-09-24 decision that sessions are not shared, and the premise "with sessions kept per account" of the 2026-10-01 decision on memory; injection (2026-09-24) stays as the fallback for a home without the links and is not extended. Relay stays removed: with one store there is nothing to copy. "Only login state" cannot be one directory: `CLAUDE_SECURESTORAGE_CONFIG_DIR` separates the credentials but not `.claude.json`, so each account keeps its own `.claude.json`, `history.jsonl`, `sessions`, and the files its organization sets; and no variable moves `projects`, so it can only be linked. `setup` makes the links in the home it has just created, once, before the login, the one exception to the write boundary; a home registered with `add` is never touched, only checked (R11, R12, R13, R18) |
+| 2026-10-03 | A linked `settings.json` is shared whole, authentication settings included; remuda warns instead of enforcing | The credentials of a login are in the Keychain (or the home's `.credentials.json`), not in `settings.json`; authentication settings there are ones the user wrote. So `setup` does not link a `settings.json` that has them when it creates a home, and later ones are reported in the Accounts view and at every launch of an account that reads them through the link, by name. The alternatives raised in review, no raw link to the source's `settings.json` but filtered injection or a sanitized copy, were not taken: the linked layout stays as it is. remuda no longer says that authentication is never shared, only that it is never injected (R11, R18) |
 
 ## Technology
 
@@ -97,17 +99,19 @@ Codex accounts (`CODEX_HOME`), identity (`codex login status`; email and plan fr
 usage (cached from the rate limits in rollouts, live through `codex app-server`), the rollout
 session index, and launch / resume / fork (SPEC R4, R10, R10a, R17).
 
-**M2.5 · Shared configuration** — **Implemented; dogfooding pending**
-Sessions stay with the account that created them; configuration is shared by injection at launch
-(SPEC R18): instructions (`CLAUDE.md`, skills, commands, agents, rules) through `--add-dir`,
-settings and the auto-memory location through one `--settings`, enabled plugins through
-`--plugin-dir`, and the memory of user-scope subagents through an environment variable.
-Nothing is written into any home, and existing symlink layouts are detected so nothing loads
-twice.
-It is released as 0.2.0 after it has run on a real multi-account setup. Homes that symlink every
-component, `projects` included, into the source home get nothing injected, and their sessions
-are in one shared store rather than with the account that created them, so such a setup first
-moves `projects` to per-account stores.
+**M2.5 · Shared session store and configuration** — **Done**
+Accounts share one session store and their configuration through symlinks in each member's
+home, pointing at the source's (SPEC R18): `remuda setup` makes them in the home it creates,
+and the Accounts view reports what a home registered with `add` does not link, or links that it
+must not (R11). Only login state stays per account.
+Injection at launch is the fallback for a home without the links: instructions (`CLAUDE.md`,
+skills, commands, agents, rules) through `--add-dir`, settings and the auto-memory location
+through one `--settings`, enabled plugins through `--plugin-dir`, and the memory of user-scope
+subagents through an environment variable. It writes nothing into any home, skips each
+component a home already links, and cannot share sessions.
+The linked layout is the one in daily use. Injection has run only in the tests, not on a real
+multi-account setup: the author's homes link everything, so nothing is injected there. 0.2.0
+follows this milestone.
 
 ## Later, as needed
 
@@ -115,8 +119,8 @@ moves `projects` to per-account stores.
   sessions.
 - Rename sessions: `claude -p --resume <id> "/rename <new-name>"` (needs verification).
 - Cleanup: only via a `claude project purge --dry-run` preview followed by confirmed execution;
-  remuda never deletes files itself. Note that with a shared `projects` directory, cleanup affects
-  every account.
+  remuda never deletes files itself. With the shared `projects` directory, cleanup affects every
+  account.
 - Interact with running sessions through `messagingSocketPath`.
 - Relocate homes using `CLAUDE_SECURESTORAGE_CONFIG_DIR` (R2).
 - `--private` for command-line output (R21 covers the TUI only).
@@ -125,8 +129,11 @@ moves `projects` to per-account stores.
 - A TUI key for `pick`: the recommendation in the Accounts view, and a launch from it.
 - Share user-scope MCP servers (`mcpServers` in the source's `.claude.json`) through
   `--mcp-config`, with R18's withholding rules applied to their `env` and `headers`. Not done
-  until there is a server to verify it against. Project trust in `.claude.json` cannot be shared
-  without writing into a home (R13).
+  until there is a server to verify it against. Project trust in `.claude.json` cannot be shared:
+  `.claude.json` stays per account (R18).
+- Share `plugins` through `CLAUDE_CODE_PLUGIN_CACHE_DIR` instead of a link, so that an install
+  from a member's home is not recorded through that home's `plugins` link (R11). Not done until
+  plugin loading and the `plugins/synced` directories are verified with it.
 
 ## Known issues
 
@@ -141,8 +148,13 @@ moves `projects` to per-account stores.
   hooks as the user; a follow-up is to confine them the same way.
 - A member that shares some but not all of `CLAUDE.md`, `skills`, `commands`, `agents` with the
   source through symlinks gets all four through `--add-dir`, so the ones it already shares load
-  twice (R11 warns). A follow-up is to link, per member, only the items it does not share (one
-  link set per combination under `$REMUDA_HOME/shared/claude/`).
+  twice (R11 warns, and says to link the others too). Injection is not extended to cover this.
+- A linked `settings.json` is shared whole: authentication settings added to the source's
+  after `setup` reach every account that links it. remuda warns (R11, and at each launch) but
+  does not prevent it, by decision (2026-10-03).
+- `remuda setup` links only what the source has at that moment. An item the source gets later
+  (`rules`, `agent-memory`, `file-history`) is not linked into existing homes: R11 reports it,
+  and the user makes the link.
 
 ## Open questions
 

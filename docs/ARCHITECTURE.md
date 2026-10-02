@@ -46,8 +46,11 @@ Three rules shape the whole design and are worth knowing before reading any modu
 - **Home strings are sacred** (R2). A home is stored and passed to the agent byte-for-byte.
   Canonical paths (realpath) are used only to compare directories: shared stores, duplicate
   registrations, components already shared with the source. They are never passed to an agent.
-- **Writes are confined** (R13). Everything remuda writes is under `$REMUDA_HOME`; nothing is
-  written into an account's home.
+- **Writes are confined** (R13). Everything remuda writes is under `$REMUDA_HOME`. The one
+  write inside a home is the set of symlinks `setup` makes in the directory it has just created,
+  before the login (R12, R18); nothing is written into a home after that, or into a home
+  registered with `add`. `setup` reaches that directory without following a symlink below
+  `$REMUDA_HOME`, and writes into it through its descriptor.
 - **The library never reads the process environment.** `main.rs` captures the environment, the
   current directory, the clock, the time zone and whether the standard streams are terminals into
   a `cli::Context` once, and everything below receives an `Env` snapshot. This is what makes the
@@ -94,12 +97,12 @@ The exceptions, all for a type or a small helper:
 | `provider::app_server` | JSON-RPC client for `codex app-server` (`account/read`, `account/rateLimits/read`) | R4, R10 |
 | `probe` | Run a short agent command with captured output and a timeout (killing the process group); run many in parallel; run `curl` with its configuration on stdin | R4, R10, R23 |
 | `launch` | Classify arguments, inject `--session-id`, set or unset the home variable, the launch log, `exec` and foreground runs | R2, R6, R16, R17 |
-| `share` | Shared configuration: `plan` (reads only) and `apply` (item links, rule copies, settings file) | R18 |
-| `setup` | Create the new home and register it; the login command | R5, R13, R17 |
+| `share` | Shared configuration injected at launch, the fallback for what a home does not link: `plan` (reads only) and `apply` (item links, rule copies, settings file) | R18 |
+| `setup` | Create the new home, link a member's to the source's session store and configuration (`LINKS`, `share_links`), and register it; the login command | R5, R12, R13, R17, R18 |
 | `identity` | `claude auth status --json`, `.claude.json` fallback, `codex login status`, `account/read` | R10a |
 | `usage` | Cached and live usage for both providers, window labels, severity, reset instants | R10 |
 | `live` | Running claude sessions: `agents --json`, `sessions/*.json` fallback checked against `ps`; attach, logs, stop, rm | R7, R16 |
-| `checks` | Warnings for the Accounts view | R11 |
+| `checks` | Warnings for the Accounts view, among them what a member's home links and does not | R11 |
 | `index` | The session index over claude transcripts and codex rollouts; incremental cache | R8, R17 |
 | `transcript` | Reading claude transcripts without loading them whole: windows, complete lines, preview | R8 |
 | `attribution` | Which accounts a session belongs to: launch log, live sessions, `history.jsonl` | R9 |
@@ -248,9 +251,40 @@ an `Event`.
 
 ## Shared configuration
 
-`share::plan` decides, for one account, one directory and one argument list, what the source's
-configuration adds; `share::apply` makes it real. The Configuration pane (R22) calls `plan` only,
-which is why the pane cannot disagree with a launch.
+Accounts share one session store and their configuration through symlinks in each member's home
+(R18). `setup::create_and_register` makes them once, for the home it has just created:
+
+```text
+ remuda setup work                      [share.claude] from = "default"
+        │
+        ▼
+ setup::plan              every check, and the source's home, before any side effect
+        │
+        ▼
+ setup::create_and_register
+        ├─ create_home    $REMUDA_HOME/homes/claude/work, mode 0700, must not exist; each
+        │                 level is opened from the one above without following a symlink
+        │                 (a symlinked homes or homes/claude is refused), and the new home
+        │                 stays open
+        ├─ share_links    through that descriptor, only if the directory is empty: for each
+        │                 item of LINKS the source has, work/<item> -> <source home>/<item>
+        │                 (as registered); settings.json only if it has no
+        │                 authentication at that moment (checked once);
+        │                 never .claude.json, history.jsonl, sessions, remote-settings.json,
+        │                 policy-limits.json; nothing replaced, nothing removed
+        └─ register       config.toml
+        │
+        ▼
+ claude auth login        in the new home, in the foreground
+```
+
+A home registered with `add` is never linked by remuda; `checks::sharing` reports what it does
+not link (R11).
+
+Injection is the fallback for what a member's home does not link. `share::plan` decides, for
+one account, one directory and one argument list, what the source's configuration adds;
+`share::apply` makes it real. The Configuration pane (R22) calls `plan` only, which is why the
+pane cannot disagree with a launch.
 
 ```text
  [share.claude] from = "default"                 member account "work"
@@ -269,14 +303,16 @@ which is why the pane cannot disagree with a launch.
 ```
 
 Each row is skipped when the member's home already resolves to the source's item by realpath
-(an existing symlink layout, R12), so nothing loads twice.
+(the links above, R12), so nothing loads twice; a fully linked home gets nothing injected.
+Sessions have no row: they are shared only through the `projects` link.
 
 ## Files remuda owns
 
 ```text
  $REMUDA_HOME/                    (default ~/.remuda)
  ├── config.toml                  registry; written by add / setup / remove      registry
- ├── homes/<provider>/<name>/     empty homes created by setup                   setup
+ ├── homes/<provider>/<name>/     homes created by setup: empty, or holding      setup
+ │                                the links to the source's home (R18)
  ├── shared/claude/.claude/       one symlink per shared instruction item,       share
  │                                copies of the source's rules
  └── state/                       caches and logs; safe to delete
@@ -302,7 +338,7 @@ and `tests/common/rollouts.rs` build synthetic records with the real shapes.
 | Test file | Covers |
 | --- | --- |
 | `harness.rs` | The sandbox itself (R15) |
-| `registry_cli.rs`, `remove_cli.rs`, `setup_cli.rs` | `add`, `remove`, `setup` (R1–R3, R13, R14, R14a) |
+| `registry_cli.rs`, `remove_cli.rs`, `setup_cli.rs` | `add`, `remove`, `setup` and its links (R1–R3, R12–R14, R14a, R18) |
 | `run_cli.rs`, `launch_log.rs`, `tui_launch.rs` | Launch, `--session-id`, launch log, TUI launches (R2, R5, R6, R16) |
 | `share_cli.rs` | Shared configuration (R18) |
 | `index.rs`, `codex_index.rs`, `preview.rs`, `sessions_cli.rs` | Session index and preview (R8, R17) |
@@ -329,6 +365,7 @@ cargo run --release --example codex_timing -- [<codex home>]
 | --- | --- |
 | Add or change a subcommand | SPEC R5, `cli`, a `tests/*_cli.rs` file |
 | Change what a launch passes to the agent | SPEC R6 / R18, `launch::prepare_with` or `share::plan` |
+| Change what `setup` links in a new home | SPEC R12 / R13 / R18, `setup::LINKS` and `setup::share_links`, `tests/setup_cli.rs`; it is the write boundary |
 | Support another agent CLI | SPEC R4, `provider` (every `match Provider`), `index`, `usage`, `identity` |
 | Read a new field from transcripts | `transcript` (index) or `stats` (counts); bump the cache's `SCHEMA_VERSION` |
 | Add a TUI action | `tui::app` (`Key` → `Effect`), `tui::workers` (the effect), `tui::render`, `tui::privacy` |
