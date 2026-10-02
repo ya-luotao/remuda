@@ -45,8 +45,9 @@ starts and is not saved. While it is on, the TUI shows:
 - notices, errors and check messages with the above replaced. A path remuda puts there itself
   is masked whole. In text from elsewhere (an agent's output, a system error, a check message)
   nothing says where a path ends, so a line is masked from its first word with a `/` to its end,
-  and what follows the path on that line is hidden with it. A lone `/name` (`/login`, `/tmp`) is
-  left as it is.
+  and what follows the path on that line is hidden with it. Only Claude's `/login` and `/rewind`,
+  which remuda's own messages name, are left as they are, unless a directory remuda knows has
+  that very name.
 
 It keeps visible the numbers (usage percentages, reset times, token counts, costs), model names, plans,
 login methods, providers, session IDs, pids and times. It does not hide the output of an agent

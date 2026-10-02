@@ -5242,6 +5242,29 @@ fn secret_states() -> Vec<SecretState> {
             "zq\\\"acme",
         ),
         state(
+            "home of one component",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                app.home = Some("/zqprivatehome".into());
+                app.notice = Some(Notice {
+                    text: "cannot read /zqprivatehome: permission denied".into(),
+                    level: Level::Error,
+                });
+            },
+            "cannot read /zqprivatehome:",
+        ),
+        state(
+            "path whose first component has a blank",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                app.notice = Some(Notice {
+                    text: "no /zqMy Disk/zqsecret here".into(),
+                    level: Level::Error,
+                });
+            },
+            "no /zqMy Disk",
+        ),
+        state(
             "account removed",
             |app| {
                 keys(app, &[Key::Char('1')]);
@@ -5408,15 +5431,91 @@ fn private_mode_masks_a_message_from_elsewhere_alone() {
         "new session as account-1: cannot run claude: cannot run ~/•••/••• · cannot write \
          the launch log /•••/••• · warning: claude:account-1 reads 2 settings of claude:default"
     );
-    // A slash command is not a path (the rest of its line stays), a path after it is.
+    // A slash command remuda's own messages name is not a path (the rest of its line stays);
+    // a path after it is.
     app.notice = Some(Notice {
-        text: "zqalpha: /rewind finds no backup; see /memory or ./zqdir/x for more".into(),
+        text: "zqalpha: /rewind finds no backup; see /login or ./zqdir/x for more".into(),
         level: Level::Warn,
     });
     assert_eq!(
         private_notice(&app),
-        "account-1: /rewind finds no backup; see /memory or •••/•••/•••"
+        "account-1: /rewind finds no backup; see /login or •••/•••/•••"
     );
+}
+
+/// R21: any other `/name` is a path, masked with the rest of its line: a home of one
+/// component, the first component of a path with a blank in it, a name that only starts like
+/// a command. And a path the TUI knows is masked even when it reads like a command.
+#[test]
+fn private_mode_masks_every_slash_name_but_claudes_commands() {
+    let said = |app: &mut App, text: &str| {
+        app.notice = Some(Notice {
+            text: text.into(),
+            level: Level::Error,
+        });
+        private_notice(app)
+    };
+    // `$HOME` of one component.
+    let accounts = vec![Account::default_for(CLAUDE), zq_account(CLAUDE, "zqalpha")];
+    let mut app = App::new(
+        accounts,
+        TimeZone::UTC,
+        Some("/zqprivatehome".into()),
+        ts(NOW),
+    );
+    update(&mut app, Event::Resize(160, 40));
+    assert_eq!(
+        said(&mut app, "cannot read /zqprivatehome: permission denied"),
+        "cannot read /•••"
+    );
+    assert_eq!(said(&mut app, "in `/zqprivatehome`."), "in `/•••");
+    assert_eq!(
+        said(&mut app, "cannot read /zqprivatehome/x y/z: denied"),
+        "cannot read ~/•••/•••"
+    );
+    // The first component of a path with a blank in it; a name of one component.
+    assert_eq!(said(&mut app, "no /zqMy Disk/zqsecret here"), "no /•••/•••");
+    assert_eq!(said(&mut app, "no /zqsecret here"), "no /•••");
+    // Only the whole command is one.
+    for name in [
+        "/loginx",
+        "/login-zqsecret",
+        "/login_zq",
+        "/login.zqsecret",
+        "/login/zq",
+    ] {
+        let masked = said(&mut app, &format!("see {name} for zqalpha"));
+        assert!(
+            masked.starts_with("see /•••") && !masked.contains("zq"),
+            "{name}: {masked}"
+        );
+        assert!(!masked.contains("login"), "{name}: {masked}");
+    }
+    assert_eq!(
+        said(&mut app, "see /login, (/rewind) or `/login`. for zqalpha"),
+        "see /login, (/rewind) or `/login`. for account-1"
+    );
+
+    // A path the TUI knows that reads like a command: the directory remuda started in, a
+    // home, a store, a typed directory.
+    let mut app = secret_app();
+    assert_eq!(said(&mut app, "start in /rewind."), "start in /rewind.");
+    app.cwd = Some(PathBuf::from("/rewind"));
+    assert_eq!(said(&mut app, "start in /rewind."), "start in /•••");
+    app.cwd = Some(PathBuf::from(ZQ_CWD));
+    assert_eq!(said(&mut app, "home `/login`!"), "home `/login`!");
+    app.accounts[1].account.home = Home::Path("/login/".into());
+    assert_eq!(said(&mut app, "home `/login`!"), "home `/•••");
+    app.accounts[1].account.home = Home::Path(format!("{ZQ_HOME}/.zqhomes/zqalpha"));
+    if let Some(stores) = &mut app.stores {
+        stores[0].path = PathBuf::from("/login");
+    }
+    assert_eq!(said(&mut app, "store (/login)"), "store (/•••");
+    let mut app = secret_app();
+    keys(&mut app, &[Key::Char('1'), Key::Char('j'), Key::Char('n')]);
+    clear_field(&mut app);
+    type_str(&mut app, " /rewind ");
+    assert_eq!(said(&mut app, "typed /rewind: gone"), "typed /•••");
 }
 
 /// R21: what is typed in the open form is masked in its error with or without the blanks
