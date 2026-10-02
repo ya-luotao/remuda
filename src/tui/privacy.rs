@@ -81,6 +81,9 @@ pub struct Scrubber {
     home: Option<String>,
     /// Exact text and what it becomes, longest first.
     secrets: Vec<(String, String)>,
+    /// Paths the app knows (`$HOME`, homes, stores, the start directory, a typed directory):
+    /// a path starts wherever one of them does, whatever else the text looks like there.
+    paths: Vec<String>,
     /// Account names (qualified, then bare) and their aliases, longest first within each.
     names: Vec<(String, String)>,
 }
@@ -98,7 +101,18 @@ impl Scrubber {
                 secrets.push((text.to_string(), shown));
             }
         };
+        let mut paths: Vec<String> = Vec::new();
+        let mut path = |p: &str| {
+            let p = p.trim_end_matches('/');
+            if p.len() >= MIN_SECRET && p.starts_with('/') && !paths.iter().any(|q| q == p) {
+                paths.push(p.to_string());
+            }
+        };
+        path(home.as_deref().unwrap_or_default());
         for a in &app.accounts {
+            if let Home::Path(p) = &a.account.home {
+                path(p);
+            }
             if let Some(Identity::LoggedIn { email, org, .. }) = &a.identity {
                 if let Some(e) = email {
                     secret(e, MASKED_EMAIL.to_string());
@@ -113,15 +127,27 @@ impl Scrubber {
                 secret(name, MASK.to_string());
             }
         }
+        for store in app.stores.iter().flatten() {
+            path(&store.path.to_string_lossy());
+        }
+        if let Some(cwd) = &app.cwd {
+            path(&cwd.to_string_lossy());
+        }
         secret(&app.history.query, MASK.to_string());
         if let Some(Overlay::Form(form)) = &app.overlay {
             for field in &form.fields {
                 if field.mask == Mask::Plain {
                     continue;
                 }
+                let mut shown = masked_value(field, home.as_deref());
+                if field.mask == Mask::Path {
+                    path(&field.value);
+                    path(field.value.trim());
+                    // As the form reads the directory, not with the blanks typed around it.
+                    shown = mask_path(field.value.trim(), home.as_deref());
+                }
                 // As typed, and as the form reads it (without the blanks around it); each also
                 // as an error quotes it (`{:?}`).
-                let shown = masked_value(field, home.as_deref());
                 for value in [field.value.as_str(), field.value.trim()] {
                     secret(value, shown.clone());
                     let quoted = format!("{value:?}");
@@ -153,6 +179,7 @@ impl Scrubber {
         Scrubber {
             home,
             secrets,
+            paths,
             names: qualified,
         }
     }
@@ -187,30 +214,76 @@ impl Scrubber {
 
     /// Each line from its first path to its end, as one path. Where a path ends cannot be told
     /// (one may hold blanks, `: `, `, `, quotes and brackets), so the rest of the line is taken
-    /// for it: that may hide what follows a path, never show a part of one.
+    /// for it: that may hide what follows a path, never show a part of one. A path starts
+    /// where [`path_start`] finds one, or where a path the app knows does, whichever is first.
     fn mask_paths(&self, text: &str) -> String {
         let mut out = String::new();
         for (i, line) in text.split('\n').enumerate() {
             if i > 0 {
                 out.push('\n');
             }
-            let start = path_start(line).unwrap_or(line.len());
+            let start = [path_start(line, &self.paths), self.known_path(line)]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(line.len());
             out.push_str(&line[..start]);
             out.push_str(&mask_path(&line[start..], self.home.as_deref()));
         }
         out
     }
+
+    /// Where a path the app knows first occurs in `line` as whole components, anywhere in a
+    /// word: what follows it does not go on its last name (`$HOME` = `/Users/you` does not
+    /// occur in `/Users/yours` or `/Users/you-2`, and does in `/Users/you.` and `/Users/you/x`).
+    fn known_path(&self, line: &str) -> Option<usize> {
+        let component_ends = |after: &str| {
+            after
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+        };
+        self.paths
+            .iter()
+            .filter_map(|p| {
+                line.match_indices(p.as_str())
+                    .find(|(i, _)| component_ends(&line[i + p.len()..]))
+                    .map(|(i, _)| i)
+            })
+            .min()
+    }
 }
 
-/// Where the first path of `line` starts: in its first word that holds a `/` (`/a/b`, `~/a`,
-/// `./a/b`, `a/b`). At the `/` or `~/` itself when it begins the word or follows a quote, a
-/// bracket, `=` or `:` in it (`home:/Users/you` keeps `home:`); otherwise the word is a
-/// relative path, from its start or from after the last quote, bracket or `=` before the `/`.
-/// A `/` with a name and no second `/` in the word (`/login`, `/tmp`) is not a path: a slash
-/// command as likely, and a top-level directory says little; the line is looked through
-/// further.
-fn path_start(line: &str) -> Option<usize> {
-    const OPENERS: [char; 6] = ['(', '[', '"', '\'', '“', '='];
+/// Claude's slash commands that remuda's own messages name: `/login` (the `ANTHROPIC_API_KEY`
+/// check) and `/rewind` (the `file-history` check), both in `checks`. Such a word is not a
+/// path. Add one here when a message of remuda starts naming it, and no other: any other
+/// `/name` may be a directory.
+const COMMANDS: [&str; 2] = ["/login", "/rewind"];
+
+/// Whether `word` (from its `/` to the next blank) is one of [`COMMANDS`], whole: nothing
+/// after it but punctuation (`/login-x`, `/login.x` and `/login/x` are not `/login`). Not
+/// when it is one of `known`, the paths the app knows, or the first component of one: a
+/// directory may have a command's name.
+fn is_command(word: &str, known: &[String]) -> bool {
+    COMMANDS.iter().any(|command| {
+        word.strip_prefix(command).is_some_and(|after| {
+            after
+                .chars()
+                .all(|c| !c.is_alphanumeric() && !"/-_~".contains(c))
+        }) && !known.iter().any(|p| {
+            p.strip_prefix(command)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+    })
+}
+
+/// Where the first path of `line` starts: in its first word that holds a `/` (`/a/b`, `/a`,
+/// `~/a`, `./a/b`, `a/b`) and is not one of Claude's slash commands ([`is_command`]). At the
+/// `/` or `~/` itself when it begins the word or follows a quote, a bracket, `=` or `:` in it
+/// (`home:/Users/you` keeps `home:`); otherwise the word is a relative path, from its start or
+/// from after the last quote, bracket or `=` before the `/`.
+fn path_start(line: &str, known: &[String]) -> Option<usize> {
+    const OPENERS: [char; 7] = ['(', '[', '"', '\'', '“', '`', '='];
     let mut from = 0;
     while let Some(slash) = line[from..].find('/').map(|i| from + i) {
         let word = line[..slash]
@@ -238,7 +311,7 @@ fn path_start(line: &str) -> Option<usize> {
                 .map_or(0, |(i, c)| i + c.len_utf8());
             return Some(word + opener);
         }
-        if root < slash || line[slash + 1..end].contains('/') {
+        if root < slash || !is_command(&line[slash..end], known) {
             return Some(root);
         }
         from = end;
@@ -1203,6 +1276,7 @@ mod tests {
                 .iter()
                 .map(|(a, b)| (a.to_string(), b.to_string()))
                 .collect(),
+            paths: vec!["/Users/you".into()],
             names: Vec::new(),
         };
         let mut qualified: Vec<(String, String)> = Vec::new();
@@ -1312,18 +1386,16 @@ mod tests {
         }
     }
 
-    /// R21: a word that is one `/` and a name (`/login`, `/rewind`, `/tmp`) is a slash command
-    /// as likely as a path, and a top-level directory says little: it is not a path, and the
-    /// line is looked through further.
+    /// R21: Claude's slash commands that remuda's own messages name are not paths, as whole
+    /// words only; any other `/name` is one, masked with the rest of its line.
     #[test]
-    fn scrubber_leaves_a_lone_top_level_name() {
+    fn scrubber_leaves_claudes_slash_commands_only() {
         let s = scrubber(&["claude:max"], &[]);
         for text in [
             "ANTHROPIC_API_KEY is set: it overrides every account's /login",
-            "run `claude -p /usage` again, or /memory, as max did not",
             "not file-history: /rewind does not find the file backups; link it too",
-            "see (/memory), \"/tmp\", [/var] and x=/opt; home:/Users too",
-            "/ is the root",
+            "see (/login), \"/rewind\", `/login`, [/rewind]. x=/login; do:/rewind! as max",
+            "/login",
         ] {
             assert_eq!(s.text(text), text.replace("max", "account-1"), "{text}");
         }
@@ -1334,12 +1406,72 @@ mod tests {
         );
         assert_eq!(s.text("/login then /a/b: c"), "/login then /•••/•••");
         assert_eq!(s.text("/login then x/y z"), "/login then •••/•••");
-        // With a second `/`, or from `~`, it is a path.
-        assert_eq!(s.text("in /tmp/ or"), "in /•••/•••");
-        assert_eq!(s.text("in ~/x or"), "in ~/•••");
-        assert_eq!(s.text("in (/tmp/x) or"), "in (/•••/•••");
-        // The first component of a path that holds a blank is such a word: it shows.
-        assert_eq!(s.text("no /My Disk/secret here"), "no /My •••/•••");
+        // Not a command: a longer name, a path under it, another name, a command that
+        // remuda's messages do not name.
+        for (text, masked) in [
+            ("see /loginx for more", "see /•••"),
+            ("see /login-secret for more", "see /•••"),
+            ("see /login_secret for more", "see /•••"),
+            ("see /login.secret for more", "see /•••"),
+            ("see /login/secret for more", "see /•••/•••"),
+            ("see /login~ for more", "see /•••"),
+            ("see /login，秘密 for more", "see /•••"),
+            ("see ~/login for more", "see ~/•••"),
+            ("see x/login for more", "see •••/•••"),
+            ("see /Login for more", "see /•••"),
+            ("see /memory and /usage", "see /•••/•••"),
+            ("see /tmp or \"/var\" (x)", "see /•••/•••"),
+            ("/ is the root", "/•••"),
+            // The first component of a path with a blank in it.
+            ("no /My Disk/secret here", "no /•••/•••"),
+        ] {
+            assert_eq!(s.text(text), masked, "{text}");
+        }
+    }
+
+    /// R21: a path the app knows starts a path wherever it occurs, as whole components: one
+    /// of a single component, and one that reads like a command.
+    #[test]
+    fn scrubber_masks_known_paths_first() {
+        let mut s = scrubber(&["claude:max"], &[]);
+        s.home = Some("/privatehome".into());
+        s.paths = vec![
+            "/privatehome".into(),
+            "/login".into(),
+            "/rewind stuff".into(),
+        ];
+        for (text, masked) in [
+            (
+                "cannot read /privatehome: permission denied",
+                "cannot read /•••",
+            ),
+            ("cannot read /privatehome", "cannot read ~"),
+            ("cannot read /privatehome/x: denied", "cannot read ~/•••"),
+            ("in `/privatehome`.", "in `/•••"),
+            ("at home:/privatehome, as max", "at home:/•••"),
+            // Anywhere in a word.
+            ("at x/privatehome/y", "at •••/•••/•••"),
+            // Named like a command.
+            ("run /login again", "run /•••"),
+            ("run `/login`. again", "run `/•••"),
+            ("in /rewind stuff/x y", "in /•••/•••"),
+            ("in `/rewind stuff`. ok", "in `/•••"),
+            ("in /rewind stuff. ok", "in /•••"),
+            // `/rewind` alone is still the command.
+            ("run /rewind again", "run /rewind again"),
+        ] {
+            assert_eq!(s.text(text), masked, "{text}");
+        }
+        // The first component of a known path is not a command either.
+        s.paths = vec!["/login/me".into()];
+        assert_eq!(s.text("run /login again"), "run /•••");
+        assert_eq!(s.text("run /rewind again"), "run /rewind again");
+        s.paths = vec!["/privatehome".into()];
+        // A sibling is not the known path, and is a path all the same.
+        assert_eq!(s.text("in /privatehomes"), "in /•••");
+        assert_eq!(s.known_path("in /privatehomes or /privatehome-2"), None);
+        assert_eq!(s.known_path("in /privatehome."), Some(3));
+        assert_eq!(s.known_path("in x/privatehome/y"), Some(4));
     }
 
     /// `$HOME` shows as `~` only as whole components, and a trailing `/` in it changes nothing.

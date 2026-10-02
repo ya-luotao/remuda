@@ -1266,11 +1266,16 @@ status and hint lines, notices, the help box) shows:
     masked from its first path to its end, as one path. A path starts in the first word that
     holds a `/`: at the `/` or `~/` itself when it begins the word or follows a quote, a bracket,
     `=`, or `:` in it; otherwise after the last quote, bracket, or `=` in the word, or at its
-    start, and the rest is a relative path (`./a/b`, `a/b`, `key=a/b`). This may hide what
-    follows a path on its line (the reason of an error, say), and never shows part of one. A word that is one `/` and a name, without a second `/` (`/login`,
-    `/rewind`, `/tmp`), is not a path: it is as likely a slash command, and a top-level directory
-    says little. The first component of a path with a blank in it (`/My Disk/x`) is such a word,
-    and shows.
+    start, and the rest is a relative path (`./a/b`, `a/b`, `key=a/b`). A `/` and a single name
+    is a path like any other (`/tmp`; the `/My` of `/My Disk/x`). This may hide what follows a
+    path on its line (the reason of an error, say), and never shows part of one.
+  - Only Claude's slash commands that remuda's own messages name, `/login` and `/rewind`, are
+    not paths, and only as whole words: nothing but punctuation follows the command in its word
+    (`/loginx`, `/login-x`, `/login.x`, and `/login/x` are paths).
+  - A path the TUI knows (`$HOME`, a home, a store, the directory remuda started in, a directory
+    typed in the open form) starts a path wherever it occurs as whole components, even within a
+    word. One that is named like one of those commands, or lies under such a name, makes that
+    name a path again: with a home `/login` or `/login/me`, `/login` is masked.
   - A notice made of several messages (the result of a launch and each of its warnings) is
     masked message by message: what one hides does not reach the next.
 
