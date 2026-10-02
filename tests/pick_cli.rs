@@ -48,6 +48,31 @@ fn claude_json(email: &str, age: i64, limits: &[Value]) -> String {
 
 const DAY: i64 = 86_400;
 
+/// A request body without the parts that follow the clock, so that two runs a moment apart
+/// compare equal: the local time, and the time left until each reset (`3d` becomes `2d23h` as
+/// soon as a second passes).
+fn without_clock(body: &str) -> String {
+    const RESETS: &str = "resets in ";
+    let mut out = String::new();
+    let mut rest = body;
+    while let Some(i) = rest.find(RESETS) {
+        out.push_str(&rest[..i + RESETS.len()]);
+        rest = &rest[i + RESETS.len()..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(rest.len());
+        out.push('_');
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    const TIME: &str = "local time: ";
+    if let Some(i) = out.find(TIME) {
+        let end = out[i..].find("\\n").map_or(out.len(), |j| i + j);
+        out.replace_range(i + TIME.len()..end, "_");
+    }
+    out
+}
+
 /// Registers `(provider, name, home)` and appends `pick`.
 fn configure(sb: &Sandbox, accounts: &[(&str, &str, &Path)], pick: &str) {
     let mut text = String::new();
@@ -395,6 +420,58 @@ fn the_request_is_private() {
     );
 }
 
+/// Every qualified name in the notes is aliased, however it is written: right after CJK text,
+/// before full-width punctuation, after `-` or `_`, and when the account is not registered (it
+/// gets the next alias, in the order the notes name them). A longer name is another account,
+/// and bare names stay as written. `--print-request` shows exactly what is sent.
+#[test]
+fn every_qualified_name_in_the_notes_is_aliased() {
+    let sb = Sandbox::new();
+    let secret = sb.make_claude_home("h/secretname");
+    sb.write_claude_json(
+        Some(&secret),
+        &claude_json("a@example.com", 600, &[limit("weekly_all", 10.0, 3 * DAY)]),
+    );
+    let other = sb.make_claude_home("h/other");
+    sb.write_claude_json(
+        Some(&other),
+        &claude_json("b@example.com", 600, &[limit("weekly_all", 30.0, 3 * DAY)]),
+    );
+    let notes = "把claude:secretname留给大重构。别用 claude:oldsecret（已移除的账号）；\
+                 -claude:secretname、_claude:secretname_ 和 codex:secretcodex 也一样。\
+                 claude:secretname2 不是它。max 照旧。";
+    configure(
+        &sb,
+        &[
+            ("claude", "secretname", &secret),
+            ("claude", "other", &other),
+        ],
+        &format!("[pick]\nnotes = \"{notes}\"\n"),
+    );
+    sb.set_jev_response(&answer("claude:account-1 / default", 0.9, &[]));
+    let out = pick(&sb, true, &[]);
+    assert_eq!(field(&out, "account"), "claude:secretname");
+    let body = sb.jev_request_body();
+    for leak in ["secretname", "oldsecret", "secretcodex"] {
+        assert!(!body.contains(leak), "{leak:?} in {body}");
+    }
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let state = v["state"].as_str().unwrap();
+    assert!(
+        state.contains(
+            "把claude:account-1留给大重构。别用 claude:account-3（已移除的账号）；\
+             -claude:account-1、_claude:account-4 和 codex:account-1 也一样。\
+             claude:account-5 不是它。max 照旧。"
+        ),
+        "{state}"
+    );
+    let printed = pick(&sb, false, &["--print-request"]);
+    assert_eq!(
+        without_clock(printed.stdout.trim_end()),
+        without_clock(&body)
+    );
+}
+
 /// `--print-request` prints the body a send uses, sends nothing, and needs no key.
 #[test]
 fn print_request_shows_the_body_without_sending() {
@@ -412,7 +489,10 @@ fn print_request_shows_the_body_without_sending() {
 
     sb.set_jev_response(&answer("claude:account-1 / claude-opus-5-5", 0.9, &[]));
     pick(&sb, true, &[]);
-    assert_eq!(sb.jev_request_body(), printed.stdout.trim_end());
+    assert_eq!(
+        without_clock(&sb.jev_request_body()),
+        without_clock(printed.stdout.trim_end())
+    );
 }
 
 /// Staleness is shown; a stale exhausted window stays exhausted until its reset, and a reset

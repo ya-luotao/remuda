@@ -111,7 +111,7 @@ The exceptions, all for a type or a small helper:
 | `account_config` | What an account's sessions load and where each item comes from | R22 |
 | `pick` | `[pick]`; candidates, windows and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options | R3, R23 |
 | `jev` | The request to Jev (aliased state, Choice and Score questions), `curl` transport, response parsing | R23 |
-| `privacy` | Account-name aliases, and whole-word aliasing of names in free text | R21, R23 |
+| `privacy` | Account-name aliases, whole-word aliasing of names in free text, and aliasing of every `provider:name` in the `pick` notes | R21, R23 |
 | `text` | Terminal text measured in display columns | – |
 | `tui` | Terminal ownership, the event loop, foreground launches | R16 |
 | `tui::app` | All TUI state and the pure `update(app, event) -> effects` | R8, R16, R17, R20–R22 |
@@ -247,7 +247,9 @@ an `Event`.
   which names are aliased and personal fields masked. `privacy::Snapshot` keeps that copy until
   the app changes, since making it for every frame is too slow for a large index. Every
   field of the state is destructured there, so a new field does not compile until it is decided
-  how private mode shows it (R21).
+  how private mode shows it (R21). A notice or a form's error is an `app::Marked`: the pieces it
+  was put together from, each path marked (`.path()`), so that a path is masked whole and a
+  message from elsewhere (`.text()`, a piece of its own) is masked without reaching the next.
 
 ## Shared configuration
 
@@ -369,6 +371,6 @@ cargo run --release --example codex_timing -- [<codex home>]
 | Support another agent CLI | SPEC R4, `provider` (every `match Provider`), `index`, `usage`, `identity` |
 | Read a new field from transcripts | `transcript` (index) or `stats` (counts); bump the cache's `SCHEMA_VERSION` |
 | Add a TUI action | `tui::app` (`Key` → `Effect`), `tui::workers` (the effect), `tui::render`, `tui::privacy` |
-| Add something shown on screen | `tui::app` state, `tui::render`, and its case in `tui::privacy::redacted` |
+| Add something shown on screen | `tui::app` state, `tui::render`, and its case in `tui::privacy::redacted`; a path in a notice goes in with `Marked::path` |
 | Add a model price | SPEC R20 table and `pricing` |
 | Change what `remuda pick` sends to Jev | SPEC R23, `jev::request` and `jev::state_text`; the privacy test in `tests/pick_cli.rs` |

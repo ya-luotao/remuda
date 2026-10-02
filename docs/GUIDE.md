@@ -42,8 +42,11 @@ starts and is not saved. While it is on, the TUI shows:
 - paths with every component masked, and `$HOME` as `~` (`~/•••/•••`);
 - in the configuration pane, the names of agents, skills, commands, plugins, hooks, settings,
   `env` variables and MCP servers stay visible; descriptions are masked;
-- notices, errors and check messages with the above replaced, as a best effort: a path is
-  recognized from a `/` or `~/` that begins a word, or from a directory remuda knows.
+- notices, errors and check messages with the above replaced. A path remuda puts there itself
+  is masked whole. In text from elsewhere (an agent's output, a system error, a check message)
+  nothing says where a path ends, so a line is masked from its first word with a `/` to its end,
+  and what follows the path on that line is hidden with it. A lone `/name` (`/login`, `/tmp`) is
+  left as it is.
 
 It keeps visible the numbers (usage percentages, reset times, token counts, costs), model names, plans,
 login methods, providers, session IDs, pids and times. It does not hide the output of an agent
@@ -226,8 +229,9 @@ models = ["gpt-6-astra"]
 - **What is sent.** Each feasible account under an alias (`claude:account-1`, as in private
   mode; `default` stays `default`) with its usage windows, the local weekday and time, your models
   and efforts, and your notes. In the notes, accounts written as `provider:name` are replaced by
-  their aliases; everything else is sent as written, so write accounts that way and keep secrets
-  out of the notes. Credentials, emails, organizations, paths and session content are never sent.
+  their aliases, registered or not, whatever is written around them (CJK text, punctuation, `-`,
+  `_`); everything else is sent as written, so write accounts that way and keep secrets out of
+  the notes. Credentials, emails, organizations, paths and session content are never sent.
   `remuda pick --print-request` prints the exact request without sending it; `--offline` never
   sends.
 - **Output.** The account, model and effort, what decided (and the rules' choice when Jev chose

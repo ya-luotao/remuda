@@ -15,7 +15,7 @@ use crate::registry::{self, Account, Registry};
 use crate::{account_config, attribution, checks, identity, live, stats, transcript, usage};
 
 use super::Deps;
-use super::app::{self, Effect, Event, LaunchRequest, PREVIEW_MESSAGES};
+use super::app::{self, Effect, Event, LaunchRequest, Marked, PREVIEW_MESSAGES};
 
 /// `claude auth status` / `codex login status` per account; the same default as `remuda list`.
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -232,7 +232,7 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
 /// through `tx`) and every account seen before (one may have been unregistered meanwhile and
 /// still run it, C2). An account that cannot be read may be running it, and so may one the
 /// registry cannot say: both refuse too.
-fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Option<String> {
+fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Option<Marked> {
     if let Some(error) = request.cwd.as_deref().and_then(check_dir) {
         return Some(error);
     }
@@ -240,10 +240,11 @@ fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Opt
     let accounts = match Registry::load(&deps.config) {
         Ok(registry) => registry.all(&deps.env),
         Err(e) => {
-            return Some(format!(
-                "cannot confirm that session {} is not running: cannot read the registry: {e:#}",
+            let said = format!(
+                "cannot confirm that session {} is not running: cannot read the registry: ",
                 app::short_id(&id)
-            ));
+            );
+            return Some(Marked::from(said).text(format!("{e:#}")));
         }
     };
     if accounts != deps.accounts {
@@ -262,21 +263,24 @@ fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Opt
         .iter()
         .find(|s| s.session_id.as_deref() == Some(id.as_str()) && !s.is_inactive())
     {
-        return Some(app::running_text(running));
+        return Some(app::running_text(running).into());
     }
     if found.unknown.is_empty() {
         return None;
     }
-    let why: Vec<String> = found
-        .unknown
-        .iter()
-        .map(|u| format!("{}: {}", app::short_account(&u.account), u.reason))
-        .collect();
-    Some(format!(
-        "cannot confirm that session {} is not running: {}",
-        app::short_id(&id),
-        why.join("; ")
-    ))
+    // Each account's reason is a piece of its own: what private mode masks in one does not
+    // reach the next (R21).
+    let mut said = Marked::from(format!(
+        "cannot confirm that session {} is not running: ",
+        app::short_id(&id)
+    ));
+    for (i, u) in found.unknown.iter().enumerate() {
+        let sep = if i == 0 { "" } else { "; " };
+        said = said
+            .text(format!("{sep}{}: ", app::short_account(&u.account)))
+            .text(&u.reason);
+    }
+    Some(said)
 }
 
 /// Every account of `lists`, once, in first-seen order.
@@ -290,15 +294,19 @@ pub(super) fn union(lists: &[&[Account]]) -> Vec<Account> {
     all
 }
 
-/// Why `dir` cannot be a launch directory, if it cannot.
-fn check_dir(dir: &Path) -> Option<String> {
+/// Why `dir` cannot be a launch directory, if it cannot; the directory is marked as the path
+/// it is, so private mode masks it whole whatever its name holds (R21).
+fn check_dir(dir: &Path) -> Option<Marked> {
+    let path = || Marked::default().path(dir.display());
     match std::fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => None,
-        Ok(_) => Some(format!("{} is not a directory", dir.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Some(format!("{} does not exist", dir.display()))
-        }
-        Err(e) => Some(format!("cannot use {}: {e}", dir.display())),
+        Ok(_) => Some(path().text(" is not a directory")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(path().text(" does not exist")),
+        Err(e) => Some(
+            Marked::from("cannot use ")
+                .join(&path())
+                .text(format!(": {e}")),
+        ),
     }
 }
 
@@ -617,11 +625,19 @@ mod tests {
         let gone = dir.path().join("gone");
         assert_eq!(
             check(Some(gone.clone())),
-            Some(format!("{} does not exist", gone.display()))
+            Some(
+                Marked::default()
+                    .path(gone.display())
+                    .text(" does not exist")
+            )
         );
         assert_eq!(
             check(Some(file.clone())),
-            Some(format!("{} is not a directory", file.display()))
+            Some(
+                Marked::default()
+                    .path(file.display())
+                    .text(" is not a directory")
+            )
         );
     }
 

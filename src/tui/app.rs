@@ -3,6 +3,8 @@
 //! work is requested as [`Effect`]s and comes back as [`Event`]s.
 
 use std::collections::HashMap;
+use std::fmt::Display;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use jiff::tz::TimeZone;
@@ -141,7 +143,7 @@ pub enum Event {
     LaunchChecked {
         check: u64,
         request: LaunchRequest,
-        error: Option<String>,
+        error: Option<Marked>,
     },
     /// `claude logs <short_id>` as plain text, or why it failed.
     Logs {
@@ -240,10 +242,96 @@ pub enum Level {
     Error,
 }
 
+/// Text the TUI puts together (a notice, a form's error), in the pieces it was made of: the
+/// words and names remuda wrote, each path it put there, each message that came from elsewhere
+/// (an agent's output, a system error). It reads as one string; private mode (R21) masks it
+/// piece by piece, a path whole whatever characters it holds, and what it must guess in one
+/// message never reaches into the next.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Marked {
+    text: String,
+    /// Where each piece ends in `text`, and whether it is a path.
+    pieces: Vec<(usize, bool)>,
+}
+
+impl Marked {
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// With `text` after it, as a piece of its own.
+    pub fn text(self, text: impl AsRef<str>) -> Self {
+        self.piece(text.as_ref(), false)
+    }
+
+    /// With the path `path` after it.
+    pub fn path(self, path: impl Display) -> Self {
+        self.piece(&path.to_string(), true)
+    }
+
+    /// With the pieces of `other` after it.
+    pub fn join(mut self, other: &Marked) -> Self {
+        for (piece, path) in other.pieces() {
+            self = self.piece(piece, path);
+        }
+        self
+    }
+
+    fn piece(mut self, piece: &str, path: bool) -> Self {
+        if !piece.is_empty() {
+            self.text.push_str(piece);
+            self.pieces.push((self.text.len(), path));
+        }
+        self
+    }
+
+    /// Each piece in order, and whether it is a path.
+    pub fn pieces(&self) -> impl Iterator<Item = (&str, bool)> {
+        let mut start = 0;
+        self.pieces.iter().map(move |(end, path)| {
+            let piece = &self.text[start..*end];
+            start = *end;
+            (piece, *path)
+        })
+    }
+}
+
+impl From<String> for Marked {
+    fn from(text: String) -> Self {
+        Marked::default().text(text)
+    }
+}
+
+impl From<&str> for Marked {
+    fn from(text: &str) -> Self {
+        Marked::default().text(text)
+    }
+}
+
+impl Deref for Marked {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl PartialEq<str> for Marked {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for Marked {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
 /// A one-line message in the status bar; the next key press clears it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
-    pub text: String,
+    pub text: Marked,
     pub level: Level,
 }
 
@@ -400,7 +488,7 @@ pub struct Form {
     /// Index into `fields`.
     pub focus: usize,
     /// Why the last submit was refused.
-    pub error: Option<String>,
+    pub error: Option<Marked>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -864,7 +952,7 @@ impl App {
         self.overlay = Some(overlay);
     }
 
-    fn notify(&mut self, level: Level, text: impl Into<String>) {
+    fn notify(&mut self, level: Level, text: impl Into<Marked>) {
         self.notice = Some(Notice {
             text: text.into(),
             level,
@@ -891,10 +979,10 @@ impl App {
         if level == Level::Info && failed {
             level = Level::Warn;
         }
-        let mut text = format!("{}: {what}", request.what);
+        // What the agent or the system said, and each warning, are pieces of their own (R21).
+        let mut text = Marked::from(format!("{}: ", request.what)).text(what);
         for w in warnings {
-            text.push_str(" · ");
-            text.push_str(&w);
+            text = text.text(" · ").text(w);
         }
         self.notify_after_child(level, text);
         self.live_stale = true;
@@ -902,9 +990,9 @@ impl App {
     }
 
     /// How a foreground child ended, and the pending launch it cancelled, if any.
-    fn notify_after_child(&mut self, level: Level, mut text: String) {
+    fn notify_after_child(&mut self, level: Level, mut text: Marked) {
         if let Some(what) = self.cancelled.take() {
-            text.push_str(&format!(" · {what} was cancelled: start it again"));
+            text = text.text(format!(" · {what} was cancelled: start it again"));
         }
         self.notify(level, text);
     }
@@ -1442,7 +1530,7 @@ impl App {
             }
             Err(e) => {
                 if let Some(Overlay::Form(form)) = &mut self.overlay {
-                    form.error = Some(e);
+                    form.error = Some(e.into());
                 }
             }
         }
@@ -1617,10 +1705,9 @@ impl App {
         if level == Level::Info && links.iter().any(|note| note.warning) {
             level = Level::Warn;
         }
-        let mut text = format!("set up {name}: {text}");
+        let mut text = Marked::from(format!("set up {name}: ")).text(text);
         for note in links {
-            text.push_str(" · ");
-            text.push_str(&note.text);
+            text = text.text(" · ").text(note.text);
         }
         self.notify_after_child(level, text);
     }
@@ -1865,10 +1952,9 @@ impl App {
             .collect();
         match owners.as_slice() {
             [] => {
-                let text = format!(
-                    "session {short} is in {}, which no registered account has",
-                    store.display()
-                );
+                let text = Marked::from(format!("session {short} is in "))
+                    .path(store.display())
+                    .text(", which no registered account has");
                 self.notify(Level::Error, text);
             }
             [only] => {
@@ -1920,11 +2006,11 @@ impl App {
         }
         // The stores may have been read again while the picker was open.
         if self.store_problem(&account.qualified(), path).is_some() {
-            let text = format!(
-                "{name} cannot find session {short}: the rollout is in {}, which is not {name}'s \
-                 sessions store",
-                store.display()
-            );
+            let text = Marked::from(format!(
+                "{name} cannot find session {short}: the rollout is in "
+            ))
+            .path(store.display())
+            .text(format!(", which is not {name}'s sessions store"));
             self.notify(Level::Error, text);
             return;
         }
@@ -2010,12 +2096,15 @@ impl App {
                     Home::Path(home) => format!("{home}/projects"),
                     Home::Default => "~/.claude/projects".to_string(),
                 };
-                let text = format!(
-                    "{name} cannot find session {short}: its projects store is {}, \
-                     the transcript is in {}; link {own} to that store to share sessions",
-                    store.path.display(),
-                    entry_store.display()
-                );
+                let text = Marked::from(format!(
+                    "{name} cannot find session {short}: its projects store is "
+                ))
+                .path(store.path.display())
+                .text(", the transcript is in ")
+                .path(entry_store.display())
+                .text("; link ")
+                .path(own)
+                .text(" to that store to share sessions");
                 self.notify(Level::Error, text);
                 return;
             }
@@ -2517,7 +2606,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 // What the app has seen meanwhile counts too (R16).
                 let error = error.or_else(|| {
                     let id = request.resumes()?;
-                    app.running_check(&id).err().map(|busy| busy.text())
+                    app.running_check(&id).err().map(|busy| busy.text().into())
                 });
                 // Only the form that started this check hears about it (C1).
                 let form = match &mut app.overlay {
@@ -2526,7 +2615,10 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 };
                 match (error, form) {
                     (Some(e), Some(form)) => form.error = Some(e),
-                    (Some(e), None) => app.notify(Level::Error, format!("{}: {e}", request.what)),
+                    (Some(e), None) => {
+                        let text = Marked::from(format!("{}: ", request.what)).join(&e);
+                        app.notify(Level::Error, text);
+                    }
                     (None, form) => {
                         if form.is_some() {
                             app.overlay = None;
@@ -2555,16 +2647,15 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                         Control::Stop => "stopped",
                         Control::Remove => "removed",
                     };
-                    let mut text = format!("{done} {short_id}");
+                    let mut text = Marked::from(format!("{done} {short_id}"));
                     if let Some(line) = out.lines().find(|l| !l.trim().is_empty()) {
-                        text.push_str(" · ");
-                        text.push_str(line.trim());
+                        text = text.text(" · ").text(line.trim());
                     }
                     (Level::Info, text)
                 }
                 Err(e) => (
                     Level::Error,
-                    format!("claude {} {short_id} {e}", verb.command()),
+                    Marked::from(format!("claude {} {short_id} ", verb.command())).text(e),
                 ),
             };
             app.notify(level, text);
@@ -2593,13 +2684,15 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             let name = display_name(&account);
             match result {
                 Ok(()) => {
-                    let text = format!(
-                        "removed {name}; its home {} was left in place",
-                        account.home
-                    );
+                    let text = Marked::from(format!("removed {name}; its home "))
+                        .path(&account.home)
+                        .text(" was left in place");
                     app.notify(Level::Info, text);
                 }
-                Err(e) => app.notify(Level::Error, format!("cannot remove {name}: {e}")),
+                Err(e) => {
+                    let text = Marked::from(format!("cannot remove {name}: ")).text(e);
+                    app.notify(Level::Error, text);
+                }
             }
         }
         Event::RolloutWritten { path, at } => {

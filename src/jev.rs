@@ -302,16 +302,12 @@ pub fn state_text(
     out
 }
 
-/// `notes` with each qualified account name (`claude:max`, a whole word) replaced by its alias;
-/// bare names stay as written (R23: `max` may be an effort as well as an account).
+/// `notes` with each qualified account name (`claude:max`) replaced by its alias, whatever is
+/// written around it and whether or not the account is registered
+/// ([`privacy::alias_qualified`]); bare names stay as written (R23: `max` may be an effort as
+/// well as an account).
 pub fn alias_notes(notes: &str, aliases: &Aliases) -> String {
-    let mut names: Vec<(String, String)> = aliases
-        .pairs()
-        .filter(|(name, alias)| name != alias)
-        .map(|(name, alias)| (name.to_string(), alias.to_string()))
-        .collect();
-    names.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
-    privacy::alias_words(notes, &names)
+    privacy::alias_qualified(notes, aliases)
 }
 
 /// Why Jev is not asked, if it is not (R23): `--offline`, no key, no notes, or nothing to
@@ -643,7 +639,7 @@ mod tests {
              (default)\n\
              \n\
              user notes (written by the user; follow them when they apply):\n\
-             Keep claude:account-1 for long refactors; max effort only for claude:maxi.\n\
+             Keep claude:account-1 for long refactors; max effort only for claude:account-2.\n\
              codex:account-1 is the company's.\n\
              \n\
              task: none given\n"
@@ -859,7 +855,8 @@ mod tests {
         assert!(snippet(&"x".repeat(500)).chars().count() == SNIPPET + 1);
     }
 
-    /// R23: aliasing in the notes touches qualified names only, as whole words.
+    /// R23: aliasing in the notes touches qualified names only, and every one of them: a name
+    /// that is not registered (`claude:maxi`) gets an alias of its own.
     #[test]
     fn notes_alias_only_qualified_names() {
         let (_, _, aliases) = fixture();
@@ -868,7 +865,14 @@ mod tests {
                 "claude:max, max, claude:maxi, (codex:work) claude:default",
                 &aliases
             ),
-            "claude:account-1, max, claude:maxi, (codex:account-1) claude:default"
+            "claude:account-1, max, claude:account-2, (codex:account-1) claude:default"
+        );
+        assert_eq!(
+            alias_notes(
+                "把claude:max留给大重构；-codex:work、_claude:gone_ 不用",
+                &aliases
+            ),
+            "把claude:account-1留给大重构；-codex:account-1、_claude:account-2 不用"
         );
     }
 
