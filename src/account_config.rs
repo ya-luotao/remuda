@@ -529,13 +529,16 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
             Origin::Own
         };
         (Some(dir), origin)
-    } else {
-        let origin = if plan.memory_shared {
-            Origin::AlreadySource
-        } else {
-            Origin::Own
+    } else if plan.memory_shared {
+        // Through a linked `projects`, a launch names the directory by the source's path
+        // (R18); the home's path resolves to it.
+        let dir = match (&plan.agent_memory, &plan.source) {
+            (Some(_), Some((_, from))) => project.memory_dir(from),
+            _ => project.memory_dir(&home),
         };
-        (project.memory_dir(&home), origin)
+        (dir, Origin::AlreadySource)
+    } else {
+        (project.memory_dir(&home), Origin::Own)
     };
     view.memory = Memory {
         files: dir.as_deref().map(Path::new).and_then(markdown_files),
@@ -549,6 +552,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         .get(share::MEMORY_DIR_VAR)
         .filter(|_| !plan.inherited_memory_dir);
     let (dir, origin) = match (&plan.agent_memory, users) {
+        _ if plan.agent_memory_shared => (home.join(share::AGENT_MEMORY), Origin::AlreadySource),
         (Some(from), _) => (from.join(share::AGENT_MEMORY), Origin::Shared),
         (None, Some(dir)) => (Path::new(dir).join(share::AGENT_MEMORY), Origin::Own),
         (None, None) if plan.agent_memory_shared => {

@@ -168,10 +168,13 @@ arguments:
   into the source's `projects/<project>/`.
 
 Injection writes nothing into any account home, and a part a home links is not injected again;
-a fully linked home gets nothing injected. Sessions cannot be injected: an account whose
-`projects` is its own sees and resumes only its own sessions. A home that shares `projects`
-with the source through a symlink gets no memory location injected, so its agent memory is shared
-only if `agent-memory` is a symlink too. What an account has for itself is not shared: the MCP
+a fully linked home gets nothing injected but the memory variable. Sessions cannot be injected:
+an account whose `projects` is its own sees and resumes only its own sessions. A home that shares
+`projects` with the source through a symlink gets `CLAUDE_CODE_REMOTE_MEMORY_DIR` set to the
+source's home instead of a memory location: its memory is in the source's store already, but
+claude asks for permission on every memory write that goes through the link, and not through
+the source's own path. Its agent memory is the source's too. What an account has for itself is
+not shared: the MCP
 servers and project trust in its `.claude.json`. `share` applies to Claude
 accounts only, and `from` must name a Claude account; anything else is a load error. The Accounts
 view warns about problems such as a missing source home or a plugin whose install is gone.
@@ -291,8 +294,7 @@ to make:
 - a home that does not share `projects` with the source: it does not see or resume the sessions
   there. This is a notice, not an error; its memory is still shared by injection.
 - a home that shares `projects` but not `file-history` (`/rewind` does not find the file
-  backups of another account's session) or not `agent-memory` (the memory of user-scope
-  subagents is not shared).
+  backups of another account's session).
 - a `plugins` link that installed plugins are recorded through: it must stay a symlink, or
   those plugins stop loading for every account.
 - a `settings.json` linked to the source's while the source's sets authentication settings:
