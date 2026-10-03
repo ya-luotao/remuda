@@ -294,7 +294,9 @@ to make:
 - a home that does not share `projects` with the source: it does not see or resume the sessions
   there. This is a notice, not an error; its memory is still shared by injection.
 - a home that shares `projects` but not `file-history` (`/rewind` does not find the file
-  backups of another account's session).
+  backups of another account's session), or not `agent-memory` where a settings file chooses
+  `autoMemoryDirectory` (a launch then does not redirect memory, so the memory of user-scope
+  subagents is not shared).
 - a `plugins` link that installed plugins are recorded through: it must stay a symlink, or
   those plugins stop loading for every account.
 - a `settings.json` linked to the source's while the source's sets authentication settings:

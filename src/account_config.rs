@@ -552,12 +552,10 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         .get(share::MEMORY_DIR_VAR)
         .filter(|_| !plan.inherited_memory_dir);
     let (dir, origin) = match (&plan.agent_memory, users) {
+        (None, Some(dir)) => (Path::new(dir).join(share::AGENT_MEMORY), Origin::Own),
+        // Linked: already the source's, whether or not a launch sets the variable too.
         _ if plan.agent_memory_shared => (home.join(share::AGENT_MEMORY), Origin::AlreadySource),
         (Some(from), _) => (from.join(share::AGENT_MEMORY), Origin::Shared),
-        (None, Some(dir)) => (Path::new(dir).join(share::AGENT_MEMORY), Origin::Own),
-        (None, None) if plan.agent_memory_shared => {
-            (home.join(share::AGENT_MEMORY), Origin::AlreadySource)
-        }
         (None, None) => (home.join(share::AGENT_MEMORY), Origin::Own),
     };
     view.agent_memory = Memory {
@@ -1667,6 +1665,21 @@ mod tests {
         symlink(src.join("agent-memory"), max.join("agent-memory")).unwrap();
         let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
         assert_eq!(view.agent_memory.origin, Origin::AlreadySource);
+        // Linked, with `projects` linked too (a launch sets the variable): still the link.
+        symlink(src.join("projects"), max.join("projects")).unwrap();
+        let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
+        assert_eq!(view.agent_memory.origin, Origin::AlreadySource);
+        // The user's own variable wins over the link, as it does for claude.
+        let mut env = f.env.clone();
+        env.insert(share::MEMORY_DIR_VAR.to_string(), "/theirs".to_string());
+        let view = read(&named("max", &max), &sharing(&source), Some(&work), &env);
+        assert_eq!(view.agent_memory.origin, Origin::Own);
+        assert_eq!(
+            view.agent_memory.dir,
+            Some("/theirs/agent-memory".to_string())
+        );
+        fs::remove_file(max.join("projects")).unwrap();
+        let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
         assert_eq!(
             view.agent_memory.dir,
             Some(max.join("agent-memory").display().to_string())

@@ -16,9 +16,10 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   working directories, which no allow rule or `additionalDirectories` entry gets past (2.1.288).
   Such a launch now sets `CLAUDE_CODE_REMOTE_MEMORY_DIR` to the source's home, so claude names
   the same directory by the source's path and writes without asking; the memory of user-scope
-  subagents is the source's as well, linked or not, and the R11 check that asked for an
-  `agent-memory` link next to a `projects` link is gone (SPEC R18, R11). Not set when the user
-  passes `--settings`, sets the variable, or a settings file chooses `autoMemoryDirectory`.
+  subagents is the source's as well, linked or not (SPEC R18). Not set when the user passes
+  `--settings`, sets the variable, or a settings file chooses `autoMemoryDirectory`; the R11
+  check that asks for an `agent-memory` link next to a `projects` link now fires only in that
+  last case, where the link is what shares it.
 
 ## [0.2.0] - 2026-10-03
 

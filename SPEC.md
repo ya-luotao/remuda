@@ -487,7 +487,10 @@ appeared in no `history.jsonl`.
 - A registered home does not exist, or appears not to be logged in.
 - Shared configuration (R18): the source account does not exist or its home is missing; a home
   shares some but not all of `CLAUDE.md`, `skills`, `commands`, `agents`, `rules` with the source
-  through symlinks (those items may load twice); rules of the source whose frontmatter has
+  through symlinks (those items may load twice); a home that shares `projects` with the source
+  through a symlink but not `agent-memory`, when the source has one and a settings file of the
+  source or the home chooses `autoMemoryDirectory` (a launch then does not redirect memory, so
+  the memory of user-scope subagents is not shared); rules of the source whose frontmatter has
   `paths`, when some member gets
   the rules at launch (they are not applied there); an enabled plugin whose install path does not
   exist; an `installed_plugins.json` whose format is not recognized; authentication keys in the
@@ -521,7 +524,7 @@ appeared in no `history.jsonl`.
     message says to remove the link, so that the rest is injected, or to move those settings
     out of the source's `settings.json`.
   The messages about items shared in part (`CLAUDE.md` and the other instruction items,
-  `file-history`) suggest linking the rest.
+  `file-history`, `agent-memory`) suggest linking the rest.
 
 ## R12. Symlinks in homes
 
@@ -1090,7 +1093,9 @@ not see the sessions in the source's store (R11, R16).
     tidies memory files under `projects/` (`tiny_memory`, `memory/proposals`) it looks under
     `<dir>/projects/`, the source's store. `memory: project` is not affected.
   - A member that shares `projects` with the source through a symlink gets the variable, so
-    its agent memory is the source's whether or not `agent-memory` is linked too.
+    its agent memory is the source's whether or not `agent-memory` is linked too; where a
+    settings file chooses `autoMemoryDirectory` the variable is not set, and only a link
+    shares it (R11 warns).
 - **Order.** Injected options come before the user's arguments, each in the `--option=value` form,
   so that a variadic option (such as `--add-dir`) cannot consume the user's arguments.
 
