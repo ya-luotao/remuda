@@ -113,8 +113,9 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
 /// missing; members whose home shares some but not all instruction items with the source
 /// through symlinks (those load twice); members whose `.claude.json`, `history.jsonl` or
 /// `sessions` is a link to another account's (checked even without the source's home);
-/// members that do not share `projects` with the source, or share it but not `file-history`
-/// or `agent-memory`; members whose `plugins` link the source's installs go through; members
+/// members that do not share `projects` with the source, or share it but not `file-history`,
+/// or not `agent-memory` where a settings file chooses `autoMemoryDirectory` (a launch then
+/// does not redirect memory); members whose `plugins` link the source's installs go through; members
 /// that read the source's authentication settings through a linked `settings.json`; rules of
 /// the source limited to paths, which claude ignores where the rules are injected;
 /// authentication keys of the source's settings, which are withheld where settings are
@@ -241,19 +242,26 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
                     ),
                 });
             }
-            // Agent memory follows auto-memory (R18): it is redirected only where remuda also
-            // injects the auto-memory location, which a shared `projects` rules out.
+            // Agent memory follows auto-memory (R18): a launch through a shared `projects` sets
+            // the memory variable to the source's home, unless a settings file chooses
+            // `autoMemoryDirectory`; then only a link shares the source's `agent-memory`.
             let agent_memory = from.join(share::AGENT_MEMORY);
-            if agent_memory.is_dir()
+            let chosen = settings.contains_key(share::MEMORY_KEY)
+                || share::read_settings(&home.join(SETTINGS))
+                    .is_ok_and(|own| own.contains_key(share::MEMORY_KEY));
+            if chosen
+                && agent_memory.is_dir()
                 && !share::resolves_to(&home.join(share::AGENT_MEMORY), &agent_memory)
             {
                 checks.push(Check {
                     account: Some(account.qualified()),
                     message: format!(
-                        "shares projects with {name} through a symlink but not {}: the memory \
-                         of user-scope subagents is not shared with this account; link it too \
-                         ({})",
+                        "shares projects with {name} through a symlink but not {}, and a \
+                         settings file chooses {}, so a launch does not redirect memory: the \
+                         memory of user-scope subagents is not shared with this account; link \
+                         it too ({})",
                         share::AGENT_MEMORY,
+                        share::MEMORY_KEY,
                         link(share::AGENT_MEMORY)
                     ),
                 });
@@ -719,13 +727,15 @@ mod tests {
         assert_eq!(sharing_checks(&accounts, &f.env, &sharing), []);
     }
 
-    /// R11, R18: a member whose `projects` is the source's gets no memory redirected, so the
-    /// source's `agent-memory` is not shared with it unless it is linked too.
+    /// R11, R18: a member whose `projects` is the source's shares the source's `agent-memory`
+    /// through the memory variable set at launch, linked or not: nothing to say about it,
+    /// unless a settings file chooses `autoMemoryDirectory`, which keeps the variable unset.
     #[test]
-    fn agent_memory_apart_from_a_shared_projects() {
+    fn agent_memory_goes_with_a_shared_projects() {
         let f = fixture();
         let native = f.root.join("home/.claude");
         fs::create_dir_all(native.join("projects")).unwrap();
+        fs::create_dir_all(native.join("agent-memory/reviewer")).unwrap();
         let max = f.root.join("max");
         fs::create_dir_all(&max).unwrap();
         symlink(native.join("projects"), max.join("projects")).unwrap();
@@ -733,26 +743,34 @@ mod tests {
         let sharing = sharing_from(Account::default_for(CLAUDE));
         assert_eq!(sharing_checks(&accounts, &f.env, &sharing), []);
 
-        fs::create_dir_all(native.join("agent-memory/reviewer")).unwrap();
-        let got = sharing_checks(&accounts, &f.env, &sharing);
-        assert_eq!(
-            messages(&got),
-            [(
-                Some("claude:max"),
-                format!(
-                    "shares projects with claude:default through a symlink but not \
-                     agent-memory: the memory of user-scope subagents is not shared with this \
-                     account; link it too ({} -> {})",
-                    max.join("agent-memory").display(),
-                    native.join("agent-memory").display()
-                )
-                .as_str()
-            )]
+        // The source's or the home's settings choose the location: only a link shares it.
+        let warning = format!(
+            "shares projects with claude:default through a symlink but not agent-memory, and \
+             a settings file chooses autoMemoryDirectory, so a launch does not redirect \
+             memory: the memory of user-scope subagents is not shared with this account; link \
+             it too ({} -> {})",
+            max.join("agent-memory").display(),
+            native.join("agent-memory").display()
         );
+        for home in [&native, &max] {
+            fs::write(
+                home.join("settings.json"),
+                r#"{"autoMemoryDirectory":"/m"}"#,
+            )
+            .unwrap();
+            assert_eq!(
+                messages(&sharing_checks(&accounts, &f.env, &sharing)),
+                [(Some("claude:max"), warning.as_str())]
+            );
+            fs::remove_file(home.join("settings.json")).unwrap();
+        }
+        fs::write(max.join("settings.json"), r#"{"autoMemoryDirectory":"/m"}"#).unwrap();
         symlink(native.join("agent-memory"), max.join("agent-memory")).unwrap();
         assert_eq!(sharing_checks(&accounts, &f.env, &sharing), []);
+        fs::remove_file(max.join("settings.json")).unwrap();
+        assert_eq!(sharing_checks(&accounts, &f.env, &sharing), []);
 
-        // Its own `projects`: the memory is redirected at launch instead, and the only thing
+        // Its own `projects`: the memory is redirected at launch as well, and the only thing
         // to say is that the account does not share sessions.
         fs::remove_file(max.join("agent-memory")).unwrap();
         fs::remove_file(max.join("projects")).unwrap();

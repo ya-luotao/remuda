@@ -8,6 +8,19 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ## [Unreleased]
 
+### Fixed
+
+- A member whose `projects` is a link to the source's (the layout `remuda setup` creates) had
+  claude ask for permission on every auto-memory write: claude grants its memory directory by
+  the literal path and then finds the resolved one under the source's `.claude/`, outside the
+  working directories, which no allow rule or `additionalDirectories` entry gets past (2.1.288).
+  Such a launch now sets `CLAUDE_CODE_REMOTE_MEMORY_DIR` to the source's home, so claude names
+  the same directory by the source's path and writes without asking; the memory of user-scope
+  subagents is the source's as well, linked or not (SPEC R18). Not set when the user passes
+  `--settings`, sets the variable, or a settings file chooses `autoMemoryDirectory`; the R11
+  check that asks for an `agent-memory` link next to a `projects` link now fires only in that
+  last case, where the link is what shares it.
+
 ## [0.2.0] - 2026-10-03
 
 ### Added

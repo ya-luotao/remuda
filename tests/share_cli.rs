@@ -328,7 +328,7 @@ fn nothing_is_shared_without_a_source() {
 }
 
 /// R12, R18: a home that already shares everything with the source through symlinks gets
-/// nothing injected.
+/// nothing injected but the memory variable, for the `projects` link.
 #[test]
 fn a_symlinked_home_gets_nothing() {
     let s = shared();
@@ -346,7 +346,7 @@ fn a_symlinked_home_gets_nothing() {
     assert_eq!(inv.args[..3], ["-p", "hi", "--session-id"]);
     assert_eq!(inv.args.len(), 4, "{:?}", inv.args);
     assert_eq!(inv.add_dir_claude_md, None);
-    assert_eq!(inv.memory_dir, None);
+    assert_eq!(inv.memory_dir.as_deref(), Some(s.source.to_str().unwrap()));
     assert!(s.sb.launches()[0].get("shared").is_none());
 }
 
@@ -393,7 +393,7 @@ fn the_sources_rules_are_copied_for_members() {
 }
 
 /// R18: the memory of user-scope subagents goes to the source's home only where the
-/// auto-memory location is injected too.
+/// auto-memory location is injected too, or already the source's through a linked `projects`.
 #[test]
 fn agent_memory_is_redirected_with_auto_memory() {
     let s = shared();
@@ -404,7 +404,7 @@ fn agent_memory_is_redirected_with_auto_memory() {
         "nothing is created"
     );
 
-    // No auto-memory injected: the user's own settings, a shared `projects`, a non-session.
+    // No auto-memory injected: the user's own settings, a non-session.
     for args in [
         &["max", "--settings", "/my.json"][..],
         &["max", "auth", "status"],
@@ -413,9 +413,23 @@ fn agent_memory_is_redirected_with_auto_memory() {
         s.sb.remuda().arg("run").args(args).assert().success();
         assert_eq!(s.sb.only_invocation().memory_dir, None, "{args:?}");
     }
+    // A shared `projects`: no `autoMemoryDirectory`, but the variable, so that claude writes
+    // its memory by the source's path rather than through the link.
     symlink(s.source.join("projects"), s.max.join("projects")).unwrap();
     fs::remove_file(s.sb.claude_out()).unwrap();
-    assert_eq!(s.run(&["max"]).memory_dir, None);
+    let inv = s.run(&["max"]);
+    assert_eq!(inv.memory_dir.as_deref(), Some(s.source.to_str().unwrap()));
+    assert!(
+        settings_of(&inv.args).is_none_or(|s| s.get("autoMemoryDirectory").is_none()),
+        "{:?}",
+        inv.args
+    );
+    fs::remove_file(s.sb.claude_out()).unwrap();
+    s.sb.remuda()
+        .args(["run", "max", "--settings", "/my.json"])
+        .assert()
+        .success();
+    assert_eq!(s.sb.only_invocation().memory_dir, None);
 
     // The source and an opted-out account get nothing, not even what an outer remuda session
     // of a member left in the environment; a value of the user's own passes through.
@@ -442,7 +456,8 @@ fn agent_memory_is_redirected_with_auto_memory() {
 }
 
 /// R18: each component on its own: instructions shared by symlink leave `--add-dir` out;
-/// shared `projects` leaves auto-memory out; shared `plugins` leaves `--plugin-dir` out.
+/// shared `projects` leaves auto-memory out (the memory variable stands in); shared
+/// `plugins` leaves `--plugin-dir` out.
 #[test]
 fn components_are_skipped_one_by_one() {
     let s = shared();
@@ -456,6 +471,7 @@ fn components_are_skipped_one_by_one() {
     let settings = settings_of(&inv.args).unwrap();
     assert_eq!(settings["model"], json!("opus"));
     assert!(settings.get("autoMemoryDirectory").is_none(), "{settings}");
+    assert_eq!(inv.memory_dir.as_deref(), Some(s.source.to_str().unwrap()));
 
     // Some but not all instruction items shared: `--add-dir` again (R11 warns).
     fs::remove_file(s.max.join("agents")).unwrap();

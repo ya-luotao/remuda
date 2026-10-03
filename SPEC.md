@@ -488,8 +488,10 @@ appeared in no `history.jsonl`.
 - Shared configuration (R18): the source account does not exist or its home is missing; a home
   shares some but not all of `CLAUDE.md`, `skills`, `commands`, `agents`, `rules` with the source
   through symlinks (those items may load twice); a home that shares `projects` with the source
-  through a symlink but not `agent-memory`, when the source has one (the memory of user-scope
-  subagents is not shared); rules of the source whose frontmatter has `paths`, when some member gets
+  through a symlink but not `agent-memory`, when the source has one and a settings file of the
+  source or the home chooses `autoMemoryDirectory` (a launch then does not redirect memory, so
+  the memory of user-scope subagents is not shared); rules of the source whose frontmatter has
+  `paths`, when some member gets
   the rules at launch (they are not applied there); an enabled plugin whose install path does not
   exist; an `installed_plugins.json` whose format is not recognized; authentication keys in the
   source's settings that are withheld from the settings injected at launch (said of the
@@ -522,7 +524,7 @@ appeared in no `history.jsonl`.
     message says to remove the link, so that the rest is injected, or to move those settings
     out of the source's `settings.json`.
   The messages about items shared in part (`CLAUDE.md` and the other instruction items,
-  `agent-memory`) suggest linking the rest.
+  `file-history`, `agent-memory`) suggest linking the rest.
 
 ## R12. Symlinks in homes
 
@@ -833,8 +835,8 @@ not see the sessions in the source's store (R11, R16).
   | Instructions: `CLAUDE.md`, `skills/`, `commands/`, `agents/`, `rules/` | every one the source has resolves to the source's | `--add-dir=$REMUDA_HOME/shared/claude` (whose `.claude/` holds one link per item of the source's first four, and copies of its rules) and `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` in the child environment |
   | Settings | `settings.json` resolves to the source's | the part of the source's `settings.json` that neither the home nor the project defines, in the single `--settings` |
   | Plugins | `plugins/` resolves to the source's | `--plugin-dir=<install path>` for each plugin enabled in the source's settings |
-  | Auto-memory | `projects/` resolves to the source's | `autoMemoryDirectory`, in the single `--settings` |
-  | Agent memory | `agent-memory/` resolves to the source's, `autoMemoryDirectory` is not injected, or the user set the variable | `CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>` in the child environment |
+  | Auto-memory | `projects/` resolves to the source's: `CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>` is set instead (below) | `autoMemoryDirectory`, in the single `--settings` |
+  | Agent memory | `agent-memory/` resolves to the source's, neither `autoMemoryDirectory` is injected nor `projects/` resolves to the source's, or the user set the variable | `CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>` in the child environment |
 
 - **Instructions.** `$REMUDA_HOME/shared/claude/.claude` is a directory in which remuda keeps
   copies of the source's rules (below) and
@@ -1054,10 +1056,24 @@ not see the sessions in the source's store (R11, R16).
   in its environment claude keeps it in `<dir>/agent-memory/<agent>/` instead. remuda sets the
   variable to the source's home, as registered, exactly when it injects `autoMemoryDirectory`
   and the settings file carrying it was written, unless the home's `agent-memory` resolves to
-  the source's. The condition is not optional: the variable also moves the default auto-memory
-  location, to `<dir>/projects/<project>/memory`, so remuda sets it only where it has itself
-  decided where auto-memory goes. remuda creates nothing: claude makes the directory when a
-  subagent first writes.
+  the source's; or when the home's `projects` resolves to the source's (next bullet). The
+  condition is not optional: the variable also moves the default auto-memory location, to
+  `<dir>/projects/<project>/memory`, so remuda sets it only where it has itself decided where
+  auto-memory goes, or where that is already the place. remuda creates nothing: claude makes
+  the directory when a subagent first writes.
+  - **A linked `projects`.** A home whose `projects` resolves to the source's keeps its
+    auto-memory in the source's store already, but by a path through the link. claude grants
+    its memory directory write access by that literal path and then checks the resolved one,
+    which is under the source's `.claude/` and outside the working directories: every memory
+    write asks for permission, in every mode, and no `Edit(//…)` allow rule or
+    `additionalDirectories` entry avoids it (observed on 2.1.288). With the variable set to the
+    source's home claude names the directory by the source's path, the same directory without
+    the link, and writes freely; `autoMemoryDirectory` is not injected (it would be the same
+    place). Not set when the user passes `--settings` or `--setting-sources`, sets the variable
+    themselves, or a settings file (the source's, the home's, the project's) chooses
+    `autoMemoryDirectory`: remuda does not know which of the two claude would follow. In this
+    case a malformed settings file of the source means no `autoMemoryDirectory` seen, not a
+    failed launch, as for any launch that injects nothing.
   - **A variable already in remuda's environment.** With the source's home as its value, it was
     set by an outer remuda launch (a member's session that starts remuda again): it is decided
     again for this launch, and removed from the child's environment when this launch does not
@@ -1076,8 +1092,10 @@ not see the sessions in the source's store (R11, R16).
     and the source, which has no variable, no longer read the same directory; and where claude
     tidies memory files under `projects/` (`tiny_memory`, `memory/proposals`) it looks under
     `<dir>/projects/`, the source's store. `memory: project` is not affected.
-  - A member that shares `projects` with the source through a symlink gets no memory injected,
-    so its agent memory is shared only if `agent-memory` is linked too (R11 warns).
+  - A member that shares `projects` with the source through a symlink gets the variable, so
+    its agent memory is the source's whether or not `agent-memory` is linked too; where a
+    settings file chooses `autoMemoryDirectory` the variable is not set, and only a link
+    shares it (R11 warns).
 - **Order.** Injected options come before the user's arguments, each in the `--option=value` form,
   so that a variadic option (such as `--add-dir`) cannot consume the user's arguments.
 

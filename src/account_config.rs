@@ -529,13 +529,16 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
             Origin::Own
         };
         (Some(dir), origin)
-    } else {
-        let origin = if plan.memory_shared {
-            Origin::AlreadySource
-        } else {
-            Origin::Own
+    } else if plan.memory_shared {
+        // Through a linked `projects`, a launch names the directory by the source's path
+        // (R18); the home's path resolves to it.
+        let dir = match (&plan.agent_memory, &plan.source) {
+            (Some(_), Some((_, from))) => project.memory_dir(from),
+            _ => project.memory_dir(&home),
         };
-        (project.memory_dir(&home), origin)
+        (dir, Origin::AlreadySource)
+    } else {
+        (project.memory_dir(&home), Origin::Own)
     };
     view.memory = Memory {
         files: dir.as_deref().map(Path::new).and_then(markdown_files),
@@ -549,11 +552,10 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         .get(share::MEMORY_DIR_VAR)
         .filter(|_| !plan.inherited_memory_dir);
     let (dir, origin) = match (&plan.agent_memory, users) {
-        (Some(from), _) => (from.join(share::AGENT_MEMORY), Origin::Shared),
         (None, Some(dir)) => (Path::new(dir).join(share::AGENT_MEMORY), Origin::Own),
-        (None, None) if plan.agent_memory_shared => {
-            (home.join(share::AGENT_MEMORY), Origin::AlreadySource)
-        }
+        // Linked: already the source's, whether or not a launch sets the variable too.
+        _ if plan.agent_memory_shared => (home.join(share::AGENT_MEMORY), Origin::AlreadySource),
+        (Some(from), _) => (from.join(share::AGENT_MEMORY), Origin::Shared),
         (None, None) => (home.join(share::AGENT_MEMORY), Origin::Own),
     };
     view.agent_memory = Memory {
@@ -1663,6 +1665,21 @@ mod tests {
         symlink(src.join("agent-memory"), max.join("agent-memory")).unwrap();
         let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
         assert_eq!(view.agent_memory.origin, Origin::AlreadySource);
+        // Linked, with `projects` linked too (a launch sets the variable): still the link.
+        symlink(src.join("projects"), max.join("projects")).unwrap();
+        let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
+        assert_eq!(view.agent_memory.origin, Origin::AlreadySource);
+        // The user's own variable wins over the link, as it does for claude.
+        let mut env = f.env.clone();
+        env.insert(share::MEMORY_DIR_VAR.to_string(), "/theirs".to_string());
+        let view = read(&named("max", &max), &sharing(&source), Some(&work), &env);
+        assert_eq!(view.agent_memory.origin, Origin::Own);
+        assert_eq!(
+            view.agent_memory.dir,
+            Some("/theirs/agent-memory".to_string())
+        );
+        fs::remove_file(max.join("projects")).unwrap();
+        let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
         assert_eq!(
             view.agent_memory.dir,
             Some(max.join("agent-memory").display().to_string())

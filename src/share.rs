@@ -113,8 +113,11 @@ pub struct Plan {
     pub settings: Map<String, Value>,
     /// The `autoMemoryDirectory` remuda adds (also in `settings`), if any.
     pub memory: Option<String>,
-    /// The source's home, when [`MEMORY_DIR_VAR`] is set to it: only together with `memory`,
-    /// without which the variable would also move auto-memory.
+    /// The source's home, when [`MEMORY_DIR_VAR`] is set to it: together with `memory`, or when
+    /// `projects` is the source's already (`memory_shared`). The variable also moves auto-memory,
+    /// to `<source home>/projects/<project>/memory`: with `memory` injected that is where it goes
+    /// anyway; through a linked `projects` it is where it already is, now by a path without the
+    /// link, which claude's own permission check for its memory directory needs.
     pub agent_memory: Option<PathBuf>,
     /// remuda's own environment has [`MEMORY_DIR_VAR`] with the source's home as its value: an
     /// outer remuda launch set it for its own session. It is decided again for this launch and
@@ -246,25 +249,47 @@ pub fn plan(
     }
     let settings_part = !settings_shared && user_settings.is_none();
     let memory_part = !memory_shared && user_settings.is_none();
-    // Before any settings file is read for injection: a launch that shares everything by
-    // symlink does not fail on a malformed one (the read above ignores it).
-    if !(settings_part || memory_part || plugins_part) {
+    // A variable the user set is kept.
+    let users = env.contains_key(MEMORY_DIR_VAR) && !plan.inherited_memory_dir;
+    // Auto-memory through a linked `projects` is where the source keeps it, but claude's own
+    // permission check for its memory directory does not follow the link and asks for every
+    // write there. The variable names the source's home instead, so claude reaches the same
+    // directory by a path without the link (and the memory of user-scope subagents goes to
+    // the source's too). Set unless the user chose the memory location themselves.
+    let linked_memory = memory_shared && user_settings.is_none() && !users;
+    let reads = settings_part || memory_part || plugins_part;
+    if !(reads || linked_memory) {
         return Ok(plan);
     }
 
-    let source_settings = read_settings(&from.join("settings.json"))?;
+    // A launch that shares everything by symlink does not fail on a malformed settings file
+    // (the read above ignores it); one that injects something does.
+    let settings_path = from.join("settings.json");
+    let source_settings = if reads {
+        read_settings(&settings_path)?
+    } else {
+        read_settings(&settings_path).unwrap_or_default()
+    };
     // The home's own settings: read only when it is a file that is not the source's (a
     // directory or a dangling link defines nothing).
     let own = if settings_shared {
         source_settings.clone()
     } else if fs::metadata(&own_path).is_ok_and(|m| m.is_file()) {
-        read_settings(&own_path)?
+        if reads {
+            read_settings(&own_path)?
+        } else {
+            read_settings(&own_path).unwrap_or_default()
+        }
     } else {
         Map::new()
     };
 
     let project = Project::locate(cwd);
     let layers = project.settings(env);
+    // A location the source, the home or the project's local settings chose is kept.
+    let chosen = source_settings.contains_key(MEMORY_KEY)
+        || own.contains_key(MEMORY_KEY)
+        || layers.iter().any(|l| l.contains_key(MEMORY_KEY));
     if settings_part || memory_part {
         let mut injected = Map::new();
         if settings_part {
@@ -274,23 +299,20 @@ pub fn plan(
             }
             strip_auth(&mut injected);
         }
-        // A location the source, the home or the project's local settings chose is kept.
-        let chosen = source_settings.contains_key(MEMORY_KEY)
-            || own.contains_key(MEMORY_KEY)
-            || layers.iter().any(|l| l.contains_key(MEMORY_KEY));
         if memory_part
             && !chosen
             && let Some(memory) = project.memory_dir(&from)
         {
             injected.insert(MEMORY_KEY.to_string(), Value::String(memory.clone()));
             plan.memory = Some(memory);
-            // A variable the user set is kept.
-            let users = env.contains_key(MEMORY_DIR_VAR) && !plan.inherited_memory_dir;
             if !plan.agent_memory_shared && !users {
                 plan.agent_memory = Some(from.clone());
             }
         }
         plan.settings = injected;
+    }
+    if linked_memory && !chosen {
+        plan.agent_memory = Some(from.clone());
     }
 
     if plugins_part {
@@ -372,22 +394,25 @@ fn apply_source(plan: &Plan, config: &Path) -> Result<Shared> {
         }
     }
     shared.notices.extend(plan.notices.iter().cloned());
+    // The variable moves auto-memory too: only where it already is (a linked `projects`), or
+    // with the settings that pin it there.
+    let mut memory_placed = plan.memory_shared;
     if !plan.settings.is_empty() {
         let json = serde_json::to_string(&Value::Object(plan.settings.clone()))?;
         match write_settings(&settings_dir(config), &json, SystemTime::now()) {
             Ok(path) => {
                 shared.args.push(format!("--settings={}", path.display()));
-                // Only with the settings that keep auto-memory where it is.
-                if let Some(dir) = &plan.agent_memory {
-                    shared
-                        .env
-                        .push((MEMORY_DIR_VAR.to_string(), dir.display().to_string()));
-                }
+                memory_placed |= plan.memory.is_some();
             }
             Err(e) => shared.notices.push(format!(
                 "settings from {name} are not shared this time: {e:#}"
             )),
         }
+    }
+    if memory_placed && let Some(dir) = &plan.agent_memory {
+        shared
+            .env
+            .push((MEMORY_DIR_VAR.to_string(), dir.display().to_string()));
     }
     for plugin in &plan.plugins {
         if let Ok(install) = &plugin.outcome {
@@ -3051,7 +3076,8 @@ mod tests {
     /// R18: the memory of user-scope subagents is redirected to the source's home only
     /// together with the injected auto-memory location: not when `projects` or `agent-memory`
     /// is the source's already, when the user passes `--settings`, when a settings file
-    /// chooses the auto-memory location, or when the variable is already set.
+    /// chooses the auto-memory location, or when the variable is already set. A linked
+    /// `projects` is the exception: the variable is set without `autoMemoryDirectory`.
     #[test]
     fn agent_memory_follows_the_injected_auto_memory() {
         let dir = tempfile::tempdir().unwrap();
@@ -3077,7 +3103,7 @@ mod tests {
                 .find(|(k, _)| k == MEMORY_DIR_VAR)
                 .map(|(_, v)| v.clone());
             assert_eq!(var.is_some(), plan.agent_memory.is_some());
-            assert!(var.is_none() || plan.memory.is_some());
+            assert!(var.is_none() || plan.memory.is_some() || plan.memory_shared);
             var
         };
         let env = Env::new();
@@ -3102,10 +3128,28 @@ mod tests {
         assert!(got.memory.is_some());
         fs::remove_file(max.join(AGENT_MEMORY)).unwrap();
 
-        // `projects` is the source's: auto-memory is not injected, nor the variable.
+        // `projects` is the source's: auto-memory is not injected, but the variable is set, so
+        // that claude reaches the memory directory by a path without the link.
         fs::remove_dir(max.join("projects")).unwrap();
         symlink(source_home.join("projects"), max.join("projects")).unwrap();
+        assert_eq!(var(&[], &env), Some(source_home.display().to_string()));
+        let got = plan(&sharing, &account, &[], Some(&root), &env).unwrap();
+        assert!(got.memory_shared && got.memory.is_none(), "{got:?}");
+        assert!(!got.settings.contains_key(MEMORY_KEY), "{got:?}");
+        // Still the user's call: their own `--settings` or variable, or a chosen location.
+        assert_eq!(var(&["--settings", "/mine.json"], &env), None);
+        assert_eq!(var(&[], &set), None);
+        fs::write(max.join("settings.json"), r#"{"autoMemoryDirectory":"/m"}"#).unwrap();
         assert_eq!(var(&[], &env), None);
+        fs::remove_file(max.join("settings.json")).unwrap();
+
+        // Everything linked and the source's settings malformed: set, and no error.
+        fs::write(source_home.join("settings.json"), "{not json").unwrap();
+        fs::create_dir_all(source_home.join("plugins")).unwrap();
+        for item in ["settings.json", "plugins"] {
+            symlink(source_home.join(item), max.join(item)).unwrap();
+        }
+        assert_eq!(var(&[], &env), Some(source_home.display().to_string()));
     }
 
     fn named(name: &str, home: &Path) -> Account {

@@ -335,7 +335,8 @@ fn setup_links_a_members_home_to_the_source() {
         .collect();
     assert_eq!(login.entries, expected);
 
-    // R18: a session of the new account gets nothing injected.
+    // R18: a session of the new account gets nothing injected but the memory variable, which
+    // lets claude write its auto-memory by the source's path instead of through the link.
     sb.remuda()
         .args(["run", "work", "-p", "hi"])
         .assert()
@@ -345,7 +346,7 @@ fn setup_links_a_members_home_to_the_source() {
     assert_eq!(inv.args.len(), 4, "{:?}", inv.args);
     assert_eq!(inv.config_dir.as_deref(), Some(home_str.as_str()));
     assert_eq!(inv.add_dir_claude_md, None);
-    assert_eq!(inv.memory_dir, None);
+    assert_eq!(inv.memory_dir.as_deref(), Some(source_str.as_str()));
     let [launch] = sb.launches().try_into().unwrap();
     assert!(launch.get("shared").is_none(), "{launch}");
     assert!(!sb.remuda_home().join("shared").exists());

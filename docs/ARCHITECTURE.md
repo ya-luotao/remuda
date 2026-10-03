@@ -305,7 +305,10 @@ pane cannot disagree with a launch.
  enabledPlugins + installed_plugins.json  ─────► --plugin-dir=<install path>  (one per plugin)
  projects/<project>/memory  ───────────────────► autoMemoryDirectory (inside the same --settings)
  agent-memory/  ───────────────────────────────► CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>
-                                                   (only with autoMemoryDirectory)
+                                                   (with autoMemoryDirectory, or when the
+                                                   member's projects/ is a link to the source's:
+                                                   claude then writes memory by the source's
+                                                   path, not through the link, without asking)
 ```
 
 Each row is skipped when the member's home already resolves to the source's item by realpath
