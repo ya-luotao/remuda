@@ -1,7 +1,6 @@
 # remuda roadmap
 
-**Status:** v0.1.0. Milestones M0–M3 and M2.5 are complete; M2.5 goes out with 0.2.0, which is
-not released yet.
+**Status:** v0.2.0. Milestones M0–M3 and M2.5 are complete; M2.5 went out with 0.2.0.
 
 remuda is a multi-account and session manager for coding agents (Claude Code and Codex). Its
 behavior contract is [SPEC.md](SPEC.md); this document records the design principles, decisions,
@@ -110,8 +109,8 @@ through one `--settings`, enabled plugins through `--plugin-dir`, and the memory
 subagents through an environment variable. It writes nothing into any home, skips each
 component a home already links, and cannot share sessions.
 The linked layout is the one in daily use. Injection has run only in the tests, not on a real
-multi-account setup: the author's homes link everything, so nothing is injected there. 0.2.0
-follows this milestone.
+multi-account setup: the author's homes link everything, so nothing is injected there. Released
+in 0.2.0.
 
 ## Later, as needed
 

@@ -8,6 +8,8 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-03
+
 ### Added
 
 - Recommendations (SPEC R23): `remuda pick` recommends the account, model and effort to launch
@@ -112,7 +114,9 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   not extended. **Write boundary:** `remuda setup` used to create an empty home; with
   `[share.claude]` set it now also makes the links above in that new, empty directory, the one
   case in which remuda writes inside a home (SPEC R12, R13). Without `[share.claude]`, and for
-  Codex, the home is created empty as before.
+  Codex, the home is created empty as before. The injection has been exercised by the test
+  suite only: on the author's own accounts every component is linked, so nothing is injected
+  there.
 - When an account cannot find a session to resume, the message says which `projects` to link
   (SPEC R16).
 - Shared instructions (SPEC R18) are exposed through per-item links:
@@ -193,5 +197,6 @@ Initial release.
   `sessions`; a session index over Codex rollouts; resume and fork from the TUI, with confirmation
   before resuming in place.
 
-[Unreleased]: https://github.com/ya-luotao/remuda/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ya-luotao/remuda/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ya-luotao/remuda/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ya-luotao/remuda/releases/tag/v0.1.0

@@ -326,7 +326,7 @@ the specification ([SPEC.md](SPEC.md), R2 and R13):
 
 ## Status
 
-Remuda is at version 0.1.0. Its behavior is specified in [SPEC.md](SPEC.md) and covered by
+Remuda is at version 0.2.0. Its behavior is specified in [SPEC.md](SPEC.md) and covered by
 tests, but the project is young: until 1.0, minor releases may contain breaking changes, which are
 always listed in [CHANGELOG.md](CHANGELOG.md).
 
