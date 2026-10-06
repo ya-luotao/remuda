@@ -9,10 +9,10 @@
 //! `$REMUDA_HOME/state/settings/`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, symlink};
+use std::io;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -22,8 +22,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::Env;
 use crate::registry::{Account, Sharing};
+use crate::{Env, owned};
 
 /// With it set, `--add-dir` also loads `CLAUDE.md` from the added directory (R18).
 pub const CLAUDE_MD_VAR: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
@@ -49,7 +49,7 @@ pub const MAX_PROJECT_NAME: usize = 200;
 
 /// `$REMUDA_HOME/shared/claude`, next to `config.toml` (R13, R18).
 pub fn dir(config: &Path) -> PathBuf {
-    config.with_file_name("shared").join("claude")
+    owned::shared_dir(config)
 }
 
 /// What a launch gets from the source account.
@@ -426,7 +426,7 @@ fn apply_source(plan: &Plan, config: &Path) -> Result<Shared> {
 
 /// `$REMUDA_HOME/state/settings`: the injected settings, one file per content (R18).
 pub fn settings_dir(config: &Path) -> PathBuf {
-    config.with_file_name("state").join("settings")
+    owned::settings_dir(config)
 }
 
 /// Settings files not used for this long are removed when a new one is written (R18).
@@ -434,126 +434,56 @@ pub const SETTINGS_KEPT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Writes `json` to `<dir>/<sha256 of json>.json`, mode 0600, atomically (R18); a file with
 /// that name is reused, and its mtime set to `now` to mark it used. Writing a new file first
-/// removes the files of `dir` not used since [`SETTINGS_KEPT`] before `now`.
+/// removes the files of `dir` not used since [`SETTINGS_KEPT`] before `now`. `dir` is a
+/// directory of remuda's own, the user's alone ([`owned::settings`]).
 pub fn write_settings(dir: &Path, json: &str, now: SystemTime) -> Result<PathBuf> {
     let name = format!("{:x}.json", Sha256::digest(json.as_bytes()));
     let path = dir.join(&name);
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("cannot create {}", dir.display()))?;
+    let settings = owned::settings(dir)?;
     // Held until this returns: a file is never pruned between being chosen and being marked
-    // used, by this remuda or another.
-    let _lock = Lock::settings(dir)?;
-    if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .and_then(|f| f.set_modified(now))
+    // used, by this remuda or another. Without locks, remuda goes on without one (R18).
+    let _lock = settings
+        .lock_file(SETTINGS_LOCK, &owned::Flock, owned::Lockless::Proceed)
+        .with_context(|| format!("cannot lock {}", dir.join(SETTINGS_LOCK).display()))?;
+    if settings
+        .kind(&name)
+        .is_ok_and(|kind| kind == Some(owned::Kind::File))
+    {
+        settings
+            .touch(&name, now)
             .with_context(|| format!("cannot use {}", path.display()))?;
         return Ok(path);
     }
-    prune_settings(dir, now);
-    let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let written = (|| -> io::Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
-        fs::rename(&tmp, &path)
-    })();
-    if let Err(e) = written {
-        let _ = fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("cannot write {}", path.display()));
-    }
+    prune_settings(&settings, now);
+    settings.sweep();
+    settings
+        .write(&name, json.as_bytes(), owned::FileMode::Private)
+        .with_context(|| format!("cannot write {}", path.display()))?;
     Ok(path)
 }
 
 /// The lock file of the settings directory: never a settings file, so never pruned.
 pub const SETTINGS_LOCK: &str = ".lock";
 
-/// An exclusive `flock`, released when dropped. On a file system without locking there is no
-/// lock, and remuda goes on without it (R18).
-struct Lock(Option<fs::File>);
-
-impl Lock {
-    /// On `<dir>/.lock` (a regular file, 0600) of the settings directory.
-    fn settings(dir: &Path) -> Result<Lock> {
-        let path = dir.join(SETTINGS_LOCK);
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)
-            .with_context(|| format!("cannot open {}", path.display()))?;
-        Lock::on(file, &path)
-    }
-
-    /// On the directory `dir` itself: nothing is created for it.
-    fn directory(dir: &Path) -> Result<Lock> {
-        let file = fs::File::open(dir).with_context(|| format!("cannot open {}", dir.display()))?;
-        Lock::on(file, dir)
-    }
-
-    fn on(file: fs::File, path: &Path) -> Result<Lock> {
-        loop {
-            // SAFETY: the descriptor is open for the call.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                return Ok(Lock(Some(file)));
-            }
-            let e = io::Error::last_os_error();
-            let code = e.raw_os_error().unwrap_or(0);
-            if code == libc::EINTR {
-                continue;
-            }
-            // Not a pattern: EOPNOTSUPP and ENOTSUP are one value on Linux.
-            let unsupported = [libc::EBADF, libc::ENOLCK, libc::EOPNOTSUPP, libc::ENOTSUP];
-            if unsupported.contains(&code) {
-                return Ok(Lock(None));
-            }
-            return Err(e).with_context(|| format!("cannot lock {}", path.display()));
-        }
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        if let Some(file) = &self.0 {
-            // SAFETY: the descriptor is still open; closing it would release the lock anyway.
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        }
-    }
-}
-
 /// Removes the settings files of `dir` (`<64 hex digits>.json`) last used before
 /// [`SETTINGS_KEPT`] ago; anything else there is left alone.
-fn prune_settings(dir: &Path, now: SystemTime) {
+fn prune_settings(dir: &owned::Dir, now: SystemTime) {
     let Some(cutoff) = now.checked_sub(SETTINGS_KEPT) else {
         return;
     };
-    let Ok(listing) = fs::read_dir(dir) else {
+    let Ok(names) = dir.names() else {
         return;
     };
-    for item in listing.flatten() {
-        let name = item.file_name();
+    for name in names {
         let ours = name
             .to_str()
             .and_then(|n| n.strip_suffix(".json"))
             .is_some_and(|stem| {
                 stem.len() == 64 && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
             });
-        let old = item
-            .metadata()
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| t < cutoff);
-        if ours && old && item.file_type().is_ok_and(|t| t.is_file()) {
-            let _ = fs::remove_file(item.path());
+        let old = |meta: owned::Meta| meta.kind == owned::Kind::File && meta.modified < cutoff;
+        if ours && dir.meta(&name).is_ok_and(|meta| meta.is_some_and(old)) {
+            let _ = dir.remove_file(&name);
         }
     }
 }
@@ -1050,87 +980,94 @@ fn rule_copies(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// `.<32 hex digits>.tmp`: the name [`apply_rules`] writes a copy under. Not a rule's name, so
-/// claude never loads a copy half written.
-fn is_temp_name(name: &std::ffi::OsStr) -> bool {
-    name.as_encoded_bytes()
-        .strip_prefix(b".")
-        .and_then(|rest| rest.strip_suffix(b".tmp"))
-        .is_some_and(|hex| hex.len() == 32 && hex.iter().all(u8::is_ascii_hexdigit))
+/// The name [`apply_rules`] writes a copy under ([`owned::is_temp_name`]): not a rule's name,
+/// so claude never loads a copy half written. Also `.<32 hex digits>.tmp`, the name of
+/// earlier versions, for what one of those left behind.
+fn is_temp_name(name: &OsStr) -> bool {
+    owned::is_temp_name(name)
+        || name
+            .as_encoded_bytes()
+            .strip_prefix(b".")
+            .and_then(|rest| rest.strip_suffix(b".tmp"))
+            .is_some_and(|hex| hex.len() == 32 && hex.iter().all(u8::is_ascii_hexdigit))
 }
 
-/// Whether `rules` and every directory of `dir` below it are directories (not links to one);
-/// `false` when one is missing, an error when something else is there.
-fn real_dirs(mirror: &Path, dir: &Path) -> Result<bool> {
-    let mut path = mirror.to_path_buf();
-    for part in std::iter::once(None).chain(dir.components().map(Some)) {
-        if let Some(part) = part {
-            path.push(part);
-        }
-        match fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_dir() => {}
-            Ok(_) => bail!(
-                "{} is not a directory; remuda does not replace it",
-                path.display()
-            ),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", path.display())),
+/// A level of the copies that is not a directory, a link to one included, is never replaced.
+fn not_replaced(blocked: owned::Blocked) -> anyhow::Error {
+    match blocked.why {
+        owned::Why::Symlink | owned::Why::NotADirectory => anyhow::anyhow!(
+            "{} is not a directory; remuda does not replace it",
+            blocked.path.display()
+        ),
+        owned::Why::Create(_) | owned::Why::Open(_) => blocked.into(),
+    }
+}
+
+/// `rules` in `root` and every directory of `dir` below it, each opened from the one above
+/// and never through a link, with its name; `None` when one is missing, an error when
+/// something else is there.
+fn real_dirs<'a>(root: &owned::Dir, dir: &'a Path) -> Result<Option<Vec<(&'a OsStr, owned::Dir)>>> {
+    let mut levels: Vec<(&OsStr, owned::Dir)> = Vec::new();
+    let parts = dir.components().map(|part| part.as_os_str());
+    for name in std::iter::once(OsStr::new(RULES)).chain(parts) {
+        let opened = levels.last().map_or(root, |(_, above)| above).sub(name);
+        match opened {
+            Ok(level) => levels.push((name, level)),
+            Err(missing) if missing.is_missing() => return Ok(None),
+            Err(blocked) => return Err(not_replaced(blocked)),
         }
     }
-    Ok(true)
+    Ok(Some(levels))
 }
 
-/// Carries out [`rules_plan`] under `root`: removals first, then the writes. Every directory
-/// on the way is checked again, or made, one level at a time, never through a link; each copy
-/// is written read-only (mode 0400, so that editing the copy instead of the source's rule
-/// fails) under a temporary name in its directory and renamed into place; a removed copy's
-/// directories go with it when that leaves them empty, `rules` itself included.
-fn apply_rules(root: &Path, steps: Vec<RuleStep>) -> Result<()> {
-    let mirror = root.join(RULES);
+/// Carries out [`rules_plan`] in `root`: removals first, then the writes. Every directory on
+/// the way is opened from the one above, or made, one level at a time, never through a link;
+/// each copy is written read-only (mode 0400, so that editing the copy instead of the
+/// source's rule fails) under a temporary name in its directory and renamed into place; a
+/// removed copy's directories go with it when that leaves them empty, `rules` itself included.
+fn apply_rules(root: &owned::Dir, steps: Vec<RuleStep>) -> Result<()> {
     for step in steps {
         match step {
             RuleStep::Remove(rel) => {
                 let dir = rel.parent().unwrap_or(Path::new(""));
-                if !real_dirs(&mirror, dir)? {
+                let (Some(levels), Some(name)) = (real_dirs(root, dir)?, rel.file_name()) else {
                     continue;
-                }
-                let dest = mirror.join(&rel);
+                };
+                let at = levels.last().map_or(root, |(_, level)| level);
                 // Checked again right before: never anything but a regular file.
-                if fs::symlink_metadata(&dest).is_ok_and(|m| m.file_type().is_file())
-                    && let Err(e) = fs::remove_file(&dest)
+                if at
+                    .kind(name)
+                    .is_ok_and(|kind| kind == Some(owned::Kind::File))
+                    && let Err(e) = at.remove_file(name)
                     && e.kind() != io::ErrorKind::NotFound
                 {
-                    return Err(e).with_context(|| format!("cannot remove {}", dest.display()));
+                    return Err(e).with_context(|| {
+                        format!("cannot remove {}", at.path().join(name).display())
+                    });
                 }
                 // Fails on a directory that still holds something: it stays.
-                let mut dir = Some(dir);
-                while let Some(d) = dir
-                    && fs::remove_dir(mirror.join(d)).is_ok()
-                {
-                    dir = d.parent();
+                for (depth, (name, _)) in levels.iter().enumerate().rev() {
+                    let above = depth.checked_sub(1).map_or(root, |above| &levels[above].1);
+                    if above.remove_dir(name).is_err() {
+                        break;
+                    }
                 }
             }
             RuleStep::Clear(rel) => {
-                if real_dirs(&mirror, &rel)? {
-                    remove_empty_dirs(&mirror.join(&rel))?;
+                if let (Some(levels), Some(name)) = (
+                    real_dirs(root, rel.parent().unwrap_or(Path::new("")))?,
+                    rel.file_name(),
+                ) {
+                    remove_empty_dirs(levels.last().map_or(root, |(_, level)| level), name)?;
                 }
             }
             RuleStep::Write { rel, bytes } => {
-                let dir = make_dirs(&mirror, rel.parent().unwrap_or(Path::new("")))?;
-                let dest = mirror.join(&rel);
-                let tmp = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
-                let written = (|| -> io::Result<()> {
-                    let mut file = fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o400)
-                        .open(&tmp)?;
-                    file.write_all(&bytes)?;
-                    fs::rename(&tmp, &dest)
-                })();
-                if let Err(e) = written {
-                    let _ = fs::remove_file(&tmp);
-                    return Err(e).with_context(|| format!("cannot write {}", dest.display()));
+                let dir = make_dirs(root, rel.parent().unwrap_or(Path::new("")))?;
+                if let Some(name) = rel.file_name() {
+                    dir.write(name, &bytes, owned::FileMode::ReadOnly)
+                        .with_context(|| {
+                            format!("cannot write {}", dir.path().join(name).display())
+                        })?;
                 }
             }
         }
@@ -1138,54 +1075,39 @@ fn apply_rules(root: &Path, steps: Vec<RuleStep>) -> Result<()> {
     Ok(())
 }
 
-/// `rules` and the directories of `dir` below it, each made when missing and never taken
-/// through a link; the last one.
-fn make_dirs(mirror: &Path, dir: &Path) -> Result<PathBuf> {
-    let mut path = mirror.to_path_buf();
-    for part in std::iter::once(None).chain(dir.components().map(Some)) {
-        if let Some(part) = part {
-            path.push(part);
-        }
-        loop {
-            match fs::symlink_metadata(&path) {
-                Ok(meta) if meta.file_type().is_dir() => break,
-                Ok(_) => bail!(
-                    "{} is not a directory; remuda does not replace it",
-                    path.display()
-                ),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::create_dir(&path) {
-                    Ok(()) => break,
-                    // Made in between: looked at again.
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(e) => {
-                        return Err(e).with_context(|| format!("cannot create {}", path.display()));
-                    }
-                },
-                Err(e) => {
-                    return Err(e).with_context(|| format!("cannot inspect {}", path.display()));
-                }
-            }
-        }
+/// `rules` in `root` and the directories of `dir` below it, each made when missing and never
+/// taken through a link; the last one.
+fn make_dirs(root: &owned::Dir, dir: &Path) -> Result<owned::Dir> {
+    let mut at = root.sub_or_create(RULES).map_err(not_replaced)?;
+    for part in dir.components() {
+        at = at.sub_or_create(part.as_os_str()).map_err(not_replaced)?;
     }
-    Ok(path)
+    Ok(at)
 }
 
-/// Removes the directory `dir` and the directories in it, none of which holds a file any more;
-/// one that does is an error.
-fn remove_empty_dirs(dir: &Path) -> Result<()> {
-    let listing = match fs::read_dir(dir) {
-        Ok(listing) => listing,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("cannot read {}", dir.display())),
+/// Removes the directory `name` of `above` and the directories in it, none of which holds a
+/// file any more; one that does is an error. A `name` that is not a directory (any more) is
+/// left alone.
+fn remove_empty_dirs(above: &owned::Dir, name: &OsStr) -> Result<()> {
+    let dir = match above.sub(name) {
+        Ok(dir) => dir,
+        Err(missing) if missing.is_missing() => return Ok(()),
+        Err(blocked) => return Err(not_replaced(blocked)),
     };
-    for entry in listing.flatten() {
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            remove_empty_dirs(&entry.path())?;
+    let names = dir
+        .names()
+        .with_context(|| format!("cannot read {}", dir.path().display()))?;
+    for entry in names {
+        if dir
+            .kind(&entry)
+            .is_ok_and(|kind| kind == Some(owned::Kind::Dir))
+        {
+            remove_empty_dirs(&dir, &entry)?;
         }
     }
-    match fs::remove_dir(dir) {
+    match above.remove_dir(name) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => {
-            Err(e).with_context(|| format!("cannot remove {}", dir.display()))
+            Err(e).with_context(|| format!("cannot remove {}", dir.path().display()))
         }
         _ => Ok(()),
     }
@@ -1205,51 +1127,49 @@ fn remove_empty_dirs(dir: &Path) -> Result<()> {
 /// when missing; one that is a symlink, or anything else, fails before anything is written
 /// ([`own_dirs`]).
 pub fn ensure_links(dir: &Path, source: &Path) -> Result<()> {
-    own_dirs(dir)?;
-    let root = dir.join(".claude");
-    let old_link = match fs::symlink_metadata(&root) {
-        Ok(meta) if meta.file_type().is_dir() => return fill(&root, source),
-        Ok(meta) if meta.file_type().is_symlink() => true,
-        Ok(_) => bail!(
+    let claude = own_dirs(dir)?;
+    let root = dir.join(CLAUDE_DIR);
+    let inspect = |e| anyhow::Error::new(e).context(format!("cannot inspect {}", root.display()));
+    let old_link = match claude.kind(CLAUDE_DIR).map_err(inspect)? {
+        Some(owned::Kind::Dir) => return fill(&claude.sub(CLAUDE_DIR)?, source),
+        Some(owned::Kind::Symlink) => true,
+        Some(_) => bail!(
             "{} is neither a directory nor a symlink; remuda does not replace it",
             root.display()
         ),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", root.display())),
+        None => false,
     };
 
-    let staged = Staged::build(dir, source)?;
+    let staged = Staged::build(&claude, source)?;
     if old_link {
         // Only a symlink is removed, checked again right before: a concurrent remuda may have
         // put the directory in place already (then nothing is removed) and a directory or a
         // file is never removed.
-        match fs::symlink_metadata(&root) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                if let Err(e) = fs::remove_file(&root)
-                    && e.kind() != io::ErrorKind::NotFound
-                {
-                    return match fs::symlink_metadata(&root) {
-                        Ok(meta) if meta.file_type().is_dir() => fill(&root, source),
-                        _ => Err(e).with_context(|| format!("cannot remove {}", root.display())),
-                    };
-                }
-            }
-            Ok(_) | Err(_) => {}
+        if claude
+            .kind(CLAUDE_DIR)
+            .is_ok_and(|kind| kind == Some(owned::Kind::Symlink))
+            && let Err(e) = claude.remove_file(CLAUDE_DIR)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            return match claude.kind(CLAUDE_DIR) {
+                Ok(Some(owned::Kind::Dir)) => fill(&claude.sub(CLAUDE_DIR)?, source),
+                _ => Err(e).with_context(|| format!("cannot remove {}", root.display())),
+            };
         }
     }
     // A directory cannot be renamed over a symlink or a file; over a directory only when it
     // is empty. On failure, the reason is read from what is there now, not from the errno
     // (which differs between systems): a directory means another remuda won the race, and
     // its items are checked instead.
-    match fs::rename(&staged.path, &root) {
+    match claude.rename(&staged.name, CLAUDE_DIR) {
         Ok(()) => {
             staged.commit();
             Ok(())
         }
-        Err(e) => match fs::symlink_metadata(&root) {
-            Ok(meta) if meta.file_type().is_dir() => {
+        Err(e) => match claude.kind(CLAUDE_DIR) {
+            Ok(Some(owned::Kind::Dir)) => {
                 drop(staged);
-                fill(&root, source)
+                fill(&claude.sub(CLAUDE_DIR)?, source)
             }
             _ => {
                 drop(staged);
@@ -1259,76 +1179,51 @@ pub fn ensure_links(dir: &Path, source: &Path) -> Result<()> {
     }
 }
 
+/// The directory in `shared/claude` that an added directory's instructions are read from.
+const CLAUDE_DIR: &str = ".claude";
+
 /// `dir` (`shared/claude`) and the directory it is in (`shared`), each a directory, made when
-/// missing (R13, R18). One that is a symlink is an error, like one that is anything else:
-/// every write below it, and the removal of rule copies the source no longer has, would
-/// happen where the link points. What is above `shared` is `$REMUDA_HOME`, the user's path:
-/// taken as given, and created as needed.
-fn own_dirs(dir: &Path) -> Result<()> {
-    let shared = dir.parent();
-    if let Some(home) = shared.and_then(Path::parent) {
-        fs::create_dir_all(home).with_context(|| format!("cannot create {}", home.display()))?;
-    }
-    for path in shared.into_iter().chain([dir]) {
-        loop {
-            match fs::symlink_metadata(path) {
-                Ok(meta) if meta.file_type().is_dir() => break,
-                Ok(meta) if meta.file_type().is_symlink() => bail!(
-                    "{} is a symlink; remuda does not write through it",
-                    path.display()
-                ),
-                Ok(_) => bail!(
-                    "{} is not a directory; remuda does not replace it",
-                    path.display()
-                ),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::create_dir(path) {
-                    Ok(()) => break,
-                    // Made in between: looked at again.
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                    Err(e) => {
-                        return Err(e).with_context(|| format!("cannot create {}", path.display()));
-                    }
-                },
-                Err(e) => {
-                    return Err(e).with_context(|| format!("cannot inspect {}", path.display()));
-                }
-            }
-        }
-    }
-    Ok(())
+/// missing, and `dir` open (R13, R18). One that is a symlink is an error, like one that is
+/// anything else: every write below it, and the removal of rule copies the source no longer
+/// has, would happen where the link points ([`owned::shared`]).
+fn own_dirs(dir: &Path) -> Result<owned::Dir> {
+    Ok(owned::shared(dir)?)
 }
 
-/// The item links and rule copies of `source` under `root` (an existing `.claude` directory),
+/// The item links and rule copies of `source` in `root` (an existing `.claude` directory),
 /// changed only where they differ: decided for every item first, so an entry remuda does not
 /// replace fails before anything is written, and a directory that is already right gets no
 /// write. A write that fails midway leaves the rest for the next launch. One remuda at a time
-/// (a lock on `root` itself): another's removals never meet this one's writes.
-fn fill(root: &Path, source: &Path) -> Result<()> {
-    let _lock = Lock::directory(root)?;
+/// (a lock on `root` itself): another's removals never meet this one's writes. Everything is
+/// written through `root`'s descriptor, never through its path (R13).
+fn fill(root: &owned::Dir, source: &Path) -> Result<()> {
+    let _lock = root
+        .lock(&owned::Flock, owned::Lockless::Proceed)
+        .with_context(|| format!("cannot lock {}", root.path().display()))?;
     enum Action {
         Create,
         Remove,
     }
     let mut actions = Vec::new();
     for item in INSTRUCTIONS {
-        let link = root.join(item);
+        let link = root.path().join(item);
         let target = source.join(item);
         let wanted = fs::metadata(&target).is_ok();
-        match fs::symlink_metadata(&link) {
-            Ok(meta) if meta.file_type().is_symlink() => {
+        match root.kind(item) {
+            Ok(Some(owned::Kind::Symlink)) => {
                 if !wanted {
-                    actions.push((link, target, Action::Remove));
-                } else if fs::read_link(&link).ok().as_deref() != Some(target.as_path()) {
-                    actions.push((link, target, Action::Create));
+                    actions.push((item, target, Action::Remove));
+                } else if root.read_link(item).ok().as_deref() != Some(target.as_path()) {
+                    actions.push((item, target, Action::Create));
                 }
             }
-            Ok(_) => bail!(
+            Ok(Some(_)) => bail!(
                 "{} is not a symlink; remuda does not replace it",
                 link.display()
             ),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Ok(None) => {
                 if wanted {
-                    actions.push((link, target, Action::Create));
+                    actions.push((item, target, Action::Create));
                 }
             }
             Err(e) => {
@@ -1336,14 +1231,21 @@ fn fill(root: &Path, source: &Path) -> Result<()> {
             }
         }
     }
-    let rules = rules_plan(root, source)?;
-    for (link, target, action) in actions {
+    let rules = rules_plan(root.path(), source)?;
+    // What a remuda killed between making a temporary link and renaming it left behind.
+    root.sweep();
+    for (item, target, action) in actions {
+        let link = root.path().join(item);
         match action {
-            Action::Create => place_link(&target, &link)?,
+            Action::Create => root
+                .replace_link(item, &target)
+                .with_context(|| format!("cannot create {}", link.display()))?,
             Action::Remove => {
                 // Checked again right before: never anything but a symlink.
-                if fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink())
-                    && let Err(e) = fs::remove_file(&link)
+                if root
+                    .kind(item)
+                    .is_ok_and(|kind| kind == Some(owned::Kind::Symlink))
+                    && let Err(e) = root.remove_file(item)
                     && e.kind() != io::ErrorKind::NotFound
                 {
                     return Err(e).with_context(|| format!("cannot remove {}", link.display()));
@@ -1354,44 +1256,37 @@ fn fill(root: &Path, source: &Path) -> Result<()> {
     apply_rules(root, rules)
 }
 
-/// A symlink to `target` at `link`, created or replaced atomically: a temporary link in the
-/// same directory, renamed into place.
-fn place_link(target: &Path, link: &Path) -> Result<()> {
-    let name = link.file_name().and_then(|n| n.to_str()).unwrap_or("link");
-    let tmp = link.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    symlink(target, &tmp).with_context(|| format!("cannot create {}", tmp.display()))?;
-    if let Err(e) = fs::rename(&tmp, link) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("cannot create {}", link.display()));
-    }
-    Ok(())
-}
-
 /// A `.claude` directory built under a temporary name, removed again when dropped without
 /// [`Staged::commit`]: every error path after it exists cleans it up.
-struct Staged {
+struct Staged<'a> {
+    /// `shared/claude`, where it is built and renamed into place.
+    parent: &'a owned::Dir,
+    name: String,
     path: PathBuf,
     committed: bool,
 }
 
-impl Staged {
-    /// `<dir>/.claude.<uuid>.tmp` holding a link for each item `source` has, and its rules.
-    fn build(dir: &Path, source: &Path) -> Result<Staged> {
-        let path = dir.join(format!(".claude.{}.tmp", uuid::Uuid::new_v4().simple()));
-        fs::create_dir(&path).with_context(|| format!("cannot create {}", path.display()))?;
+impl<'a> Staged<'a> {
+    /// `.claude.<uuid>.tmp` in `parent`, holding a link for each item `source` has, and its
+    /// rules.
+    fn build(parent: &'a owned::Dir, source: &Path) -> Result<Staged<'a>> {
+        let name = format!(".claude.{}.tmp", uuid::Uuid::new_v4().simple());
+        let dir = parent.create_new(&name)?;
         let staged = Staged {
-            path,
+            parent,
+            path: dir.path().to_path_buf(),
+            name,
             committed: false,
         };
         for item in INSTRUCTIONS {
             let target = source.join(item);
             if fs::metadata(&target).is_ok() {
-                let link = staged.path.join(item);
-                symlink(&target, &link)
-                    .with_context(|| format!("cannot create {}", link.display()))?;
+                dir.link(item, &target).with_context(|| {
+                    format!("cannot create {}", staged.path.join(item).display())
+                })?;
             }
         }
-        apply_rules(&staged.path, rules_plan(&staged.path, source)?)?;
+        apply_rules(&dir, rules_plan(&staged.path, source)?)?;
         Ok(staged)
     }
 
@@ -1401,12 +1296,12 @@ impl Staged {
     }
 }
 
-impl Drop for Staged {
+impl Drop for Staged<'_> {
     fn drop(&mut self) {
         if !self.committed {
             // Only what `build` created: symlinks, which are unlinked, not followed, and the
             // rule copies.
-            let _ = fs::remove_dir_all(&self.path);
+            let _ = self.parent.remove_tree(&self.name);
         }
     }
 }
@@ -1808,6 +1703,7 @@ fn resolve(base: &Path, p: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use serde_json::json;
@@ -2530,7 +2426,8 @@ mod tests {
         fs::create_dir_all(&shared).unwrap();
         let a = source_home(dir.path(), "a");
         let source_before = tree(&a);
-        let staged = Staged::build(&shared, &a).unwrap();
+        let claude = owned::Dir::open(&shared).unwrap();
+        let staged = Staged::build(&claude, &a).unwrap();
         let path = staged.path.clone();
         assert!(path.starts_with(&shared) && path.is_dir());
         assert_eq!(names(&path), ["CLAUDE.md", "agents", "skills"]);
@@ -2539,7 +2436,7 @@ mod tests {
         assert_eq!(names(&shared), Vec::<String>::new());
         assert_eq!(tree(&a), source_before);
 
-        let staged = Staged::build(&shared, &a).unwrap();
+        let staged = Staged::build(&claude, &a).unwrap();
         let path = staged.path.clone();
         staged.commit();
         assert!(path.is_dir());
@@ -2554,7 +2451,8 @@ mod tests {
         let shared = dir.path().join("shared");
         fs::create_dir_all(&shared).unwrap();
         let a = source_home(dir.path(), "a");
-        let stale = Staged::build(&shared, &a).unwrap();
+        let claude = owned::Dir::open(&shared).unwrap();
+        let stale = Staged::build(&claude, &a).unwrap();
         let stale_path = stale.path.clone();
         stale.commit();
         let stale_before = tree(&stale_path);
@@ -2740,8 +2638,13 @@ mod tests {
         fs::write(rules.join("mine.txt"), "kept").unwrap();
         symlink("/somewhere", rules.join("theirs.md")).unwrap();
         fs::write(rules.join("stray.md"), "not the source's").unwrap();
-        let leftover = format!(".{}.tmp", uuid::Uuid::new_v4().simple());
+        // Under the lock every temporary file there is a leftover, whoever made it: one of
+        // this process, and one named as earlier versions named theirs.
+        let hex = uuid::Uuid::new_v4().simple();
+        let leftover = format!(".remuda-{}-{hex}.tmp", std::process::id());
+        assert!(owned::is_temp_name(OsStr::new(&leftover)));
         fs::write(rules.join("lang").join(&leftover), "half").unwrap();
+        fs::write(rules.join(format!(".{hex}.tmp")), "half").unwrap();
         fs::write(rules.join(".keep.tmp"), "not remuda's name").unwrap();
         fs::write(a.join("rules/style.md"), "be very terse").unwrap();
         fs::write(a.join("rules/new.md"), "new").unwrap();
@@ -3743,13 +3646,113 @@ mod tests {
         );
     }
 
+    /// A process that has exited and been waited for: its temporary files are leftovers.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    fn temp_of(pid: u32) -> String {
+        format!(".remuda-{pid}-{}.tmp", uuid::Uuid::new_v4().simple())
+    }
+
+    /// R13, R18: `state/settings` is a directory of remuda's own, the user's alone: remuda
+    /// removes files there, so one that is a symlink is refused, and nothing is written or
+    /// removed where it points. One from before is tightened, like `state/`.
+    #[test]
+    fn a_settings_directory_that_is_a_symlink_is_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("remuda/state");
+        let settings = state.join("settings");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir(&outside).unwrap();
+        // What remuda would remove in a directory of its own: a settings file unused for long.
+        let old = outside.join(format!("{}.json", "a".repeat(64)));
+        fs::write(&old, "{}").unwrap();
+        let long_ago = SystemTime::now() - Duration::from_secs(90 * 24 * 60 * 60);
+        let file = fs::File::options().write(true).open(&old).unwrap();
+        file.set_modified(long_ago).unwrap();
+        symlink(&outside, &settings).unwrap();
+        let before = tree(dir.path());
+        let e = write_settings(&settings, r#"{"a":1}"#, SystemTime::now()).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "{} is a symlink; remuda does not write through it",
+                settings.display()
+            )
+        );
+        assert_eq!(tree(dir.path()), before);
+        assert!(old.exists());
+
+        fs::remove_file(&settings).unwrap();
+        fs::create_dir(&settings).unwrap();
+        fs::set_permissions(&settings, fs::Permissions::from_mode(0o755)).unwrap();
+        write_settings(&settings, r#"{"a":1}"#, SystemTime::now()).unwrap();
+        assert_eq!(fs::metadata(&settings).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(fs::metadata(&state).unwrap().mode() & 0o7777, 0o700);
+    }
+
+    /// R3, R18: a settings file whose write was killed leaves its temporary file; the next
+    /// new settings file removes it, and not that of a process still running.
+    #[test]
+    fn a_settings_write_cut_short_is_cleaned_up_by_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("state/settings");
+        let now = SystemTime::now();
+        let first = write_settings(&settings, r#"{"a":1}"#, now).unwrap();
+        let (gone, running) = (temp_of(dead_pid()), temp_of(std::process::id()));
+        fs::write(settings.join(&gone), "{\"hal").unwrap();
+        fs::write(settings.join(&running), "{\"hal").unwrap();
+        // Reusing a file writes nothing, and removes nothing.
+        write_settings(&settings, r#"{"a":1}"#, now).unwrap();
+        assert!(settings.join(&gone).exists());
+        let second = write_settings(&settings, r#"{"b":1}"#, now).unwrap();
+        let mut want = vec![
+            SETTINGS_LOCK.to_string(),
+            running,
+            first.file_name().unwrap().to_str().unwrap().to_string(),
+            second.file_name().unwrap().to_str().unwrap().to_string(),
+        ];
+        want.sort();
+        assert_eq!(names(&settings), want);
+    }
+
+    /// R18: an item link whose replacement was killed between the temporary link and the
+    /// rename leaves that link in `.claude`; the next launch removes it, and nothing else
+    /// that it did not make.
+    #[test]
+    fn a_link_replacement_cut_short_is_cleaned_up_by_the_next_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("remuda/shared/claude");
+        let a = source_home(dir.path(), "a");
+        ensure_links(&shared, &a).unwrap();
+        let root = shared.join(".claude");
+        let gone = temp_of(dead_pid());
+        symlink(a.join("skills"), root.join(&gone)).unwrap();
+        fs::write(root.join("mine.txt"), "kept").unwrap();
+        symlink("/somewhere", root.join(".mine.tmp")).unwrap();
+        ensure_links(&shared, &a).unwrap();
+        assert_eq!(
+            names(&root),
+            [".mine.tmp", "CLAUDE.md", "agents", "mine.txt", "skills"]
+        );
+        assert_eq!(links(&shared).len(), 3);
+    }
+
     /// R18: the settings lock is `.lock`, a regular 0600 file, and excludes a second holder
     /// until the first is dropped; pruning never removes it.
     #[test]
     fn the_settings_lock_is_exclusive_and_kept() {
         let dir = tempfile::tempdir().unwrap();
-        let held = Lock::settings(dir.path()).unwrap();
-        assert!(held.0.is_some());
+        let settings = owned::Dir::open(dir.path()).unwrap();
+        let held = settings
+            .lock_file(SETTINGS_LOCK, &owned::Flock, owned::Lockless::Proceed)
+            .unwrap();
+        assert!(held.is_held());
         let lock = dir.path().join(SETTINGS_LOCK);
         let meta = fs::symlink_metadata(&lock).unwrap();
         assert!(meta.is_file());

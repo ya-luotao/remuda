@@ -483,3 +483,162 @@ fn add_refuses_a_name_that_would_leave_the_config_invalid() {
         row("claude", "personal", personal.to_str().unwrap())
     );
 }
+
+/// R3: `add`s at the same time are all registered. Each reads, checks and writes
+/// `config.toml` under the registry's lock, so none writes over another's account (eight at
+/// once used to leave seven, every one of them exiting 0).
+#[test]
+fn concurrent_adds_are_all_registered() {
+    const ADDS: usize = 12;
+    let sb = Sandbox::new();
+    sb.write_config("# mine\n");
+    let homes: Vec<_> = (0..ADDS)
+        .map(|n| sb.make_claude_home(&format!("profiles/a{n}")))
+        .collect();
+    let barrier = std::sync::Barrier::new(ADDS);
+    std::thread::scope(|scope| {
+        for (n, home) in homes.iter().enumerate() {
+            let (sb, barrier) = (&sb, &barrier);
+            scope.spawn(move || {
+                barrier.wait();
+                sb.remuda()
+                    .args(["add", &format!("a{n}"), home.to_str().unwrap()])
+                    .assert()
+                    .success()
+                    .stderr("");
+            });
+        }
+    });
+    let mut got = stored(&sb);
+    got.sort();
+    let mut want: Vec<_> = homes
+        .iter()
+        .enumerate()
+        .map(|(n, home)| row("claude", &format!("a{n}"), home.to_str().unwrap()))
+        .collect();
+    want.sort();
+    assert_eq!(got, want);
+    assert!(sb.read_config().starts_with("# mine\n"));
+    let names: Vec<_> = fs::read_dir(sb.remuda_home())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(names, ["config.toml"], "temp or lock files left behind");
+}
+
+/// R3, R14a: `add`s and `remove`s at the same time are all carried out, and one name asked
+/// for twice is given once: the other `add` is told so and changes nothing.
+#[test]
+fn concurrent_adds_and_removes_are_all_carried_out() {
+    const EACH: usize = 6;
+    let sb = Sandbox::new();
+    let home = |name: &str| sb.make_claude_home(&format!("profiles/{name}"));
+    for n in 0..EACH {
+        let name = format!("old{n}");
+        sb.remuda()
+            .args(["add", &name, home(&name).to_str().unwrap()])
+            .assert()
+            .success();
+    }
+    let twice = [home("twice-a"), home("twice-b")];
+    let barrier = std::sync::Barrier::new(2 * EACH + 2);
+    let taken = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for n in 0..EACH {
+            let (sb, barrier) = (&sb, &barrier);
+            let new = home(&format!("new{n}"));
+            scope.spawn(move || {
+                barrier.wait();
+                sb.remuda()
+                    .args(["add", &format!("new{n}"), new.to_str().unwrap()])
+                    .assert()
+                    .success();
+            });
+            scope.spawn(move || {
+                barrier.wait();
+                sb.remuda()
+                    .args(["remove", &format!("old{n}")])
+                    .assert()
+                    .success();
+            });
+        }
+        for path in &twice {
+            let (sb, barrier, taken) = (&sb, &barrier, &taken);
+            scope.spawn(move || {
+                barrier.wait();
+                let out = sb
+                    .remuda()
+                    .args(["add", "twice", path.to_str().unwrap()])
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8(out.stderr).unwrap();
+                taken.lock().unwrap().push((out.status.code(), stderr));
+            });
+        }
+    });
+    let mut taken = taken.into_inner().unwrap();
+    taken.sort();
+    assert_eq!(taken[0], (Some(0), String::new()));
+    assert_eq!(taken[1].0, Some(1));
+    assert!(
+        taken[1].1.contains("account claude:twice already exists"),
+        "{}",
+        taken[1].1
+    );
+    let mut names: Vec<String> = stored(&sb).into_iter().map(|(_, name, _)| name).collect();
+    names.sort();
+    let mut want: Vec<String> = (0..EACH).map(|n| format!("new{n}")).collect();
+    want.push("twice".to_string());
+    assert_eq!(names, want);
+}
+
+/// R3: two `$REMUDA_HOME`s that share one registry, one through a `config.toml` that is a
+/// symlink to the other's, take the same lock: `add`s through both at the same time are all
+/// registered in the one file (the lock is on the directory of the file that is replaced).
+#[test]
+fn concurrent_adds_through_a_linked_registry_are_all_registered() {
+    const ADDS: usize = 16;
+    let sb = Sandbox::new();
+    // A registry large enough that reading and writing it take a moment.
+    sb.write_config(&format!("# mine\n{}", "# padding\n".repeat(4000)));
+    let second = sb.root().join("second");
+    fs::create_dir(&second).unwrap();
+    std::os::unix::fs::symlink(sb.config_path(), second.join("config.toml")).unwrap();
+    let homes: Vec<_> = (0..ADDS)
+        .map(|n| sb.make_claude_home(&format!("profiles/a{n}")))
+        .collect();
+    let barrier = std::sync::Barrier::new(ADDS);
+    std::thread::scope(|scope| {
+        for (n, home) in homes.iter().enumerate() {
+            let (sb, barrier, second) = (&sb, &barrier, &second);
+            scope.spawn(move || {
+                let mut add = sb.remuda();
+                if n % 2 == 1 {
+                    add.env("REMUDA_HOME", second);
+                }
+                barrier.wait();
+                add.args(["add", &format!("a{n}"), home.to_str().unwrap()])
+                    .assert()
+                    .success()
+                    .stderr("");
+            });
+        }
+    });
+    let mut names: Vec<String> = stored(&sb).into_iter().map(|(_, name, _)| name).collect();
+    names.sort();
+    let mut want: Vec<String> = (0..ADDS).map(|n| format!("a{n}")).collect();
+    want.sort();
+    assert_eq!(names, want);
+    assert!(sb.read_config().starts_with("# mine\n"));
+    assert_eq!(
+        fs::read_link(second.join("config.toml")).unwrap(),
+        sb.config_path()
+    );
+    for dir in [sb.remuda_home(), second] {
+        let names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["config.toml"], "temp or lock files left behind");
+    }
+}
