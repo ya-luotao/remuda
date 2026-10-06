@@ -27,7 +27,7 @@ use crate::transcript::Message;
 use crate::usage::{CachedUsage, LiveResult, LiveUsage, Reading, Snapshot, UsageRow};
 
 use super::work::{Claim, Round, Slot};
-use super::{render, search};
+use super::{accounts, render, search};
 
 /// Live sessions are re-collected this long after the last collection finished (R7).
 pub const LIVE_EVERY: SignedDuration = SignedDuration::from_secs(5);
@@ -173,7 +173,8 @@ pub enum Event {
         report: stats::Report,
         error: Option<String>,
     },
-    /// The registry was read again (after a setup or a removal, or by a pre-launch check).
+    /// The registry lists other accounts than when it was last read
+    /// ([`super::accounts::Listing::read`]): these, from now on.
     Accounts(Vec<Account>),
     /// [`Effect::RemoveAccount`] finished: done, or why not.
     AccountRemoved {
@@ -403,6 +404,10 @@ pub enum Effect {
     },
     /// `remuda remove` (R14a): unregister the account, then read the registry again.
     RemoveAccount(Account),
+    /// Read the registry again (R16), answered by [`Event::Accounts`] when it lists other
+    /// accounts than before. Never held back by other work: it is how a refresh reads the
+    /// registry while everything else is still running.
+    ReadAccounts,
     Quit,
 }
 
@@ -607,8 +612,8 @@ pub struct Form {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormKind {
     /// `n`: a new session for `account`: directory, optional name. The account itself, not its
-    /// row: rows move when the registry changes while the form is open; on submit it is
-    /// resolved by name again (R17).
+    /// row: rows move when the registry changes while the form is open; on submit it must
+    /// still be listed, home and all (R16).
     NewSession { account: Account },
     /// `s`: a new account: name, optional email.
     Setup,
@@ -746,7 +751,8 @@ pub struct ConfigPane {
     pub work: Slot<Account>,
 }
 
-/// The Stats view (R20): computed the first time it opens, then on each `r`.
+/// The Stats view (R20): computed the first time it opens, then on each `r` and when the
+/// account list changes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatsState {
     /// The last report; kept while the next one is computed.
@@ -956,7 +962,13 @@ impl App {
         self.history.show_all || !is_noise(entry)
     }
 
-    /// `r`: everything except live usage, skipping what is already running (an account still
+    /// `r`: the registry first, whatever is still running (R16), then [`Self::refresh`].
+    fn reload(&mut self, fx: &mut Vec<Effect>) {
+        fx.push(Effect::ReadAccounts);
+        self.refresh(fx);
+    }
+
+    /// Everything except live usage, skipping what is already running (an account still
     /// being asked is not asked twice).
     fn refresh(&mut self, fx: &mut Vec<Effect>) {
         // Choosing an account for `remuda run` needs identities, usage and checks only.
@@ -1385,7 +1397,7 @@ impl App {
                 let len = View::ALL.len();
                 self.switch(View::ALL[(self.view.position() + len - 1) % len], fx);
             }
-            Key::Char('r') => self.refresh(fx),
+            Key::Char('r') => self.reload(fx),
             Key::Char('u') => self.live_usage(fx),
             Key::Esc if self.work.launch.is_running() => {
                 if let Some(request) = self.work.launch.cancel() {
@@ -1507,7 +1519,7 @@ impl App {
             }
             Key::Esc | Key::Char('q') => fx.push(Effect::Quit),
             Key::Char('?') => self.help = true,
-            Key::Char('r') => self.refresh(fx),
+            Key::Char('r') => self.reload(fx),
             Key::Char('u') => self.live_usage(fx),
             other => {
                 self.navigate(other);
@@ -1557,16 +1569,10 @@ impl App {
                 let request = confirm.request.clone();
                 self.overlay = None;
                 match key {
-                    Key::Char('y')
-                        if !self.accounts.iter().any(|a| a.account == request.account) =>
-                    {
-                        let text =
-                            format!("{} is no longer registered", display_name(&request.account));
-                        self.notify(Level::Error, text);
-                    }
-                    Key::Char('y') => {
-                        self.check_launch(request, fx);
-                    }
+                    Key::Char('y') => match self.unlisted(&request.account) {
+                        Some(gone) => self.notify(Level::Error, gone),
+                        None => self.check_launch(request, fx),
+                    },
                     _ => self.notify(Level::Info, "cancelled"),
                 }
             }
@@ -1656,12 +1662,15 @@ impl App {
         }
     }
 
-    /// The launch for a filled-in new-session form: its account as registered now (by name),
-    /// `~` expanded, a relative directory taken from remuda's own, the name passed as `-n` (R6).
+    /// The launch for a filled-in new-session form: its account, which must still be listed
+    /// as it was when the form opened (one of its name with another home is another account,
+    /// R2, R16), `~` expanded, a relative directory taken from remuda's own, the name passed
+    /// as `-n` (R6).
     fn new_session_request(&self, form: &Form, account: &Account) -> Result<LaunchRequest, String> {
-        let account = self
-            .account_named(&account.qualified())
-            .ok_or_else(|| format!("{} is no longer registered", display_name(account)))?;
+        if let Some(gone) = self.unlisted(account) {
+            return Err(gone);
+        }
+        let account = account.clone();
         let raw = form.value(0);
         if raw.is_empty() {
             return Err("enter a directory".to_string());
@@ -1753,8 +1762,15 @@ impl App {
         })
     }
 
+    /// Why `account`, held since before the rows last changed, is not one of them now.
+    fn unlisted(&self, account: &Account) -> Option<String> {
+        accounts::unlisted(self.accounts.iter().map(|a| &a.account), account)
+    }
+
     /// The registry changed: account rows are rebuilt (known accounts keep their state) and
-    /// everything per account is read again. The same accounts again change nothing.
+    /// everything per account is read again (sessions only where they are shown: the registry
+    /// may change while an account is chosen for `remuda run` too). The same accounts again
+    /// change nothing.
     fn set_accounts(&mut self, accounts: Vec<Account>, fx: &mut Vec<Effect>) {
         if self.accounts.iter().map(|a| &a.account).eq(accounts.iter()) {
             return;
@@ -1775,7 +1791,14 @@ impl App {
         self.ask_again(Query::Identity, fx);
         self.ask_again(Query::CachedUsage, fx);
         self.rerun(Work::Checks, fx);
-        self.refresh_sessions(fx);
+        if self.mode == Mode::Browse {
+            self.refresh_sessions(fx);
+        }
+        // The statistics are per account too (R20). A computation that is running is not
+        // doubled: it answers for the accounts as they are when it ends.
+        if self.stats.requested {
+            self.request_stats(fx);
+        }
         // Read again at the end of the update: a setup or a removal may have changed it. A
         // read that is out is from before: its answer is not shown, and no second read
         // starts beside it; the account is read once more when it answers.

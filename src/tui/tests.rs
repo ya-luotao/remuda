@@ -166,8 +166,9 @@ fn start_requests_everything_in_the_background() {
             Effect::Checks
         ]
     );
-    // `r` while everything is still running does not stack it.
-    assert_eq!(keys(&mut app, &[Key::Char('r')]), []);
+    // `r` while everything is still running does not stack it: only the registry is read
+    // again (R16).
+    assert_eq!(keys(&mut app, &[Key::Char('r')]), [Effect::ReadAccounts]);
     update(
         &mut app,
         Event::IndexDone {
@@ -182,6 +183,7 @@ fn start_requests_everything_in_the_background() {
     assert_eq!(
         keys(&mut app, &[Key::Char('r')]),
         [
+            Effect::ReadAccounts,
             Effect::RefreshIndex,
             Effect::Identities(everyone()),
             Effect::CachedUsage(everyone()),
@@ -220,8 +222,15 @@ fn finish_accounts(app: &mut App) {
 fn refresh_starts_each_kind_of_work_once_until_it_finishes() {
     let mut app = app();
     app.start();
-    let r = [Key::Char('r'); 5];
-    assert_eq!(keys(&mut app, &r), []);
+    // What five `r` start besides reading the registry, which each of them does (R16).
+    let refresh = |app: &mut App| {
+        let mut fx = keys(app, &[Key::Char('r'); 5]);
+        let all = fx.len();
+        fx.retain(|e| *e != Effect::ReadAccounts);
+        assert_eq!(all - fx.len(), 5, "the registry is read again every time");
+        fx
+    };
+    assert_eq!(refresh(&mut app), []);
 
     // Each account is asked on its own: those that have answered are asked again while the
     // last one is still out, and that one is not asked twice.
@@ -235,7 +244,7 @@ fn refresh_starts_each_kind_of_work_once_until_it_finishes() {
         );
     }
     assert_eq!(
-        keys(&mut app, &r),
+        refresh(&mut app),
         [Effect::Identities(vec![account("default"), account("max")])]
     );
     update(
@@ -246,7 +255,7 @@ fn refresh_starts_each_kind_of_work_once_until_it_finishes() {
         },
     );
     assert_eq!(
-        keys(&mut app, &r),
+        refresh(&mut app),
         [Effect::Identities(vec![account("team")])]
     );
 
@@ -259,20 +268,20 @@ fn refresh_starts_each_kind_of_work_once_until_it_finishes() {
             },
         );
     }
-    assert_eq!(keys(&mut app, &r), [Effect::CachedUsage(everyone())]);
+    assert_eq!(refresh(&mut app), [Effect::CachedUsage(everyone())]);
 
     update(&mut app, Event::Attribution(Attribution::default()));
-    assert_eq!(keys(&mut app, &r), [Effect::Attribution]);
+    assert_eq!(refresh(&mut app), [Effect::Attribution]);
     update(&mut app, Event::Checks(vec![]));
-    assert_eq!(keys(&mut app, &r), [Effect::Checks]);
+    assert_eq!(refresh(&mut app), [Effect::Checks]);
     let done = Event::IndexDone {
         entries: vec![],
         error: None,
     };
     update(&mut app, done);
-    assert_eq!(keys(&mut app, &r), [Effect::RefreshIndex]);
+    assert_eq!(refresh(&mut app), [Effect::RefreshIndex]);
     update(&mut app, Event::Live(vec![]));
-    assert_eq!(keys(&mut app, &r), [Effect::Live]);
+    assert_eq!(refresh(&mut app), [Effect::Live]);
 }
 
 #[test]
@@ -2419,6 +2428,7 @@ fn pick_mode_loads_only_what_choosing_an_account_needs() {
     assert_eq!(
         keys(&mut app, &[Key::Char('r')]),
         [
+            Effect::ReadAccounts,
             Effect::Identities(everyone()),
             Effect::CachedUsage(everyone()),
             Effect::Checks
@@ -2433,6 +2443,96 @@ fn pick_mode_loads_only_what_choosing_an_account_needs() {
             account("team")
         ])]
     );
+}
+
+/// R16: `r` reads the registry again even while the identities, usage and checks it would
+/// start are still running (nothing else repeats while an account is chosen for `remuda
+/// run`), and the answers still to come start nothing in its place.
+#[test]
+fn a_refresh_reads_the_registry_whatever_is_still_running() {
+    let mut app = pick_app();
+    app.start();
+    assert_eq!(keys(&mut app, &[Key::Char('r')]), [Effect::ReadAccounts]);
+    let before = app.clone();
+    finish_accounts(&mut app);
+    assert_eq!(update(&mut app, Event::Checks(vec![])), []);
+    assert_ne!(app, before, "the answers were applied");
+    // Browse mode too, with the index, the live list and the attribution running as well.
+    let mut app = self::app();
+    app.start();
+    assert_eq!(keys(&mut app, &[Key::Char('r')]), [Effect::ReadAccounts]);
+}
+
+/// R16, R11: checks that are running when the account list changes may have read the list
+/// from before: they are not doubled, and run once more when they end, so a new account gets
+/// its checks and those of an account that is gone do not stay. The slot of the checks keeps
+/// count (`work::tests`); what was found for the old list is not shown
+/// ([`checks_run_again_when_the_accounts_change_meanwhile`]).
+#[test]
+fn checks_run_once_more_when_the_account_list_changed_meanwhile() {
+    let mut app = app();
+    app.start();
+    assert!(app.work.checks.is_running());
+    let fx = update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("max"), account("new")]),
+    );
+    assert!(!fx.contains(&Effect::Checks), "not two at once: {fx:?}");
+    // The answer for the old list is not the one shown, and the checks start again.
+    let old = Check {
+        account: Some("claude:team".into()),
+        message: "home does not exist".into(),
+    };
+    assert_eq!(update(&mut app, Event::Checks(vec![old])), [Effect::Checks]);
+    assert_eq!(app.checks, None);
+    assert!(app.work.checks.is_running());
+    // Their answer is for the list as it is: nothing more to start.
+    assert_eq!(update(&mut app, Event::Checks(vec![])), []);
+    assert_eq!(app.checks, Some(vec![]));
+    assert!(!app.work.checks.is_running());
+
+    // `r` while they run does not ask for another run, and no change does not either.
+    keys(&mut app, &[Key::Char('r')]);
+    keys(&mut app, &[Key::Char('r')]);
+    update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("max"), account("new")]),
+    );
+    assert_eq!(update(&mut app, Event::Checks(vec![])), []);
+    // The list changes while nothing runs: started at once, as before.
+    let fx = update(&mut app, Event::Accounts(vec![account("default")]));
+    assert!(fx.contains(&Effect::Checks), "{fx:?}");
+    assert_eq!(update(&mut app, Event::Checks(vec![])), []);
+}
+
+/// R16: the registry may change while an account is chosen for `remuda run` (a refresh reads
+/// it again): the rows follow it, and still only what choosing needs is read.
+#[test]
+fn pick_mode_follows_the_registry_without_reading_sessions() {
+    let mut app = pick_app();
+    app.start();
+    finish_accounts(&mut app);
+    update(&mut app, Event::Checks(vec![]));
+    assert_eq!(
+        update(
+            &mut app,
+            Event::Accounts(vec![account("default"), account("max")])
+        ),
+        [
+            Effect::Identities(vec![account("default"), account("max")]),
+            Effect::CachedUsage(vec![account("default"), account("max")]),
+            Effect::Checks
+        ]
+    );
+    let names: Vec<&str> = app
+        .accounts
+        .iter()
+        .map(|a| a.account.name.as_str())
+        .collect();
+    assert_eq!(names, ["default", "max"]);
+    let work = &app.work;
+    assert!(!work.index.is_running() && !work.live.is_running());
+    assert!(!work.attribution.is_running());
 }
 
 #[test]
@@ -3894,6 +3994,43 @@ fn form_index_shift() {
     );
 }
 
+/// R16, R2: the form keeps the account it was opened for, home and all. Registered again
+/// with another home while the form is open (the list on screen follows the registry), it is
+/// another account: the form says so and starts nothing, instead of a session in the other
+/// home.
+#[test]
+fn a_form_whose_account_changed_home_starts_nothing() {
+    let mut app = new_session_form();
+    let moved = Account {
+        home: Home::Path("/h/elsewhere".into()),
+        ..account("max")
+    };
+    update(
+        &mut app,
+        Event::Accounts(vec![account("default"), moved.clone(), account("team")]),
+    );
+    assert_eq!(
+        form(&app).kind,
+        FormKind::NewSession {
+            account: account("max")
+        },
+        "the form still holds the account it was opened for"
+    );
+    assert_eq!(keys(&mut app, &[Key::Enter]), []);
+    assert_eq!(app.work.launch.running(), None);
+    assert_eq!(
+        form(&app).error.as_deref(),
+        Some("max is now registered with another home")
+    );
+    // A form opened now is for the account as it is registered now.
+    keys(&mut app, &[Key::Esc, Key::Char('n')]);
+    let want = LaunchRequest {
+        account: moved,
+        ..request("max", &[], Some(CWD), "new session as max")
+    };
+    assert_eq!(keys(&mut app, &[Key::Enter]), [check_of(&app, want)]);
+}
+
 /// The account picker keeps accounts, not rows: the chosen one is resolved by name, and
 /// refused once it is gone.
 #[test]
@@ -4082,6 +4219,36 @@ fn codex_prompt_account_gone_before_yes() {
     );
 }
 
+/// R16, R2: registered again with another home by the time of `y`, the prompt's account is
+/// another account: refused, and said so.
+#[test]
+fn codex_prompt_account_in_another_home_before_yes() {
+    let mut app = codex_app();
+    keys(&mut app, &[Key::Enter]);
+    assert!(matches!(app.overlay, Some(Overlay::ResumeCodex(_))));
+    let accounts: Vec<Account> = app
+        .accounts
+        .iter()
+        .map(|a| match a.account.qualified().as_str() {
+            "codex:work" => Account {
+                home: Home::Path("/c/elsewhere".into()),
+                ..a.account.clone()
+            },
+            _ => a.account.clone(),
+        })
+        .collect();
+    update(&mut app, Event::Accounts(accounts));
+    assert_eq!(keys(&mut app, &[Key::Char('y')]), []);
+    assert_eq!(app.work.launch.running(), None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "codex:work is now registered with another home",
+            Level::Error
+        ))
+    );
+}
+
 /// R18, R21: the notice of a finished setup says what the new home was linked to, without
 /// paths; a link that failed makes it a warning.
 #[test]
@@ -4267,6 +4434,49 @@ fn stats_app() -> App {
         },
     );
     app
+}
+
+/// R16, R20: the statistics are per account: once the view has been opened, a changed account
+/// list computes them again, whichever view is shown; a computation that is running is not
+/// doubled (it answers for the accounts as they are when it ends), and statistics never asked
+/// for are not computed.
+#[test]
+fn a_changed_account_list_computes_the_statistics_again() {
+    let mut app = stats_app();
+    keys(&mut app, &[Key::Char('1')]);
+    assert!(!app.work.stats.is_running());
+    let stats = |fx: &[Effect]| fx.iter().filter(|e| **e == Effect::Stats).count();
+    let fx = update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("max")]),
+    );
+    assert_eq!(stats(&fx), 1, "{fx:?}");
+    assert!(app.work.stats.is_running());
+    assert!(
+        app.stats.report.is_some(),
+        "the last report stays meanwhile"
+    );
+    // Changed again while that runs: not a second computation at once.
+    let fx = update(&mut app, Event::Accounts(vec![account("default")]));
+    assert_eq!(stats(&fx), 0, "{fx:?}");
+    // The same accounts again change nothing.
+    update(
+        &mut app,
+        Event::Stats {
+            report: stats_report(),
+            error: None,
+        },
+    );
+    let fx = update(&mut app, Event::Accounts(vec![account("default")]));
+    assert_eq!(fx, []);
+
+    // The view was never opened: nothing to compute again.
+    let mut app = idle_app();
+    let fx = update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("max")]),
+    );
+    assert_eq!(stats(&fx), 0, "{fx:?}");
 }
 
 fn squeezed(line: &str) -> String {

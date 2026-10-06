@@ -158,6 +158,9 @@ fn exit_codes_come_back() {
 
 // --- the TUI's launch path, one test per kind of launch ------------------------------------
 
+use std::sync::{Arc, mpsc};
+
+use remuda::tui::accounts::Listing;
 use remuda::tui::app::{Event, Exit, LaunchRequest};
 use remuda::tui::{self, Deps, Screen};
 
@@ -186,22 +189,40 @@ impl Screen for FakeScreen {
     }
 }
 
+/// A TUI started now: its accounts are the registry's as it is (the implicit default alone
+/// when there is none).
 fn deps(sb: &Sandbox) -> Deps {
+    let env: remuda::Env = [("HOME".to_string(), sb.home().display().to_string())].into();
     Deps {
-        accounts: vec![],
-        env: [("HOME".to_string(), sb.home().display().to_string())].into(),
+        listing: Arc::new(Listing::open(sb.config_path(), env.clone()).unwrap()),
+        env,
         claude: Some(sb.bin().join("claude")),
         codex: None,
         ps: None,
-        seen: vec![],
         tz: jiff::tz::TimeZone::UTC,
         clock: jiff::Timestamp::now,
-        config: sb.config_path(),
         state_dir: sb.remuda_home().join("state"),
         cwd: Some(sb.work()),
         mode: remuda::tui::app::Mode::Browse,
         private: false,
     }
+}
+
+/// Where a launch tells that the registry changed, when no test listens.
+fn quiet() -> mpsc::Sender<Event> {
+    mpsc::channel().0
+}
+
+/// Writes a registry with `accounts`: the TUI launches only accounts it lists (R16).
+fn register(sb: &Sandbox, accounts: &[&Account]) {
+    let mut text = String::new();
+    for a in accounts {
+        text.push_str(&format!(
+            "[[account]]\nprovider = \"{}\"\nname = \"{}\"\nhome = \"{}\"\n\n",
+            a.provider, a.name, a.home
+        ));
+    }
+    sb.write_config(&text);
 }
 
 fn tui_launch(sb: &Sandbox, account: &Account, args: &[&str], cwd: Option<&Path>) -> Event {
@@ -212,7 +233,7 @@ fn tui_launch(sb: &Sandbox, account: &Account, args: &[&str], cwd: Option<&Path>
         what: "test".into(),
     };
     let mut screen = FakeScreen::default();
-    let event = tui::launch_in_foreground(&mut screen, &deps(sb), request).unwrap();
+    let event = tui::launch_in_foreground(&mut screen, &deps(sb), request, &quiet()).unwrap();
     assert_eq!(screen.calls, ["suspend", "resume"], "the TUI steps aside");
     event
 }
@@ -234,7 +255,9 @@ fn project(sb: &Sandbox) -> std::path::PathBuf {
 fn tui_new_session_injects_an_id_and_names_it() {
     let sb = Sandbox::new();
     let dir = project(&sb);
-    let event = tui_launch(&sb, &named("max", "/p/max/"), &["-n", "fix it"], Some(&dir));
+    let max = named("max", "/p/max/");
+    register(&sb, &[&max]);
+    let event = tui_launch(&sb, &max, &["-n", "fix it"], Some(&dir));
     assert_eq!(exit_of(&event), &Ok(Exit::Code(0)));
     let inv = sb.only_invocation();
     assert_eq!(inv.cwd, dir.canonicalize().unwrap());
@@ -275,9 +298,11 @@ fn tui_resume_runs_in_the_sessions_directory() {
 fn tui_fork_gets_a_new_id_and_records_the_original() {
     let sb = Sandbox::new();
     let dir = project(&sb);
+    let team = named("team", "/p/team");
+    register(&sb, &[&team]);
     tui_launch(
         &sb,
-        &named("team", "/p/team"),
+        &team,
         &["--resume", "s-1", "--fork-session"],
         Some(&dir),
     );
@@ -297,7 +322,9 @@ fn tui_fork_gets_a_new_id_and_records_the_original() {
 #[test]
 fn tui_attach_runs_in_remudas_directory_and_injects_nothing() {
     let sb = Sandbox::new();
-    tui_launch(&sb, &named("max", "/p/max"), &["attach", "766560c5"], None);
+    let max = named("max", "/p/max");
+    register(&sb, &[&max]);
+    tui_launch(&sb, &max, &["attach", "766560c5"], None);
     let inv = sb.only_invocation();
     assert_eq!(inv.cwd, sb.work().canonicalize().unwrap());
     assert_eq!(inv.config_dir.as_deref(), Some("/p/max"));
@@ -311,16 +338,18 @@ fn tui_attach_runs_in_remudas_directory_and_injects_nothing() {
 #[test]
 fn tui_launch_without_claude_does_not_suspend() {
     let sb = Sandbox::new();
+    let max = named("max", "/p/max");
+    register(&sb, &[&max]);
     let mut deps = deps(&sb);
     deps.claude = None;
     let request = LaunchRequest {
-        account: named("max", "/p/max"),
+        account: max,
         args: vec![],
         cwd: None,
         what: "new session as max".into(),
     };
     let mut screen = FakeScreen::default();
-    let event = tui::launch_in_foreground(&mut screen, &deps, request).unwrap();
+    let event = tui::launch_in_foreground(&mut screen, &deps, request, &quiet()).unwrap();
     assert!(screen.calls.is_empty());
     assert_eq!(
         exit_of(&event),
@@ -332,8 +361,10 @@ fn tui_launch_without_claude_does_not_suspend() {
 #[test]
 fn tui_launch_that_cannot_suspend_runs_nothing() {
     let sb = Sandbox::new();
+    let max = named("max", "/p/max");
+    register(&sb, &[&max]);
     let request = LaunchRequest {
-        account: named("max", "/p/max"),
+        account: max,
         args: vec![],
         cwd: None,
         what: "new session as max".into(),
@@ -342,7 +373,7 @@ fn tui_launch_that_cannot_suspend_runs_nothing() {
         fail_suspend: true,
         ..FakeScreen::default()
     };
-    let event = tui::launch_in_foreground(&mut screen, &deps(&sb), request).unwrap();
+    let event = tui::launch_in_foreground(&mut screen, &deps(&sb), request, &quiet()).unwrap();
     let Err(e) = exit_of(&event) else {
         panic!("{event:?}")
     };
@@ -436,6 +467,7 @@ fn tui_launches_get_shared_configuration() {
     assert_eq!(sb.launches()[0]["shared"][0]["option"], json!("--add-dir"));
 
     // A registry that cannot be read now: the launch does not happen.
+    let deps = deps(&sb);
     sb.write_config("[share.claude]\nfrom = \"nobody\"\n");
     let mut screen = FakeScreen::default();
     let request = LaunchRequest {
@@ -444,7 +476,7 @@ fn tui_launches_get_shared_configuration() {
         cwd: Some(dir),
         what: "test".into(),
     };
-    let event = tui::launch_in_foreground(&mut screen, &deps(&sb), request).unwrap();
+    let event = tui::launch_in_foreground(&mut screen, &deps, request, &quiet()).unwrap();
     assert!(screen.calls.is_empty());
     let Err(e) = exit_of(&event) else {
         panic!("{event:?}")
@@ -484,7 +516,7 @@ fn tui_memory_uses_the_real_start_directory() {
             what: "test".into(),
         };
         let mut screen = FakeScreen::default();
-        tui::launch_in_foreground(&mut screen, &deps, request).unwrap();
+        tui::launch_in_foreground(&mut screen, &deps, request, &quiet()).unwrap();
         let inv = sb.only_invocation();
         let path = inv.args[0]
             .strip_prefix("--settings=")
@@ -530,6 +562,7 @@ fn tui_codex_resume_runs_codex_in_its_home_and_directory() {
     let sb = Sandbox::new();
     sb.install_codex();
     let dir = project(&sb);
+    register(&sb, &[&codex_work()]);
     let deps = Deps {
         codex: Some(sb.bin().join("codex")),
         ..deps(&sb)
@@ -543,7 +576,7 @@ fn tui_codex_resume_runs_codex_in_its_home_and_directory() {
         what: "resume 019c1e08 as codex:work".into(),
     };
     let mut screen = FakeScreen::default();
-    let event = tui::launch_in_foreground(&mut screen, &deps, request).unwrap();
+    let event = tui::launch_in_foreground(&mut screen, &deps, request, &quiet()).unwrap();
     assert_eq!(exit_of(&event), &Ok(Exit::Code(0)));
     assert_eq!(screen.calls, ["suspend", "resume"]);
     let [inv] = sb.codex_invocations().try_into().unwrap();
@@ -565,6 +598,7 @@ fn tui_codex_fork_is_logged_with_fork_of_and_without_a_session_id() {
     let sb = Sandbox::new();
     sb.install_codex();
     let dir = project(&sb);
+    register(&sb, &[&codex_work()]);
     let deps = Deps {
         codex: Some(sb.bin().join("codex")),
         ..deps(&sb)
@@ -577,7 +611,7 @@ fn tui_codex_fork_is_logged_with_fork_of_and_without_a_session_id() {
         what: "fork 019c1e08 as codex:work".into(),
     };
     let mut screen = FakeScreen::default();
-    let event = tui::launch_in_foreground(&mut screen, &deps, request).unwrap();
+    let event = tui::launch_in_foreground(&mut screen, &deps, request, &quiet()).unwrap();
     assert_eq!(exit_of(&event), &Ok(Exit::Code(0)));
     let [inv] = sb.codex_invocations().try_into().unwrap();
     assert_eq!(inv.args, args);
@@ -591,6 +625,7 @@ fn tui_codex_fork_is_logged_with_fork_of_and_without_a_session_id() {
 #[test]
 fn tui_codex_launch_without_codex_does_not_suspend() {
     let sb = Sandbox::new();
+    register(&sb, &[&codex_work()]);
     let request = LaunchRequest {
         account: codex_work(),
         args: vec!["-C".into(), "/w".into()],
@@ -598,7 +633,7 @@ fn tui_codex_launch_without_codex_does_not_suspend() {
         what: "new session as codex:work".into(),
     };
     let mut screen = FakeScreen::default();
-    let event = tui::launch_in_foreground(&mut screen, &deps(&sb), request).unwrap();
+    let event = tui::launch_in_foreground(&mut screen, &deps(&sb), request, &quiet()).unwrap();
     assert!(screen.calls.is_empty());
     assert_eq!(
         exit_of(&event),
@@ -624,7 +659,8 @@ fn tui_codex_setup_runs_codex_login_in_the_new_home() {
     };
     let mut screen = FakeScreen::default();
     let event =
-        tui::setup_in_foreground(&mut screen, &deps, Provider::Codex, "work", None).unwrap();
+        tui::setup_in_foreground(&mut screen, &deps, Provider::Codex, "work", None, &quiet())
+            .unwrap();
     assert_eq!(
         event,
         Event::SetupDone {
@@ -676,6 +712,7 @@ fn tui_setup_creates_registers_and_logs_in_in_the_foreground() {
         Provider::Claude,
         "work",
         Some("me+work@example.com".into()),
+        &quiet(),
     )
     .unwrap();
     assert_eq!(
@@ -728,7 +765,8 @@ fn tui_setup_links_a_members_home() {
         };
         let mut screen = FakeScreen::default();
         let event =
-            tui::setup_in_foreground(&mut screen, &deps, Provider::Claude, name, None).unwrap();
+            tui::setup_in_foreground(&mut screen, &deps, Provider::Claude, name, None, &quiet())
+                .unwrap();
         let note = |text: &str| remuda::setup::Note {
             warning: false,
             text: text.into(),
@@ -788,7 +826,8 @@ fn tui_setup_refusals_happen_before_anything_is_created() {
     fs::create_dir_all(&existing).unwrap();
     let mut screen = FakeScreen::default();
     let Event::SetupDone { result, .. } =
-        tui::setup_in_foreground(&mut screen, &deps, Provider::Claude, "work", None).unwrap()
+        tui::setup_in_foreground(&mut screen, &deps, Provider::Claude, "work", None, &quiet())
+            .unwrap()
     else {
         panic!()
     };
@@ -801,9 +840,15 @@ fn tui_setup_refusals_happen_before_anything_is_created() {
         claude: None,
         ..deps
     };
-    let Event::SetupDone { result, .. } =
-        tui::setup_in_foreground(&mut screen, &no_claude, Provider::Claude, "other", None).unwrap()
-    else {
+    let Event::SetupDone { result, .. } = tui::setup_in_foreground(
+        &mut screen,
+        &no_claude,
+        Provider::Claude,
+        "other",
+        None,
+        &quiet(),
+    )
+    .unwrap() else {
         panic!()
     };
     assert!(result.unwrap_err().contains("claude"));
@@ -830,7 +875,8 @@ fn tui_setup_when_the_terminal_cannot_be_handed_over() {
         ..FakeScreen::default()
     };
     let Event::SetupDone { result, .. } =
-        tui::setup_in_foreground(&mut screen, &deps, Provider::Claude, "work", None).unwrap()
+        tui::setup_in_foreground(&mut screen, &deps, Provider::Claude, "work", None, &quiet())
+            .unwrap()
     else {
         panic!()
     };
@@ -847,7 +893,8 @@ fn tui_setup_when_the_terminal_cannot_be_handed_over() {
         ..FakeScreen::default()
     };
     let err =
-        tui::setup_in_foreground(&mut screen, &deps, Provider::Claude, "work", None).unwrap_err();
+        tui::setup_in_foreground(&mut screen, &deps, Provider::Claude, "work", None, &quiet())
+            .unwrap_err();
     assert!(
         format!("{err:#}").contains("cannot take the terminal back"),
         "{err:#}"
@@ -859,14 +906,12 @@ fn tui_setup_when_the_terminal_cannot_be_handed_over() {
 
 // --- the pre-launch check: fresh running sessions of every account (R16) ------------------
 
-use std::sync::{Arc, mpsc};
-
 use remuda::tui::app::Effect;
 use remuda::tui::workers;
 
 const U: &str = "0badf00d-0000-4000-8000-000000000000";
 
-/// `max` and `team` registered, and the TUI started with them (and `default`); every account
+/// `max` and `team` registered, and a TUI started with them (and `default`); every account
 /// answers `agents --json` from its fixture; no ps.
 fn two_accounts(sb: &Sandbox) -> (Deps, Account, Account) {
     let max = sb.make_claude_home("p/max");
@@ -879,17 +924,7 @@ fn two_accounts(sb: &Sandbox) -> (Deps, Account, Account) {
         named("max", max.to_str().unwrap()),
         named("team", team.to_str().unwrap()),
     );
-    let accounts = vec![
-        Account::default_for(Provider::Claude),
-        max.clone(),
-        team.clone(),
-    ];
-    let deps = Deps {
-        seen: accounts.clone(),
-        accounts,
-        ..deps(sb)
-    };
-    (deps, max, team)
+    (deps(sb), max, team)
 }
 
 fn home_of(account: &Account) -> &Path {
@@ -1078,7 +1113,7 @@ fn a_resume_is_checked_against_accounts_registered_after_the_tui_started() {
             work
         ])]
     );
-    // A fork or a new session reads nothing more.
+    // A new session reads the registry too, and finds nothing new to tell.
     let (events, error) = check_launch_events(&deps, &max, &["-n", "x"], &project(&sb));
     assert_eq!((events, error), (vec![], None));
 }
@@ -1098,6 +1133,14 @@ fn a_resume_is_refused_when_the_registry_cannot_be_read() {
         ),
         "{error}"
     );
+    // A missing directory is still told as such, for a resume and for a new session.
+    let gone = sb.root().join("gone");
+    for args in [&["--resume", U][..], &["-n", "x"]] {
+        assert_eq!(
+            check_launch(&deps, &max, args, &gone),
+            Some(format!("{} does not exist", gone.display()))
+        );
+    }
     assert_eq!(
         check_launch(
             &deps,
@@ -1136,14 +1179,502 @@ fn a_resume_is_checked_against_accounts_removed_from_the_registry() {
             max.clone()
         ])]
     );
-    // Once the TUI shows the new registry, `team` is still remembered as seen.
-    let deps = Deps {
-        accounts: vec![Account::default_for(Provider::Claude), max.clone()],
-        seen: deps.seen.clone(),
-        ..deps
-    };
+    // Once the TUI shows the new registry, `team` is still remembered as seen (and there is
+    // nothing more to tell).
     let error = check_launch(&deps, &max, &["--resume", U], &project(&sb));
     assert!(error.unwrap().contains("running in team"));
+}
+
+// --- the registry changes while the TUI runs (R16) -----------------------------------------
+
+fn request(account: &Account, args: &[&str], cwd: Option<&Path>) -> LaunchRequest {
+    LaunchRequest {
+        account: account.clone(),
+        args: args.iter().map(|a| a.to_string()).collect(),
+        cwd: cwd.map(Path::to_path_buf),
+        what: "test".into(),
+    }
+}
+
+/// R16: an account that `remuda remove` took out of the registry in another terminal starts
+/// no new session and no fork: the check before the launch reads the registry again, says
+/// why, and tells the TUI once.
+#[test]
+fn an_account_removed_elsewhere_starts_no_new_session_and_no_fork() {
+    let sb = Sandbox::new();
+    let (deps, max, team) = two_accounts(&sb);
+    let dir = project(&sb);
+    sb.register(&[("max", home_of(&max))]);
+    let listed = vec![Account::default_for(Provider::Claude), max.clone()];
+
+    let (events, error) = check_launch_events(&deps, &team, &["-n", "x"], &dir);
+    assert_eq!(error.as_deref(), Some("team is no longer registered"));
+    assert_eq!(events, [Event::Accounts(listed)], "told once");
+    let fork = ["--resume", U, "--fork-session"];
+    let (events, error) = check_launch_events(&deps, &team, &fork, &dir);
+    assert_eq!(error.as_deref(), Some("team is no longer registered"));
+    assert_eq!(events, [], "the TUI already knows");
+    // A resume in place is refused the same way, before any account is asked.
+    assert_eq!(
+        check_launch(&deps, &team, &["--resume", U], &dir).as_deref(),
+        Some("team is no longer registered")
+    );
+    assert!(sb.invocations().is_empty(), "{:?}", sb.invocations());
+    // The account comes before the directory: with both wrong, the account is what is said.
+    let gone = sb.root().join("gone");
+    assert_eq!(
+        check_launch(&deps, &team, &["-n", "x"], &gone).as_deref(),
+        Some("team is no longer registered")
+    );
+    assert_eq!(
+        check_launch(&deps, &max, &["-n", "x"], &gone),
+        Some(format!("{} does not exist", gone.display()))
+    );
+    // The accounts still listed start as before.
+    assert_eq!(check_launch(&deps, &max, &["-n", "x"], &dir), None);
+    assert_eq!(check_launch(&deps, &max, &fork, &dir), None);
+}
+
+/// R16: the registry is read before anything else can end a launch or its check, so a change
+/// reaches the TUI whatever the answer is: a missing directory in the check, a missing agent
+/// executable in the launch (an attach has no check before it). An account that is gone is
+/// what is said, not the directory or the executable.
+#[test]
+fn the_registry_is_read_before_the_directory_and_the_executable() {
+    let sb = Sandbox::new();
+    let (deps, max, team) = two_accounts(&sb);
+    let listed = vec![Account::default_for(Provider::Claude), max.clone()];
+    let gone = sb.root().join("gone");
+
+    // The check, for a directory that does not exist: the change is told all the same.
+    sb.register(&[("max", home_of(&max))]);
+    let (events, error) = check_launch_events(&deps, &max, &["-n", "x"], &gone);
+    assert_eq!(error, Some(format!("{} does not exist", gone.display())));
+    assert_eq!(events, [Event::Accounts(listed.clone())]);
+
+    // The launch, in a TUI that found no `claude` when it started.
+    sb.register(&[("max", home_of(&max)), ("team", home_of(&team))]);
+    let deps = Deps {
+        claude: None,
+        ..self::deps(&sb)
+    };
+    sb.register(&[("max", home_of(&max))]);
+    let (tx, rx) = mpsc::channel();
+    let mut screen = FakeScreen::default();
+    let attach = request(&team, &["attach", "0badf00d"], None);
+    let event = tui::launch_in_foreground(&mut screen, &deps, attach, &tx).unwrap();
+    assert_eq!(
+        exit_of(&event),
+        &Err("team is no longer registered".to_string()),
+        "not the executable"
+    );
+    assert_eq!(
+        rx.try_iter().collect::<Vec<_>>(),
+        [Event::Accounts(listed)],
+        "told although nothing could have run"
+    );
+    // An account still listed is told of the executable.
+    let attach = request(&max, &["attach", "0badf00d"], None);
+    let event = tui::launch_in_foreground(&mut screen, &deps, attach, &tx).unwrap();
+    assert_eq!(
+        exit_of(&event),
+        &Err("`claude` not found on PATH".to_string())
+    );
+    assert!(screen.calls.is_empty());
+    assert!(sb.invocations().is_empty(), "{:?}", sb.invocations());
+}
+
+/// R16, R2: the same name registered again with another home is another account: a launch
+/// that still holds the old home is refused.
+#[test]
+fn an_account_registered_again_with_another_home_is_not_launched_with_the_old_one() {
+    let sb = Sandbox::new();
+    let (deps, max, team) = two_accounts(&sb);
+    let moved = sb.make_claude_home("q/team");
+    sb.register(&[("max", home_of(&max)), ("team", &moved)]);
+    assert_eq!(
+        check_launch_events(&deps, &team, &["-n", "x"], &project(&sb)).1,
+        Some("team is now registered with another home".to_string())
+    );
+    let mut screen = FakeScreen::default();
+    let event =
+        tui::launch_in_foreground(&mut screen, &deps, request(&team, &[], None), &quiet()).unwrap();
+    assert_eq!(
+        exit_of(&event),
+        &Err("team is now registered with another home".to_string())
+    );
+    assert!(sb.invocations().is_empty(), "{:?}", sb.invocations());
+}
+
+/// R16: the launch itself reads the registry once more, whatever kind it is (an attach has
+/// no check before it; an account can go while a check runs): nothing is handed over, run or
+/// logged for an account no longer listed, and the TUI is told once.
+#[test]
+fn a_launch_reads_the_registry_again_and_runs_nothing_for_an_account_gone() {
+    let sb = Sandbox::new();
+    let (deps, max, team) = two_accounts(&sb);
+    let dir = project(&sb);
+    sb.register(&[("max", home_of(&max))]);
+    let (tx, rx) = mpsc::channel();
+    let kinds: [&[&str]; 4] = [
+        &["-n", "x"],
+        &["--resume", U, "--fork-session"],
+        &["--resume", U],
+        &["attach", "0badf00d"],
+    ];
+    for args in kinds {
+        let mut screen = FakeScreen::default();
+        let request = request(&team, args, Some(&dir));
+        let event = tui::launch_in_foreground(&mut screen, &deps, request, &tx).unwrap();
+        assert_eq!(
+            exit_of(&event),
+            &Err("team is no longer registered".to_string()),
+            "{args:?}"
+        );
+        assert!(screen.calls.is_empty(), "{args:?}: the TUI stays");
+    }
+    assert!(sb.invocations().is_empty(), "{:?}", sb.invocations());
+    assert!(!sb.launch_log().exists(), "nothing was logged");
+    assert_eq!(
+        rx.try_iter().collect::<Vec<_>>(),
+        [Event::Accounts(vec![
+            Account::default_for(Provider::Claude),
+            max.clone()
+        ])]
+    );
+
+    // An account still listed runs, in its home as the registry has it (R2).
+    let mut screen = FakeScreen::default();
+    let request = request(&max, &["-n", "x"], Some(&dir));
+    let event = tui::launch_in_foreground(&mut screen, &deps, request, &tx).unwrap();
+    assert_eq!(exit_of(&event), &Ok(Exit::Code(0)));
+    assert_eq!(screen.calls, ["suspend", "resume"]);
+    let inv = sb.only_invocation();
+    assert_eq!(inv.config_dir.as_deref(), home_of(&max).to_str());
+    assert_eq!(rx.try_iter().count(), 0, "nothing new to tell");
+}
+
+/// R16: a setup from the TUI reads the registry again: the new account is told before the
+/// setup's own result is.
+#[test]
+fn a_setup_from_the_tui_tells_the_new_account() {
+    let sb = Sandbox::new();
+    let deps = Deps {
+        env: [
+            ("HOME".to_string(), sb.home().display().to_string()),
+            (
+                "REMUDA_HOME".to_string(),
+                sb.remuda_home().display().to_string(),
+            ),
+        ]
+        .into(),
+        ..deps(&sb)
+    };
+    let (tx, rx) = mpsc::channel();
+    let mut screen = FakeScreen::default();
+    tui::setup_in_foreground(&mut screen, &deps, Provider::Claude, "work", None, &tx).unwrap();
+    let home = sb.remuda_home().join("homes/claude/work");
+    assert_eq!(
+        rx.try_iter().collect::<Vec<_>>(),
+        [Event::Accounts(vec![
+            Account::default_for(Provider::Claude),
+            named("work", home.to_str().unwrap())
+        ])],
+        "in the channel when the setup returns"
+    );
+    // A setup that registers nothing tells nothing.
+    let mut screen = FakeScreen::default();
+    let Event::SetupDone { result, .. } =
+        tui::setup_in_foreground(&mut screen, &deps, Provider::Claude, "work", None, &tx).unwrap()
+    else {
+        panic!()
+    };
+    assert!(result.is_err());
+    assert_eq!(rx.try_iter().count(), 0);
+}
+
+use remuda::tui::app::{self, App, Key, Mode, Overlay};
+
+/// The event loop without a terminal: events are applied in order, background effects run on
+/// their workers, and a launch runs on a [`FakeScreen`].
+struct Headless {
+    app: App,
+    deps: Arc<Deps>,
+    tx: mpsc::Sender<Event>,
+    rx: mpsc::Receiver<Event>,
+    screen: FakeScreen,
+    /// Every `Accounts` event applied.
+    told: Vec<Vec<Account>>,
+}
+
+impl Headless {
+    fn start(sb: &Sandbox, deps: Deps) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let accounts = deps.listing.read(&tx).accounts;
+        let mut app = App::new(accounts, deps.tz.clone(), None, jiff::Timestamp::now());
+        app.cwd = Some(sb.work());
+        Headless {
+            app,
+            deps: Arc::new(deps),
+            tx,
+            rx,
+            screen: FakeScreen::default(),
+            told: Vec::new(),
+        }
+    }
+
+    /// Applies `event` and starts what it asks for, which is returned.
+    fn apply(&mut self, event: Event) -> Vec<Effect> {
+        if let Event::Accounts(accounts) = &event {
+            self.told.push(accounts.clone());
+        }
+        let effects = app::update(&mut self.app, event);
+        self.dispatch(effects.clone());
+        effects
+    }
+
+    fn dispatch(&mut self, effects: Vec<Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::Launch(request) => {
+                    let event =
+                        tui::launch_in_foreground(&mut self.screen, &self.deps, request, &self.tx)
+                            .unwrap();
+                    self.tx.send(event).unwrap();
+                }
+                other => workers::spawn(other, &self.deps, &self.tx),
+            }
+        }
+    }
+
+    fn keys(&mut self, keys: &[Key]) {
+        for key in keys {
+            self.apply(Event::Key(*key));
+        }
+    }
+
+    /// Applies what the workers send until `done`.
+    fn run_until(&mut self, done: impl Fn(&App) -> bool) {
+        while !done(&self.app) {
+            let event = self
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("the app gets there");
+            self.apply(event);
+        }
+    }
+
+    fn rows(&self) -> Vec<String> {
+        self.app
+            .accounts
+            .iter()
+            .map(|a| a.account.name.clone())
+            .collect()
+    }
+}
+
+/// R16, without a terminal: the registry loses an account while the TUI shows it; the new
+/// session started for it reads the registry, one `Accounts` event takes its row away, and
+/// the form says why nothing was launched. An account still listed launches as before.
+#[test]
+fn a_registry_change_reaches_the_app_and_the_account_gone_does_not_launch() {
+    let sb = Sandbox::new();
+    let (deps, max, team) = two_accounts(&sb);
+    let mut tui = Headless::start(&sb, deps);
+    assert_eq!(tui.rows(), ["default", "max", "team"]);
+    // `n` on team opens its form; meanwhile `remuda remove team` runs in another terminal.
+    tui.keys(&[Key::Down, Key::Down, Key::Char('n')]);
+    sb.register(&[("max", home_of(&max))]);
+    tui.keys(&[Key::Enter]);
+    assert!(
+        tui.app.work.launch.is_running(),
+        "the launch waits for its check"
+    );
+    tui.run_until(|app| !app.work.launch.is_running());
+
+    assert_eq!(
+        tui.told,
+        [vec![Account::default_for(Provider::Claude), max.clone()]],
+        "one event"
+    );
+    assert_eq!(tui.rows(), ["default", "max"]);
+    let Some(Overlay::Form(form)) = &tui.app.overlay else {
+        panic!("{:?}", tui.app.overlay)
+    };
+    assert_eq!(
+        form.error.as_ref().map(|e| e.as_str()),
+        Some("team is no longer registered")
+    );
+    assert!(
+        tui.screen.calls.is_empty(),
+        "the terminal was not handed over"
+    );
+    assert!(!sb.launch_log().exists(), "nothing was launched");
+    assert!(sb.invocations_with(Some(home_of(&team))).is_empty());
+
+    // The row the selection is on now is max: its new session starts.
+    tui.keys(&[Key::Esc, Key::Char('n'), Key::Enter]);
+    tui.run_until(|_| sb.launch_log().exists());
+    assert_eq!(tui.screen.calls, ["suspend", "resume"]);
+    let log = sb.launches();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0]["account"], json!("claude:max"));
+    let launched: Vec<_> = sb
+        .invocations_with(Some(home_of(&max)))
+        .into_iter()
+        .filter(|inv| inv.args.first().map(String::as_str) == Some("--session-id"))
+        .collect();
+    assert_eq!(launched.len(), 1, "{:?}", sb.invocations());
+    assert_eq!(tui.told.len(), 1, "nothing more to tell");
+}
+
+/// R16, R2, without a terminal: a new-session form is open for an account when another
+/// `remuda` registers its name again with another home, and the running-sessions collection
+/// the TUI repeats brings the new list to the screen. Enter then starts nothing: the form
+/// holds the account it was opened for, which is not the one of that name any more.
+#[test]
+fn a_form_open_while_its_account_moves_to_another_home_starts_nothing() {
+    let sb = Sandbox::new();
+    let (deps, max, team) = two_accounts(&sb);
+    let mut tui = Headless::start(&sb, deps);
+    tui.keys(&[Key::Down, Key::Down, Key::Char('n')]);
+    let moved = sb.make_claude_home("q/team");
+    sb.set_agents(Some(&moved), "[]");
+    sb.register(&[("max", home_of(&max)), ("team", &moved)]);
+    workers::spawn(Effect::Live, &tui.deps, &tui.tx);
+    tui.run_until(|app| app.live_loaded);
+    let moved = named("team", moved.to_str().unwrap());
+    assert_eq!(
+        tui.told,
+        [vec![
+            Account::default_for(Provider::Claude),
+            max.clone(),
+            moved.clone()
+        ]]
+    );
+    assert_eq!(tui.app.accounts[2].account, moved, "the row is the new one");
+
+    assert_eq!(tui.apply(Event::Key(Key::Enter)), [], "nothing is started");
+    assert_eq!(tui.app.work.launch.running(), None);
+    let Some(Overlay::Form(form)) = &tui.app.overlay else {
+        panic!("{:?}", tui.app.overlay)
+    };
+    assert_eq!(
+        form.error.as_ref().map(|e| e.as_str()),
+        Some("team is now registered with another home")
+    );
+    assert!(
+        tui.screen.calls.is_empty(),
+        "the terminal was not handed over"
+    );
+    assert!(!sb.launch_log().exists(), "nothing was launched");
+    for home in [home_of(&team), home_of(&moved)] {
+        let launched = sb
+            .invocations_with(Some(home))
+            .into_iter()
+            .any(|inv| inv.args.first().map(String::as_str) == Some("--session-id"));
+        assert!(!launched, "{:?}", sb.invocations());
+    }
+}
+
+/// R16, without a terminal: `r` reads the registry again although the identities, usage and
+/// checks it would start are still counted as running: their answers are queued behind the
+/// key, and nothing else repeats while an account is chosen for `remuda run`.
+#[test]
+fn a_refresh_reads_the_registry_while_earlier_answers_are_still_queued() {
+    let sb = Sandbox::new();
+    let (deps, max, team) = two_accounts(&sb);
+    let mut tui = Headless::start(&sb, deps);
+    tui.app.mode = Mode::PickForRun;
+    let started = tui.app.start();
+    let everyone = vec![Account::default_for(Provider::Claude), max.clone(), team];
+    assert_eq!(
+        started,
+        [
+            Effect::Identities(everyone.clone()),
+            Effect::CachedUsage(everyone),
+            Effect::Checks
+        ]
+    );
+    tui.dispatch(started);
+    // Every answer of the old list is in the queue, none applied: three identities, three
+    // cached usages, the checks.
+    let queued: Vec<Event> = (0..7)
+        .map(|_| {
+            tui.rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        queued.iter().all(|e| !matches!(e, Event::Accounts(_))),
+        "{queued:?}"
+    );
+    // `remuda remove team` in another terminal, then `r`: the key is applied first.
+    sb.register(&[("max", home_of(&max))]);
+    assert_eq!(
+        tui.apply(Event::Key(Key::Char('r'))),
+        [Effect::ReadAccounts]
+    );
+    for event in queued {
+        assert_eq!(tui.apply(event), [], "an old answer starts nothing");
+    }
+    tui.run_until(|app| app.accounts.len() == 2);
+    assert_eq!(tui.rows(), ["default", "max"]);
+    assert_eq!(
+        tui.told,
+        [vec![Account::default_for(Provider::Claude), max]],
+        "one event"
+    );
+}
+
+/// R10, R16, without a terminal: `u` while an account is chosen for `remuda run`, where nothing
+/// else reads the registry. One account was removed and another registered again with another
+/// home meanwhile: the registry is read before anything is asked, the rows follow it, and
+/// `claude -p /usage` runs for the account still listed only, not in the homes that left.
+#[test]
+fn live_usage_is_not_asked_in_a_home_that_left_the_registry() {
+    let sb = Sandbox::new();
+    let (deps, max, team) = two_accounts(&sb);
+    let moved = sb.make_claude_home("q/max");
+    for home in [
+        None,
+        Some(home_of(&max)),
+        Some(home_of(&team)),
+        Some(&*moved),
+    ] {
+        sb.set_live_usage(home, "Current session: 0% used\n");
+    }
+    let mut tui = Headless::start(&sb, deps);
+    tui.app.mode = Mode::PickForRun;
+    sb.register(&[("max", &moved)]);
+    let default = Account::default_for(Provider::Claude);
+    assert_eq!(
+        tui.apply(Event::Key(Key::Char('u'))),
+        [Effect::LiveUsage(vec![
+            default.clone(),
+            max.clone(),
+            team.clone()
+        ])],
+        "the app still shows the old rows"
+    );
+    // Until the rows are the registry's, the account still listed has its usage, and the
+    // identities read for the new list have answered (later than any query started by `u`).
+    tui.run_until(|app| {
+        app.accounts.len() == 2
+            && app.accounts[0].live.is_some()
+            && app.accounts.iter().all(|a| a.identity.is_some())
+    });
+    let moved = named("max", moved.to_str().unwrap());
+    assert_eq!(tui.told, [vec![default, moved.clone()]], "one event");
+    assert_eq!(tui.app.accounts[1].account, moved);
+    let asked: Vec<Option<String>> = sb
+        .invocations()
+        .into_iter()
+        .filter(|inv| inv.args.first().map(String::as_str) == Some("-p"))
+        .map(|inv| inv.config_dir)
+        .collect();
+    assert_eq!(asked, [None], "only the native login was asked");
 }
 
 /// R17: codex has no running-session source: a codex resume is not checked against claude's
@@ -1151,7 +1682,9 @@ fn a_resume_is_checked_against_accounts_removed_from_the_registry() {
 #[test]
 fn a_codex_resume_only_has_its_directory_checked() {
     let sb = Sandbox::new();
-    let (deps, _, _) = two_accounts(&sb);
+    let (_, max, team) = two_accounts(&sb);
+    register(&sb, &[&max, &team, &codex_work()]);
+    let deps = deps(&sb);
     let dir = project(&sb);
     let args = ["resume", CODEX_ID, "-C", dir.to_str().unwrap()];
     assert_eq!(check_launch(&deps, &codex_work(), &args, &dir), None);
@@ -1207,13 +1740,15 @@ fn inherited_config_dir_is_removed_for_default() {
     );
     let sb = Sandbox::new();
     let dir = project(&sb);
+    let max = named("max", "/p/max");
+    register(&sb, &[&max]);
     tui_launch(
         &sb,
         &Account::default_for(Provider::Claude),
         &["--resume", U],
         Some(&dir),
     );
-    tui_launch(&sb, &named("max", "/p/max"), &["--resume", U], Some(&dir));
+    tui_launch(&sb, &max, &["--resume", U], Some(&dir));
     let invocations = sb.invocations();
     assert_eq!(invocations[0].config_dir, None, "default: removed (R2)");
     assert_eq!(

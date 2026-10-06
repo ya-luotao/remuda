@@ -50,6 +50,17 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Fixed
 
+- The TUI went on launching as an account that `remuda remove` had taken out of the registry in
+  another terminal: a new session, a fork, a resume or an attach as that account still started; a
+  setup, a removal or a resume in place read `config.toml` again, and then only the list on
+  screen followed. The TUI now reads the registry before every launch (in the check before it,
+  and once more when it starts), on every refresh, and whenever it starts work that goes over the
+  accounts, so the list on screen follows a change made elsewhere; the checks and, once computed,
+  the statistics are done again for the new list (SPEC R11, R20), and live usage (`u`) is asked
+  only of accounts still listed (SPEC R10). Nothing is launched as an account no longer listed:
+  the TUI says "<account> is no longer registered" and keeps the terminal (SPEC R16). The same
+  holds for `remuda run` without an account: an account removed while the picker was open is not
+  launched once chosen, and remuda exits with an error.
 - TUI: a held key no longer starts a thread or an agent command for every repeat. `Enter` or
   `f` on a session checks that launch once (each check runs `claude agents --json` for every
   account): the check already running is the one waited for, and a check that was cancelled

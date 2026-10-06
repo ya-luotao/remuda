@@ -3,10 +3,12 @@
 //! private mode, and launching the agents from them.
 //!
 //! [`app`] holds the state and the pure `update`; [`render`] draws it; this module owns the
-//! terminal and the event loop (including foreground launches, which suspend the TUI), and
-//! [`workers`] run the slow parts in the background; [`work`] keeps count of them (what is
-//! out, what runs again, which answer is still wanted).
+//! terminal and the event loop (including foreground launches, which suspend the TUI),
+//! [`workers`] run the slow parts in the background, [`work`] keeps count of them (what is
+//! out, what runs again, which answer is still wanted), and [`accounts`] says which accounts
+//! there are.
 
+pub mod accounts;
 pub mod app;
 pub mod privacy;
 pub mod render;
@@ -24,7 +26,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -39,26 +41,24 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::account_command::OnPath;
 use crate::provider::Provider;
-use crate::registry::{Account, Registry};
+use crate::registry::Account;
 use crate::{Env, launch, owned, paths, setup};
 
+use accounts::Listing;
 use app::{App, Effect, Event, Exit, Key, LaunchRequest, Mode};
 
 /// Everything the TUI needs from the process, captured once by the caller.
 #[derive(Clone)]
 pub struct Deps {
-    pub accounts: Vec<Account>,
+    /// Which accounts there are, and where `config.toml` is: read again by whatever goes
+    /// over the accounts. Shared by every clone.
+    pub listing: Arc<Listing>,
     pub env: Env,
     pub claude: Option<PathBuf>,
     pub codex: Option<PathBuf>,
     pub ps: Option<PathBuf>,
-    /// Every account shown during this session (grow-only): a pre-launch check asks these as
-    /// well as the registry's, so an account unregistered meanwhile is still asked (C2).
-    pub seen: Vec<Account>,
     pub tz: TimeZone,
     pub clock: fn() -> Timestamp,
-    /// `$REMUDA_HOME/config.toml`.
-    pub config: PathBuf,
     pub state_dir: PathBuf,
     /// The directory remuda was started in: the default for new sessions.
     pub cwd: Option<PathBuf>,
@@ -276,7 +276,9 @@ fn event_loop(
     let (tx, rx) = mpsc::channel::<Event>();
     let size = terminal.size()?;
     let home = paths::user_home(&deps.env).map(|h| h.display().to_string());
-    let mut app = App::new(deps.accounts.clone(), deps.tz.clone(), home, (deps.clock)());
+    // Reading is the only way to the accounts: what `Listing::open` read is not handed out.
+    let accounts = deps.listing.read(&tx).accounts;
+    let mut app = App::new(accounts, deps.tz.clone(), home, (deps.clock)());
     app.mode = deps.mode;
     app.cwd = deps.cwd.clone();
     app::update(&mut app, Event::Resize(size.width, size.height));
@@ -299,17 +301,6 @@ fn event_loop(
         // Nothing happened (no key, result or tick): the screen is still current.
         let idle = batch.is_empty();
         for event in batch {
-            // The registry was read again: every task started from now on (including those
-            // this event starts) sees the same accounts as the app.
-            if let Event::Accounts(accounts) = &event
-                && *accounts != deps.accounts
-            {
-                deps = Arc::new(Deps {
-                    accounts: accounts.clone(),
-                    seen: workers::union(&[&deps.seen, accounts]),
-                    ..Deps::clone(&deps)
-                });
-            }
             let effects = app::update(&mut app, event);
             if app.private != deps.private {
                 deps = Arc::new(Deps {
@@ -323,7 +314,7 @@ fn event_loop(
                     Effect::Pick(account) => return Ok(Some(account)),
                     Effect::Launch(request) => {
                         let (request, what) = for_screen(&app, request);
-                        let mut event = launch_in_foreground(terminal, &deps, request)?;
+                        let mut event = launch_in_foreground(terminal, &deps, request, &tx)?;
                         restore_what(&mut event, what);
                         // Results come back through the queue, after this batch.
                         let _ = tx.send(event);
@@ -335,15 +326,8 @@ fn event_loop(
                         name,
                         email,
                     } => {
-                        let event = setup_in_foreground(terminal, &deps, provider, &name, email)?;
-                        // Whatever happened, the registry may have changed: the new account
-                        // is picked up when this event is applied (above).
-                        if let Ok(registry) = Registry::load(&deps.config) {
-                            let accounts = registry.all(&deps.env);
-                            if accounts != deps.accounts {
-                                let _ = tx.send(Event::Accounts(accounts));
-                            }
-                        }
+                        let event =
+                            setup_in_foreground(terminal, &deps, provider, &name, email, &tx)?;
                         let _ = tx.send(event);
                         let size = terminal.size()?;
                         let _ = tx.send(Event::Resize(size.width, size.height));
@@ -409,13 +393,16 @@ fn read_input(wait: Duration) -> io::Result<Vec<Event>> {
 
 /// Runs a [`LaunchRequest`] the way `remuda run` would (R6: same env change, injection and
 /// launch log), in the foreground with the TUI suspended (R16), and reports how it ended.
+/// The registry is read again first (a change is told through `tx`): nothing runs as an
+/// account it no longer lists, or while it cannot be read.
 /// Only a failure to take the terminal back is an error: the TUI cannot go on without it.
 pub fn launch_in_foreground(
     screen: &mut impl Screen,
     deps: &Deps,
     request: LaunchRequest,
+    tx: &Sender<Event>,
 ) -> Result<Event> {
-    let (result, warnings) = run_launch(screen, deps, &request)?;
+    let (result, warnings) = run_launch(screen, deps, &request, tx)?;
     Ok(Event::Launched {
         request,
         result,
@@ -427,26 +414,30 @@ fn run_launch(
     screen: &mut impl Screen,
     deps: &Deps,
     request: &LaunchRequest,
+    tx: &Sender<Event>,
 ) -> Result<(Result<Exit, String>, Vec<String>)> {
+    // The registry as it is now, before anything else can end the launch: the last word on
+    // whether the account is still listed (R16), and its shared configuration (R18).
+    let reading = deps.listing.read(tx);
+    if let Some(why) = reading.refusal(&request.account) {
+        return Ok((Err(why), Vec::new()));
+    }
     let provider = request.account.provider;
     let Some(program) = deps.program(provider) else {
         let missing = format!("`{}` not found on PATH", provider.program());
         return Ok((Err(missing), Vec::new()));
     };
     let cwd = request.cwd.as_deref().or(deps.cwd.as_deref());
-    // The registry as it is now, for its shared configuration (R18).
-    let planned = Registry::load(&deps.config).and_then(|registry| {
-        launch::plan(
-            &request.account,
-            request.args.clone(),
-            cwd,
-            (deps.clock)().to_string(),
-            || uuid::Uuid::new_v4().to_string(),
-            &registry.sharing,
-            &deps.env,
-            &deps.config,
-        )
-    });
+    let planned = launch::plan(
+        &request.account,
+        request.args.clone(),
+        cwd,
+        (deps.clock)().to_string(),
+        || uuid::Uuid::new_v4().to_string(),
+        &reading.sharing,
+        &deps.env,
+        deps.listing.config(),
+    );
     let plan = match planned {
         Ok(plan) => plan,
         Err(e) => return Ok((Err(format!("{e:#}")), Vec::new())),
@@ -472,14 +463,18 @@ fn run_launch(
 /// (`claude auth login`, `codex login`) in the foreground while the TUI is suspended. Nothing
 /// is created when a check fails or the terminal cannot be handed over; a failed login keeps
 /// the registration. Like a launch, only a failure to take the terminal back is an error.
+/// Whatever happened, the registry is read again: a new account is told through `tx` before
+/// this returns, ahead of the result.
 pub fn setup_in_foreground(
     screen: &mut impl Screen,
     deps: &Deps,
     provider: Provider,
     name: &str,
     email: Option<String>,
+    tx: &Sender<Event>,
 ) -> Result<Event> {
     let (result, links) = run_setup(screen, deps, provider, name, email)?;
+    deps.listing.read(tx);
     Ok(Event::SetupDone {
         provider,
         name: name.to_string(),
@@ -496,8 +491,8 @@ fn run_setup(
     email: Option<String>,
 ) -> Result<(Result<Exit, String>, Vec<setup::Note>)> {
     let checked = || -> Result<_, String> {
-        let plan =
-            setup::plan(&deps.config, provider, name, &deps.env).map_err(|e| format!("{e:#}"))?;
+        let plan = setup::plan(deps.listing.config(), provider, name, &deps.env)
+            .map_err(|e| format!("{e:#}"))?;
         let program = deps
             .program(provider)
             .ok_or_else(|| format!("`{}` not found on PATH", provider.program()))?;
@@ -518,7 +513,7 @@ fn run_setup(
     }
     let login = setup::login_command(provider);
     let mut links = Vec::new();
-    let status = match setup::create_and_register(&deps.config, &plan) {
+    let status = match setup::create_and_register(deps.listing.config(), &plan) {
         Err(e) => Err(format!("{e:#}")),
         Ok(linked) => {
             // The notice after the login: the source and the items, no paths (R21).

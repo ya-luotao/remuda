@@ -66,7 +66,8 @@ Modules are layered: each layer uses the layers below it.
 ```text
  ┌─ entry ───────────────────────────────────────────────────────────────────┐
  │  main ──► cli                        tui ─ app · work · workers · render  │
- │                                            privacy · timeline · search    │
+ │                                            privacy · timeline · search ·  │
+ │                                            accounts                       │
  ├─ features ────────────────────────────────────────────────────────────────┤
  │  launch · share · setup · home_items  accounts: identity · usage · live · │
  │                                                 checks · account_config   │
@@ -131,6 +132,7 @@ The exceptions, all for a type or a small helper:
 | `tui::app` | All TUI state and the pure `update(app, event) -> effects` | R8, R16, R17, R20–R22 |
 | `tui::work` | The slot of one kind of background work: whether a round is out, whether it runs once more, whether a result is the one still wanted | R7, R16, R22 |
 | `tui::workers` | Runs each background effect on a thread and sends back events | R7–R11, R20, R22 |
+| `tui::accounts` | The account listing: reads the registry again for whatever goes over the accounts, tells a change once, refuses a launch as an account no longer listed | R3, R16 |
 | `tui::render` | Draws the state; views, overlays, key reference | – |
 | `tui::privacy` | Private mode: the redacted copy of the state that is drawn; aliases from `privacy` | R21 |
 | `tui::timeline` | The shared seven-day reset timeline | R10 |
@@ -290,7 +292,7 @@ an `Event`.
                  │           tui::workers::spawn
                  │   RefreshIndex · Identities · CachedUsage · LiveUsage · Live
                  │   Attribution · Checks · Stats · Preview · Config · CheckLaunch
-                 │   Logs · Control · RemoveAccount · RolloutWritten
+                 │   Logs · Control · RemoveAccount · RolloutWritten · ReadAccounts
                  │                    │
                  └──── mpsc::Sender<Event> ◄──── a thread per effect (per account for
                                                  identities and live usage)
@@ -315,6 +317,19 @@ an `Event`.
   round's number as well, a second check that an answer is the one asked for (R16).
 - A launch that resumes a session in place is preceded by `CheckLaunch`, which queries every
   account's running sessions again right before starting (R16).
+- Neither the app nor `Deps` is where the accounts come from: `tui::accounts::Listing` is, and
+  `Listing::read` is the only way to them. A worker that goes over the accounts reads the registry
+  when it starts (what is asked of each account goes to the accounts its effect names that are
+  still listed); so do the check before a launch and the launch itself, and `r` asks for a read of
+  its own (`ReadAccounts`), which nothing still running holds back. A read that finds another list
+  than the last one sends one `Event::Accounts` before it returns, so the app rebuilds its rows
+  ahead of any result for the new list, and results for an account that is gone find no row.
+  Results that are not per account but for the whole list: the checks run once more through their
+  slot when the list changed while they ran, and those for the old list are not shown; the
+  statistics go out through `Listing::answer`, which holds a report back when the list changed
+  while it was computed, and the worker then computes it again (their slot keeps a second
+  computation from starting beside it). What a `config.toml` that cannot be read means (the last
+  accounts, nothing shared, built-in prices, no launch) is decided there once, in `Reading`.
 - In private mode, `render` does not draw `App` itself but `privacy::redacted(app)`, a copy in
   which names are aliased and personal fields masked. `privacy::Snapshot` keeps that copy until
   the app changes, since making it for every frame is too slow for a large index. Every
@@ -515,6 +530,7 @@ cargo run --release --example codex_timing -- [<codex home>]
 | Change when a file is read again, or what an unreadable directory means | SPEC R8, `tracking` (`decide`, `Listing`); its unit tests drive it with a fake adapter |
 | Keep another set of append-only files up to date | A `tracking::Files` adapter (how to list, how to read one file) and a map for `tracking::refresh` |
 | Add a TUI action | `tui::app` (`Key` → `Effect`), `tui::workers` (the effect), `tui::render`, `tui::privacy` |
+| Use the accounts, shared configuration or prices in the TUI | `deps.listing.read(&tx)` in the worker (`tui::accounts`); never `Registry::load` |
 | Add background work to the TUI | a `work::Slot` in the `tui::app` state (asked before the `Effect` goes out, told when the `Event` comes back), the effect in `tui::workers`, the slot's case in `tui::privacy::redacted` |
 | Add something shown on screen | `tui::app` state, `tui::render`, and its case in `tui::privacy::redacted`; a path in a notice goes in with `Marked::path` |
 | Add a model price | SPEC R20 table and `pricing` |
