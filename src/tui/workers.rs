@@ -12,7 +12,7 @@ use crate::index::{self, Index};
 use crate::pricing::Prices;
 use crate::provider::{Provider, codex};
 use crate::registry::{self, Account, Registry};
-use crate::{account_config, attribution, checks, identity, live, stats, transcript, usage};
+use crate::{account_config, attribution, checks, identity, live, owned, stats, transcript, usage};
 
 use super::Deps;
 use super::app::{self, Effect, Event, LaunchRequest, Marked, PREVIEW_MESSAGES};
@@ -93,7 +93,7 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
         }
         Effect::Attribution => {
             thread::spawn(move || {
-                let log = deps.state_dir.join("launches.jsonl");
+                let log = owned::launch_log(&deps.state_dir);
                 let base = attribution::collect(&deps.accounts, &deps.env, &log, &[]);
                 let _ = tx.send(Event::Attribution(base));
             });
@@ -371,7 +371,7 @@ fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
         errors.push(format!("stats cache: {e:#}"));
     }
     errors.extend(prices_error);
-    let log = deps.state_dir.join("launches.jsonl");
+    let log = owned::launch_log(&deps.state_dir);
     let attribution = attribution::collect(&deps.accounts, &deps.env, &log, &[]);
     let report = stats::report(
         &cache,
