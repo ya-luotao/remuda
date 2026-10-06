@@ -720,8 +720,8 @@ pub struct ConfigPane {
     /// The last answer for `account`; kept while it is read again.
     pub loaded: Option<Result<ConfigView, String>>,
     /// The account being read, under the number of its [`Effect::Config`]: only the answer to
-    /// that one is kept. Stale from a change of the account list until a read begun after it
-    /// has answered: what was read before is not shown.
+    /// that one is kept. A change of the account list makes the reads that are out void: what
+    /// was read before it is not shown.
     pub work: Slot<Account>,
 }
 
@@ -813,8 +813,9 @@ pub struct App {
     pub work: Background,
     /// The pending launch a foreground child cancelled, told when the child ends.
     pub(super) cancelled: Option<String>,
-    /// The check the open form started: only its answer belongs in the form (C1).
-    pub(super) form_check: Option<Round>,
+    /// The pending launch was submitted by the open form: only then does the answer of its
+    /// check belong in the form (C1).
+    pub(super) form_check: bool,
     /// `Ctrl-P`: the screen is drawn from [`super::privacy::redacted`] (R21).
     pub private: bool,
     /// Every account name seen, with its private-mode alias.
@@ -864,7 +865,7 @@ impl App {
             stores: None,
             work: Background::default(),
             cancelled: None,
-            form_check: None,
+            form_check: false,
             private: false,
             aliases,
         }
@@ -975,7 +976,7 @@ impl App {
     /// round began: what it found is from before, and the next round starts here.
     fn ran(&mut self, work: Work, fx: &mut Vec<Effect>) -> bool {
         match self.work.slot(work).settle(&()) {
-            Claim::Again(_) => {
+            Claim::Again(_) | Claim::Void(_) => {
                 fx.push(work.effect());
                 false
             }
@@ -1021,7 +1022,7 @@ impl App {
         fx: &mut Vec<Effect>,
     ) -> Option<&mut AccountState> {
         let row = self.accounts.iter_mut().find(|a| a.account == *account)?;
-        if let Claim::Again(_) = row.work.slot(query).settle(&()) {
+        if row.work.slot(query).settle(&()).next().is_some() {
             fx.push(query.effect(vec![account.clone()]));
         }
         Some(row)
@@ -1050,7 +1051,7 @@ impl App {
         if let Some(request) = self.work.launch.cancel() {
             self.notify(Level::Info, format!("{} cancelled", request.what));
         }
-        self.form_check = None;
+        self.form_check = false;
         self.overlay = Some(overlay);
     }
 
@@ -1230,6 +1231,9 @@ impl App {
         self.config.scroll = 0;
         if account.provider == CLAUDE {
             self.read_config(account, fx);
+        } else {
+            // Nothing is read for it; the read of the account shown before is for no one.
+            self.config.work.cancel();
         }
     }
 
@@ -1271,10 +1275,10 @@ impl App {
         }
     }
 
-    /// A read that is out stays out: its answer finds no account shown and is dropped, and a
-    /// pane opened again for that account meanwhile reads once more when it answers, not twice
-    /// at once.
+    /// A read that is out is given up: its answer is for no pane. A pane opened again for
+    /// that account before it answers waits for it and reads once more, not twice at once.
     fn close_config(&mut self) {
+        self.config.work.cancel();
         self.config = ConfigPane {
             work: std::mem::take(&mut self.config.work),
             ..ConfigPane::default()
@@ -1377,7 +1381,7 @@ impl App {
             Key::Esc
                 if self.view == View::Live && self.logs.is_some() && !self.preview.expanded =>
             {
-                self.logs = None;
+                self.close_logs();
             }
             Key::Char('t') if self.view == View::Stats => {
                 self.stats.period = self.stats.period.next();
@@ -1506,7 +1510,7 @@ impl App {
                 Key::Esc => {
                     self.overlay = None;
                     self.work.launch.cancel();
-                    self.form_check = None;
+                    self.form_check = false;
                 }
                 Key::Enter => self.submit(fx),
                 Key::Tab | Key::Down => form.focus = (form.focus + 1) % form.fields.len(),
@@ -1599,12 +1603,10 @@ impl App {
         };
         let outcome = match &form.kind {
             FormKind::NewSession { account } => match self.new_session_request(form, account) {
-                // The form stays up until the check answers. Submitted again unchanged, the
-                // check that is out is this form's already.
+                // The form stays up until the check answers.
                 Ok(request) => {
-                    if let Some(check) = self.check_launch(request, fx) {
-                        self.form_check = Some(check);
-                    }
+                    self.check_launch(request, fx);
+                    self.form_check = true;
                     return;
                 }
                 Err(e) => Err(e),
@@ -2215,13 +2217,14 @@ impl App {
         self.check_launch(request, fx);
     }
 
-    /// Makes `request` the pending launch and starts its check, whose number is returned.
-    /// `None` when that very launch is pending already: the check that is out is the one it
-    /// waits for, and none is started (a held `Enter` checks once).
-    fn check_launch(&mut self, request: LaunchRequest, fx: &mut Vec<Effect>) -> Option<Round> {
-        let check = self.work.launch.start(request.clone())?;
-        fx.push(Effect::CheckLaunch { check, request });
-        Some(check)
+    /// Makes `request` the pending launch and starts its check, unless a check of that very
+    /// launch is out. Pending already (a held `Enter`): that check is the one it waits for.
+    /// Cancelled and not yet answered: it is checked again when that one answers, which
+    /// itself starts nothing (R16).
+    fn check_launch(&mut self, request: LaunchRequest, fx: &mut Vec<Effect>) {
+        if let Some(check) = self.work.launch.start(request.clone()) {
+            fx.push(Effect::CheckLaunch { check, request });
+        }
     }
 
     /// Whether `session_id` may be resumed in place as far as the live list knows (R16).
@@ -2373,13 +2376,14 @@ impl App {
         if self.preview.settled >= PREVIEW_DEBOUNCE_TICKS
             && self.preview.work.start(target.clone()).is_some()
         {
-            let provider = self
-                .index
-                .entries
-                .get(&target)
-                .map_or(CLAUDE, |e| e.provider);
-            fx.push(Effect::Preview(target, provider));
+            fx.push(self.preview_effect(target));
         }
+    }
+
+    /// The reading of the transcript at `path`, as its provider writes it.
+    fn preview_effect(&self, path: PathBuf) -> Effect {
+        let provider = self.index.entries.get(&path).map_or(CLAUDE, |e| e.provider);
+        Effect::Preview(path, provider)
     }
 
     /// Merges newly read entries into the index.
@@ -2440,7 +2444,7 @@ impl App {
         if self.logs.as_ref().map(|l| &l.key) != self.selected_live().map(LiveSession::key).as_ref()
             || self.view != View::Live
         {
-            self.logs = None;
+            self.close_logs();
         }
         let target = match self.view {
             View::History => self.selected_entry().map(|e| e.path.clone()),
@@ -2450,10 +2454,30 @@ impl App {
             View::Accounts | View::Stats => return,
         };
         if target != self.preview.target {
+            // A reading that is out is of the transcript left: for no one, unless the
+            // selection comes back before it answers. What is shown of that transcript is
+            // then from before that reading, and does not stand in for it: coming back
+            // reads.
+            if let Some(left) = self.preview.work.cancel()
+                && self
+                    .preview
+                    .loaded
+                    .as_ref()
+                    .is_some_and(|(p, _)| *p == left)
+            {
+                self.preview.loaded = None;
+            }
             self.preview.target = target;
             self.preview.settled = 0;
             self.preview.scroll = 0;
         }
+    }
+
+    /// The logs go; a run that is out is for no one, unless they are asked for again before
+    /// it answers.
+    fn close_logs(&mut self) {
+        self.logs = None;
+        self.work.logs.cancel();
     }
 }
 
@@ -2642,10 +2666,15 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 app.checks = Some(checks);
             }
         }
-        // Any reading of the transcript wanted is shown, whichever round it is.
+        // The reading waited for is that of the transcript wanted, and the only one out for it.
         Event::Preview { path, result } => {
-            app.preview.work.settle(&path);
-            if app.preview.target.as_ref() == Some(&path) {
+            let claim = app.preview.work.settle(&path);
+            // Left and wanted again before it answered: read once more. What this reading
+            // found is shown meanwhile.
+            if claim.next().is_some() {
+                fx.push(app.preview_effect(path.clone()));
+            }
+            if claim.counts() && app.preview.target.as_ref() == Some(&path) {
                 app.preview.loaded = Some((path, result));
             }
         }
@@ -2654,26 +2683,23 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             account,
             result,
         } => {
-            // The read that is out, by its number, for the account still shown.
+            // The read waited for, by its number: the account shown.
             let claim = app.config.work.claim(request, &account);
             let shown = app.config.account.as_ref() == Some(&account);
-            // Asked again since this read began (`r`, the pane opened again, the account list
-            // changed): what it read may be from before, so the account is read once more, if
-            // it is still shown.
-            if let Claim::Again(request) = claim {
-                if shown {
-                    fx.push(Effect::Config {
-                        request,
-                        account: account.clone(),
-                        cwd: app.cwd.clone(),
-                    });
-                } else {
-                    app.config.work.cancel();
-                }
+            // Asked again since this read began (`r`, the pane opened or the selection came
+            // back, the account list changed): what it read may be from before, so the
+            // account is read once more.
+            if let Some(request) = claim.next() {
+                fx.push(Effect::Config {
+                    request,
+                    account: account.clone(),
+                    cwd: app.cwd.clone(),
+                });
             }
-            // What was read before the account list changed is not shown: the read that has
-            // just started tells.
-            if claim != Claim::Stray && shown && !app.config.work.stale() {
+            // What was read before the account list changed is void, and not shown: the read
+            // that has just started tells. That is this read's own mark, whichever other
+            // account was read and answered in between.
+            if claim.counts() && shown {
                 // The source may be a name not seen yet (R21).
                 if let Ok(view) = &result
                     && let Some(source) = view.role.source()
@@ -2699,59 +2725,63 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             request,
             error,
         } => {
-            // Only the check that is out, by its number and for this very launch: one that was
-            // cancelled, or an earlier one of the same launch, starts nothing (R16).
-            if app.work.launch.claim(check, &request) == Claim::Done {
-                // What the app has seen meanwhile counts too (R16).
-                let error = error.or_else(|| {
-                    let id = request.resumes()?;
-                    app.running_check(&id).err().map(|busy| busy.text().into())
-                });
-                // Only the form that started this check hears about it (C1).
-                let form = match &mut app.overlay {
-                    Some(Overlay::Form(form)) if app.form_check == Some(check) => Some(form),
-                    _ => None,
-                };
-                match (error, form) {
-                    (Some(e), Some(form)) => form.error = Some(e),
-                    (Some(e), None) => {
-                        let text = Marked::from(format!("{}: ", request.what)).join(&e);
-                        app.notify(Level::Error, text);
-                    }
-                    (None, form) => {
-                        if form.is_some() {
-                            app.overlay = None;
-                            app.form_check = None;
+            // Only the check waited for, by its number and for this very launch, starts it: one
+            // that was cancelled starts nothing, whatever it found (R16).
+            match app.work.launch.claim(check, &request) {
+                Claim::Stray => {}
+                // Cancelled, and the same launch asked for before it answered: what it found
+                // is from before that, so the launch is checked again.
+                Claim::Again(check) | Claim::Void(check) => {
+                    fx.push(Effect::CheckLaunch { check, request });
+                }
+                Claim::Done => {
+                    // What the app has seen meanwhile counts too (R16).
+                    let error = error.or_else(|| {
+                        let id = request.resumes()?;
+                        app.running_check(&id).err().map(|busy| busy.text().into())
+                    });
+                    // Only the form that submitted this launch hears about it (C1).
+                    let form = match &mut app.overlay {
+                        Some(Overlay::Form(form)) if app.form_check => Some(form),
+                        _ => None,
+                    };
+                    match (error, form) {
+                        (Some(e), Some(form)) => form.error = Some(e),
+                        (Some(e), None) => {
+                            let text = Marked::from(format!("{}: ", request.what)).join(&e);
+                            app.notify(Level::Error, text);
                         }
-                        app.foreground(Effect::Launch(request), &mut fx);
+                        (None, form) => {
+                            if form.is_some() {
+                                app.overlay = None;
+                            }
+                            app.foreground(Effect::Launch(request), &mut fx);
+                        }
                     }
+                    app.form_check = false;
                 }
             }
         }
-        // Any reading of the logs of the session shown is taken, whichever round it is: the
-        // session of that account, since two accounts may each have one of this short id.
+        // The run waited for is that of the session shown: the session of that account, since
+        // two accounts may each have one of this short id. It is the only run out for it.
         Event::Logs {
             account,
             short_id,
             result,
         } => {
-            let shown = app
-                .logs
-                .as_mut()
-                .filter(|logs| logs.key.0 == account.qualified() && logs.short_id == short_id);
-            let wanted = shown.is_some();
-            if let Some(logs) = shown {
+            let target = (account, short_id);
+            let claim = app.work.logs.settle(&target);
+            let (account, short_id) = target;
+            if claim.counts()
+                && let Some(logs) = &mut app.logs
+                && logs.key.0 == account.qualified()
+                && logs.short_id == short_id
+            {
                 logs.result = Some(result);
             }
-            // Asked for again since this run began: once more, if they are still shown.
-            let target = (account, short_id);
-            if let Claim::Again(_) = app.work.logs.settle(&target) {
-                if wanted {
-                    let (account, short_id) = target;
-                    fx.push(Effect::Logs { account, short_id });
-                } else {
-                    app.work.logs.cancel();
-                }
+            // Asked for again since this run began: what it read may be from before.
+            if claim.next().is_some() {
+                fx.push(Effect::Logs { account, short_id });
             }
         }
         Event::ControlDone {

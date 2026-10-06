@@ -248,13 +248,16 @@ an `Event`.
   whether an effect goes out: work that is already out for the same target is not started
   twice (a held key starts one thread), and work asked for again because what it reads may have
   changed (a launch ended, the account list changed, the user asks for the configuration or
-  the logs again) runs once more when the round that is out reports.
+  the logs again) runs once more when the round that is out reports. A target has one round
+  out at most, whatever was asked in between: a round given up (a cancelled check, a session
+  the selection left) stays out until it reports, and its target asked for again waits for it.
 - Results that can arrive late are matched by what they carry, never by position: the account
-  they belong to (identities, usage), the transcript or the account's session they are for
-  (preview, logs), or
-  the number the slot gave their round (the Configuration pane, pre-launch checks), so an answer
-  to an outdated or cancelled request is ignored. Work without a target has one round out at
-  most, so its result needs no number.
+  they belong to (identities, usage), or the target they are for (the transcript of a preview,
+  the account's session of the logs, the account of the Configuration pane, the launch of a
+  pre-launch check). The slot then says whether that target's round is the one waited for, so
+  an answer to a request that was given up is ignored. Since a target has one round out, the
+  target is enough to find the round; the Configuration pane and pre-launch checks carry the
+  round's number as well, a second check that an answer is the one asked for (R16).
 - A launch that resumes a session in place is preceded by `CheckLaunch`, which queries every
   account's running sessions again right before starting (R16).
 - In private mode, `render` does not draw `App` itself but `privacy::redacted(app)`, a copy in

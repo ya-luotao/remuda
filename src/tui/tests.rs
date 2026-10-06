@@ -4787,9 +4787,11 @@ fn secret_app() -> App {
     app
 }
 
-/// The preview of the current selection, loaded.
+/// The preview of the current selection, loaded: read once the selection has settled.
 fn load_preview(app: &mut App) {
     let target = app.preview.target.clone().expect("a preview target");
+    tick(app, 0);
+    tick(app, 0);
     let messages = vec![
         Message {
             role: Role::User,
@@ -5041,6 +5043,8 @@ fn secret_states() -> Vec<SecretState> {
             |app| {
                 keys(app, &[Key::Char('3')]);
                 let target = app.preview.target.clone().expect("a preview target");
+                tick(app, 0);
+                tick(app, 0);
                 update(
                     app,
                     Event::Preview {
@@ -6430,6 +6434,314 @@ fn logs_of_two_accounts_with_one_short_id_are_read_apart() {
     );
 }
 
+/// R7, R16: moving away from a session and back while its logs are still being read. A session
+/// has one `claude logs` out at a time, whatever was asked in between: going back waits for
+/// that run and reads once more when it answers, so an earlier answer cannot be taken for a
+/// later one, and the answer for a session that was left is for no one.
+#[test]
+fn logs_asked_again_after_moving_away_and_back_wait_for_the_run_that_is_out() {
+    let logs = |name: &str, id: &str| Effect::Logs {
+        account: account(name),
+        short_id: id.into(),
+    };
+    let answer = |app: &mut App, name: &str, id: &str, text: &str| {
+        update(
+            app,
+            Event::Logs {
+                account: account(name),
+                short_id: id.into(),
+                result: Ok(text.into()),
+            },
+        )
+    };
+    let mut app = history_with(&["max"]);
+    update(
+        &mut app,
+        Event::Live(vec![
+            background("claude:max", "aaaaaaaa", A, "blocked"),
+            background("claude:team", "bbbbbbbb", B, "blocked"),
+        ]),
+    );
+    keys(&mut app, &[Key::Char('2')]);
+    assert_eq!(keys(&mut app, &[Key::Char('l')]), [logs("max", "aaaaaaaa")]);
+    assert_eq!(
+        keys(&mut app, &[Key::Char('j'), Key::Char('l')]),
+        [logs("team", "bbbbbbbb")]
+    );
+    // Back on max while its first run is out: no second run beside it.
+    assert_eq!(keys(&mut app, &[Key::Char('k'), Key::Char('l')]), []);
+    assert!(text(&app).contains("loading logs…"), "{}", text(&app));
+    // team's session was left: its answer is for no one, and it is not read again.
+    assert_eq!(answer(&mut app, "team", "bbbbbbbb", "the log of team"), []);
+    assert!(!text(&app).contains("the log of team"), "{}", text(&app));
+    // max's run began before `l` was pressed again: shown, and read once more.
+    assert_eq!(
+        answer(&mut app, "max", "aaaaaaaa", "read first"),
+        [logs("max", "aaaaaaaa")]
+    );
+    assert!(text(&app).contains("read first"), "{}", text(&app));
+    assert_eq!(answer(&mut app, "max", "aaaaaaaa", "read second"), []);
+    assert!(text(&app).contains("read second"), "{}", text(&app));
+    // An answer with no run out (none can come) changes nothing.
+    assert_eq!(answer(&mut app, "max", "aaaaaaaa", "from nowhere"), []);
+    assert!(text(&app).contains("read second"), "{}", text(&app));
+}
+
+/// R8: the selection moved to another session and back while the first preview is still being
+/// read. A transcript has one reading out at a time: coming back waits for it and reads once
+/// more when it answers, and the answer for the transcript that was left is for no one.
+#[test]
+fn a_preview_left_and_selected_again_waits_for_the_reading_that_is_out() {
+    let msg = |t: &str| {
+        vec![Message {
+            role: Role::User,
+            text: t.into(),
+        }]
+    };
+    let answer = |app: &mut App, id: &str, text: &str| {
+        update(
+            app,
+            Event::Preview {
+                path: path(id),
+                result: Ok(msg(text)),
+            },
+        )
+    };
+    let mut app = app();
+    update(
+        &mut app,
+        Event::IndexLoaded(vec![entry("a", "a", 1), entry("b", "b", 2)]),
+    );
+    keys(&mut app, &[Key::Char('3')]);
+    tick(&mut app, 0);
+    assert_eq!(tick(&mut app, 0), [Effect::Preview(path("b"), CLAUDE)]);
+    keys(&mut app, &[Key::Char('j')]);
+    tick(&mut app, 0);
+    assert_eq!(tick(&mut app, 0), [Effect::Preview(path("a"), CLAUDE)]);
+    // Back on `b` while its first reading is out: no second one beside it.
+    keys(&mut app, &[Key::Char('k')]);
+    assert_eq!(tick(&mut app, 0), []);
+    assert_eq!(tick(&mut app, 0), []);
+    assert_eq!(tick(&mut app, 0), []);
+    assert_eq!(answer(&mut app, "a", "of a"), []);
+    assert_eq!(app.preview.loaded, None);
+    // Read before the selection left: shown, and read once more.
+    assert_eq!(
+        answer(&mut app, "b", "read first"),
+        [Effect::Preview(path("b"), CLAUDE)]
+    );
+    assert_eq!(app.preview.loaded, Some((path("b"), Ok(msg("read first")))));
+    assert_eq!(answer(&mut app, "b", "read second"), []);
+    assert_eq!(
+        app.preview.loaded,
+        Some((path("b"), Ok(msg("read second"))))
+    );
+    assert_eq!(tick(&mut app, 0), []);
+}
+
+/// R22: the selection moved to another account and back while the first read is out. An
+/// account has one read out at a time: coming back waits for it and reads once more when it
+/// answers, and the answer for the account that was left is for no one.
+#[test]
+fn the_pane_moved_away_and_back_waits_for_the_read_that_is_out() {
+    let answer = |app: &mut App, request: u64, name: &str, model: &str| {
+        update(
+            app,
+            Event::Config {
+                request,
+                account: account(name),
+                result: Ok(Box::new(config_with_model(model))),
+            },
+        )
+    };
+    let mut app = app();
+    assert_eq!(
+        keys(&mut app, &[Key::Char('p')]),
+        [config_effect(1, "default")]
+    );
+    assert_eq!(keys(&mut app, &[Key::Char('j')]), [config_effect(2, "max")]);
+    // Back on `default` while its first read is out: no second one beside it.
+    assert_eq!(keys(&mut app, &[Key::Char('k')]), []);
+    assert_eq!(answer(&mut app, 2, "max", "of max"), []);
+    assert_eq!(app.config.loaded, None);
+    assert_eq!(
+        answer(&mut app, 1, "default", "read first"),
+        [config_effect(3, "default")]
+    );
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("read first"))));
+    // Its number is spent: the same answer again is for no one.
+    assert_eq!(answer(&mut app, 1, "default", "again"), []);
+    assert_eq!(answer(&mut app, 3, "default", "read second"), []);
+    assert_eq!(
+        app.config.loaded,
+        Some(Ok(config_with_model("read second")))
+    );
+}
+
+/// R22: what was read before the account list was read again is not shown, also when the
+/// read of another account, begun after it, has answered in between and the selection has
+/// come back. A read begun after the list changed is shown like any other.
+#[test]
+fn a_read_from_before_a_new_account_list_stays_hidden_whatever_answers_in_between() {
+    let answer = |app: &mut App, request: u64, name: &str, model: &str| {
+        update(
+            app,
+            Event::Config {
+                request,
+                account: account(name),
+                result: Ok(Box::new(config_with_model(model))),
+            },
+        )
+    };
+    let mut app = app();
+    assert_eq!(
+        keys(&mut app, &[Key::Char('p')]),
+        [config_effect(1, "default")]
+    );
+    let mut accounts = everyone();
+    accounts.push(account("new"));
+    let fx = update(&mut app, Event::Accounts(accounts));
+    assert_eq!(config_effects(&fx), Vec::<&Effect>::new());
+    // Another account, read after the list changed: shown.
+    assert_eq!(keys(&mut app, &[Key::Char('j')]), [config_effect(2, "max")]);
+    assert_eq!(answer(&mut app, 2, "max", "of max"), []);
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("of max"))));
+    // Back on `default`, whose read from before the change is still out.
+    assert_eq!(keys(&mut app, &[Key::Char('k')]), []);
+    assert_eq!(
+        answer(&mut app, 1, "default", "before the change"),
+        [config_effect(3, "default")]
+    );
+    assert_eq!(app.config.loaded, None);
+    // `r` while the read begun after the change is out: that one is shown, like any `r`.
+    assert_eq!(config_effects(&keys(&mut app, &[Key::Char('r')])).len(), 0);
+    assert_eq!(
+        answer(&mut app, 3, "default", "after the change"),
+        [config_effect(4, "default")]
+    );
+    assert_eq!(
+        app.config.loaded,
+        Some(Ok(config_with_model("after the change")))
+    );
+    assert_eq!(answer(&mut app, 4, "default", "after r"), []);
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("after r"))));
+}
+
+/// R8: a preview shown meanwhile (read before the selection left, while the transcript is
+/// read once more) does not stand in for the reading still out. The selection gone and back
+/// again, that reading is waited for, or, when it has answered to no one, made again.
+#[test]
+fn a_preview_shown_meanwhile_does_not_stand_in_for_the_reading_still_out() {
+    let msg = |t: &str| {
+        vec![Message {
+            role: Role::User,
+            text: t.into(),
+        }]
+    };
+    let answer = |app: &mut App, text: &str| {
+        update(
+            app,
+            Event::Preview {
+                path: path("b"),
+                result: Ok(msg(text)),
+            },
+        )
+    };
+    let read_b = [Effect::Preview(path("b"), CLAUDE)];
+    for answers_before_settling in [false, true] {
+        let mut app = app();
+        update(
+            &mut app,
+            Event::IndexLoaded(vec![entry("a", "a", 1), entry("b", "b", 2)]),
+        );
+        keys(&mut app, &[Key::Char('3')]);
+        tick(&mut app, 0);
+        assert_eq!(tick(&mut app, 0), read_b);
+        keys(&mut app, &[Key::Char('j'), Key::Char('k')]);
+        tick(&mut app, 0);
+        assert_eq!(tick(&mut app, 0), []);
+        assert_eq!(answer(&mut app, "read first"), read_b);
+        assert_eq!(app.preview.loaded, Some((path("b"), Ok(msg("read first")))));
+        // Away and back while the second reading is out.
+        keys(&mut app, &[Key::Char('j'), Key::Char('k')]);
+        if answers_before_settling {
+            // It answers to no one; the selection settled, the transcript is read again.
+            assert_eq!(answer(&mut app, "read second"), []);
+            tick(&mut app, 0);
+            assert_eq!(tick(&mut app, 0), read_b);
+            assert_eq!(answer(&mut app, "read third"), []);
+        } else {
+            // The selection settled first: no reading beside the one out, which is shown
+            // and, begun before the selection left, followed by one more.
+            tick(&mut app, 0);
+            assert_eq!(tick(&mut app, 0), []);
+            assert_eq!(answer(&mut app, "read second"), read_b);
+            assert_eq!(
+                app.preview.loaded,
+                Some((path("b"), Ok(msg("read second"))))
+            );
+            assert_eq!(answer(&mut app, "read third"), []);
+        }
+        assert_eq!(app.preview.loaded, Some((path("b"), Ok(msg("read third")))));
+        assert_eq!(tick(&mut app, 0), []);
+    }
+}
+
+/// R16: a check that was cancelled starts nothing, whatever it finds, also when the same
+/// launch is asked for again before it has answered. No second check starts beside it: the
+/// launch is checked again when it answers, and only that check starts it.
+#[test]
+fn a_cancelled_check_asked_for_again_is_checked_again_when_it_answers() {
+    for found in [None, Some("/x does not exist")] {
+        let mut app = history_with(&["max"]);
+        let fx = keys(&mut app, &[Key::Enter]);
+        let first = app.work.launch.round();
+        assert_eq!(fx, [check_of(&app, resume_a("max"))]);
+        keys(&mut app, &[Key::Esc]);
+        assert_eq!(keys(&mut app, &[Key::Enter]), []);
+        assert!(text(&app).contains("checking that aaaaaaaa is not running…"));
+        // The cancelled check answers: neither a launch nor its error.
+        let old = Event::LaunchChecked {
+            check: first,
+            request: resume_a("max"),
+            error: found.map(Marked::from),
+        };
+        let fx = update(&mut app, old);
+        assert_ne!(app.work.launch.round(), first);
+        assert_eq!(fx, [check_of(&app, resume_a("max"))]);
+        assert_eq!(notice(&app), None);
+        assert_eq!(
+            answer(&mut app, resume_a("max"), None),
+            [Effect::Launch(resume_a("max"))]
+        );
+    }
+
+    // The same through the new-session form, closed and filled in again: the check that
+    // follows is the open form's.
+    let mut app = new_session_form();
+    let want = request("max", &[], Some(CWD), "new session as max");
+    let fx = keys(&mut app, &[Key::Enter, Key::Esc]);
+    assert_eq!(fx, [check_of(&app, want.clone())]);
+    assert_eq!(keys(&mut app, &[Key::Char('n'), Key::Enter]), []);
+    let old = Event::LaunchChecked {
+        check: app.work.launch.round(),
+        request: want.clone(),
+        error: None,
+    };
+    let fx = update(&mut app, old);
+    assert_eq!(fx, [check_of(&app, want.clone())]);
+    assert!(app.overlay.is_some());
+    let fx = answer(&mut app, want.clone(), Some("/x does not exist".into()));
+    assert_eq!(fx, []);
+    assert_eq!(form(&app).error.as_deref(), Some("/x does not exist"));
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, want.clone())]
+    );
+    assert_eq!(answer(&mut app, want.clone(), None), [Effect::Launch(want)]);
+    assert_eq!(app.overlay, None);
+}
+
 /// The settings of [`config_view`] with this model: what a read finds after an edit.
 fn config_with_model(model: &str) -> crate::account_config::ConfigView {
     let mut view = config_view();
@@ -6501,7 +6813,7 @@ fn a_held_p_reads_the_configuration_one_at_a_time() {
     assert_eq!(app.config.loaded, None);
     assert_eq!(
         keys(&mut app, &[Key::Char('p')]),
-        [config_effect(3, "default")]
+        [config_effect(2, "default")]
     );
 }
 
