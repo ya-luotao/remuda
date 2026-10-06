@@ -5,9 +5,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::Env;
+use crate::home_items::{self, Id, Source};
 use crate::index::Store;
 use crate::registry::{Account, CLAUDE, Home, Sharing};
 use crate::share::{self, Installs};
@@ -21,27 +22,6 @@ pub struct Check {
 }
 
 pub const API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
-
-/// What each account keeps for itself even when everything else is linked (R18), with what
-/// breaks when it is another account's.
-const PER_ACCOUNT: [(&str, &str); 3] = [
-    (
-        ".claude.json",
-        "the two logins get mixed up (claude does not fetch the account's profile again within \
-         24 hours)",
-    ),
-    (
-        "history.jsonl",
-        "sessions in a shared store lose their attribution",
-    ),
-    (
-        "sessions",
-        "running sessions cannot be told apart by account",
-    ),
-];
-/// Where a home keeps the file backups of `/rewind`, by session ID.
-const FILE_HISTORY: &str = "file-history";
-const SETTINGS: &str = "settings.json";
 
 /// All file-system and environment checks, in a stable order: environment, then per account
 /// (registry order), then shared stores. `stores` is [`crate::index::stores`] of `accounts`.
@@ -136,7 +116,7 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
     }
     // Without the source's home nothing is shared, and only what does not depend on it is
     // checked: the members' own files.
-    let from = source.home_dir(env).filter(|d| d.is_dir());
+    let from = Source::of(source, env);
     if from.is_none() {
         let home = source
             .home_dir(env)
@@ -148,12 +128,17 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             ),
         });
     }
-    let installs = from.as_deref().map(share::installed_plugins);
+    let installs = from
+        .as_ref()
+        .map(|from| share::installed_plugins(from.home()));
+    // A settings file of the source that cannot be read chooses nothing and withholds nothing.
+    let unread = Map::new();
     let settings = from
-        .as_deref()
-        .and_then(|from| share::read_settings(&from.join(SETTINGS)).ok())
-        .unwrap_or_default();
-    let withheld = share::withheld(&settings);
+        .as_ref()
+        .and_then(|from| from.settings().ok())
+        .unwrap_or(&unread);
+    let withheld = from.as_ref().map(Source::withheld).unwrap_or_default();
+    let (projects, settings_file) = (Id::Projects.name(), Id::Settings.name());
     let mut rules_injected = false;
     // Members whose `settings.json` is the source's, and members that get settings at launch.
     let (mut settings_linked, mut settings_injected) = (0, 0);
@@ -164,8 +149,10 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
         let Some(home) = account.home_dir(env).filter(|d| d.is_dir()) else {
             continue;
         };
-        if let Some(from) = &from {
-            if !share::resolves_to(&home.join("plugins"), &from.join("plugins"))
+        // What the home has of the source's items, looked at once.
+        let items = from.as_ref().map(|from| from.relate(&home));
+        if let Some(items) = &items {
+            if !items.linked(Id::Plugins)
                 && let Installs::Unrecognized(path) = share::installed_plugins(&home)
             {
                 checks.push(Check {
@@ -177,113 +164,94 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
                     ),
                 });
             }
-            let items = share::instructions(from, &home);
-            if items.partial() {
+            let instructions = items.instructions();
+            if instructions.partial() {
                 checks.push(Check {
                     account: Some(account.qualified()),
                     message: format!(
                         "shares {} with {name} through symlinks but not {}: the shared ones \
                          load twice (with the injected --add-dir); link the others too, or none",
-                        items.shared.join(", "),
-                        items.missing.join(", ")
+                        instructions.linked.join(", "),
+                        instructions.unlinked.join(", ")
                     ),
                 });
             }
-            rules_injected |= items.missing.contains(&share::RULES);
+            rules_injected |= instructions.unlinked.contains(&Id::Rules.name());
         }
         // What stays per account (R18), when it is a link to another account's: checked
         // whether or not the source's home exists.
-        for (item, breaks) in PER_ACCOUNT {
-            let Some(own) = per_account(account, item, env) else {
-                continue;
-            };
-            if !fs::symlink_metadata(&own).is_ok_and(|m| m.file_type().is_symlink()) {
-                continue;
-            }
-            let other = accounts.iter().find(|other| {
-                other.provider == CLAUDE
-                    && *other != account
-                    && per_account(other, item, env)
-                        .is_some_and(|theirs| share::resolves_to(&own, &theirs))
+        for link in home_items::linked_elsewhere(account, accounts, env) {
+            checks.push(Check {
+                account: Some(account.qualified()),
+                message: format!(
+                    "{} is a symlink to that of {}: {}; each account needs its own",
+                    link.name, link.account, link.breaks
+                ),
             });
-            if let Some(other) = other {
-                checks.push(Check {
-                    account: Some(account.qualified()),
-                    message: format!(
-                        "{item} is a symlink to that of {}: {breaks}; each account needs its own",
-                        other.qualified()
-                    ),
-                });
-            }
         }
-        let Some(from) = &from else {
+        let (Some(from), Some(items)) = (&from, &items) else {
             continue;
         };
-        // `<home>/<item> -> <source home>/<item>`: the link that would share `item`.
-        let link = |item: &str| {
+        // `<home>/<item> -> <source home>/<item>`: the link that would share the item.
+        let link = |id: Id| {
             format!(
                 "{} -> {}",
-                home.join(item).display(),
-                from.join(item).display()
+                id.at(&home).display(),
+                id.at(from.home()).display()
             )
         };
-        let projects = from.join("projects");
-        if share::resolves_to(&home.join("projects"), &projects) {
-            let file_history = from.join(FILE_HISTORY);
-            if file_history.is_dir() && !share::resolves_to(&home.join(FILE_HISTORY), &file_history)
-            {
+        // An item that goes with `projects` and is not linked with it: what the account
+        // loses (`why` adds when), and the link to make.
+        let apart = |id: Id, why: &str| {
+            format!(
+                "shares {projects} with {name} through a symlink but not {}{why}: {}; link it \
+                 too ({})",
+                id.name(),
+                id.item().loses.unwrap_or_default(),
+                link(id)
+            )
+        };
+        if items.linked(Id::Projects) {
+            if items.unlinked(Id::FileHistory) {
                 checks.push(Check {
                     account: Some(account.qualified()),
-                    message: format!(
-                        "shares projects with {name} through a symlink but not {FILE_HISTORY}: \
-                         /rewind does not find the file backups of a session resumed from \
-                         another account; link it too ({})",
-                        link(FILE_HISTORY)
-                    ),
+                    message: apart(Id::FileHistory, ""),
                 });
             }
             // Agent memory follows auto-memory (R18): a launch through a shared `projects` sets
             // the memory variable to the source's home, unless a settings file chooses
             // `autoMemoryDirectory`; then only a link shares the source's `agent-memory`.
-            let agent_memory = from.join(share::AGENT_MEMORY);
             let chosen = settings.contains_key(share::MEMORY_KEY)
-                || share::read_settings(&home.join(SETTINGS))
+                || share::read_settings(&Id::Settings.at(&home))
                     .is_ok_and(|own| own.contains_key(share::MEMORY_KEY));
-            if chosen
-                && agent_memory.is_dir()
-                && !share::resolves_to(&home.join(share::AGENT_MEMORY), &agent_memory)
-            {
+            if chosen && items.unlinked(Id::AgentMemory) {
+                let why = format!(
+                    ", and a settings file chooses {}, so a launch does not redirect memory",
+                    share::MEMORY_KEY
+                );
                 checks.push(Check {
                     account: Some(account.qualified()),
-                    message: format!(
-                        "shares projects with {name} through a symlink but not {}, and a \
-                         settings file chooses {}, so a launch does not redirect memory: the \
-                         memory of user-scope subagents is not shared with this account; link \
-                         it too ({})",
-                        share::AGENT_MEMORY,
-                        share::MEMORY_KEY,
-                        link(share::AGENT_MEMORY)
-                    ),
+                    message: apart(Id::AgentMemory, &why),
                 });
             }
-        } else if projects.is_dir() {
+        } else if items.unlinked(Id::Projects) {
             // Not an error: memory is still shared by injection (R18). Sessions are not.
             checks.push(Check {
                 account: Some(account.qualified()),
                 message: format!(
                     "not sharing sessions with {name}: it does not see the sessions in {} and \
-                     cannot resume them; link projects to share them ({})",
-                    projects.display(),
-                    link("projects")
+                     cannot resume them; link {projects} to share them ({})",
+                    Id::Projects.at(from.home()).display(),
+                    link(Id::Projects)
                 ),
             });
         }
         // A plugin installed from a member's home is recorded through that home's `plugins`
         // link, which every account then depends on.
         if let Some(Installs::Known(plugins)) = &installs
-            && share::resolves_to(&home.join("plugins"), &from.join("plugins"))
+            && items.linked(Id::Plugins)
         {
-            let through = home.join("plugins");
+            let through = Id::Plugins.at(&home);
             let held = plugins
                 .values()
                 .filter(|installs| {
@@ -310,16 +278,16 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
         }
         // A home that links the source's `settings.json` reads all of it: nothing of it is
         // withheld there, as it is from the settings injected at launch (R18).
-        if share::resolves_to(&home.join(SETTINGS), &from.join(SETTINGS)) {
+        if items.linked(Id::Settings) {
             settings_linked += 1;
             if !withheld.is_empty() {
                 checks.push(Check {
                     account: Some(account.qualified()),
                     message: format!(
-                        "{SETTINGS} is that of {name} through a symlink, and it sets \
+                        "{settings_file} is that of {name} through a symlink, and it sets \
                          authentication settings ({}): this account reads them through the \
                          link; remove the link (the rest is then injected at launch), or move \
-                         them out of that {SETTINGS}",
+                         them out of that {settings_file}",
                         withheld.join(", ")
                     ),
                 });
@@ -328,11 +296,11 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             settings_injected += 1;
         }
     }
-    let (Some(from), Some(installs)) = (from, installs) else {
+    let (Some(from), Some(installs)) = (&from, installs) else {
         return checks;
     };
     if rules_injected {
-        let scoped = share::scoped_rules(&from.join(share::RULES));
+        let scoped = share::scoped_rules(&Id::Rules.at(from.home()));
         if !scoped.is_empty() {
             let files: Vec<String> = scoped.iter().map(|p| p.display().to_string()).collect();
             checks.push(Check {
@@ -366,7 +334,7 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             message,
         });
     }
-    let plugins = share::enabled_plugins(&settings);
+    let plugins = share::enabled_plugins(settings);
     match installs {
         Installs::Unrecognized(path) => checks.push(Check {
             account: Some(name),
@@ -390,16 +358,6 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
         }
     }
     checks
-}
-
-/// Where `account` keeps `item` of [`PER_ACCOUNT`]: in its home, except the native login's
-/// `.claude.json` (R2).
-fn per_account(account: &Account, item: &str, env: &Env) -> Option<PathBuf> {
-    if item == ".claude.json" {
-        account.claude_json(env)
-    } else {
-        account.home_dir(env).map(|home| home.join(item))
-    }
 }
 
 /// Top-level entries of `dir` that are symlinks to nothing, with their targets.
@@ -426,7 +384,7 @@ fn has_cleanup_period(account: &Account, env: &Env) -> bool {
     let Some(home) = account.home_dir(env) else {
         return false;
     };
-    fs::read(home.join("settings.json"))
+    fs::read(Id::Settings.at(&home))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .is_some_and(|v| v.get("cleanupPeriodDays").is_some_and(|d| !d.is_null()))
@@ -441,25 +399,7 @@ mod tests {
     use super::*;
     use crate::index;
     use crate::registry::CODEX;
-
-    struct Fixture {
-        _dir: tempfile::TempDir,
-        root: PathBuf,
-        env: Env,
-    }
-
-    fn fixture() -> Fixture {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let home = root.join("home");
-        fs::create_dir_all(home.join(".claude")).unwrap();
-        let env: Env = [("HOME".to_string(), home.display().to_string())].into();
-        Fixture {
-            _dir: dir,
-            root,
-            env,
-        }
-    }
+    use crate::test_homes::{ClaudeHome, Root};
 
     fn named(name: &str, home: &Path) -> Account {
         Account {
@@ -485,7 +425,7 @@ mod tests {
 
     #[test]
     fn a_clean_setup_has_no_problems() {
-        let f = fixture();
+        let f = Root::new();
         let max = f.root.join("max");
         fs::create_dir_all(max.join("projects")).unwrap();
         let work = f.root.join("codex-work");
@@ -502,7 +442,7 @@ mod tests {
 
     #[test]
     fn api_key_in_the_environment() {
-        let mut f = fixture();
+        let mut f = Root::new();
         f.env.insert(API_KEY_VAR.into(), "sk-test".into());
         let got = run(&[], &f.env, &[]);
         assert_eq!(
@@ -518,7 +458,7 @@ mod tests {
 
     #[test]
     fn missing_home_and_dangling_symlinks() {
-        let f = fixture();
+        let f = Root::new();
         let gone = f.root.join("gone");
         let max = f.root.join("max");
         fs::create_dir_all(&max).unwrap();
@@ -570,7 +510,7 @@ mod tests {
     /// listed when `codex` is on PATH, R17).
     #[test]
     fn codex_homes_are_checked_like_claude_homes() {
-        let f = fixture();
+        let f = Root::new();
         let gone = f.root.join("codex-gone");
         let work = f.root.join("codex-work");
         fs::create_dir_all(work.join("sessions")).unwrap();
@@ -626,7 +566,7 @@ mod tests {
     /// any `open` for reading forever; the checks still finish, and say nothing about it.
     #[test]
     fn codex_checks_never_open_auth_json() {
-        let f = fixture();
+        let f = Root::new();
         let work = f.root.join("codex-work");
         fs::create_dir_all(work.join("sessions")).unwrap();
         let fifo =
@@ -656,7 +596,7 @@ mod tests {
     /// R11, R18: nothing to say about a clean shared setup.
     #[test]
     fn a_clean_shared_setup_has_no_problems() {
-        let f = fixture();
+        let f = Root::new();
         let native = f.root.join("home/.claude");
         fs::write(native.join("CLAUDE.md"), "x").unwrap();
         let max = f.root.join("max");
@@ -670,7 +610,7 @@ mod tests {
     /// R11: the source's home is missing, or the source is not an account.
     #[test]
     fn a_missing_source() {
-        let f = fixture();
+        let f = Root::new();
         let gone = f.root.join("gone");
         let accounts = vec![Account::default_for(CLAUDE), named("gone", &gone)];
         let got = sharing_checks(&accounts, &f.env, &sharing_from(named("gone", &gone)));
@@ -699,7 +639,7 @@ mod tests {
     /// not when its `rules` is the source's.
     #[test]
     fn rules_limited_to_paths_where_rules_are_injected() {
-        let f = fixture();
+        let f = Root::new();
         let native = f.root.join("home/.claude");
         fs::create_dir_all(native.join("rules/lang")).unwrap();
         fs::write(native.join("rules/style.md"), "be terse").unwrap();
@@ -732,7 +672,7 @@ mod tests {
     /// unless a settings file chooses `autoMemoryDirectory`, which keeps the variable unset.
     #[test]
     fn agent_memory_goes_with_a_shared_projects() {
-        let f = fixture();
+        let f = Root::new();
         let native = f.root.join("home/.claude");
         fs::create_dir_all(native.join("projects")).unwrap();
         fs::create_dir_all(native.join("agent-memory/reviewer")).unwrap();
@@ -797,7 +737,7 @@ mod tests {
     /// for the source or an account that opted out.
     #[test]
     fn a_member_that_does_not_share_projects() {
-        let f = fixture();
+        let f = Root::new();
         let native = f.root.join("home/.claude");
         let (max, team, solo) = (f.root.join("max"), f.root.join("team"), f.root.join("solo"));
         for home in [&max, &team, &solo] {
@@ -832,7 +772,7 @@ mod tests {
     /// the source has one: `/rewind` across accounts misses the file backups.
     #[test]
     fn file_history_apart_from_a_shared_projects() {
-        let f = fixture();
+        let f = Root::new();
         let native = f.root.join("home/.claude");
         fs::create_dir_all(native.join("projects")).unwrap();
         let max = f.root.join("max");
@@ -867,7 +807,7 @@ mod tests {
     /// to anything else, a file of its own, and an account that opted out are not.
     #[test]
     fn per_account_items_linked_to_another_account() {
-        let f = fixture();
+        let f = Root::new();
         let native = f.root.join("home/.claude");
         fs::create_dir(native.join("sessions")).unwrap();
         // The native login's `.claude.json` is next to its home, not in it (R2).
@@ -927,7 +867,7 @@ mod tests {
     /// the source's home is missing and nothing else can be.
     #[test]
     fn per_account_items_are_checked_without_the_source_home() {
-        let f = fixture();
+        let f = Root::new();
         let gone = f.root.join("gone");
         let (max, team) = (f.root.join("max"), f.root.join("team"));
         for home in [&max, &team] {
@@ -970,7 +910,7 @@ mod tests {
     /// where settings are injected, and that is said only while some member gets them so.
     #[test]
     fn authentication_read_through_a_linked_settings_file() {
-        let f = fixture();
+        let f = Root::new();
         let native = f.root.join("home/.claude");
         fs::write(
             native.join("settings.json"),
@@ -1031,12 +971,165 @@ mod tests {
         assert_eq!(sharing_checks(&mixed, &f.env, &sharing), []);
     }
 
+    /// R11, R18, R22: the checks and a launch read one table of how the member's home relates
+    /// to the source's ([`crate::home_items`]), so for the same two homes they agree: what the
+    /// accounts view says is not shared is what the launch injects, and what it says is linked
+    /// the launch leaves alone. Over every combination of six links, with and without a
+    /// settings file that chooses the auto-memory location.
+    #[test]
+    fn the_checks_agree_with_the_launch_plan() {
+        const ITEMS: [&str; 6] = [
+            "projects",
+            "file-history",
+            "agent-memory",
+            "settings.json",
+            "CLAUDE.md",
+            "rules",
+        ];
+        // Bit `i` of `links`: the home links `ITEMS[i]`.
+        let layout = |links: u32| -> Vec<&str> {
+            let items = ITEMS.iter().enumerate();
+            items
+                .filter(|(i, _)| links >> i & 1 == 1)
+                .map(|(_, item)| *item)
+                .collect()
+        };
+        for (links, chosen) in (0..1u32 << ITEMS.len()).flat_map(|l| [(l, false), (l, true)]) {
+            let linked = layout(links);
+            let f = Root::new();
+            // Chosen in the home's own settings, or in the source's where the home links them.
+            let own_settings = !linked.contains(&"settings.json");
+            let native = ClaudeHome::at(f.native())
+                .dir("projects")
+                .dir("file-history")
+                .dir("agent-memory/reviewer")
+                .dir("plugins")
+                .claude_md("be brief")
+                .file(
+                    "rules/rust.md",
+                    "---\npaths:\n  - \"**/*.rs\"\n---\nno unwrap",
+                )
+                .settings(if chosen && !own_settings {
+                    r#"{"model": "opus", "apiKeyHelper": "/k", "autoMemoryDirectory": "/m"}"#
+                } else {
+                    r#"{"model": "opus", "apiKeyHelper": "/k"}"#
+                })
+                .into_path();
+            let max = f.home("max").linked(&native, &linked);
+            let max = if chosen && own_settings {
+                max.settings(r#"{"autoMemoryDirectory": "/m"}"#)
+            } else {
+                max
+            }
+            .into_path();
+            let member = named("max", &max);
+            let accounts = vec![Account::default_for(CLAUDE), member.clone()];
+            let sharing = sharing_from(Account::default_for(CLAUDE));
+
+            let checks = sharing_checks(&accounts, &f.env, &sharing);
+            let plan = share::plan(&sharing, &member, &[], Some(&f.root), &f.env).unwrap();
+            let shared = share::apply(&plan, &f.config).unwrap();
+
+            let case = format!("{linked:?}, chosen {chosen}:\n{checks:#?}\n{plan:#?}\n{shared:#?}");
+            let said = |account: &str, part: &str| {
+                checks
+                    .iter()
+                    .any(|c| c.account.as_deref() == Some(account) && c.message.contains(part))
+            };
+            let option = |name: &str| shared.args.iter().any(|a| a.starts_with(name));
+            let variable = shared
+                .env
+                .iter()
+                .any(|(name, _)| name == share::MEMORY_DIR_VAR);
+            let has = |item: &str| linked.contains(&item);
+
+            // Sessions and auto-memory: an account told it does not share sessions gets the
+            // source's memory location injected instead, unless a settings file chose one.
+            let apart = said("claude:max", "not sharing sessions");
+            assert_eq!(apart, !has("projects"), "{case}");
+            assert_eq!(apart, plan.items.unlinked(Id::Projects), "{case}");
+            assert_eq!(plan.memory.is_some(), apart && !chosen, "{case}");
+            assert_eq!(
+                said("claude:max", "but not file-history"),
+                has("projects") && !has("file-history"),
+                "{case}"
+            );
+            // Agent memory: warned about exactly where a launch through the linked `projects`
+            // does not set the variable.
+            let unredirected = said("claude:max", "so a launch does not redirect memory");
+            assert_eq!(
+                unredirected,
+                has("projects") && !has("agent-memory") && chosen,
+                "{case}"
+            );
+            assert_eq!(
+                unredirected,
+                plan.items.linked(Id::Projects)
+                    && plan.items.unlinked(Id::AgentMemory)
+                    && plan.agent_memory.is_none(),
+                "{case}"
+            );
+            // The variable goes with the memory location remuda decides: through a linked
+            // `projects`, or with the injected one unless `agent-memory` is linked itself.
+            assert_eq!(
+                variable,
+                !chosen && (has("projects") || !has("agent-memory")),
+                "{case}"
+            );
+            assert!(!(unredirected && variable), "{case}");
+
+            // Instructions: `--add-dir` for what is not linked; the linked ones then load
+            // twice, and the rules limited to paths are not applied.
+            let instructions = plan.items.instructions();
+            let unlinked = ["CLAUDE.md", "rules"]
+                .iter()
+                .filter(|item| !has(item))
+                .count();
+            assert_eq!(option("--add-dir="), unlinked > 0, "{case}");
+            assert_eq!(
+                option("--add-dir="),
+                instructions.needs_injection(),
+                "{case}"
+            );
+            assert_eq!(
+                said("claude:max", "the shared ones load twice"),
+                unlinked == 1,
+                "{case}"
+            );
+            assert_eq!(
+                said("claude:default", "rules limited to paths"),
+                option("--add-dir=") && !has("rules"),
+                "{case}"
+            );
+
+            // Settings: read whole through a link, and the launch says so; injected without
+            // the authentication otherwise, and the accounts view names what is withheld.
+            let through_link = said("claude:max", "reads them through the link");
+            assert_eq!(through_link, has("settings.json"), "{case}");
+            assert_eq!(
+                through_link,
+                plan.notices
+                    .iter()
+                    .any(|n| n.contains("reads the authentication settings of claude:default")),
+                "{case}"
+            );
+            assert_eq!(plan.settings.contains_key("model"), !through_link, "{case}");
+            assert_eq!(
+                said("claude:default", "settings keys withheld"),
+                plan.settings.contains_key("model"),
+                "{case}"
+            );
+            assert!(!plan.settings.contains_key("apiKeyHelper"), "{case}");
+            assert_eq!(option("--settings="), !plan.settings.is_empty(), "{case}");
+        }
+    }
+
     /// R11, R18: installs recorded through a member's `plugins` link make that link one every
     /// account depends on. Not said without such an install, for a `plugins` of the member's
     /// own, or when the list is not recognized.
     #[test]
     fn a_plugins_link_that_installs_go_through() {
-        let f = fixture();
+        let f = Root::new();
         let native = f.root.join("home/.claude");
         fs::create_dir_all(native.join("plugins/cache/m")).unwrap();
         let (max, team) = (f.root.join("max"), f.root.join("team"));
@@ -1129,7 +1222,7 @@ mod tests {
     /// accounts and the source are not members.
     #[test]
     fn partly_symlinked_instructions() {
-        let f = fixture();
+        let f = Root::new();
         let native = f.root.join("home/.claude");
         fs::write(native.join("CLAUDE.md"), "x").unwrap();
         fs::create_dir_all(native.join("skills")).unwrap();
@@ -1174,7 +1267,7 @@ mod tests {
     /// plugins, and is told.
     #[test]
     fn a_members_unrecognized_plugin_list() {
-        let f = fixture();
+        let f = Root::new();
         let max = f.root.join("max");
         fs::create_dir_all(max.join("plugins")).unwrap();
         let file = max.join("plugins/installed_plugins.json");
@@ -1202,7 +1295,7 @@ mod tests {
     /// R11, R18: authentication keys in the source's settings are listed as withheld.
     #[test]
     fn withheld_authentication_keys() {
-        let f = fixture();
+        let f = Root::new();
         let native = f.root.join("home/.claude");
         fs::write(
             native.join("settings.json"),
@@ -1229,7 +1322,7 @@ mod tests {
     /// `installed_plugins.json`.
     #[test]
     fn plugin_problems() {
-        let f = fixture();
+        let f = Root::new();
         let native = f.root.join("home/.claude");
         fs::create_dir_all(native.join("plugins/cache/ok")).unwrap();
         fs::write(
@@ -1275,7 +1368,7 @@ mod tests {
 
     #[test]
     fn shared_projects_need_cleanup_period_everywhere() {
-        let f = fixture();
+        let f = Root::new();
         let native = f.root.join("home/.claude");
         fs::create_dir_all(native.join("projects")).unwrap();
         let (max, team, solo) = (f.root.join("max"), f.root.join("team"), f.root.join("solo"));

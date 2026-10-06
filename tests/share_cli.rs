@@ -7,6 +7,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use common::homes::ClaudeHome;
 use common::{Invocation, Sandbox};
 use predicates::prelude::*;
 use serde_json::{Value, json};
@@ -27,34 +28,21 @@ struct Shared {
 
 fn shared() -> Shared {
     let sb = Sandbox::new();
-    let source = sb.home().join(".claude");
-    fs::create_dir_all(source.join("skills/review")).unwrap();
-    fs::create_dir_all(source.join("agents")).unwrap();
-    fs::create_dir_all(source.join("projects")).unwrap();
-    fs::write(source.join("CLAUDE.md"), "be brief\n").unwrap();
-    fs::write(
-        source.join("settings.json"),
-        format!(
+    let install = "plugins/cache/market/tools/1.0.0";
+    let source = ClaudeHome::at(sb.home().join(".claude"))
+        .skill("review")
+        .dir("agents")
+        .dir("projects")
+        .claude_md("be brief\n")
+        .settings(&format!(
             r#"{{"model": "opus", "cleanupPeriodDays": 365,
                 "hooks": {{"PreToolUse": [{HOOK}]}},
                 "enabledPlugins": {{"tools@market": true, "off@market": false}}}}"#
-        ),
-    )
-    .unwrap();
-    let plugin = source.join("plugins/cache/market/tools/1.0.0");
-    fs::create_dir_all(&plugin).unwrap();
-    fs::write(
-        source.join("plugins/installed_plugins.json"),
-        json!({
-            "version": 2,
-            "plugins": {
-                "tools@market": [{"scope": "user", "installPath": plugin, "version": "1.0.0"}],
-                "off@market": [{"scope": "user", "installPath": plugin}],
-            },
-        })
-        .to_string(),
-    )
-    .unwrap();
+        ))
+        .plugin("tools@market", install, Some("1.0.0"))
+        .plugin("off@market", install, None)
+        .into_path();
+    let plugin = source.join(install);
     let max = sb.make_claude_home("max");
     let solo = sb.make_claude_home("solo");
     let cx = sb.make_codex_home("cx");
