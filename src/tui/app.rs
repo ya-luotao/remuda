@@ -720,7 +720,8 @@ pub struct ConfigPane {
     /// The last answer for `account`; kept while it is read again.
     pub loaded: Option<Result<ConfigView, String>>,
     /// The account being read, under the number of its [`Effect::Config`]: only the answer to
-    /// that one is kept.
+    /// that one is kept. Stale from a change of the account list until a read begun after it
+    /// has answered: what was read before is not shown.
     pub work: Slot<Account>,
 }
 
@@ -1747,10 +1748,11 @@ impl App {
         self.ask_again(Query::CachedUsage, fx);
         self.rerun(Work::Checks, fx);
         self.refresh_sessions(fx);
-        // Read again at the end of the update: a setup or a removal may have changed it, and
-        // a read that is out is from before.
+        // Read again at the end of the update: a setup or a removal may have changed it. A
+        // read that is out is from before: its answer is not shown, and no second read
+        // starts beside it; the account is read once more when it answers.
         self.config.account = None;
-        self.config.work.cancel();
+        self.config.work.invalidate();
         self.clamp_lists();
     }
 
@@ -2655,8 +2657,9 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             // The read that is out, by its number, for the account still shown.
             let claim = app.config.work.claim(request, &account);
             let shown = app.config.account.as_ref() == Some(&account);
-            // Asked again since this read began (`r`, the pane opened again): what it read
-            // may be from before, so the account is read once more, if it is still shown.
+            // Asked again since this read began (`r`, the pane opened again, the account list
+            // changed): what it read may be from before, so the account is read once more, if
+            // it is still shown.
             if let Claim::Again(request) = claim {
                 if shown {
                     fx.push(Effect::Config {
@@ -2668,7 +2671,9 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                     app.config.work.cancel();
                 }
             }
-            if claim != Claim::Stray && shown {
+            // What was read before the account list changed is not shown: the read that has
+            // just started tells.
+            if claim != Claim::Stray && shown && !app.config.work.stale() {
                 // The source may be a name not seen yet (R21).
                 if let Ok(view) = &result
                     && let Some(source) = view.role.source()

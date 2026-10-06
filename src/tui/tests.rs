@@ -6061,9 +6061,13 @@ fn the_pane_follows_the_selection_and_drops_stale_answers() {
 }
 
 /// R22: `r` and a new account list read the configuration again (what it showed stays until
-/// the answer); with the pane closed, `r` reads none.
+/// the answer to `r`); with the pane closed, `r` reads none. A new account list while a read
+/// is out starts no second read beside it: the answer of the one out is from before the
+/// change and is not shown, and the account is read once more when it arrives.
 #[test]
 fn r_and_a_new_account_list_read_the_configuration_again() {
+    let none = Vec::<&Effect>::new();
+    let with_new = || vec![account("default"), account("max"), account("new")];
     let mut app = app();
     keys(&mut app, &[Key::Char('p')]);
     answer_config(&mut app, "default", config_view());
@@ -6071,17 +6075,34 @@ fn r_and_a_new_account_list_read_the_configuration_again() {
     assert_eq!(config_effects(&fx), [&config_effect(2, "default")]);
     assert!(app.config.loaded.is_some() && app.config.work.is_running());
 
-    let fx = update(
-        &mut app,
-        Event::Accounts(vec![account("default"), account("max"), account("new")]),
-    );
-    assert_eq!(config_effects(&fx), [&config_effect(3, "default")]);
+    // The read `r` started is still out when the list changes.
+    let fx = update(&mut app, Event::Accounts(with_new()));
+    assert_eq!(config_effects(&fx), none, "one read at a time");
+    assert_eq!(app.config.loaded, None);
     // The same list again changes nothing.
-    let fx = update(
-        &mut app,
-        Event::Accounts(vec![account("default"), account("max"), account("new")]),
+    let fx = update(&mut app, Event::Accounts(with_new()));
+    assert_eq!(config_effects(&fx), none);
+    let fx = answer_config(&mut app, "default", config_with_model("before"));
+    assert_eq!(fx, [config_effect(3, "default")]);
+    assert_eq!(app.config.loaded, None, "read before the list changed");
+    assert_eq!(
+        answer_config(&mut app, "default", config_with_model("after")),
+        []
     );
-    assert_eq!(config_effects(&fx), Vec::<&Effect>::new());
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("after"))));
+
+    // No read is out: a new list reads at once.
+    let fx = update(&mut app, Event::Accounts(everyone()));
+    assert_eq!(config_effects(&fx), [&config_effect(4, "default")]);
+    answer_config(&mut app, "default", config_with_model("again"));
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("again"))));
+    // `r` while the read after a new list is out: its answer is shown, like any `r`.
+    update(&mut app, Event::Accounts(with_new()));
+    answer_config(&mut app, "default", config_with_model("new list"));
+    keys(&mut app, &[Key::Char('r'), Key::Char('r')]);
+    let fx = answer_config(&mut app, "default", config_with_model("first"));
+    assert_eq!(fx, [config_effect(7, "default")]);
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("first"))));
 
     keys(&mut app, &[Key::Char('p'), Key::Char('p')]);
     let fx = keys(&mut app, &[Key::Char('r')]);
