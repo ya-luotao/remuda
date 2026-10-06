@@ -191,10 +191,12 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                     if let Some(e) = &reading.unreadable {
                         view.problems.insert(
                             0,
-                            format!(
-                                "cannot read {}: {e}; shared configuration unknown",
-                                deps.listing.config().display()
-                            ),
+                            Marked::default()
+                                .words("cannot read ")
+                                .path(deps.listing.config().display())
+                                .words(": ")
+                                .join(e)
+                                .words("; shared configuration unknown"),
                         );
                     }
                     Ok(Box::new(view))
@@ -245,7 +247,7 @@ fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Opt
     if reading.unreadable.is_none()
         && let Some(gone) = reading.refusal(&request.account)
     {
-        return Some(gone.into());
+        return Some(gone);
     }
     if let Some(error) = request.cwd.as_deref().and_then(check_dir) {
         return Some(error);
@@ -257,7 +259,7 @@ fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Opt
             "cannot confirm that session {} is not running: cannot read the registry: ",
             app::short_id(&id)
         );
-        return Some(Marked::from(said).text(e));
+        return Some(Marked::default().words(said).join(e));
     }
     let found = live::collect_report(
         &reading.seen,
@@ -278,14 +280,14 @@ fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Opt
     }
     // Each account's reason is a piece of its own: what private mode masks in one does not
     // reach the next (R21).
-    let mut said = Marked::from(format!(
+    let mut said = Marked::default().words(format!(
         "cannot confirm that session {} is not running: ",
         app::short_id(&id)
     ));
     for (i, u) in found.unknown.iter().enumerate() {
         let sep = if i == 0 { "" } else { "; " };
         said = said
-            .text(format!("{sep}{}: ", app::short_account(&u.account)))
+            .words(format!("{sep}{}: ", app::short_account(&u.account)))
             .text(&u.reason);
     }
     Some(said)
@@ -297,12 +299,14 @@ fn check_dir(dir: &Path) -> Option<Marked> {
     let path = || Marked::default().path(dir.display());
     match std::fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => None,
-        Ok(_) => Some(path().text(" is not a directory")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(path().text(" does not exist")),
+        Ok(_) => Some(path().words(" is not a directory")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(path().words(" does not exist")),
         Err(e) => Some(
-            Marked::from("cannot use ")
+            Marked::default()
+                .words("cannot use ")
                 .join(&path())
-                .text(format!(": {e}")),
+                .words(": ")
+                .text(e.to_string()),
         ),
     }
 }
@@ -332,12 +336,17 @@ fn refresh_index(deps: &Deps, tx: &Sender<Event>) {
             });
         }
     });
-    // A directory that could not be read first (R8), then a cache that could not be written.
-    let mut errors: Vec<String> = refreshed.incomplete().into_iter().collect();
+    // A directory that could not be read first (R8), then a cache that could not be written:
+    // the system's error, one text unless a cause says its pieces.
+    let mut errors: Vec<Marked> = refreshed.incomplete().into_iter().collect();
     if let Err(e) = index.save(&cache) {
-        errors.push(format!("index cache: {e:#}"));
+        errors.push(
+            Marked::default()
+                .words("index cache: ")
+                .join(&Marked::from_error(&e)),
+        );
     }
-    let error = (!errors.is_empty()).then(|| errors.join(" · "));
+    let error = each_by_itself(&errors);
     let _ = tx.send(Event::IndexDone {
         entries: index.entries.into_values().collect(),
         error,
@@ -364,11 +373,13 @@ fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
 
 /// One computation of [`compute_stats`], from one reading of the registry.
 fn stats_for(deps: &Deps, tx: &Sender<Event>, reading: &Reading) -> Event {
-    let mut errors: Vec<String> = Vec::new();
-    let prices_error = reading
-        .unreadable
-        .as_ref()
-        .map(|e| format!("prices: {e} (built-in prices used)"));
+    let mut errors: Vec<Marked> = Vec::new();
+    let prices_error = reading.unreadable.as_ref().map(|e| {
+        Marked::default()
+            .words("prices: ")
+            .join(e)
+            .words(" (built-in prices used)")
+    });
     let (accounts, prices) = (&reading.accounts, &reading.prices);
     let path = deps.state_dir.join("stats.json");
     let mut cache = stats::Cache::load(&path);
@@ -382,7 +393,11 @@ fn stats_for(deps: &Deps, tx: &Sender<Event>, reading: &Reading) -> Event {
     });
     errors.extend(refreshed.incomplete());
     if let Err(e) = cache.save_if_changed(&path, &refreshed) {
-        errors.push(format!("stats cache: {e:#}"));
+        errors.push(
+            Marked::default()
+                .words("stats cache: ")
+                .join(&Marked::from_error(&e)),
+        );
     }
     errors.extend(prices_error);
     let log = owned::launch_log(&deps.state_dir);
@@ -396,8 +411,20 @@ fn stats_for(deps: &Deps, tx: &Sender<Event>, reading: &Reading) -> Event {
         (deps.clock)(),
         &deps.tz,
     );
-    let error = (!errors.is_empty()).then(|| errors.join(" · "));
+    let error = each_by_itself(&errors);
     Event::Stats { report, error }
+}
+
+/// What a refresh could not do, as one line for the status bar, ` · ` between the errors;
+/// `None` when there is none. Each error keeps its pieces, so what private mode hides in one
+/// does not reach the next (R21).
+fn each_by_itself(errors: &[Marked]) -> Option<Marked> {
+    errors.iter().fold(None, |said: Option<Marked>, error| {
+        Some(match said {
+            Some(said) => said.words(" · ").join(error),
+            None => error.clone(),
+        })
+    })
 }
 
 #[cfg(test)]
@@ -408,6 +435,7 @@ mod tests {
     use jiff::tz::TimeZone;
 
     use super::*;
+    use crate::privacy::Piece;
     use crate::registry::{Account, CLAUDE, Home};
     use crate::tui::accounts::Listing;
 
@@ -468,6 +496,18 @@ mod tests {
             mode: crate::tui::app::Mode::Browse,
             private: false,
         })
+    }
+
+    /// `said` with `<>` for a path and `{}` for text from elsewhere: what is left is what
+    /// private mode leaves readable (R21).
+    fn shape(said: &Marked) -> String {
+        said.pieces()
+            .map(|(piece, kind)| match kind {
+                Piece::Words => piece,
+                Piece::Path => "<>",
+                Piece::Text => "{}",
+            })
+            .collect()
     }
 
     /// The workers' clock: when a live query answers (R10).
@@ -593,7 +633,10 @@ mod tests {
         let index = collect(Effect::RefreshIndex, &deps, indexed);
         let stats = collect(Effect::Stats, &deps, counted);
         chmod(0o755);
-        let said = |error: &Option<String>| {
+        let said = |error: &Option<Marked>| {
+            // R21: the directory is a path and the system's error a text of its own.
+            let told = error.as_ref().expect("an incomplete refresh says so");
+            assert_eq!(shape(told), "incomplete: cannot read <>: {}");
             let error = error.as_deref().expect("an incomplete refresh says so");
             assert!(
                 error.starts_with("incomplete: cannot read ") && error.contains("max/projects: "),
@@ -645,9 +688,14 @@ mod tests {
         let index = collect(Effect::RefreshIndex, &deps, indexed);
         let stats = collect(Effect::Stats, &deps, counted);
         chmod(0o755);
-        let said = |error: &Option<String>| {
-            let error = error.as_deref().expect("an incomplete refresh says so");
+        let said = |error: &Option<Marked>| {
             let store = home.join("projects");
+            // R21: the directory is a path and the system's error a text of its own.
+            let told = error.as_ref().expect("an incomplete refresh says so");
+            assert_eq!(shape(told), "incomplete: cannot read <>: {}");
+            let path = store.display().to_string();
+            assert_eq!(told.pieces().nth(1), Some((path.as_str(), Piece::Path)));
+            let error = error.as_deref().expect("an incomplete refresh says so");
             assert!(
                 error.starts_with(&format!("incomplete: cannot read {}: ", store.display())),
                 "{error}"
@@ -720,6 +768,51 @@ mod tests {
         );
         assert!(error.contains("config.toml"), "{error}");
         assert_eq!((unpriced.pico_usd, unpriced.unpriced_tokens), (0, 443));
+        // R21: the reason is the system's (it names the registry); what follows it is
+        // remuda's and stays readable in private mode.
+        assert_eq!(shape(&error), "prices: {} (built-in prices used)");
+    }
+
+    /// R21: an error of a cache is told in its pieces. What the system says (it names the
+    /// file) is text from elsewhere, each error by itself, so what private mode hides in one
+    /// does not reach the next; the index's is the system's whole.
+    #[test]
+    fn cache_errors_are_told_in_their_pieces() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        // Nothing can be written under a `state` that is a file.
+        fs::write(&deps.state_dir, "").unwrap();
+        fs::write(deps.listing.config(), "prices = 1\n").unwrap();
+
+        let events = collect(Effect::Stats, &deps, |e| matches!(e, Event::Stats { .. }));
+        let Some(Event::Stats {
+            error: Some(error), ..
+        }) = events.last()
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(
+            shape(error),
+            "stats cache: {} · prices: {} (built-in prices used)"
+        );
+        let told: Vec<&str> = error
+            .pieces()
+            .filter(|(_, kind)| *kind == Piece::Text)
+            .map(|(piece, _)| piece)
+            .collect();
+        assert_eq!(told.len(), 2, "{told:?}");
+        assert!(told[1].contains("config.toml"), "{told:?}");
+
+        let events = collect(Effect::RefreshIndex, &deps, |e| {
+            matches!(e, Event::IndexDone { .. })
+        });
+        let Some(Event::IndexDone {
+            error: Some(error), ..
+        }) = events.last()
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(shape(error), "index cache: {}");
     }
 
     /// The registry [`a_clock_that_unregisters`] empties, once.
@@ -838,7 +931,7 @@ mod tests {
             Some(
                 Marked::default()
                     .path(gone.display())
-                    .text(" does not exist")
+                    .words(" does not exist")
             )
         );
         assert_eq!(
@@ -846,8 +939,63 @@ mod tests {
             Some(
                 Marked::default()
                     .path(file.display())
-                    .text(" is not a directory")
+                    .words(" is not a directory")
             )
+        );
+    }
+
+    /// R16, R21: a launch refused for its account, or for a registry that cannot be read, is
+    /// told in pieces. That an account is no longer registered (or is, with another home) is
+    /// remuda's own words; why the registry cannot be read is the system's text, after
+    /// remuda's words when a resume cannot be confirmed for it.
+    #[test]
+    fn a_refused_launch_says_why_in_pieces() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let id = "0badf00d-0000-4000-8000-000000000000";
+        let check = |account: Account, args: &[&str]| {
+            let request = LaunchRequest {
+                account,
+                args: args.iter().map(|a| a.to_string()).collect(),
+                cwd: None,
+                what: "x".into(),
+            };
+            let check = Effect::CheckLaunch { check: 7, request };
+            let events = collect(check, &deps, |e| matches!(e, Event::LaunchChecked { .. }));
+            let Some(Event::LaunchChecked { error, .. }) = events.last() else {
+                panic!("{events:?}")
+            };
+            error.clone()
+        };
+        let listed = max(&deps);
+        let gone = Account {
+            name: "team".into(),
+            ..listed.clone()
+        };
+        let moved = Account {
+            home: Home::Path(dir.path().join("elsewhere").display().to_string()),
+            ..listed.clone()
+        };
+        for (account, said) in [
+            (gone, "team is no longer registered"),
+            (moved, "max is now registered with another home"),
+        ] {
+            let error = check(account, &[]).expect("refused");
+            assert_eq!(error.pieces().collect::<Vec<_>>(), [(said, Piece::Words)]);
+        }
+
+        fs::write(deps.listing.config(), "not toml [").unwrap();
+        // A new session is refused when it starts; a resume in place cannot be confirmed.
+        assert_eq!(check(listed.clone(), &[]), None);
+        let error = check(listed, &["--resume", id]).expect("refused");
+        assert_eq!(
+            shape(&error),
+            "cannot confirm that session 0badf00d is not running: cannot read the registry: {}"
+        );
+        let why = error.pieces().last().expect("a reason").0;
+        assert!(
+            why.contains(&deps.listing.config().display().to_string()),
+            "{why}"
         );
     }
 
@@ -1050,6 +1198,16 @@ mod tests {
             view.problems[0].ends_with("; shared configuration unknown"),
             "{:?}",
             view.problems
+        );
+        // R21: the registry is a path, the reason is the system's, the rest remuda's words.
+        assert_eq!(
+            shape(&view.problems[0]),
+            "cannot read <>: {}; shared configuration unknown"
+        );
+        let config = deps.listing.config().display().to_string();
+        assert_eq!(
+            view.problems[0].pieces().nth(1),
+            Some((config.as_str(), Piece::Path))
         );
 
         let work = Account {

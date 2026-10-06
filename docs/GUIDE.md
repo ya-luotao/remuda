@@ -42,12 +42,12 @@ starts and is not saved. While it is on, the TUI shows:
 - paths with every component masked, and `$HOME` as `~` (`~/•••/•••`);
 - in the configuration pane, the names of agents, skills, commands, plugins, hooks, settings,
   `env` variables and MCP servers stay visible; descriptions are masked;
-- notices, errors and check messages with the above replaced. A path remuda puts there itself
-  is masked whole. In text from elsewhere (an agent's output, a system error, a check message)
-  nothing says where a path ends, so a line is masked from its first word with a `/` to its end,
-  and what follows the path on that line is hidden with it. Only Claude's `/login` and `/rewind`,
-  which remuda's own messages name, are left as they are, unless a directory remuda knows has
-  that very name.
+- notices, errors, check messages and the problems of the configuration pane with the above
+  replaced. A path remuda puts there itself is masked whole, and what the message says around
+  it stays readable (the reason, what to do, a `/login` or `/rewind` it names). In text from
+  elsewhere (an agent's output, a system error, a name read from a file) nothing says where a
+  path ends, so a line is masked from its first word with a `/` to its end, and what follows
+  the path on that line is hidden with it; a `/login` there is a path like any other.
 
 It keeps visible the numbers (usage percentages, reset times, token counts, costs), model names, plans,
 login methods, providers, session IDs, pids and times. It does not hide the output of an agent

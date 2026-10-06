@@ -14,6 +14,7 @@ use anyhow::Result;
 
 use crate::Env;
 use crate::pricing::Prices;
+use crate::privacy::Marked;
 use crate::registry::{Account, Registry, Sharing};
 
 use super::app::{self, Event};
@@ -45,8 +46,11 @@ pub struct Reading {
     pub seen: Vec<Account>,
     pub sharing: Sharing,
     pub prices: Prices,
-    /// Why `config.toml` could not be read or is not valid; the reason names the file.
-    pub unreadable: Option<String>,
+    /// Why `config.toml` could not be read or is not valid; the reason names the file. In
+    /// its pieces ([`Marked::from_error`]): what shows it (a problem of the Configuration
+    /// pane, the error of the statistics, a launch refused) puts its own words around them,
+    /// and private mode masks each piece by itself (R21).
+    pub unreadable: Option<Marked>,
 }
 
 impl Listing {
@@ -114,8 +118,8 @@ impl Listing {
 
     /// The registry as it is now, or why it cannot be read. A list that differs from the one
     /// held replaces it and is told.
-    fn load(&self, state: &mut State, tx: &Sender<Event>) -> Result<Registry, String> {
-        let registry = Registry::load(&self.config).map_err(|e| format!("{e:#}"))?;
+    fn load(&self, state: &mut State, tx: &Sender<Event>) -> Result<Registry, Marked> {
+        let registry = Registry::load(&self.config).map_err(|e| Marked::from_error(&e))?;
         let accounts = registry.all(&self.env);
         if accounts != state.accounts {
             state.seen = union(&[&state.seen, &accounts]);
@@ -131,11 +135,14 @@ impl Reading {
     /// Why nothing is launched as `account`, if nothing is (R16): the registry cannot be read,
     /// or it no longer lists the account (one of that name with another home is another
     /// account, R2).
-    pub fn refusal(&self, account: &Account) -> Option<String> {
+    ///
+    /// A message (R21): the reason of a registry that cannot be read keeps its pieces, and
+    /// that an account is not listed is remuda's own words, with the account's name in them.
+    pub fn refusal(&self, account: &Account) -> Option<Marked> {
         if let Some(why) = &self.unreadable {
             return Some(why.clone());
         }
-        unlisted(&self.accounts, account)
+        unlisted(&self.accounts, account).map(|gone| Marked::default().words(gone))
     }
 }
 
@@ -182,6 +189,7 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::privacy::Piece;
     use crate::registry::{CLAUDE, Home};
 
     fn account(name: &str, home: &str) -> Account {
@@ -457,5 +465,44 @@ mod tests {
             reading.refusal(&codex).as_deref(),
             Some("codex:work is no longer registered")
         );
+        // R21: that an account is not listed is remuda's to say, the account's name in it:
+        // its own words, in which private mode replaces the name and looks for no path.
+        for gone in [&team, &max, &codex] {
+            let said = reading.refusal(gone).expect("refused");
+            assert_eq!(
+                said.pieces().collect::<Vec<_>>(),
+                [(said.as_str(), Piece::Words)]
+            );
+        }
+    }
+
+    /// R21: why the registry cannot be read is told as the error said it, in its pieces: the
+    /// same message whoever shows it (a launch refused, a problem of the Configuration pane,
+    /// the prices of the statistics), each with its own words around it.
+    #[test]
+    fn an_unreadable_registry_says_why_in_pieces() {
+        let dir = tempfile::tempdir().unwrap();
+        let max = account("max", "/p/max");
+        let listing = listing(dir.path(), &[&max]);
+        let (tx, _rx) = mpsc::channel();
+        assert_eq!(listing.read(&tx).unreadable, None);
+
+        fs::write(listing.config(), "not toml [").unwrap();
+        let reading = listing.read(&tx);
+        let error = Registry::load(listing.config()).unwrap_err();
+        let why = reading.unreadable.clone().expect("unreadable");
+        // The string a launch prints for it, byte for byte, and it names the file.
+        assert_eq!(why.as_str(), format!("{error:#}"));
+        assert!(
+            why.contains(&listing.config().display().to_string()),
+            "{why}"
+        );
+        assert_eq!(why, Marked::from_error(&error));
+        // The registry's errors are the system's so far: text from elsewhere, where private
+        // mode looks for the file's path.
+        assert!(why.pieces().all(|(_, kind)| kind == Piece::Text), "{why:?}");
+        // An account still listed is refused for that reason, as it is.
+        assert_eq!(reading.refusal(&max), Some(why));
+        assert_eq!(reading.accounts, [default(), max]);
     }
 }

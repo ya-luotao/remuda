@@ -420,7 +420,7 @@ fn run_launch(
     // whether the account is still listed (R16), and its shared configuration (R18).
     let reading = deps.listing.read(tx);
     if let Some(why) = reading.refusal(&request.account) {
-        return Ok((Err(why), Vec::new()));
+        return Ok((Err(why.to_string()), Vec::new()));
     }
     let provider = request.account.provider;
     let Some(program) = deps.program(provider) else {

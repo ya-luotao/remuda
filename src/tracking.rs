@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
+use crate::privacy::Marked;
+
 /// Worker threads for reading files (IO bound).
 const WORKERS: usize = 8;
 
@@ -377,17 +379,22 @@ impl RefreshStats {
     }
 
     /// The directories that could not be read, as one line for a status bar; `None` after a
-    /// complete refresh.
-    pub fn incomplete(&self) -> Option<String> {
+    /// complete refresh. In its pieces: the directory is a path and the system's error a text
+    /// of its own, so private mode masks the one whole and keeps that the refresh is
+    /// incomplete (R21).
+    pub fn incomplete(&self) -> Option<Marked> {
         let first = self.unreadable.first()?;
-        Some(match self.unreadable.len() {
-            1 => format!("incomplete: {first}"),
-            n => format!(
-                "incomplete: cannot read {n} directories, first {}: {}",
-                first.path.display(),
-                first.error
-            ),
-        })
+        let said = match self.unreadable.len() {
+            1 => "incomplete: cannot read ".to_string(),
+            n => format!("incomplete: cannot read {n} directories, first "),
+        };
+        Some(
+            Marked::default()
+                .words(said)
+                .path(first.path.display())
+                .words(": ")
+                .text(&first.error),
+        )
     }
 }
 
@@ -1695,18 +1702,49 @@ mod tests {
         };
         let mut s = RefreshStats::default();
         assert_eq!((s.incomplete(), s.kept()), (None, 0));
-        s.unreadable.push(unreadable("/h/projects", 3));
+        s.unreadable.push(unreadable("/h/a, b (old)/projects", 3));
         assert_eq!(
             s.incomplete().as_deref(),
-            Some("incomplete: cannot read /h/projects: Permission denied (os error 13)")
+            Some("incomplete: cannot read /h/a, b (old)/projects: Permission denied (os error 13)")
+        );
+        // R21: the directory is a path, whatever characters it holds, and the system's error
+        // a text of its own; that the refresh is incomplete is remuda's to say.
+        use crate::privacy::Piece;
+        let pieces = |s: &RefreshStats| {
+            let said = s.incomplete().expect("incomplete");
+            said.pieces()
+                .map(|(piece, kind)| (piece.to_string(), kind))
+                .collect::<Vec<_>>()
+        };
+        let piece = |text: &str, kind| (text.to_string(), kind);
+        assert_eq!(
+            pieces(&s),
+            [
+                piece("incomplete: cannot read ", Piece::Words),
+                piece("/h/a, b (old)/projects", Piece::Path),
+                piece(": ", Piece::Words),
+                piece("Permission denied (os error 13)", Piece::Text),
+            ]
         );
         s.unreadable.push(unreadable("/h/sessions", 4));
         assert_eq!(
             s.incomplete().as_deref(),
             Some(
-                "incomplete: cannot read 2 directories, first /h/projects: Permission denied \
-                 (os error 13)"
+                "incomplete: cannot read 2 directories, first /h/a, b (old)/projects: \
+                 Permission denied (os error 13)"
             )
+        );
+        assert_eq!(
+            pieces(&s),
+            [
+                piece(
+                    "incomplete: cannot read 2 directories, first ",
+                    Piece::Words
+                ),
+                piece("/h/a, b (old)/projects", Piece::Path),
+                piece(": ", Piece::Words),
+                piece("Permission denied (os error 13)", Piece::Text),
+            ]
         );
         assert_eq!(s.kept(), 7);
     }

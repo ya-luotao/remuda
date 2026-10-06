@@ -3,8 +3,6 @@
 //! work is requested as [`Effect`]s and comes back as [`Event`]s.
 
 use std::collections::HashMap;
-use std::fmt::Display;
-use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use jiff::tz::TimeZone;
@@ -19,6 +17,7 @@ use crate::index::{Entry, Index, Store};
 use crate::launch::{self, Intent};
 use crate::live::{self, Control, LiveId, LiveSession};
 use crate::privacy::Aliases;
+pub use crate::privacy::Marked;
 use crate::provider::Provider;
 use crate::registry::{self, Account, CLAUDE, CODEX, Home};
 use crate::setup;
@@ -110,7 +109,7 @@ pub enum Event {
     /// the directories that could not be read (R8), a cache that could not be written.
     IndexDone {
         entries: Vec<Entry>,
-        error: Option<String>,
+        error: Option<Marked>,
     },
     Identity {
         account: Account,
@@ -171,7 +170,7 @@ pub enum Event {
     /// [`Effect::Stats`] finished; `error` says why the cache could not be written.
     Stats {
         report: stats::Report,
-        error: Option<String>,
+        error: Option<Marked>,
     },
     /// The registry lists other accounts than when it was last read
     /// ([`super::accounts::Listing::read`]): these, from now on.
@@ -248,92 +247,6 @@ pub enum Level {
     Info,
     Warn,
     Error,
-}
-
-/// Text the TUI puts together (a notice, a form's error), in the pieces it was made of: the
-/// words and names remuda wrote, each path it put there, each message that came from elsewhere
-/// (an agent's output, a system error). It reads as one string; private mode (R21) masks it
-/// piece by piece, a path whole whatever characters it holds, and what it must guess in one
-/// message never reaches into the next.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Marked {
-    text: String,
-    /// Where each piece ends in `text`, and whether it is a path.
-    pieces: Vec<(usize, bool)>,
-}
-
-impl Marked {
-    pub fn as_str(&self) -> &str {
-        &self.text
-    }
-
-    /// With `text` after it, as a piece of its own.
-    pub fn text(self, text: impl AsRef<str>) -> Self {
-        self.piece(text.as_ref(), false)
-    }
-
-    /// With the path `path` after it.
-    pub fn path(self, path: impl Display) -> Self {
-        self.piece(&path.to_string(), true)
-    }
-
-    /// With the pieces of `other` after it.
-    pub fn join(mut self, other: &Marked) -> Self {
-        for (piece, path) in other.pieces() {
-            self = self.piece(piece, path);
-        }
-        self
-    }
-
-    fn piece(mut self, piece: &str, path: bool) -> Self {
-        if !piece.is_empty() {
-            self.text.push_str(piece);
-            self.pieces.push((self.text.len(), path));
-        }
-        self
-    }
-
-    /// Each piece in order, and whether it is a path.
-    pub fn pieces(&self) -> impl Iterator<Item = (&str, bool)> {
-        let mut start = 0;
-        self.pieces.iter().map(move |(end, path)| {
-            let piece = &self.text[start..*end];
-            start = *end;
-            (piece, *path)
-        })
-    }
-}
-
-impl From<String> for Marked {
-    fn from(text: String) -> Self {
-        Marked::default().text(text)
-    }
-}
-
-impl From<&str> for Marked {
-    fn from(text: &str) -> Self {
-        Marked::default().text(text)
-    }
-}
-
-impl Deref for Marked {
-    type Target = str;
-
-    fn deref(&self) -> &str {
-        &self.text
-    }
-}
-
-impl PartialEq<str> for Marked {
-    fn eq(&self, other: &str) -> bool {
-        self.text == other
-    }
-}
-
-impl PartialEq<&str> for Marked {
-    fn eq(&self, other: &&str) -> bool {
-        self.text == *other
-    }
 }
 
 /// A one-line message in the status bar; the next key press clears it.
@@ -758,8 +671,8 @@ pub struct StatsState {
     /// The last report; kept while the next one is computed.
     pub report: Option<stats::Report>,
     /// What the last computation could not do: read a directory (the report is incomplete,
-    /// R20), write the cache, read the prices.
-    pub error: Option<String>,
+    /// R20), write the cache, read the prices. In its pieces (R21).
+    pub error: Option<Marked>,
     /// The view has been opened: `r` computes again.
     pub requested: bool,
     /// `(done, total)` transcripts read by the computation running.
@@ -810,8 +723,9 @@ pub struct App {
     /// The cache has been loaded (or found missing): an empty list now means no sessions.
     pub index_loaded: bool,
     pub index_refreshed: Option<Timestamp>,
-    /// What the last refresh could not do: read a directory (R8), write the cache.
-    pub index_error: Option<String>,
+    /// What the last refresh could not do: read a directory (R8), write the cache. In its
+    /// pieces (R21).
+    pub index_error: Option<Marked>,
     pub(super) by_session: HashMap<String, PathBuf>,
 
     /// Launch log + `history.jsonl`; `attribution` adds live sessions to it.

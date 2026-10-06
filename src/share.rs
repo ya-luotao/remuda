@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::home_items::{self, Id, Membership, Relations};
+use crate::privacy::Marked;
 use crate::registry::{Account, Sharing};
 use crate::{Env, owned};
 
@@ -1270,11 +1271,19 @@ pub fn read_settings(path: &Path) -> Result<Map<String, Value>> {
     let bytes = match read_regular(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Map::new()),
-        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+        Err(e) => {
+            let said = Marked::default().words("cannot read ").path(path.display());
+            return Err(said.because(e));
+        }
     };
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(Value::Object(map)) => Ok(map),
-        _ => bail!("{} is not a JSON object", path.display()),
+        // In its pieces: the Configuration pane shows it (R22), and private mode masks the
+        // file and keeps what is wrong with it (R21).
+        _ => Err(Marked::default()
+            .path(path.display())
+            .words(" is not a JSON object")
+            .into()),
     }
 }
 
@@ -1711,6 +1720,47 @@ mod tests {
             let e = read_settings(&path).unwrap_err().to_string();
             assert!(e.contains("is not a JSON object"), "{bad:?}: {e}");
         }
+    }
+
+    /// R18, R21: the error of a settings file reads as it did (what a launch prints), and
+    /// says which of its pieces is the file: the Configuration pane masks that whole in
+    /// private mode and keeps what is wrong with it.
+    #[test]
+    fn a_settings_error_says_which_piece_is_the_file() {
+        use crate::privacy::Piece;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a, b (old)").join("settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = path.display().to_string();
+        fs::write(&path, "[]").unwrap();
+        let e = read_settings(&path).unwrap_err();
+        assert_eq!(format!("{e}"), format!("{file} is not a JSON object"));
+        assert_eq!(format!("{e:#}"), format!("{file} is not a JSON object"));
+        assert_eq!(
+            Marked::from_error(&e).pieces().collect::<Vec<_>>(),
+            [
+                (file.as_str(), Piece::Path),
+                (" is not a JSON object", Piece::Words)
+            ]
+        );
+        // One that cannot be read: the reason follows as the cause, as with a context, and
+        // is the system's text.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let e = read_settings(&path).unwrap_err();
+        assert_eq!(format!("{e}"), format!("cannot read {file}"));
+        let reason = e.chain().nth(1).expect("a cause").to_string();
+        assert_eq!(format!("{e:#}"), format!("cannot read {file}: {reason}"));
+        assert_eq!(e.chain().count(), 2);
+        assert_eq!(
+            Marked::from_error(&e).pieces().collect::<Vec<_>>(),
+            [
+                ("cannot read ", Piece::Words),
+                (file.as_str(), Piece::Path),
+                (": ", Piece::Words),
+                (reason.as_str(), Piece::Text)
+            ]
+        );
     }
 
     /// R18: every UTF-16 code unit that is not an ASCII letter or digit becomes `-` (a
