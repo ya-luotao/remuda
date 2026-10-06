@@ -5,9 +5,6 @@ use std::collections::hash_map::Entry as Slot;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::thread;
 
 use anyhow::Result;
 use jiff::tz::TimeZone;
@@ -17,19 +14,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::Env;
 use crate::attribution::Attribution;
-use crate::index::{self, RefreshStats, Stat};
+use crate::index::{self, RefreshStats};
 use crate::pricing::{PRICES_AS_OF, Prices, Rate};
 use crate::provider::Provider;
 use crate::registry::{self, Account};
 use crate::text::{self, human_count, human_usd};
-use crate::transcript::{contains, read_at};
+use crate::tracking::{self, Files, Listed, Listing, Stat};
+use crate::transcript::{complete_lines, contains, read_at};
 
 /// Bump whenever [`Row`], [`FileStats`] or the counting rules change: a mismatching cache is
 /// rebuilt (2: cache write by lifetime, fast / US flags).
 pub const SCHEMA_VERSION: u32 = 2;
-
-/// Worker threads for reading transcripts (IO bound).
-const WORKERS: usize = 8;
 
 /// Read size; an unfinished line is carried over to the next read.
 const CHUNK: u64 = 8 * 1024 * 1024;
@@ -228,7 +223,8 @@ impl Cache {
     /// nothing and the file exists (it is tens of MB on a large corpus). Returns whether it
     /// was written.
     pub fn save_if_changed(&self, path: &Path, refreshed: &RefreshStats) -> Result<bool> {
-        let changed = refreshed.reused != refreshed.files || refreshed.removed > 0;
+        let changed =
+            refreshed.reused + refreshed.kept() != refreshed.files || refreshed.removed > 0;
         if !changed && path.exists() {
             return Ok(false);
         }
@@ -306,194 +302,117 @@ pub fn sources(accounts: &[Account], env: &Env) -> Vec<Source> {
     out
 }
 
-/// The files of a source with the session id their path gives, and their stat.
-fn list_source(source: &Source) -> Vec<(PathBuf, String, Stat)> {
-    match source.kind {
-        SourceKind::Claude => list_claude(&source.path),
-        SourceKind::CodexSessions | SourceKind::CodexArchived => {
-            let mut out = Vec::new();
-            index::list_rollouts(&source.path, &mut out);
-            out
-        }
-    }
-}
-
 /// `<store>/*/*.jsonl` (the session id is the stem), and every `*.jsonl` at any depth below a
 /// directory `<store>/<project>/<dir>/` (subagent transcripts; the session id is `<dir>`).
-/// Symlinked directories below a project are not followed; unreadable entries and non-UTF-8
-/// names are skipped.
-fn list_claude(store: &Path) -> Vec<(PathBuf, String, Stat)> {
-    let mut out = Vec::new();
-    let Ok(projects) = fs::read_dir(store) else {
-        return out;
-    };
-    for project in projects.flatten() {
-        let dir = project.path();
-        if !fs::metadata(&dir).is_ok_and(|m| m.is_dir()) {
+/// Symlinked directories below a project are not followed; non-UTF-8 names are skipped. What
+/// cannot be listed or examined is the listing's to tell (R8).
+fn list_claude(store: &Path, listing: &mut Listing) {
+    for project in listing.read_dir(store) {
+        if !listing.is_dir(&project) {
             continue;
         }
-        let Ok(items) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for item in items.flatten() {
-            let Ok(kind) = item.file_type() else { continue };
-            if kind.is_dir() {
-                if let Some(session_id) = item.file_name().to_str() {
-                    list_below(&item.path(), session_id, &mut out);
+        for item in listing.read_dir(project.path()) {
+            if item.is_dir() {
+                if let Some(session_id) = item.name() {
+                    list_below(item.path(), session_id, listing);
                 }
-                continue;
-            }
-            let path = item.path();
-            if let Some(session_id) = jsonl_stem(&path) {
+            } else if let Some(session_id) = item.name().and_then(jsonl_stem) {
                 let session_id = session_id.to_string();
-                push_file(path, session_id, &mut out);
+                listing.file(&item, session_id);
             }
         }
     }
-    out
 }
 
 /// Every `*.jsonl` at any depth below `dir`, for `session_id`.
-fn list_below(dir: &Path, session_id: &str, out: &mut Vec<(PathBuf, String, Stat)>) {
-    let Ok(items) = fs::read_dir(dir) else {
-        return;
-    };
-    for item in items.flatten() {
-        let Ok(kind) = item.file_type() else { continue };
-        let path = item.path();
-        if kind.is_dir() {
-            list_below(&path, session_id, out);
-        } else if jsonl_stem(&path).is_some() {
-            push_file(path, session_id.to_string(), out);
+fn list_below(dir: &Path, session_id: &str, listing: &mut Listing) {
+    for item in listing.read_dir(dir) {
+        if item.is_dir() {
+            list_below(item.path(), session_id, listing);
+        } else if item.name().and_then(jsonl_stem).is_some() {
+            listing.file(&item, session_id.to_string());
         }
     }
 }
 
-/// The non-empty UTF-8 stem of a `*.jsonl` file name.
-fn jsonl_stem(path: &Path) -> Option<&str> {
-    path.file_name()?
-        .to_str()?
-        .strip_suffix(".jsonl")
-        .filter(|s| !s.is_empty())
+/// The non-empty stem of a `*.jsonl` file name.
+fn jsonl_stem(name: &str) -> Option<&str> {
+    name.strip_suffix(".jsonl").filter(|s| !s.is_empty())
 }
 
-fn push_file(path: PathBuf, session_id: String, out: &mut Vec<(PathBuf, String, Stat)>) {
-    match fs::metadata(&path) {
-        Ok(meta) if meta.is_file() => out.push((path, session_id, Stat::of(&meta))),
-        _ => {}
+/// How the statistics list a source and read one of its files ([`tracking::Files`]).
+struct Requests;
+
+impl Files<Source> for Requests {
+    type Tracked = FileStats;
+
+    fn list(&self, source: &Source, listing: &mut Listing) {
+        match source.kind {
+            SourceKind::Claude => list_claude(&source.path, listing),
+            SourceKind::CodexSessions | SourceKind::CodexArchived => {
+                index::list_rollouts(&source.path, listing)
+            }
+        }
     }
-}
 
-/// A transcript or rollout that has to be read.
-struct Job {
-    provider: Provider,
-    path: PathBuf,
-    session_id: String,
-    source: PathBuf,
-    /// Present when [`refresh`] decided on an incremental read; `None` means whole.
-    cached: Option<FileStats>,
+    fn stat(file: &FileStats) -> Stat {
+        Stat {
+            size: file.size,
+            mtime_ns: file.mtime_ns,
+            ino: file.ino,
+        }
+    }
+
+    fn listed_under(file: &FileStats, source: &Source) -> bool {
+        file.source == source.path && file.provider == source.kind.provider()
+    }
+
+    fn read(
+        &self,
+        source: &Source,
+        listed: &Listed,
+        file: &File,
+        stat: Stat,
+        cached: Option<&FileStats>,
+    ) -> Option<(FileStats, u64)> {
+        count(source, listed, file, stat, cached, CHUNK)
+    }
 }
 
 /// Brings `cache` up to date with `sources`, like the index (R8): unchanged files are reused,
 /// grown ones read from their last complete line, any other one whole; vanished files and
-/// files of sources no longer listed drop out. `progress(done, total)` is called after listing
-/// and after each file read, `total` being the files that need reading. Never fails:
-/// unreadable files are dropped.
+/// files of sources no longer listed drop out, while those below a directory that exists but
+/// cannot be listed stay as they were, the directory being reported in
+/// [`RefreshStats::unreadable`]. `progress(done, total)` is called after listing and after each
+/// file read, `total` being the files that need reading. Never fails: unreadable files are
+/// dropped.
 pub fn refresh(
     cache: &mut Cache,
     sources: &[Source],
     mut progress: impl FnMut(usize, usize),
 ) -> RefreshStats {
-    let mut stats = RefreshStats::default();
-    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut jobs: Vec<Job> = Vec::new();
-    for source in sources {
-        let provider = source.kind.provider();
-        for (path, session_id, stat) in list_source(source) {
-            if !seen.insert(path.clone()) {
-                continue;
-            }
-            let cached = cache
-                .files
-                .get(&path)
-                .filter(|f| f.ino == stat.ino && f.source == source.path && f.provider == provider);
-            let incremental = match cached {
-                Some(f) if f.size == stat.size && f.mtime_ns == stat.mtime_ns => {
-                    stats.reused += 1;
-                    continue;
-                }
-                Some(f) if stat.size > f.size && stat.mtime_ns >= f.mtime_ns => {
-                    stats.incremental += 1;
-                    cached.cloned()
-                }
-                _ => {
-                    stats.cold += 1;
-                    None
-                }
-            };
-            jobs.push(Job {
-                provider,
-                path,
-                session_id,
-                source: source.path.clone(),
-                cached: incremental,
-            });
-        }
-    }
-    let before = cache.files.len();
-    cache.files.retain(|path, _| seen.contains(path));
-    stats.removed = before - cache.files.len();
-
-    let total = jobs.len();
-    progress(0, total);
-    let next = AtomicUsize::new(0);
-    let (tx, rx) = mpsc::channel::<(usize, Option<(FileStats, u64)>)>();
-    thread::scope(|scope| {
-        for _ in 0..WORKERS.min(total) {
-            let tx = tx.clone();
-            let (jobs, next) = (&jobs, &next);
-            scope.spawn(move || {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(job) = jobs.get(i) else { break };
-                    if tx.send((i, scan(job))).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(tx);
-        for (done, (i, result)) in rx.into_iter().enumerate() {
-            match result {
-                Some((file, bytes)) => {
-                    stats.bytes_read += bytes;
-                    cache.files.insert(jobs[i].path.clone(), file);
-                }
-                // Vanished or unreadable since listing: drop it rather than keep stale counts.
-                None => {
-                    cache.files.remove(&jobs[i].path);
-                }
-            }
-            progress(done + 1, total);
-        }
-    });
-    stats.files = cache.files.len();
-    stats
+    tracking::refresh(&mut cache.files, sources, &Requests, |p| {
+        progress(p.done, p.total)
+    })
 }
 
-/// Reads one file: from the cached offset, or whole. Returns what was counted and the bytes
-/// read; `None` if the file cannot be read.
-fn scan(job: &Job) -> Option<(FileStats, u64)> {
-    let file = File::open(&job.path).ok()?;
-    // Stat the open file: it may have changed since listing. The listing's decision can only
-    // be downgraded here (to a whole read), never upgraded.
-    let stat = Stat::of(&file.metadata().ok()?);
-    let mut counted = match &job.cached {
-        Some(cached) if stat.size > cached.size && stat.ino == cached.ino => cached.clone(),
-        _ => FileStats {
-            provider: job.provider,
-            session_id: job.session_id.clone(),
-            source: job.source.clone(),
+/// Counts one file, open as `file`: on from `cached` (from its offset), or whole, reading
+/// `chunk` bytes at a time. Returns what was counted and the bytes read; `None` if the file
+/// cannot be read.
+fn count(
+    source: &Source,
+    listed: &Listed,
+    file: &File,
+    stat: Stat,
+    cached: Option<&FileStats>,
+    chunk: u64,
+) -> Option<(FileStats, u64)> {
+    let mut counted = match cached {
+        Some(cached) => cached.clone(),
+        None => FileStats {
+            provider: source.kind.provider(),
+            session_id: listed.session_id.clone(),
+            source: source.path.clone(),
             size: 0,
             mtime_ns: 0,
             ino: stat.ino,
@@ -517,29 +436,27 @@ fn scan(job: &Job) -> Option<(FileStats, u64)> {
         if at >= stat.size {
             break;
         }
-        let chunk = read_at(&file, at, CHUNK.min(stat.size - at)).ok()?;
-        if chunk.is_empty() {
+        let buf = read_at(file, at, chunk.min(stat.size - at)).ok()?;
+        if buf.is_empty() {
             break;
         }
-        bytes += chunk.len() as u64;
-        let (Some(first), Some(last)) = (
-            chunk.iter().position(|&b| b == b'\n'),
-            chunk.iter().rposition(|&b| b == b'\n'),
-        ) else {
-            carry.extend_from_slice(&chunk);
+        bytes += buf.len() as u64;
+        // Cut at the first `\n`: what is before it ends the carried line.
+        let lines = complete_lines(&buf, true);
+        let Some(end) = lines.end else {
+            carry.extend_from_slice(&buf);
             continue;
         };
-        // The chunk's first line ends the carried one.
-        carry.extend_from_slice(&chunk[..first]);
-        let rest = chunk[first..last].split(|&b| b == b'\n').skip(1);
-        for line in std::iter::once(&carry[..]).chain(rest) {
-            if !line.is_empty() {
-                counter.line(line);
-            }
+        carry.extend_from_slice(&buf[..lines.start - 1]);
+        if !carry.is_empty() {
+            counter.line(&carry);
         }
-        offset += (carry.len() + last - first + 1) as u64;
+        for line in &lines.lines {
+            counter.line(line);
+        }
+        offset += (carry.len() + 1 + end - lines.start) as u64;
         carry.clear();
-        carry.extend_from_slice(&chunk[last + 1..]);
+        carry.extend_from_slice(&buf[end..]);
     }
     counted.scanned_offset = offset;
     Some((counted, bytes))
@@ -1615,6 +1532,94 @@ fn model_rows(models: &Models<'_>) -> Vec<ModelRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A claude assistant record of `id` with `output` tokens, as one line.
+    fn message(id: &str, output: u64) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"2026-09-24T10:00:00Z\",\"message\":\
+             {{\"id\":\"{id}\",\"model\":\"claude-test\",\"usage\":{{\"input_tokens\":1,\
+             \"output_tokens\":{output}}}}}}}\n"
+        )
+    }
+
+    /// R8, R20: only complete lines are parsed, wherever the reads cut the file. Read in
+    /// chunks of any size (shorter than a line, ending right at a `\n`, longer than the file),
+    /// a file counts as it does read at once, whole and on from a cached offset.
+    #[test]
+    fn a_file_counts_the_same_whatever_the_chunk_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let first = [
+            message("msg_1", 10),
+            "\n".to_string(),
+            "not json\n".to_string(),
+            // Longer than most of the chunks below, and repeating a message.
+            format!("{{\"padding\":\"{}\"}}\n", "x".repeat(300)),
+            message("msg_1", 25),
+            message("msg_2", 7),
+        ]
+        .concat();
+        let unfinished = &message("msg_3", 99)[..40];
+        let source = Source {
+            kind: SourceKind::Claude,
+            path: dir.path().to_path_buf(),
+            accounts: vec![],
+        };
+        let listed = |path: &Path| Listed {
+            path: path.to_path_buf(),
+            session_id: "s".into(),
+            stat: Stat::of(&fs::metadata(path).unwrap()),
+        };
+        let read = |cached: Option<&FileStats>, chunk: u64| {
+            let file = File::open(&path).unwrap();
+            let stat = Stat::of(&file.metadata().unwrap());
+            count(&source, &listed(&path), &file, stat, cached, chunk).unwrap()
+        };
+        // Every size up to past the first line's end, then some around the file's.
+        let sizes = |len: usize| (1..=200).chain([len as u64 - 1, len as u64, len as u64 + 1]);
+
+        fs::write(&path, [first.as_str(), unfinished].concat()).unwrap();
+        let len = first.len() + unfinished.len();
+        let (whole, bytes) = read(None, CHUNK);
+        assert_eq!(bytes, len as u64);
+        assert_eq!(
+            whole.scanned_offset,
+            first.len() as u64,
+            "the unfinished line waits"
+        );
+        let outputs: Vec<u64> = whole.rows.iter().map(|r| r.tokens.output).collect();
+        assert_eq!(outputs, [25, 7]);
+        for chunk in sizes(len) {
+            assert_eq!(
+                read(None, chunk),
+                (whole.clone(), bytes),
+                "chunks of {chunk}"
+            );
+        }
+
+        // Grown: the unfinished line is finished and another follows.
+        let second = [&message("msg_3", 99)[40..], &message("msg_2", 8)].concat();
+        let mut text = fs::read(&path).unwrap();
+        text.extend_from_slice(second.as_bytes());
+        fs::write(&path, &text).unwrap();
+        let (grown, bytes) = read(Some(&whole), CHUNK);
+        assert_eq!(bytes, (unfinished.len() + second.len()) as u64);
+        assert_eq!(grown.scanned_offset, text.len() as u64);
+        let outputs: Vec<u64> = grown.rows.iter().map(|r| r.tokens.output).collect();
+        assert_eq!(outputs, [25, 8, 99]);
+        for chunk in sizes(text.len()) {
+            assert_eq!(
+                read(Some(&whole), chunk),
+                (grown.clone(), bytes),
+                "chunks of {chunk}"
+            );
+        }
+        assert_eq!(
+            read(None, 64).0.rows,
+            grown.rows,
+            "whole again, the same rows"
+        );
+    }
 
     #[test]
     fn fnv1a_matches_the_reference() {

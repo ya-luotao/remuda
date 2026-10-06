@@ -355,13 +355,29 @@ remuda help [<command>]                            help for remuda or a command
     first 1 MB is unchanged before and after a file grows). The offset is cached; when a file has
     grown and its mtime is not earlier than the cached one, only the new bytes are parsed. The whole
     file is rescanned when it shrinks, when its size is unchanged but its mtime changed, when its
-    mtime moves backward, or when its inode changed (the file was replaced).
+    mtime moves backward, or when its inode changed (the file was replaced). The file is checked
+    again once it is open, since it may have changed after it was listed: it is read incrementally
+    only if it is then still larger than cached, the same inode, and its mtime not earlier.
   - When the tail window contains no complete record (the file ends with one very long line), the
     window grows by ×4, up to 4 MB.
   - Known limitation: when a large file's only `ai-title` is in the middle and the tail window does
     contain complete records, the title is not found and the first user text is used instead.
   - Only complete lines are parsed: a final line still being written is left for the next scan.
     Lines cut by a window boundary are discarded.
+  - **A directory that is gone and one that cannot be read are different things.** A store, or a
+    directory below it, that no longer exists has no transcripts: their entries drop out of the
+    index. One that exists but cannot be read says nothing about the transcripts below it: it
+    cannot be listed (permission denied, an I/O error: any error other than the directory not
+    existing, also one met partway through the listing), or it can be listed but what it lists
+    cannot be examined (a directory that may be read but not searched gives names and nothing
+    else). The entries that store has below it stay in the index and in its cache as they were
+    last indexed, the directories that can be read are indexed as usual, and the refresh says it
+    is incomplete, naming the directory (once, not again for what is below it) and the error.
+    `remuda sessions` still lists those sessions and warns on stderr; the TUI says so in the
+    status line. Nothing is read again once the directory can be read and its transcripts have
+    not changed. The entries of a store that is no longer listed drop out all the same, also
+    where they lie below a directory another store cannot read. A single transcript that cannot
+    be opened or read is left out, as before.
 - Cache: `$REMUDA_HOME/state/index.json`, with a schema version; on a version mismatch it is
   rebuilt. Written atomically; may be deleted at any time (R3).
 - The index is built in the background: the UI does not wait for it and shows progress and the rows
@@ -1267,7 +1283,11 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   per model over everything. Counts below 1,000 are shown whole, others in K, M, B, or T, with
   one decimal below 100 (`1.2M`, `93.3B`, `118K`).
 - **Only transcripts that exist count**: tokens of transcripts deleted since (claude deletes those
-  older than `cleanupPeriodDays`) are no longer counted.
+  older than `cleanupPeriodDays`) are no longer counted. A transcript below a directory that
+  exists but cannot be read (R8) is not known to be deleted: its counts stay in the cache and in
+  the report as they were last read, and the report says that it is incomplete, naming the
+  directory and how many transcripts below it are counted that way. A directory that no longer
+  exists has no transcripts.
 - **Cache**: `$REMUDA_HOME/state/stats.json`, with a schema version, rebuilt on a mismatch,
   written atomically, deletable at any time (R3). For each transcript it holds what was counted
   from it (a 64-bit FNV-1a hash of each request's key, its timestamp, model, counts with the
@@ -1282,11 +1302,14 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   (default `all`) with a COST column, then a line saying the cost is ≈ API list price and the
   prices' date, and a line naming the models not priced, if any. With an account, it prints only
   the sections that include that account, and no overall section. Reading progress goes to
-  stderr, as for `sessions`.
+  stderr, as for `sessions`. A directory that could not be read is named in an `Incomplete:` line
+  on stdout, after the table and the lines that follow it, so that a report that is piped does
+  not pass for a complete one.
 - **TUI**: view `4`, Stats. The statistics are computed in the background the first time the
   view opens, and again on each `r` after that, with reading progress shown; `r` also reads the
   prices in `config.toml` again (when they cannot be read, the built-in prices are used and the
-  status line says so). `t` in the view cycles the period (all, today, 7 days, 30 days).
+  status line says so). A directory that could not be read is named in the status line too
+  (`incomplete: …`). `t` in the view cycles the period (all, today, 7 days, 30 days).
   The title says the cost is ≈ API list price, and the status line gives the prices' date unless it shows an error. Above
   the table, a chart shows the period over time: a bar per hour (today), per day (7 and 30 days),
   or, for all, per day from the first request with a timestamp (at most 3,660 days back), else

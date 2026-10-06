@@ -4,7 +4,7 @@ mod common;
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -567,6 +567,199 @@ fn vanished_files_drop_out() {
     let s = index::refresh(&mut index, &[], |_| {});
     assert_eq!((s.files, s.removed), (0, 1));
     assert!(index.entries.is_empty());
+}
+
+fn chmod(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// R8 (review #10): a store that exists but cannot be listed says nothing about its
+/// transcripts. Their entries stay as they were, the refresh names the store, and nothing is
+/// read again once it can be listed.
+#[test]
+fn a_store_that_cannot_be_read_keeps_its_entries_and_is_reported() {
+    let c = Corpus::new();
+    c.write("a", &[user("a", "/w", &ts(1)), ai_title("A")].concat());
+    c.write("b", &user("b", "/w", &ts(2)));
+    let mut index = Index::default();
+    c.refresh(&mut index);
+    let before = index.clone();
+    let store = c.store().path;
+
+    chmod(&store, 0o000);
+    let s = c.refresh(&mut index);
+    chmod(&store, 0o755);
+    assert_eq!(
+        index, before,
+        "nothing is known about the store: nothing changes"
+    );
+    assert_eq!(
+        (s.files, s.removed, s.reused, s.cold, s.kept()),
+        (2, 0, 0, 0, 2)
+    );
+    assert_eq!(s.unreadable.len(), 1, "{:?}", s.unreadable);
+    assert_eq!(
+        (s.unreadable[0].path.as_path(), s.unreadable[0].kept),
+        (store.as_path(), 2)
+    );
+    assert!(!s.unreadable[0].error.is_empty());
+    let said = s.incomplete().expect("an incomplete refresh says so");
+    assert!(
+        said.starts_with(&format!("incomplete: cannot read {}: ", store.display())),
+        "{said}"
+    );
+
+    let s = c.refresh(&mut index);
+    assert_eq!(
+        (s.reused, s.cold, s.incremental, s.bytes_read),
+        (2, 0, 0, 0),
+        "readable again: nothing is read again"
+    );
+    assert!(s.unreadable.is_empty());
+    assert_eq!(s.incomplete(), None);
+    assert_eq!(index, before);
+}
+
+/// R8 (review #10): only what is below the directory that cannot be listed is kept. A
+/// transcript that vanished beside it drops out, and so do those of a directory that is gone.
+#[test]
+fn a_project_that_cannot_be_read_keeps_its_entries_and_one_that_is_gone_drops_them() {
+    let c = Corpus::new();
+    let store = c.store();
+    let locked = store.path.join("-w-a");
+    let open = store.path.join("-w-b");
+    fs::create_dir(&open).unwrap();
+    c.write("a", &user("a", "/w/a", &ts(1)));
+    fs::write(open.join("b.jsonl"), user("b", "/w/b", &ts(2))).unwrap();
+    fs::write(open.join("c.jsonl"), user("c", "/w/b", &ts(3))).unwrap();
+    let mut index = Index::default();
+    c.refresh(&mut index);
+    let a = entry(&index, &c.file("a"));
+
+    chmod(&locked, 0o000);
+    fs::remove_file(open.join("c.jsonl")).unwrap();
+    let s = c.refresh(&mut index);
+    chmod(&locked, 0o755);
+    assert_eq!(
+        (s.files, s.removed, s.reused, s.kept()),
+        (2, 1, 1, 1),
+        "{:?}",
+        s.unreadable
+    );
+    assert_eq!(s.unreadable.len(), 1);
+    assert_eq!(s.unreadable[0].path, locked);
+    assert_eq!(entry(&index, &c.file("a")), a);
+    assert!(!index.entries.contains_key(&open.join("c.jsonl")));
+
+    // The project directory is gone: so are its transcripts.
+    fs::remove_dir_all(&locked).unwrap();
+    let s = c.refresh(&mut index);
+    assert_eq!((s.files, s.removed, s.reused), (1, 1, 1));
+    assert!(s.unreadable.is_empty());
+
+    // And so is the store: a directory that does not exist has no transcripts.
+    fs::remove_dir_all(&store.path).unwrap();
+    let s = index::refresh(&mut index, std::slice::from_ref(&store), |_| {});
+    assert_eq!((s.files, s.removed), (0, 1));
+    assert!(s.unreadable.is_empty());
+    assert!(index.entries.is_empty());
+}
+
+/// R8 (review #10): a project directory that can be listed but not searched gives its
+/// transcripts' names and nothing else. They are not taken for vanished: the entries stay, the
+/// directory is reported once, and nothing is read again once it can be searched.
+#[test]
+fn a_project_that_cannot_be_searched_keeps_its_entries_and_is_reported() {
+    let c = Corpus::new();
+    c.write("a", &user("a", "/w", &ts(1)));
+    c.write("b", &user("b", "/w", &ts(2)));
+    let mut index = Index::default();
+    c.refresh(&mut index);
+    let before = index.clone();
+    let project = c.store().path.join("-w-a");
+
+    chmod(&project, 0o444);
+    let names = fs::read_dir(&project).map(Iterator::count);
+    let s = c.refresh(&mut index);
+    chmod(&project, 0o755);
+    assert_eq!(names.unwrap(), 2, "its names can still be listed");
+    assert_eq!(index, before);
+    assert_eq!((s.files, s.removed, s.cold, s.kept()), (2, 0, 0, 2));
+    assert_eq!(s.unreadable.len(), 1, "{:?}", s.unreadable);
+    assert_eq!(
+        (s.unreadable[0].path.as_path(), s.unreadable[0].kept),
+        (project.as_path(), 2)
+    );
+
+    let s = c.refresh(&mut index);
+    assert_eq!(
+        (s.reused, s.cold, s.incremental, s.bytes_read),
+        (2, 0, 0, 0)
+    );
+    assert!(s.unreadable.is_empty());
+}
+
+/// R8: a store no longer listed drops out, also when it lies below a store that is still
+/// listed and cannot be read just then: that failure says nothing for another store's entries.
+#[test]
+fn a_store_no_longer_listed_drops_out_though_one_above_it_cannot_be_read() {
+    let c = Corpus::new();
+    let outer = c.store();
+    let nested = Store {
+        path: outer.path.join("nested-home/projects"),
+        accounts: vec!["claude:nested".into()],
+        ..outer.clone()
+    };
+    let inside = nested.path.join("-w-n/n.jsonl");
+    fs::create_dir_all(inside.parent().unwrap()).unwrap();
+    fs::write(&inside, user("nested", "/w/n", &ts(2))).unwrap();
+    c.write("a", &user("a", "/w/a", &ts(1)));
+    let mut index = Index::default();
+    index::refresh(&mut index, &[outer.clone(), nested.clone()], |_| {});
+    assert_eq!(entry(&index, &inside).store, nested.path);
+    assert_eq!(entry(&index, &c.file("a")).store, outer.path);
+
+    chmod(&outer.path, 0o000);
+    let s = index::refresh(&mut index, std::slice::from_ref(&outer), |_| {});
+    chmod(&outer.path, 0o755);
+    assert_eq!((s.files, s.removed, s.kept()), (1, 1, 1));
+    assert!(!index.entries.contains_key(&inside));
+    assert!(index.entries.contains_key(&c.file("a")));
+}
+
+/// R8: a file is read incrementally only if it still is the cached one, grown, once it is
+/// open. Rewritten in place between the listing and the read (the same inode, larger) with an
+/// mtime earlier than the cached one, it is scanned cold.
+#[test]
+fn a_file_rewritten_with_an_earlier_mtime_before_it_is_opened_is_rescanned_cold() {
+    let c = Corpus::new();
+    let path = c.write(SID, &user("old", "/w/a", &ts(1)));
+    let mut index = Index::default();
+    c.refresh(&mut index);
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    c.append(SID, &ai_title("T"));
+    set_mtime(&path, before + Duration::from_secs(60));
+
+    let rewritten = [
+        user("new", "/w/n", &ts(2)),
+        filler(2_000, "/w/n", &ts(3)),
+        ai_title("N"),
+    ]
+    .concat();
+    // The first report comes after the listing and before anything is read.
+    let s = index::refresh(&mut index, &[c.store()], |p| {
+        if p.done == 0 {
+            fs::write(&path, &rewritten).unwrap();
+            set_mtime(&path, before - Duration::from_secs(60));
+        }
+    });
+    assert_eq!((s.incremental, s.cold), (1, 0), "listed as grown");
+    let e = entry(&index, &path);
+    assert_eq!(e.first_user_text.as_deref(), Some("new"));
+    assert_eq!(e.cwd_first.as_deref(), Some("/w/n"));
+    assert_eq!(e.title.as_deref(), Some("N"));
+    let s = c.refresh(&mut index);
+    assert_eq!((s.reused, s.bytes_read), (1, 0), "cached as it was opened");
 }
 
 #[test]

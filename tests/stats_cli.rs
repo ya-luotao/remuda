@@ -592,6 +592,111 @@ fn stats_warns_when_the_cache_cannot_be_written() {
     );
 }
 
+/// R20, R8 (review #10): a store that exists but cannot be read is not one whose transcripts
+/// were deleted. The report keeps their counts as last read and says on stdout that it is
+/// incomplete, naming the store; the cache is left as it was.
+#[test]
+fn stats_says_when_a_store_cannot_be_read_and_keeps_its_counts() {
+    let s = setup();
+    claude_fixtures(&s);
+    let complete = stats(&s.sb, &[]);
+    assert!(!complete.contains("Incomplete"), "{complete}");
+    let cache = s.sb.remuda_home().join("state/stats.json");
+    let saved = fs::read(&cache).unwrap();
+    let written = fs::metadata(&cache).unwrap().modified().unwrap();
+    let files = |path: &Path| -> usize {
+        let v: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let below = |p: &&String| p.starts_with(s.native.canonicalize().unwrap().to_str().unwrap());
+        v["files"].as_object().unwrap().keys().filter(below).count()
+    };
+    let cached = files(&cache);
+    assert!(cached > 1);
+
+    let store = s.native.canonicalize().unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o000)).unwrap();
+    let out =
+        s.sb.remuda()
+            .arg("stats")
+            .assert()
+            .success()
+            .stderr("")
+            .get_output()
+            .clone();
+    let filtered = stats(&s.sb, &["max"]);
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let line = stdout
+        .strip_prefix(complete.as_str())
+        .unwrap_or_else(|| panic!("the same report, then the line:\n{stdout}"));
+    let said = format!("Incomplete: cannot read {}: ", store.display());
+    assert!(line.starts_with(&said), "{line}");
+    assert!(
+        line.ends_with(&format!(
+            "; {cached} transcripts below it are counted as last read\n"
+        )),
+        "{line}"
+    );
+    assert_eq!(line.lines().count(), 1, "{line}");
+    assert!(
+        filtered.ends_with(line),
+        "also for one account:\n{filtered}"
+    );
+    assert_eq!(fs::read(&cache).unwrap(), saved);
+    assert_eq!(
+        fs::metadata(&cache).unwrap().modified().unwrap(),
+        written,
+        "the cache is not rewritten"
+    );
+
+    // Readable again: the report is complete, and nothing was read again.
+    assert_eq!(stats(&s.sb, &[]), complete);
+    assert_eq!(fs::metadata(&cache).unwrap().modified().unwrap(), written);
+}
+
+/// R20, R8 (review #10): a project directory that can be listed but not searched is not one
+/// whose transcripts were deleted either: the same report, one `Incomplete:` line naming it,
+/// and the cache left as it was, so that nothing is read again afterwards.
+#[test]
+fn stats_says_when_a_project_cannot_be_searched_and_keeps_its_counts() {
+    let s = setup();
+    claude_fixtures(&s);
+    let complete = stats(&s.sb, &[]);
+    let cache = s.sb.remuda_home().join("state/stats.json");
+    let saved = fs::read(&cache).unwrap();
+    let written = fs::metadata(&cache).unwrap().modified().unwrap();
+    let project = s.native.canonicalize().unwrap().join("-w-proj");
+    let v: Value = serde_json::from_slice(&saved).unwrap();
+    let below = |p: &&String| Path::new(p.as_str()).starts_with(&project);
+    let cached = v["files"].as_object().unwrap().keys().filter(below).count();
+    assert!(cached > 2, "top-level and subagent transcripts: {cached}");
+
+    fs::set_permissions(&project, fs::Permissions::from_mode(0o444)).unwrap();
+    let out = stats(&s.sb, &[]);
+    fs::set_permissions(&project, fs::Permissions::from_mode(0o755)).unwrap();
+    let line = out
+        .strip_prefix(complete.as_str())
+        .unwrap_or_else(|| panic!("the same report, then the line:\n{out}"));
+    assert_eq!(line.lines().count(), 1, "{line}");
+    assert!(
+        line.starts_with(&format!("Incomplete: cannot read {}: ", project.display())),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(&format!(
+            "; {cached} transcripts below it are counted as last read\n"
+        )),
+        "{line}"
+    );
+    assert_eq!(fs::read(&cache).unwrap(), saved);
+
+    assert_eq!(stats(&s.sb, &[]), complete);
+    assert_eq!(
+        fs::metadata(&cache).unwrap().modified().unwrap(),
+        written,
+        "nothing was read again: the cache is not rewritten"
+    );
+}
+
 /// R5: an account that does not resolve is an error.
 #[test]
 fn stats_unknown_account_fails() {

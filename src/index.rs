@@ -1,13 +1,9 @@
 //! Session index over claude transcript stores and codex rollout stores, cached in
 //! `$REMUDA_HOME/state/index.json` (SPEC R8, R17).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::thread;
 
 use anyhow::Result;
 use jiff::Timestamp;
@@ -16,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::Env;
 use crate::provider::{Provider, codex};
 use crate::registry::{self, Account};
+use crate::tracking::{self, Files, Listed, Listing, Stat};
+pub use crate::tracking::{RefreshStats, Unreadable};
 use crate::transcript::{self, Head, Tail, WINDOW, complete_lines, read_at};
 
 /// Bump whenever [`Entry`] or the scanning rules change: a mismatching cache is rebuilt.
@@ -119,18 +117,6 @@ pub struct Progress<'a> {
     pub entry: Option<&'a Entry>,
 }
 
-/// What a [`refresh`] did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RefreshStats {
-    /// Transcripts present after the refresh.
-    pub files: usize,
-    pub reused: usize,
-    pub incremental: usize,
-    pub cold: usize,
-    pub removed: usize,
-    pub bytes_read: u64,
-}
-
 impl Index {
     /// Loads the cache; a missing, unreadable, malformed or other-schema file is an empty index.
     pub fn load(path: &Path) -> Index {
@@ -204,35 +190,13 @@ pub fn stores(accounts: &[Account], env: &Env) -> Vec<Store> {
     stores
 }
 
-/// Size, mtime and inode of a transcript as listed.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Stat {
-    pub(crate) size: u64,
-    pub(crate) mtime_ns: i128,
-    pub(crate) ino: u64,
-}
-
-impl Stat {
-    pub(crate) fn of(meta: &fs::Metadata) -> Stat {
-        Stat {
-            size: meta.len(),
-            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-            ino: meta.ino(),
-        }
-    }
-}
-
-/// A transcript or rollout that has to be read.
+/// A transcript or rollout to scan cold.
 struct Job {
     provider: Provider,
     path: PathBuf,
     /// From the file name; a rollout's own record may name another.
     session_id: String,
     store: PathBuf,
-    /// Index into the stores given to [`refresh`].
-    store_index: usize,
-    /// Present when [`refresh`] decided on an incremental scan; `None` means cold.
-    cached: Option<Entry>,
 }
 
 /// The largest head window of a rollout. Measured on 1441 real rollouts (498 of them `cli` or
@@ -240,224 +204,142 @@ struct Job {
 /// 441 (the p99 of its offset is ~800 KB), 4 MB for 444 at 100 MB more read per cold index.
 pub const CODEX_HEAD_CAP: u64 = 1024 * 1024;
 
-/// Worker threads for reading transcripts (IO bound).
-const WORKERS: usize = 8;
+/// A store as [`refresh`] tracks it: with the thread names of its `session_index.jsonl` files
+/// (every home sharing it) as they are now (R17); none for claude.
+struct Named<'a> {
+    store: &'a Store,
+    names: HashMap<String, String>,
+}
+
+/// How the index lists a store and reads one of its files ([`tracking::Files`]).
+struct Sessions;
+
+impl Files<Named<'_>> for Sessions {
+    type Tracked = Entry;
+
+    fn list(&self, dir: &Named<'_>, listing: &mut Listing) {
+        match dir.store.provider {
+            Provider::Claude => list_projects(&dir.store.path, listing),
+            Provider::Codex => list_rollouts(&dir.store.path, listing),
+        }
+    }
+
+    fn stat(entry: &Entry) -> Stat {
+        Stat {
+            size: entry.size,
+            mtime_ns: entry.mtime_ns,
+            ino: entry.ino,
+        }
+    }
+
+    fn listed_under(entry: &Entry, dir: &Named<'_>) -> bool {
+        entry.store == dir.store.path && entry.provider == dir.store.provider
+    }
+
+    /// Incrementally from the cached offset, or cold (head and tail windows).
+    fn read(
+        &self,
+        dir: &Named<'_>,
+        listed: &Listed,
+        file: &File,
+        stat: Stat,
+        cached: Option<&Entry>,
+    ) -> Option<(Entry, u64)> {
+        let (mut entry, bytes) = match cached {
+            Some(cached) => scan_incremental(file, stat, cached)?,
+            None => {
+                let job = Job {
+                    provider: dir.store.provider,
+                    path: listed.path.clone(),
+                    session_id: listed.session_id.clone(),
+                    store: dir.store.path.clone(),
+                };
+                scan_cold(&job, file, stat)?
+            }
+        };
+        if entry.provider == Provider::Codex {
+            entry.title = dir.names.get(&entry.session_id).cloned();
+        }
+        Some((entry, bytes))
+    }
+}
 
 /// Brings `index` up to date with `stores`: new files are scanned cold (head and tail
 /// windows), grown files incrementally, unchanged files reused; vanished files and files of
-/// stores no longer listed drop out. Codex titles are the thread names of the store's
-/// `session_index.jsonl` files (every home sharing it) as they are now, also for unchanged rollouts (R17). Never fails:
-/// unreadable files are skipped.
+/// stores no longer listed drop out, while those below a directory that exists but cannot be
+/// listed stay as they were, the directory being reported in [`RefreshStats::unreadable`] (R8).
+/// Codex titles are the thread names of the store's `session_index.jsonl` files (every home
+/// sharing it) as they are now, also for unchanged rollouts (R17). Never fails: unreadable
+/// files are skipped.
 pub fn refresh(
     index: &mut Index,
     stores: &[Store],
     mut progress: impl FnMut(Progress<'_>),
 ) -> RefreshStats {
-    let mut stats = RefreshStats::default();
-    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut jobs: Vec<Job> = Vec::new();
-    let names: Vec<HashMap<String, String>> = stores
+    let dirs: Vec<Named<'_>> = stores
         .iter()
-        .map(|s| codex::thread_names(&s.thread_names))
+        .map(|store| Named {
+            store,
+            names: codex::thread_names(&store.thread_names),
+        })
         .collect();
-    for (store_index, store) in stores.iter().enumerate() {
-        for (path, session_id, stat) in list_store(store) {
-            if !seen.insert(path.clone()) {
-                continue;
-            }
-            let cached = index.entries.get(&path);
-            let cached = match cached {
-                Some(e)
-                    if e.ino == stat.ino
-                        && e.store == store.path
-                        && e.provider == store.provider =>
-                {
-                    Some(e)
-                }
-                _ => None,
-            };
-            let incremental = match cached {
-                Some(e) if e.size == stat.size && e.mtime_ns == stat.mtime_ns => {
-                    stats.reused += 1;
-                    continue;
-                }
-                Some(e) if stat.size > e.size && stat.mtime_ns >= e.mtime_ns => {
-                    stats.incremental += 1;
-                    cached.cloned()
-                }
-                _ => {
-                    stats.cold += 1;
-                    None
-                }
-            };
-            jobs.push(Job {
-                provider: store.provider,
-                path,
-                session_id,
-                store: store.path.clone(),
-                store_index,
-                cached: incremental,
-            });
-        }
-    }
-    let before = index.entries.len();
-    index.entries.retain(|path, _| seen.contains(path));
-    stats.removed = before - index.entries.len();
+    let stats = tracking::refresh(&mut index.entries, &dirs, &Sessions, |p| {
+        progress(Progress {
+            done: p.done,
+            total: p.total,
+            bytes_read: p.bytes_read,
+            entry: p.item,
+        })
+    });
     // Thread names change without the rollout changing.
-    for (store, names) in stores.iter().zip(&names) {
-        if store.provider == Provider::Codex {
+    for dir in &dirs {
+        if dir.store.provider == Provider::Codex {
             for entry in index.entries.values_mut() {
-                if entry.store == store.path {
-                    entry.title = names.get(&entry.session_id).cloned();
+                if entry.store == dir.store.path {
+                    entry.title = dir.names.get(&entry.session_id).cloned();
                 }
             }
         }
     }
-
-    let total = jobs.len();
-    progress(Progress {
-        done: 0,
-        total,
-        bytes_read: 0,
-        entry: None,
-    });
-    let next = AtomicUsize::new(0);
-    let (tx, rx) = mpsc::channel::<(usize, Option<(Entry, u64)>)>();
-    thread::scope(|scope| {
-        for _ in 0..WORKERS.min(total) {
-            let tx = tx.clone();
-            let (jobs, next) = (&jobs, &next);
-            scope.spawn(move || {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(job) = jobs.get(i) else { break };
-                    if tx.send((i, scan(job))).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(tx);
-        for (done, (i, result)) in rx.into_iter().enumerate() {
-            let entry = match result {
-                Some((mut entry, bytes)) => {
-                    stats.bytes_read += bytes;
-                    if entry.provider == Provider::Codex {
-                        entry.title = names[jobs[i].store_index].get(&entry.session_id).cloned();
-                    }
-                    let path = entry.path.clone();
-                    index.entries.insert(path.clone(), entry);
-                    index.entries.get(&path)
-                }
-                // Vanished or unreadable since listing: drop it rather than keep a stale entry.
-                None => {
-                    index.entries.remove(&jobs[i].path);
-                    None
-                }
-            };
-            progress(Progress {
-                done: done + 1,
-                total,
-                bytes_read: stats.bytes_read,
-                entry,
-            });
-        }
-    });
-    stats.files = index.entries.len();
     stats
 }
 
-/// The files of a store with the session id their name gives, and their stat.
-fn list_store(store: &Store) -> Vec<(PathBuf, String, Stat)> {
-    match store.provider {
-        Provider::Claude => list_projects(&store.path),
-        Provider::Codex => {
-            let mut out = Vec::new();
-            list_rollouts(&store.path, &mut out);
-            out
-        }
-    }
-}
-
 /// `<sessions>/**/rollout-*.jsonl` (R17): `sessions/YYYY/MM/DD/` in practice. Symlinked
-/// directories below the store are not followed; unreadable entries and non-UTF-8 names are
-/// skipped.
-pub(crate) fn list_rollouts(dir: &Path, out: &mut Vec<(PathBuf, String, Stat)>) {
-    let Ok(listing) = fs::read_dir(dir) else {
-        return;
-    };
-    for item in listing.flatten() {
-        let path = item.path();
-        let Ok(kind) = item.file_type() else { continue };
-        if kind.is_dir() {
-            if item.file_name() != "archived_sessions" {
-                list_rollouts(&path, out);
+/// directories below the store are not followed; non-UTF-8 names are skipped. What cannot be
+/// listed or examined is the listing's to tell (R8).
+pub(crate) fn list_rollouts(dir: &Path, listing: &mut Listing) {
+    for item in listing.read_dir(dir) {
+        if item.is_dir() {
+            if item.name() != Some("archived_sessions") {
+                list_rollouts(item.path(), listing);
             }
             continue;
         }
-        let Some(id) = item
-            .file_name()
-            .to_str()
-            .and_then(codex::rollout_id)
-            .map(str::to_string)
-        else {
+        let Some(id) = item.name().and_then(codex::rollout_id).map(str::to_string) else {
             continue;
         };
-        match fs::metadata(&path) {
-            Ok(meta) if meta.is_file() => out.push((path, id, Stat::of(&meta))),
-            _ => {}
-        }
+        listing.file(&item, id);
     }
 }
 
-/// `<store>/*/*.jsonl`, top level of each project directory only (R8). Unreadable entries
-/// and non-UTF-8 names are skipped.
-fn list_projects(store: &Path) -> Vec<(PathBuf, String, Stat)> {
-    let mut out = Vec::new();
-    let Ok(projects) = fs::read_dir(store) else {
-        return out;
-    };
-    for project in projects.flatten() {
-        let dir = project.path();
-        if !fs::metadata(&dir).is_ok_and(|m| m.is_dir()) {
+/// `<store>/*/*.jsonl`, top level of each project directory only (R8). Non-UTF-8 names are
+/// skipped; what cannot be listed or examined is the listing's to tell.
+fn list_projects(store: &Path, listing: &mut Listing) {
+    for project in listing.read_dir(store) {
+        if !listing.is_dir(&project) {
             continue;
         }
-        let Ok(files) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            let Some(session_id) = path
-                .file_name()
-                .and_then(|n| n.to_str())
+        for file in listing.read_dir(project.path()) {
+            let Some(session_id) = file
+                .name()
                 .and_then(|n| n.strip_suffix(".jsonl"))
                 .filter(|s| !s.is_empty())
             else {
                 continue;
             };
             let session_id = session_id.to_string();
-            match fs::metadata(&path) {
-                Ok(meta) if meta.is_file() => out.push((path, session_id, Stat::of(&meta))),
-                _ => {}
-            }
+            listing.file(&file, session_id);
         }
-    }
-    out
-}
-
-/// Reads one transcript: incrementally from the cached offset, or cold. Returns the entry
-/// and the bytes read; `None` if the file cannot be read.
-fn scan(job: &Job) -> Option<(Entry, u64)> {
-    let file = File::open(&job.path).ok()?;
-    // Stat the open file: it may have changed since listing, and what we read must match.
-    // The listing's decision can only be downgraded here (to cold, if the file is no longer
-    // a grown version of the cached one), never upgraded.
-    let stat = Stat::of(&file.metadata().ok()?);
-    match &job.cached {
-        Some(cached) if stat.size > cached.size && stat.ino == cached.ino => {
-            scan_incremental(&file, stat, cached)
-        }
-        _ => scan_cold(job, &file, stat),
     }
 }
 

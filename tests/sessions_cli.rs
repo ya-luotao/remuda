@@ -287,6 +287,96 @@ fn the_index_cache_is_private() {
     assert_eq!(mode(&cache), 0o600);
 }
 
+/// R8 (review #10): a store that exists but cannot be read is not an empty one. Its sessions
+/// stay listed as last indexed and in the cache, with a warning naming the store; the stores
+/// that can be read are indexed as usual.
+#[test]
+fn a_store_that_cannot_be_read_is_warned_about_and_its_sessions_stay_listed() {
+    let Setup {
+        sb,
+        team,
+        native_projects,
+        ..
+    } = setup();
+    let titles = |rows: &[BTreeMap<String, String>]| -> Vec<String> {
+        rows.iter().map(|r| r["TITLE"].clone()).collect()
+    };
+    transcript(&native_projects, S_A, &user("native one", "/w", &ts(3)));
+    transcript(&native_projects, S_B, &user("native two", "/w", &ts(2)));
+    transcript(&team.join("projects"), S_C, &user("team one", "/w", &ts(1)));
+    let (rows, stderr) = sessions(&sb, &[]);
+    assert_eq!(titles(&rows), ["native one", "native two", "team one"]);
+    assert_eq!(stderr, "");
+
+    let store = native_projects.canonicalize().unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o000)).unwrap();
+    transcript(&team.join("projects"), S_D, &user("team two", "/w", &ts(4)));
+    let (rows, stderr) = sessions(&sb, &[]);
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        titles(&rows),
+        ["team two", "native one", "native two", "team one"]
+    );
+    let warning = format!("remuda: warning: cannot read {}: ", store.display());
+    assert!(stderr.starts_with(&warning), "{stderr}");
+    assert!(
+        stderr.ends_with("; 2 sessions below it are listed as last indexed\n"),
+        "{stderr}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    let cache = sb.remuda_home().join("state/index.json");
+    let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
+    assert_eq!(v["entries"].as_object().unwrap().len(), 4);
+
+    // Readable again: nothing to warn about.
+    let (rows, stderr) = sessions(&sb, &[]);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(stderr, "");
+}
+
+/// R8 (review #10): a project directory that can be listed but not searched is not an empty
+/// one either. Its sessions stay listed and in the cache that is saved, with one warning.
+#[test]
+fn a_project_that_cannot_be_searched_is_warned_about_and_its_sessions_stay_listed() {
+    let Setup {
+        sb,
+        native_projects,
+        ..
+    } = setup();
+    transcript(&native_projects, S_A, &user("native one", "/w", &ts(3)));
+    transcript(&native_projects, S_B, &user("native two", "/w", &ts(2)));
+    let (rows, stderr) = sessions(&sb, &[]);
+    assert_eq!((rows.len(), stderr.as_str()), (2, ""));
+    let cache = sb.remuda_home().join("state/index.json");
+    let saved = |cache: &Path| -> usize {
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(cache).unwrap()).unwrap();
+        v["entries"].as_object().unwrap().len()
+    };
+
+    let project = native_projects.canonicalize().unwrap().join("-w-proj");
+    fs::set_permissions(&project, fs::Permissions::from_mode(0o444)).unwrap();
+    let (rows, stderr) = sessions(&sb, &[]);
+    fs::set_permissions(&project, fs::Permissions::from_mode(0o755)).unwrap();
+    let titles: Vec<&str> = rows.iter().map(|r| r["TITLE"].as_str()).collect();
+    assert_eq!(titles, ["native one", "native two"]);
+    assert_eq!(
+        stderr
+            .strip_prefix(&format!(
+                "remuda: warning: cannot read {}: ",
+                project.display()
+            ))
+            .and_then(|rest| rest.split_once("; "))
+            .map(|(_, kept)| kept),
+        Some("2 sessions below it are listed as last indexed\n"),
+        "{stderr}"
+    );
+    assert_eq!(saved(&cache), 2, "the cache keeps them");
+
+    let (rows, stderr) = sessions(&sb, &[]);
+    assert_eq!((rows.len(), stderr.as_str()), (2, ""));
+}
+
 #[test]
 fn index_cache_is_written_and_reused() {
     let Setup {

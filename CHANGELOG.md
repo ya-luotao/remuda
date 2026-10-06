@@ -10,6 +10,22 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Fixed
 
+- A session store, or a directory below one, that exists but could not be read (it could not be
+  listed: permission denied, an I/O error; or it could be listed but not searched, so that
+  nothing in it could be examined) was taken for an empty one: its sessions left `remuda
+  sessions` and History, its tokens left the statistics without a word, the emptied caches were
+  saved, and everything was read again once the directory was back (all of it, for the
+  statistics). Such a directory now says nothing about its transcripts: what the caches hold
+  below it stays as it was last read, the directories that can be read are read as usual, and
+  the result says it is incomplete, naming the directory and the error: a warning on stderr
+  from `remuda sessions`, an `Incomplete:` line after the table from `remuda stats`,
+  `incomplete: …` in the status line of History and Stats. A directory that no longer exists
+  still means its transcripts are gone (SPEC R8, R20).
+- A transcript rewritten in place after it was listed and before it was read, larger and with an
+  mtime earlier than the cached one (a sync restoring an older copy, say), was read on from the
+  cached offset: the index and the statistics kept what the old content had given, and took the
+  file for unchanged from then on. It is now read whole, as R8 says of an mtime that moved
+  backward (SPEC R8, R20).
 - A member whose `projects` is a link to the source's (the layout `remuda setup` creates) had
   claude ask for permission on every auto-memory write: claude grants its memory directory by
   the literal path and then finds the resolved one under the source's `.claude/`, outside the

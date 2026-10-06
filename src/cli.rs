@@ -11,7 +11,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
 use crate::identity::{self, Identity};
-use crate::index::{self, Index};
+use crate::index::{self, Index, RefreshStats};
 use crate::privacy::Aliases;
 use crate::provider::Provider;
 use crate::registry::{self, Account, Registry};
@@ -625,6 +625,36 @@ impl IndexingProgress {
     }
 }
 
+/// More directories that could not be read than this are named up to it, the rest counted.
+const UNREADABLE_NAMED: usize = 5;
+
+/// What to say about the directories `refreshed` could not read (R8, R20), a line each: the
+/// directory, the error, and how many cached files (`session`, `transcript`) below it are
+/// still `shown` as they were. Beyond [`UNREADABLE_NAMED`] directories, one line for the rest.
+fn unreadable_lines(refreshed: &RefreshStats, file: &str, shown: &str) -> Vec<String> {
+    let kept = |n: usize, below: &str| match n {
+        0 => String::new(),
+        1 => format!("; 1 {file} below {below} is {shown}"),
+        n => format!("; {n} {file}s below {below} are {shown}"),
+    };
+    let (named, rest) = match refreshed.unreadable.len() {
+        n if n <= UNREADABLE_NAMED + 1 => (&refreshed.unreadable[..], &[][..]),
+        _ => refreshed.unreadable.split_at(UNREADABLE_NAMED),
+    };
+    let mut lines: Vec<String> = named
+        .iter()
+        .map(|u| format!("{u}{}", kept(u.kept, "it")))
+        .collect();
+    if !rest.is_empty() {
+        lines.push(format!(
+            "cannot read {} more directories{}",
+            rest.len(),
+            kept(rest.iter().map(|u| u.kept).sum(), "them")
+        ));
+    }
+    lines
+}
+
 /// `remuda sessions`: one index refresh (cached in `state/index.json`), live sessions and
 /// attribution, then the newest `limit` sessions (R5, R8, R9).
 fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
@@ -635,10 +665,13 @@ fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
     let stores = index::stores(&accounts, &ctx.env);
     let mut progress = IndexingProgress::new(ctx.stderr_is_tty, "indexing transcripts", "indexed");
     let mut stderr = std::io::stderr();
-    index::refresh(&mut index, &stores, |p| {
+    let refreshed = index::refresh(&mut index, &stores, |p| {
         progress.report(p.done, p.total, &mut stderr)
     });
     progress.finish(index.entries.len(), &mut stderr);
+    for line in unreadable_lines(&refreshed, "session", "listed as last indexed") {
+        eprintln!("remuda: warning: {line}");
+    }
     if let Err(e) = index.save(&cache) {
         eprintln!(
             "remuda: warning: cannot write index cache {}: {e:#}",
@@ -741,6 +774,10 @@ fn stats(
         "{}",
         stats::format(report.table(period), filter.as_deref(), &ctx.tz)
     );
+    // On stdout, with the report: one that is piped must not pass for a complete one (R20).
+    for line in unreadable_lines(&refreshed, "transcript", "counted as last read") {
+        println!("Incomplete: {line}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -922,6 +959,48 @@ mod tests {
             .map(|r| r.iter().map(|c| c.to_string()).collect())
             .collect();
         format_table(&rows)
+    }
+
+    /// R8, R20: each directory that could not be read is named with what is kept below it;
+    /// past a handful, the rest are counted.
+    #[test]
+    fn unreadable_directories_are_named_up_to_a_handful() {
+        let refreshed = |kept: &[usize]| RefreshStats {
+            unreadable: kept
+                .iter()
+                .enumerate()
+                .map(|(i, &kept)| index::Unreadable {
+                    path: format!("/s/p{i}").into(),
+                    error: "denied".into(),
+                    kept,
+                })
+                .collect(),
+            ..RefreshStats::default()
+        };
+        let lines = |kept: &[usize]| unreadable_lines(&refreshed(kept), "session", "listed");
+        assert!(lines(&[]).is_empty());
+        assert_eq!(
+            lines(&[0, 1, 2]),
+            [
+                "cannot read /s/p0: denied",
+                "cannot read /s/p1: denied; 1 session below it is listed",
+                "cannot read /s/p2: denied; 2 sessions below it are listed",
+            ]
+        );
+        assert_eq!(
+            lines(&[0; UNREADABLE_NAMED + 1]).len(),
+            UNREADABLE_NAMED + 1
+        );
+        let many = lines(&[1; UNREADABLE_NAMED + 3]);
+        assert_eq!(many.len(), UNREADABLE_NAMED + 1);
+        assert_eq!(
+            many[UNREADABLE_NAMED],
+            "cannot read 3 more directories; 3 sessions below them are listed"
+        );
+        assert_eq!(
+            lines(&[0; UNREADABLE_NAMED + 2])[UNREADABLE_NAMED],
+            "cannot read 2 more directories"
+        );
     }
 
     #[test]

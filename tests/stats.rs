@@ -5,8 +5,9 @@ mod common;
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use common::rollouts as cx;
 use common::transcripts as cl;
@@ -1075,6 +1076,188 @@ fn vanished_files_stop_counting() {
     let table = f.report().table(Period::All).clone();
     assert_eq!(of(&table.overall, "claude-test"), toks(7, 0, 0, 7, 0));
     assert_eq!(f.report().files, 1);
+}
+
+fn chmod(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// R20, R8 (review #10): a store that exists but cannot be listed is not a store whose
+/// transcripts were deleted. Their counts stay in the cache and in the report as last read,
+/// the refresh names the store, the cache is not rewritten, and nothing is read again once the
+/// store can be listed.
+#[test]
+fn a_store_that_cannot_be_read_keeps_its_counts_and_is_reported() {
+    let mut f = Fixture::new();
+    f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+    f.write(
+        &format!("{S_A}/subagents/agent-1.jsonl"),
+        &cl::assistant_usage(
+            S_A,
+            "msg_sub",
+            "claude-test",
+            cl::usage(7, 7, 0, 0),
+            &cl::ts(5),
+        ),
+    );
+    let counted = toks(10, 300, 100, 47, 0);
+    assert_eq!(of(&f.all().overall, "claude-test"), counted);
+    let saved = f.root.join("remuda/state/stats.json");
+    f.cache.save(&saved).unwrap();
+    let before = f.cache.clone();
+    let store = f.projects();
+
+    chmod(&store, 0o000);
+    let s = f.refresh();
+    chmod(&store, 0o755);
+    assert_eq!(f.cache, before, "nothing is known about the store");
+    assert_eq!(
+        (s.files, s.removed, s.reused, s.cold, s.kept()),
+        (2, 0, 0, 0, 2)
+    );
+    assert_eq!(s.unreadable.len(), 1, "{:?}", s.unreadable);
+    assert_eq!(
+        (s.unreadable[0].path.as_path(), s.unreadable[0].kept),
+        (store.as_path(), 2)
+    );
+    assert!(s.incomplete().is_some_and(|said| {
+        said.starts_with(&format!("incomplete: cannot read {}: ", store.display()))
+    }));
+    let report = f.report();
+    assert_eq!(
+        of(&report.table(Period::All).overall, "claude-test"),
+        counted
+    );
+    assert_eq!(report.files, 2);
+    assert!(
+        !f.cache.save_if_changed(&saved, &s).unwrap(),
+        "what was kept is no change"
+    );
+
+    let s = f.refresh();
+    assert_eq!(
+        (s.reused, s.cold, s.incremental, s.bytes_read),
+        (2, 0, 0, 0),
+        "readable again: nothing is read again"
+    );
+    assert!(s.unreadable.is_empty());
+    assert_eq!(f.cache, before);
+}
+
+/// R20, R8 (review #10): only what is below the directory that cannot be listed is kept: a
+/// transcript deleted beside it stops counting, and so do those of a directory that is gone.
+#[test]
+fn a_session_directory_that_cannot_be_read_keeps_its_counts_alone() {
+    let mut f = Fixture::new();
+    let top = f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+    let sub = f.write(
+        &format!("{S_A}/subagents/agent-1.jsonl"),
+        &cl::assistant_usage(
+            S_A,
+            "msg_sub",
+            "claude-test",
+            cl::usage(7, 7, 0, 0),
+            &cl::ts(5),
+        ),
+    );
+    f.all();
+    let locked = f.projects().join("-w-proj").join(S_A);
+
+    chmod(&locked, 0o000);
+    fs::remove_file(&top).unwrap();
+    let s = f.refresh();
+    chmod(&locked, 0o755);
+    assert_eq!((s.files, s.removed, s.kept()), (1, 1, 1));
+    assert_eq!(s.unreadable.len(), 1, "{:?}", s.unreadable);
+    assert_eq!(s.unreadable[0].path, locked);
+    assert!(f.cache.files.contains_key(&sub) && !f.cache.files.contains_key(&top));
+    let table = f.report().table(Period::All).clone();
+    assert_eq!(of(&table.overall, "claude-test"), toks(7, 0, 0, 7, 0));
+
+    // The directory is gone: its transcripts no longer count.
+    fs::remove_dir_all(&locked).unwrap();
+    let s = f.refresh();
+    assert_eq!((s.files, s.removed), (0, 1));
+    assert!(s.unreadable.is_empty());
+    assert_eq!(f.report().files, 0);
+}
+
+/// R20, R8 (review #10): directories that can be listed but not searched, a claude project and
+/// a codex day directory, give names and nothing else. Their transcripts are not taken for
+/// deleted: the counts stay, each directory is reported, and nothing is read again once they
+/// can be searched.
+#[test]
+fn directories_that_cannot_be_searched_keep_their_counts_and_are_reported() {
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let top = f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+    f.write(
+        &format!("{S_A}/subagents/agent-1.jsonl"),
+        &cl::assistant_usage(
+            S_A,
+            "msg_sub",
+            "claude-test",
+            cl::usage(7, 7, 0, 0),
+            &cl::ts(5),
+        ),
+    );
+    let rollout = cx::write_rollout(&work, R1, &r1_records(cx::ts));
+    f.all();
+    let before = f.cache.clone();
+    let (project, day) = (top.parent().unwrap(), rollout.parent().unwrap());
+
+    chmod(project, 0o444);
+    chmod(day, 0o444);
+    let s = f.refresh();
+    chmod(project, 0o755);
+    chmod(day, 0o755);
+    assert_eq!(f.cache, before);
+    assert_eq!((s.files, s.removed, s.cold, s.kept()), (3, 0, 0, 3));
+    // The project once: not again for the session directory below it, which fails too.
+    let unreadable: Vec<(&Path, usize)> = s
+        .unreadable
+        .iter()
+        .map(|u| (u.path.as_path(), u.kept))
+        .collect();
+    assert_eq!(unreadable, [(project, 2), (day, 1)]);
+
+    let s = f.refresh();
+    assert_eq!(
+        (s.reused, s.cold, s.incremental, s.bytes_read),
+        (3, 0, 0, 0)
+    );
+    assert!(s.unreadable.is_empty());
+}
+
+/// R20, R8: a file rewritten in place between the listing and the read (the same inode,
+/// larger) with an mtime earlier than the cached one is read whole: its counts are replaced,
+/// not added to.
+#[test]
+fn a_file_rewritten_with_an_earlier_mtime_before_it_is_opened_is_read_whole() {
+    let set_mtime = |path: &Path, to| {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(to).unwrap();
+    };
+    let mut f = Fixture::new();
+    let path = f.write(&format!("{S_A}.jsonl"), &msg_a2());
+    assert_eq!(of(&f.all().overall, "claude-test"), toks(1, 200, 0, 5, 0));
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    append(&path, "\n");
+    set_mtime(&path, before + Duration::from_secs(60));
+
+    let sources = f.sources();
+    // The first report comes after the listing and before anything is read.
+    let s = stats::refresh(&mut f.cache, &sources, |done, _| {
+        if done == 0 {
+            fs::write(&path, msg_a1_records().concat()).unwrap();
+            set_mtime(&path, before - Duration::from_secs(60));
+        }
+    });
+    assert_eq!((s.incremental, s.cold), (1, 0), "listed as grown");
+    let table = f.report().table(Period::All).clone();
+    assert_eq!(of(&table.overall, "claude-test"), toks(3, 300, 100, 40, 0));
+    let s = f.refresh();
+    assert_eq!((s.reused, s.bytes_read), (1, 0), "cached as it was opened");
 }
 
 /// The row of `model` in the cache entry of `path`, as the cache stores it.
