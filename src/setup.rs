@@ -7,12 +7,8 @@
 //! `codex login`). The command line and the TUI take the same steps: [`plan`] (with
 //! [`Provider::login_args`]), [`create_and_register`], then the login in the foreground.
 
-use std::ffi::{CStr, CString};
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -20,7 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::home_items::{self, Id, Membership, SetupLink, Source, Unlinked};
 use crate::provider::Provider;
 use crate::registry::{self, Account, Home, Registry};
-use crate::{Env, paths};
+use crate::{Env, owned, paths};
 
 /// The source's settings file: linked only when it holds no authentication (R18).
 const SETTINGS: &str = Id::Settings.name();
@@ -70,7 +66,7 @@ pub struct Note {
 pub fn plan(config: &Path, provider: Provider, name: &str, env: &Env) -> Result<Plan> {
     registry::check_new_name(name)?;
     let root = paths::remuda_home(env)?;
-    let dir = root.join("homes").join(provider.name()).join(name);
+    let dir = root.join(owned::HOMES).join(provider.name()).join(name);
     let home = dir
         .to_str()
         .ok_or_else(|| anyhow!("home path is not valid UTF-8: {}", dir.display()))?
@@ -104,20 +100,16 @@ pub fn plan(config: &Path, provider: Provider, name: &str, env: &Env) -> Result<
     })
 }
 
-/// The directories between `$REMUDA_HOME` and a new home: `homes`, then the provider's.
-fn levels(provider: Provider) -> [&'static str; 2] {
-    ["homes", provider.name()]
-}
-
-/// Why a level of [`levels`] that exists cannot hold a home: only a real directory does.
-fn not_a_directory(path: &Path) -> String {
-    let what = match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => "a symbolic link",
-        _ => "not a directory",
+/// Why a level below `$REMUDA_HOME` cannot hold a home: only a real directory does.
+fn level_error(blocked: owned::Blocked) -> anyhow::Error {
+    let what = match blocked.why {
+        owned::Why::Symlink => "a symbolic link",
+        owned::Why::NotADirectory => "not a directory",
+        owned::Why::Create(_) | owned::Why::Open(_) => return blocked.into(),
     };
-    format!(
+    anyhow!(
         "{} is {what}; remuda creates a home only below real directories of its own",
-        path.display()
+        blocked.path.display()
     )
 }
 
@@ -125,17 +117,7 @@ fn not_a_directory(path: &Path) -> String {
 /// and is not a real directory (R13): through a symlink there, the new home and its links
 /// would land outside `$REMUDA_HOME`. [`create_home`] refuses the same as it opens each level.
 fn check_levels(root: &Path, provider: Provider) -> Result<()> {
-    let mut dir = root.to_path_buf();
-    for level in levels(provider) {
-        dir.push(level);
-        match fs::symlink_metadata(&dir) {
-            Ok(meta) if meta.file_type().is_dir() => {}
-            Ok(_) => bail!(not_a_directory(&dir)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => break,
-            Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", dir.display())),
-        }
-    }
-    Ok(())
+    owned::check_homes(root, provider.name()).map_err(level_error)
 }
 
 /// Creates the planned home, links it to the source's (R18) and registers it; the links that
@@ -327,7 +309,7 @@ pub fn ambiguous<'a>(
 /// descriptor, never through its path again (R13).
 #[derive(Debug)]
 pub struct NewHome {
-    dir: fs::File,
+    dir: owned::Dir,
     /// For messages only.
     path: PathBuf,
 }
@@ -335,106 +317,12 @@ pub struct NewHome {
 impl NewHome {
     /// Whether the directory has no entry, read through the descriptor.
     fn is_empty(&self) -> io::Result<bool> {
-        /// A directory stream, closed when dropped.
-        struct Stream(*mut libc::DIR);
-        impl Drop for Stream {
-            fn drop(&mut self) {
-                // SAFETY: the stream came from a successful `fdopendir` and is closed once.
-                unsafe { libc::closedir(self.0) };
-            }
-        }
-        let copy = self.dir.try_clone()?;
-        // SAFETY: `copy` is an open descriptor; on success the stream owns it.
-        let stream = unsafe { libc::fdopendir(copy.as_raw_fd()) };
-        if stream.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // Closed by `closedir` from here on.
-        let _ = copy.into_raw_fd();
-        let stream = Stream(stream);
-        // The copy shares its position with the descriptor: read from the start.
-        // SAFETY: `stream.0` is a valid directory stream until `stream` is dropped.
-        unsafe { libc::rewinddir(stream.0) };
-        loop {
-            clear_errno();
-            // SAFETY: as above; the entry is read before the next call on the stream.
-            let entry = unsafe { libc::readdir(stream.0) };
-            if entry.is_null() {
-                // The end of the directory leaves errno alone; an error sets it.
-                let error = io::Error::last_os_error();
-                return match error.raw_os_error() {
-                    Some(0) | None => Ok(true),
-                    Some(_) => Err(error),
-                };
-            }
-            // SAFETY: `d_name` of an entry `readdir` returned is NUL-terminated.
-            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name != b"." && name != b".." {
-                return Ok(false);
-            }
-        }
+        self.dir.is_empty()
     }
 
     /// A symlink `name` in the directory pointing at `target`; fails where `name` exists.
     fn link(&self, name: &str, target: &Path) -> io::Result<()> {
-        let (name, target) = (
-            c_string(name.as_bytes())?,
-            c_string(target.as_os_str().as_bytes())?,
-        );
-        // SAFETY: two NUL-terminated strings and an open directory descriptor.
-        match unsafe { libc::symlinkat(target.as_ptr(), self.dir.as_raw_fd(), name.as_ptr()) } {
-            0 => Ok(()),
-            _ => Err(io::Error::last_os_error()),
-        }
-    }
-}
-
-/// Sets errno to 0, so that a null `readdir` can be told apart: end of directory or error.
-fn clear_errno() {
-    // SAFETY: the errno location is valid for the calling thread.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    unsafe {
-        *libc::__errno_location() = 0;
-    }
-    // SAFETY: as above.
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    unsafe {
-        *libc::__error() = 0;
-    }
-}
-
-fn c_string(bytes: &[u8]) -> io::Result<CString> {
-    CString::new(bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in a path"))
-}
-
-/// Opens a directory: `name` in the directory `parent`, never through a symlink, or the path
-/// `name` itself (symlinks followed) without a parent.
-fn open_dir(parent: Option<&OwnedFd>, name: &[u8]) -> io::Result<OwnedFd> {
-    let name = c_string(name)?;
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    // SAFETY: a NUL-terminated string and, with a parent, an open directory descriptor.
-    let fd = unsafe {
-        match parent {
-            Some(parent) => {
-                libc::openat(parent.as_raw_fd(), name.as_ptr(), flags | libc::O_NOFOLLOW)
-            }
-            None => libc::open(name.as_ptr(), flags),
-        }
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` was just opened and is owned by nothing else.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// A directory `name` in `parent` with `mode` (before the umask); fails where `name` exists.
-fn make_dir(parent: &OwnedFd, name: &str, mode: libc::mode_t) -> io::Result<()> {
-    let name = c_string(name.as_bytes())?;
-    // SAFETY: a NUL-terminated string and an open directory descriptor.
-    match unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), mode) } {
-        0 => Ok(()),
-        _ => Err(io::Error::last_os_error()),
+        self.dir.link(name, target)
     }
 }
 
@@ -444,49 +332,15 @@ fn make_dir(parent: &OwnedFd, name: &str, mode: libc::mode_t) -> io::Result<()> 
 /// is missing: a `homes` or `homes/<provider>` that is a symlink or not a directory is an
 /// error, and nothing is made beyond it. The home itself must not exist.
 pub fn create_home(root: &Path, provider: Provider, name: &str) -> Result<NewHome> {
-    fs::create_dir_all(root).with_context(|| format!("cannot create {}", root.display()))?;
-    let mut dir = open_dir(None, root.as_os_str().as_bytes())
-        .with_context(|| format!("cannot open {}", root.display()))?;
-    let mut path = root.to_path_buf();
-    for level in levels(provider) {
-        path.push(level);
-        dir = match open_dir(Some(&dir), level.as_bytes()) {
-            Ok(next) => next,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // Another remuda may have made it meanwhile: opened all the same.
-                if let Err(e) = make_dir(&dir, level, 0o777)
-                    && e.kind() != io::ErrorKind::AlreadyExists
-                {
-                    return Err(e).with_context(|| format!("cannot create {}", path.display()));
-                }
-                open_dir(Some(&dir), level.as_bytes()).map_err(|e| level_error(e, &path))?
-            }
-            Err(e) => return Err(level_error(e, &path)),
-        };
-    }
-    path.push(name);
-    make_dir(&dir, name, 0o700).with_context(|| format!("cannot create {}", path.display()))?;
-    let home = open_dir(Some(&dir), name.as_bytes())
-        .with_context(|| format!("cannot open {}", path.display()))?;
-    let home = fs::File::from(home);
-    // The umask may have removed bits; set the mode explicitly.
-    home.set_permissions(fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("cannot set permissions on {}", path.display()))?;
-    Ok(NewHome { dir: home, path })
-}
-
-/// Why the level at `path` could not be opened. The reason is read from what is there, not
-/// from the errno, which differs between systems for a symlink.
-fn level_error(error: io::Error, path: &Path) -> anyhow::Error {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if !meta.file_type().is_dir() => anyhow!(not_a_directory(path)),
-        _ => anyhow::Error::new(error).context(format!("cannot open {}", path.display())),
-    }
+    let homes = owned::homes(root, provider.name()).map_err(level_error)?;
+    let dir = homes.create_private(name)?;
+    let path = dir.path().to_path_buf();
+    Ok(NewHome { dir, path })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::*;
     use crate::registry::CLAUDE;

@@ -14,6 +14,7 @@ pub mod index;
 pub mod jev;
 pub mod launch;
 pub mod live;
+pub mod owned;
 pub mod paths;
 pub mod pick;
 pub mod pricing;
