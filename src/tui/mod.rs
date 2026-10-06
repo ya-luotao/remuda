@@ -4,13 +4,15 @@
 //!
 //! [`app`] holds the state and the pure `update`; [`render`] draws it; this module owns the
 //! terminal and the event loop (including foreground launches, which suspend the TUI), and
-//! [`workers`] run the slow parts in the background.
+//! [`workers`] run the slow parts in the background; [`work`] keeps count of them (what is
+//! out, what runs again, which answer is still wanted).
 
 pub mod app;
 pub mod privacy;
 pub mod render;
 pub mod search;
 pub mod timeline;
+pub mod work;
 pub mod workers;
 
 #[cfg(test)]

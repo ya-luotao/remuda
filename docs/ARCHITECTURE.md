@@ -62,7 +62,7 @@ Modules are layered: each layer uses the layers below it.
 
 ```text
  ┌─ entry ───────────────────────────────────────────────────────────────────┐
- │  main ──► cli                        tui ─ app · workers · render ·       │
+ │  main ──► cli                        tui ─ app · work · workers · render  │
  │                                            privacy · timeline · search    │
  ├─ features ────────────────────────────────────────────────────────────────┤
  │  launch · share · setup               accounts: identity · usage · live · │
@@ -115,6 +115,7 @@ The exceptions, all for a type or a small helper:
 | `text` | Terminal text measured in display columns | – |
 | `tui` | Terminal ownership, the event loop, foreground launches | R16 |
 | `tui::app` | All TUI state and the pure `update(app, event) -> effects` | R8, R16, R17, R20–R22 |
+| `tui::work` | The slot of one kind of background work: whether a round is out, whether it runs once more, whether a result is the one still wanted | R7, R16, R22 |
 | `tui::workers` | Runs each background effect on a thread and sends back events | R7–R11, R20, R22 |
 | `tui::render` | Draws the state; views, overlays, key reference | – |
 | `tui::privacy` | Private mode: the redacted copy of the state that is drawn; aliases from `privacy` | R21 |
@@ -242,9 +243,18 @@ an `Event`.
 
 - Keys are read on the loop's own thread. While a launched agent has the terminal, that thread is
   waiting for it, so nothing else reads the agent's input.
+- Every kind of background work has a `work::Slot` in the state (one per account for
+  identities and usage). `update` asks the slot before it starts anything, and the slot says
+  whether an effect goes out: work that is already out for the same target is not started
+  twice (a held key starts one thread), and work asked for again because what it reads may have
+  changed (a launch ended, the account list changed, the user asks for the configuration or
+  the logs again) runs once more when the round that is out reports.
 - Results that can arrive late are matched by what they carry, never by position: the account
-  they belong to (identities, usage), or the number of the request they answer (the
-  Configuration pane, pre-launch checks), so an answer to an outdated request is ignored.
+  they belong to (identities, usage), the transcript or the account's session they are for
+  (preview, logs), or
+  the number the slot gave their round (the Configuration pane, pre-launch checks), so an answer
+  to an outdated or cancelled request is ignored. Work without a target has one round out at
+  most, so its result needs no number.
 - A launch that resumes a session in place is preceded by `CheckLaunch`, which queries every
   account's running sessions again right before starting (R16).
 - In private mode, `render` does not draw `App` itself but `privacy::redacted(app)`, a copy in
@@ -380,6 +390,7 @@ cargo run --release --example codex_timing -- [<codex home>]
 | Support another agent CLI | SPEC R4, `provider` (every `match Provider`), `index`, `usage`, `identity` |
 | Read a new field from transcripts | `transcript` (index) or `stats` (counts); bump the cache's `SCHEMA_VERSION` |
 | Add a TUI action | `tui::app` (`Key` → `Effect`), `tui::workers` (the effect), `tui::render`, `tui::privacy` |
+| Add background work to the TUI | a `work::Slot` in the `tui::app` state (asked before the `Effect` goes out, told when the `Event` comes back), the effect in `tui::workers`, the slot's case in `tui::privacy::redacted` |
 | Add something shown on screen | `tui::app` state, `tui::render`, and its case in `tui::privacy::redacted`; a path in a notice goes in with `Marked::path` |
 | Add a model price | SPEC R20 table and `pricing` |
 | Change what `remuda pick` sends to Jev | SPEC R23, `jev::request` and `jev::state_text`; the privacy test in `tests/pick_cli.rs` |

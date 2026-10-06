@@ -10,6 +10,21 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Fixed
 
+- TUI: a held key no longer starts a thread or an agent command for every repeat. `Enter` or
+  `f` on a session checks that launch once (each check runs `claude agents --json` for every
+  account): the check already running is the one waited for, and a check that was cancelled
+  (Esc, an overlay, a foreground launch) still starts nothing when it answers (SPEC R16). `l`
+  runs one `claude logs` at a time, and `r` and `p` one read of the account's configuration:
+  asked again while one is out, they are read once more when it answers, so what changed
+  meanwhile is still shown (SPEC R22).
+- TUI: the logs of a background session could be shown for a session of another account with
+  the same short id, when the first answer arrived after the selection had moved. An answer
+  now goes to its own account's session only (SPEC R7).
+- TUI: when the account list changed (a setup, a removal) while the checks of the accounts view
+  were running, the checks found for the old list stayed on screen as current. They now run
+  again for the new list, and only those are shown (SPEC R11). Identities and cached usage are
+  asked per account: `r` asks again the accounts that have answered while a slow one is still
+  out, and no account is asked twice at once.
 - A member whose `projects` is a link to the source's (the layout `remuda setup` creates) had
   claude ask for permission on every auto-memory write: claude grants its memory directory by
   the literal path and then finds the resolved one under the source's `.claude/`, outside the
