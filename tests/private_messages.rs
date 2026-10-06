@@ -12,6 +12,7 @@ use common::Sandbox;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use remuda::account_config::{self, ConfigView};
+use remuda::privacy::Piece;
 use remuda::registry::{Account, CLAUDE, Home, Sharing};
 use remuda::tui::app::{App, Event, Key, update};
 use remuda::tui::{privacy, render};
@@ -95,7 +96,7 @@ impl Homes {
         for key in [Key::Char('p'), Key::Char('p')] {
             update(&mut app, Event::Key(key));
         }
-        let request = app.config.request;
+        let request = app.config.work.round();
         update(
             &mut app,
             Event::Config {
@@ -318,6 +319,143 @@ fn checks_keep_what_they_say_around_their_paths_in_private_mode() {
         "! account-1: not sharing sessions with claude:default: it does not see the sessions in \
          ~/•••/••• and cannot resume them; link projects to share them",
         "(~/•••/•••/••• -> ~/•••/•••)",
+    ] {
+        assert!(private.contains(said), "{said}:\n{private}");
+    }
+    leaks_nothing(&private);
+}
+
+/// R11, R18, R21: the checks whose words come from the catalog of a home's items (what a
+/// member loses without a link, what breaks when an item is another account's), from the
+/// files to the screen. Each end of the link to make is a path of its own, a settings key read
+/// from the source's file is a piece of its own, and everything the catalog says stays
+/// readable in private mode: `/rewind` among it.
+#[test]
+fn checks_worded_by_the_item_catalog_keep_their_words_in_private_mode() {
+    use std::os::unix::fs::symlink;
+
+    let h = Homes::new();
+    let source = h.source_home();
+    let member = h.member_home();
+    // The source: file backups, agent memory, two instruction items, and settings that choose
+    // a memory directory and hold an authentication key.
+    fs::create_dir_all(source.join("file-history")).unwrap();
+    fs::create_dir_all(source.join("agent-memory")).unwrap();
+    fs::create_dir_all(source.join("skills")).unwrap();
+    write(&source.join("CLAUDE.md"), "x");
+    write(
+        &source.join("settings.json"),
+        r#"{"autoMemoryDirectory": "m", "apiKeyHelper": "/zq/key", "env": {"ANTHROPIC_AUTH_TOKEN": "t"}}"#,
+    );
+    // The first member links nothing and keeps a history of its own.
+    write(&member.join("history.jsonl"), "");
+    // The second links `projects`, one instruction item of two and the settings file, and
+    // its history is the first member's.
+    let other_home = h.home.join("zq homes (old)").join("zqother (b), z");
+    fs::create_dir_all(&other_home).unwrap();
+    symlink(source.join("projects"), other_home.join("projects")).unwrap();
+    symlink(source.join("CLAUDE.md"), other_home.join("CLAUDE.md")).unwrap();
+    symlink(
+        source.join("settings.json"),
+        other_home.join("settings.json"),
+    )
+    .unwrap();
+    symlink(
+        member.join("history.jsonl"),
+        other_home.join("history.jsonl"),
+    )
+    .unwrap();
+    let mut accounts = h.accounts();
+    accounts.push(Account {
+        provider: CLAUDE,
+        name: "zqother".into(),
+        home: Home::Path(other_home.display().to_string()),
+    });
+
+    let found = checks::sharing(&accounts, &h.env, &h.sharing);
+    let mut app = h.app(accounts);
+    update(&mut app, Event::Checks(found.clone()));
+    let open = screen(&app);
+    assert!(open.contains("zqother (b), z/file-history"), "{open}");
+    app.private = true;
+    let copy = privacy::redacted(&app);
+    let masked: Vec<(String, String)> = copy
+        .checks
+        .iter()
+        .flatten()
+        .map(|c| (c.account.clone().unwrap_or_default(), c.message.to_string()))
+        .collect();
+    let said = |account: &str, message: &str| (account.to_string(), message.to_string());
+    assert_eq!(
+        masked,
+        [
+            said(
+                "claude:account-1",
+                "not sharing sessions with claude:default: it does not see the sessions in \
+                 ~/•••/••• and cannot resume them; link projects to share them (~/•••/•••/••• -> \
+                 ~/•••/•••)"
+            ),
+            said(
+                "claude:account-2",
+                "shares CLAUDE.md with claude:default through symlinks but not skills: the \
+                 shared ones load twice (with the injected --add-dir); link the others too, or \
+                 none"
+            ),
+            said(
+                "claude:account-2",
+                "history.jsonl is a symlink to that of claude:account-1: sessions in a shared \
+                 store lose their attribution; each account needs its own"
+            ),
+            said(
+                "claude:account-2",
+                "shares projects with claude:default through a symlink but not file-history: \
+                 /rewind does not find the file backups of a session resumed from another \
+                 account; link it too (~/•••/•••/••• -> ~/•••/•••)"
+            ),
+            said(
+                "claude:account-2",
+                "shares projects with claude:default through a symlink but not agent-memory, \
+                 and a settings file chooses autoMemoryDirectory, so a launch does not redirect \
+                 memory: the memory of user-scope subagents is not shared with this account; \
+                 link it too (~/•••/•••/••• -> ~/•••/•••)"
+            ),
+            said(
+                "claude:account-2",
+                "settings.json is that of claude:default through a symlink, and it sets \
+                 authentication settings (apiKeyHelper, env.ANTHROPIC_AUTH_TOKEN): this account \
+                 reads them through the link; remove the link (the rest is then injected at \
+                 launch), or move them out of that settings.json"
+            ),
+            said(
+                "claude:default",
+                "settings keys withheld from the accounts that get settings at launch \
+                 (authentication is never injected): apiKeyHelper, env.ANTHROPIC_AUTH_TOKEN"
+            ),
+        ]
+    );
+    // With private mode off each of them names its paths: nothing was masked for want of one.
+    let paths = |check: &checks::Check| {
+        check
+            .message
+            .pieces()
+            .filter(|(_, kind)| *kind == Piece::Path)
+            .count()
+    };
+    assert_eq!(
+        found.iter().map(paths).collect::<Vec<_>>(),
+        [3, 0, 0, 2, 2, 0, 0]
+    );
+    // On screen (the long ones are wrapped at this width).
+    let private = screen(&app);
+    for said in [
+        "/rewind does not find the file backups of a session resumed from",
+        "another account; link it too (~/•••/•••/••• -> ~/•••/•••)",
+        "the memory of user-scope subagents is not shared with this account; link it too \
+         (~/•••/•••/••• -> ~/•••/•••)",
+        "! account-2: history.jsonl is a symlink to that of claude:account-1: sessions in a \
+         shared store lose their attribution; each account needs its own",
+        "reads them through the link; remove the link (the rest is then injected at launch), \
+         or move them out of that settings.json",
     ] {
         assert!(private.contains(said), "{said}:\n{private}");
     }

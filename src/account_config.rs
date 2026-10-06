@@ -13,6 +13,7 @@ use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 use crate::Env;
+use crate::home_items::{self, Id, Membership};
 use crate::privacy::Marked;
 use crate::registry::{Account, Sharing};
 use crate::share::{self, Installs, MEMORY_KEY, Plan, Skip};
@@ -281,8 +282,9 @@ fn hook_counts(hooks: Option<&Value>) -> Vec<(String, usize)> {
 /// (R22): the launch's own [`share::plan`], plus what the account's and the source's files
 /// list. Everything that cannot be read is a problem in the view, never an error.
 pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env) -> ConfigView {
+    let membership = home_items::membership(sharing, account, env);
     let mut view = ConfigView {
-        role: role(account, sharing, env),
+        role: role(&membership),
         ..ConfigView::default()
     };
     let Some(home) = account.home_dir(env) else {
@@ -315,7 +317,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
     let from = plan.source.as_ref().map(|(_, from)| from.clone());
 
     // Own settings.
-    let own_path = home.join("settings.json");
+    let own_path = Id::Settings.at(&home);
     let own = if is_file(&own_path) {
         match share::read_settings(&own_path) {
             Ok(own) => own,
@@ -331,7 +333,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
     } else {
         Map::new()
     };
-    view.settings_origin = if plan.settings_shared {
+    view.settings_origin = if plan.items.linked(Id::Settings) {
         Origin::AlreadySource
     } else {
         Origin::Own
@@ -343,17 +345,9 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
 
     // The source's authentication: withheld from what is injected, read by a home that links
     // the file.
-    view.withheld = match &view.role {
-        Role::Member { .. } => sharing
-            .source
-            .as_ref()
-            .and_then(|s| s.home_dir(env))
-            .map(|from| from.join("settings.json"))
-            .filter(|p| is_file(p))
-            .and_then(|p| share::read_settings(&p).ok())
-            .map(|settings| share::withheld(&settings))
-            .unwrap_or_default(),
-        Role::Source => share::withheld(&own),
+    view.withheld = match &membership {
+        Membership::Member { home, .. } => home.withheld(),
+        Membership::Source => share::withheld(&own),
         _ => Vec::new(),
     };
 
@@ -386,34 +380,31 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
     });
 
     // Instructions: the home's, then the source's that `--add-dir` injects.
-    for name in share::items() {
-        let origin = if plan.instructions.shared.contains(&name) {
+    for item in home_items::instruction_items() {
+        let origin = if plan.items.linked(item.id) {
             Origin::AlreadySource
         } else {
             Origin::Own
         };
-        if let Some(item) = instruction(&home, name, origin) {
+        if let Some(item) = instruction(&home, item.id, origin) {
             view.instructions.push(item);
         }
     }
     if let Some(from) = &from
-        && plan.instructions.needs_injection()
+        && plan.items.instructions().needs_injection()
     {
-        for name in share::items() {
+        for item in home_items::instruction_items() {
             // As a launch counts them: rules only when there is one.
-            let has = if name == share::RULES {
-                !share::rule_files(&from.join(name)).is_empty()
-            } else {
-                from.join(name).exists()
-            };
-            if has && let Some(item) = instruction(from, name, Origin::Shared) {
+            if plan.items.source_has(item.id)
+                && let Some(item) = instruction(from, item.id, Origin::Shared)
+            {
                 view.instructions.push(item);
             }
         }
     }
 
     // Synced claude.ai skills.
-    let synced = home.join("skills").join("synced");
+    let synced = Id::Skills.at(&home).join("synced");
     if synced.is_dir() {
         let buckets = subdirs(&synced);
         view.synced = match &bucket {
@@ -453,12 +444,12 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
     for name in share::enabled_plugins(&own) {
         let install = installs.effective(&name, project.start.as_deref());
         let path = install.and_then(|i| i.path.clone());
-        let already = plan.plugins_shared
+        let already = plan.items.linked(Id::Plugins)
             || path.as_deref().is_some_and(|own_path| {
                 source_installs
                     .user_install(&name)
                     .and_then(|i| i.path.as_deref())
-                    .is_some_and(|src| share::resolves_to(own_path, src))
+                    .is_some_and(|src| home_items::resolves_to(own_path, src))
             });
         view.plugins.push(Plugin {
             origin: if already {
@@ -537,13 +528,13 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
     } else if let Some(dir) = layers.iter().rev().find_map(memory_of) {
         (Some(dir), Origin::Project)
     } else if let Some(dir) = memory_of(&own) {
-        let origin = if plan.settings_shared {
+        let origin = if plan.items.linked(Id::Settings) {
             Origin::AlreadySource
         } else {
             Origin::Own
         };
         (Some(dir), origin)
-    } else if plan.memory_shared {
+    } else if plan.items.linked(Id::Projects) {
         // Through a linked `projects`, a launch names the directory by the source's path
         // (R18); the home's path resolves to it.
         let dir = match (&plan.agent_memory, &plan.source) {
@@ -566,11 +557,13 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         .get(share::MEMORY_DIR_VAR)
         .filter(|_| !plan.inherited_memory_dir);
     let (dir, origin) = match (&plan.agent_memory, users) {
-        (None, Some(dir)) => (Path::new(dir).join(share::AGENT_MEMORY), Origin::Own),
+        (None, Some(dir)) => (Id::AgentMemory.at(Path::new(dir)), Origin::Own),
         // Linked: already the source's, whether or not a launch sets the variable too.
-        _ if plan.agent_memory_shared => (home.join(share::AGENT_MEMORY), Origin::AlreadySource),
-        (Some(from), _) => (from.join(share::AGENT_MEMORY), Origin::Shared),
-        (None, None) => (home.join(share::AGENT_MEMORY), Origin::Own),
+        _ if plan.items.linked(Id::AgentMemory) => {
+            (Id::AgentMemory.at(&home), Origin::AlreadySource)
+        }
+        (Some(from), _) => (Id::AgentMemory.at(from), Origin::Shared),
+        (None, None) => (Id::AgentMemory.at(&home), Origin::Own),
     };
     view.agent_memory = Memory {
         files: dir.is_dir().then(|| subdirs(&dir)),
@@ -580,20 +573,19 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
     view
 }
 
-fn role(account: &Account, sharing: &Sharing, env: &Env) -> Role {
-    let Some(source) = &sharing.source else {
-        return Role::Alone;
-    };
-    let qualified = account.qualified();
-    let name = source.qualified();
-    if name == qualified {
-        Role::Source
-    } else if sharing.opted_out.contains(&qualified) {
-        Role::OptedOut { source: name }
-    } else if source.home_dir(env).is_some_and(|h| h.is_dir()) {
-        Role::Member { source: name }
-    } else {
-        Role::SourceMissing { source: name }
+fn role(membership: &Membership) -> Role {
+    match membership {
+        Membership::Alone => Role::Alone,
+        Membership::Source => Role::Source,
+        Membership::OptedOut { source } => Role::OptedOut {
+            source: source.clone(),
+        },
+        Membership::SourceMissing { source } => Role::SourceMissing {
+            source: source.clone(),
+        },
+        Membership::Member { source, .. } => Role::Member {
+            source: source.clone(),
+        },
     }
 }
 
@@ -607,7 +599,7 @@ fn mark_overrides(view: &mut ConfigView, overrides: &BTreeMap<String, Value>) {
         known.extend(names);
     };
     for item in &mut view.instructions {
-        if item.name != "skills" {
+        if item.name != Id::Skills.name() {
             continue;
         }
         if let Content::Entries(entries) = &mut item.content {
@@ -646,8 +638,9 @@ fn mark_overrides(view: &mut ConfigView, overrides: &BTreeMap<String, Value>) {
 
 /// One instruction item of `home`, or `None` when there is none (or it is neither a file nor
 /// a directory as expected).
-fn instruction(home: &Path, name: &'static str, origin: Origin) -> Option<Item> {
-    let path = home.join(name);
+fn instruction(home: &Path, id: Id, origin: Origin) -> Option<Item> {
+    let name = id.name();
+    let path = id.at(home);
     let link = link_of(&path);
     let meta = match fs::metadata(&path) {
         Ok(meta) => meta,
@@ -661,15 +654,15 @@ fn instruction(home: &Path, name: &'static str, origin: Origin) -> Option<Item> 
         }
         Err(_) => return None,
     };
-    let content = match name {
-        "CLAUDE.md" => {
+    let content = match id {
+        Id::ClaudeMd => {
             let (bytes, lines) = file_stats(&path)?;
             Content::File { bytes, lines }
         }
         _ if !meta.is_dir() => return None,
-        "agents" => Content::Entries(list_agents(&path)),
-        "skills" => Content::Entries(list_skills(&path)),
-        "rules" => Content::Entries(list_rules(&path)),
+        Id::Agents => Content::Entries(list_agents(&path)),
+        Id::Skills => Content::Entries(list_skills(&path)),
+        Id::Rules => Content::Entries(list_rules(&path)),
         _ => Content::Entries(list_commands(&path)),
     };
     Some(Item {
@@ -1292,6 +1285,7 @@ mod tests {
     use super::*;
     use crate::privacy::Piece;
     use crate::registry::{CLAUDE, Home};
+    use crate::test_homes::Root;
 
     /// [`super::read`], with its problems checked (R21): remuda's own words in them hold no
     /// path, so one formatted into the words of any problem fails the test that produces it.
@@ -1328,27 +1322,6 @@ mod tests {
     const ORG: &str = "00000000-0000-4000-8000-00000000000a";
     const ACCT: &str = "00000000-0000-4000-8000-00000000000b";
     const OTHER: &str = "00000000-0000-4000-8000-00000000000c_00000000-0000-4000-8000-00000000000d";
-
-    struct Fx {
-        _dir: tempfile::TempDir,
-        root: PathBuf,
-        env: Env,
-        config: PathBuf,
-    }
-
-    fn fx() -> Fx {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        fs::create_dir_all(root.join("home")).unwrap();
-        let env: Env = [("HOME".to_string(), root.join("home").display().to_string())].into();
-        let config = root.join("remuda/config.toml");
-        Fx {
-            _dir: dir,
-            root,
-            env,
-            config,
-        }
-    }
 
     fn named(name: &str, home: &Path) -> Account {
         Account {
@@ -1453,7 +1426,7 @@ mod tests {
     /// through symlinks, broken ones marked, `synced` never one), commands by path.
     #[test]
     fn instructions_are_listed_with_their_frontmatter() {
-        let f = fx();
+        let f = Root::new();
         let home = f.root.join("max");
         write(
             &home.join("agents/reviewer.md"),
@@ -1529,7 +1502,7 @@ mod tests {
     /// bucket names are never kept.
     #[test]
     fn synced_skills_are_the_accounts_own_bucket() {
-        let f = fx();
+        let f = Root::new();
         let home = f.root.join("max");
         let bucket = format!("{ORG}_{ACCT}");
         write(
@@ -1571,7 +1544,7 @@ mod tests {
     /// `<plugin>:<skill>`; an override naming no skill is stale.
     #[test]
     fn skill_overrides_mark_off_and_stale() {
-        let f = fx();
+        let f = Root::new();
         let home = f.root.join("max");
         write(&home.join("skills/pdf/SKILL.md"), "");
         write(&home.join("skills/docx/SKILL.md"), "");
@@ -1617,7 +1590,7 @@ mod tests {
     /// symlinked skills are already the source's.
     #[test]
     fn a_member_sees_what_is_shared_and_from_where() {
-        let f = fx();
+        let f = Root::new();
         let (src, max, work) = (f.root.join("src"), f.root.join("max"), f.root.join("work"));
         fs::create_dir_all(&work).unwrap();
         write(&src.join("CLAUDE.md"), "be brief\n");
@@ -1679,7 +1652,7 @@ mod tests {
     /// the memory of user-scope subagents is the source's where a launch redirects it.
     #[test]
     fn rules_and_agent_memory_are_shown() {
-        let f = fx();
+        let f = Root::new();
         let (src, max, work) = (f.root.join("src"), f.root.join("max"), f.root.join("work"));
         fs::create_dir_all(&work).unwrap();
         write(&src.join("rules/style.md"), "be terse\n");
@@ -1737,7 +1710,7 @@ mod tests {
     /// specific), its version, scope and number of records; what it adds; `false` ones counted.
     #[test]
     fn plugins_are_deduplicated_to_the_effective_install() {
-        let f = fx();
+        let f = Root::new();
         let (home, work, other) = (f.root.join("max"), f.root.join("work"), f.root.join("o"));
         fs::create_dir_all(&work).unwrap();
         fs::create_dir_all(&other).unwrap();
@@ -1820,7 +1793,7 @@ mod tests {
     /// and MCP servers, inline or by a file; anything else there names none.
     #[test]
     fn plugin_manifests_name_hooks_and_servers() {
-        let f = fx();
+        let f = Root::new();
         let root = f.root.join("plugin");
         write(
             &root.join(".claude-plugin/plugin.json"),
@@ -1882,7 +1855,7 @@ mod tests {
     /// to the source's user install is already the source's, and is listed once.
     #[test]
     fn an_own_install_resolving_to_the_sources_is_already_the_sources() {
-        let f = fx();
+        let f = Root::new();
         let (src, max) = (f.root.join("src"), f.root.join("max"));
         let q = src.join("plugins/cache/q");
         fs::create_dir_all(&q).unwrap();
@@ -1922,7 +1895,7 @@ mod tests {
     /// for it, with the origin that says they are not withheld there.
     #[test]
     fn a_member_that_links_settings_reads_the_sources_authentication() {
-        let f = fx();
+        let f = Root::new();
         let (src, max) = (f.root.join("src"), f.root.join("max"));
         write(
             &src.join("settings.json"),
@@ -1948,7 +1921,7 @@ mod tests {
     /// a member of a missing source get nothing shared.
     #[test]
     fn roles() {
-        let f = fx();
+        let f = Root::new();
         let (src, max) = (f.root.join("src"), f.root.join("max"));
         write(&src.join("CLAUDE.md"), "x");
         write(
@@ -1996,7 +1969,7 @@ mod tests {
     /// the project root; the native login's `.claude.json` is `$HOME/.claude.json`.
     #[test]
     fn mcp_names_only() {
-        let f = fx();
+        let f = Root::new();
         let max = f.root.join("max");
         let repo = f.root.join("repo");
         fs::create_dir_all(repo.join(".git")).unwrap();
@@ -2049,7 +2022,7 @@ mod tests {
     /// is shown as shared.
     #[test]
     fn settings_problems_are_shown() {
-        let f = fx();
+        let f = Root::new();
         let (src, max) = (f.root.join("src"), f.root.join("max"));
         write(&src.join("CLAUDE.md"), "x");
         write(&src.join("settings.json"), "[]");
@@ -2092,7 +2065,7 @@ mod tests {
     /// first path on, and what remuda says around them stays readable.
     #[test]
     fn problems_mark_their_paths_and_the_errors_from_elsewhere() {
-        let f = fx();
+        let f = Root::new();
         // A home that does not exist.
         let gone = f.root.join("gone, (old)");
         let view = read(&named("gone", &gone), &Sharing::default(), None, &f.env);
@@ -2213,7 +2186,7 @@ mod tests {
     /// the settings keys and the auto-memory directory of the `--settings` file.
     #[test]
     fn the_pane_agrees_with_inject() {
-        let f = fx();
+        let f = Root::new();
         let (src, max, work) = (f.root.join("src"), f.root.join("max"), f.root.join("work"));
         fs::create_dir_all(&work).unwrap();
         write(&src.join("CLAUDE.md"), "x");
@@ -2318,7 +2291,7 @@ mod tests {
     /// never opens credentials: a FIFO there, or in place of an agent, would block forever.
     #[test]
     fn reading_writes_nothing_and_never_opens_credentials() {
-        let f = fx();
+        let f = Root::new();
         let (src, max, work) = (f.root.join("src"), f.root.join("max"), f.root.join("work"));
         fs::create_dir_all(&work).unwrap();
         write(&src.join("CLAUDE.md"), "x");

@@ -1,8 +1,7 @@
 //! Launching an agent for an account (SPEC R2, R6, R17, R18).
 
-use std::fs;
-use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -10,10 +9,11 @@ use std::process::{Command, ExitStatus};
 use anyhow::{Result, bail};
 use serde::Serialize;
 
-use crate::Env;
+use crate::interrupt;
 use crate::provider::Provider;
-use crate::registry::{self, Account, Home, Sharing};
+use crate::registry::{Account, Home, Sharing};
 use crate::share::{self, Injected, Shared};
+use crate::{Env, owned};
 
 pub const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
 pub const SECURESTORAGE_VAR: &str = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
@@ -370,63 +370,12 @@ pub fn prepare_with(
     })
 }
 
-/// Appends one JSON line to the launch log. The log holds the arguments as typed, prompts among
-/// them, so it is the user's alone (R3): its directory is made or tightened by
-/// [`registry::private_dir`], the log is created with mode 0600, and one from before is
-/// tightened to that. A log that is a symlink is written through, and the file it points at
-/// keeps its mode. Nothing is appended to a log that is not a regular file, or that the group
-/// or others can still access after that ([`refuse_shared`]): that is an error, like a log that
-/// cannot be written. The log is opened without blocking, so a FIFO in its place fails or is
-/// refused instead of holding up the launch.
-///
-/// The directory is tightened as far as it can be and is not checked again: its mode does
-/// not give away what is in a file of mode 0600.
+/// Appends one JSON line to the launch log, the user's alone (R3): what may be appended to,
+/// and how, is [`owned::append_log`]'s.
 pub fn append_log(log: &Path, record: &LaunchRecord) -> Result<()> {
-    if let Some(dir) = log.parent() {
-        registry::private_dir(dir)?;
-    }
     let mut line = serde_json::to_string(record)?;
     line.push('\n');
-    // One write on an O_APPEND file: concurrent launches do not interleave lines.
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(log)?;
-    // Tightened only as the regular file at `log` itself, which the open file is checked to be.
-    if let (Ok(at), Ok(open)) = (fs::symlink_metadata(log), file.metadata())
-        && at.file_type().is_file()
-        && (at.dev(), at.ino()) == (open.dev(), open.ino())
-    {
-        registry::tighten(&file, 0o600);
-    }
-    refuse_shared(&file, log)?;
-    file.write_all(line.as_bytes())?;
-    Ok(())
-}
-
-/// Fails when the open launch log is not a regular file (a FIFO, a socket or a device would
-/// pass the line to whoever reads it), or is one the group or others have any access to: one
-/// that could not be tightened (it belongs to another user), or the target of a symlink, which
-/// keeps its mode (R3). Read from the open file, so it is the file the line would go to.
-fn refuse_shared(file: &fs::File, log: &Path) -> Result<()> {
-    let meta = file.metadata()?;
-    if !meta.file_type().is_file() {
-        bail!(
-            "{} is not a regular file; nothing was appended",
-            log.display()
-        );
-    }
-    let mode = meta.mode() & 0o7777;
-    if mode & 0o077 != 0 {
-        bail!(
-            "{} can be accessed by the group or others (mode {mode:04o}) and was not made \
-             private; nothing was appended",
-            log.display()
-        );
-    }
-    Ok(())
+    owned::append_log(log, &line)
 }
 
 /// Finds an executable `program` in a `PATH`-style list (empty entries mean the cwd).
@@ -474,9 +423,9 @@ fn command(program: &Path, args: &[String], change: &EnvChange, cwd: Option<&Pat
 /// Runs `program args...` in the foreground (inherited stdio) under the inherited
 /// environment plus `change`, in `cwd` (`None`: remuda's own), and waits for it.
 ///
-/// Like `system(3)`: while the child runs, remuda ignores SIGINT and SIGQUIT (Ctrl-C and
-/// Ctrl-\ go to the whole foreground process group), and the child gets their default
-/// actions back.
+/// Like `system(3)`: while the child runs, remuda sits SIGINT and SIGQUIT out (Ctrl-C and
+/// Ctrl-\ go to the whole foreground process group; [`interrupt::hold`]), and the child gets
+/// their default actions back.
 pub fn run_foreground(
     program: &Path,
     args: &[String],
@@ -496,45 +445,8 @@ fn foreground(mut cmd: Command) -> io::Result<ExitStatus> {
             Ok(())
         });
     }
-    let _ignored = IgnoreInterrupts::new();
+    let _held = interrupt::hold();
     cmd.status()
-}
-
-/// SIGINT and SIGQUIT ignored for as long as any guard lives; the previous actions come back
-/// when the last one is dropped (overlapping guards on several threads nest correctly).
-struct IgnoreInterrupts;
-
-/// Live guards, and the actions to restore after the last one.
-static IGNORING: std::sync::Mutex<(usize, libc::sighandler_t, libc::sighandler_t)> =
-    std::sync::Mutex::new((0, 0, 0));
-
-impl IgnoreInterrupts {
-    fn new() -> Self {
-        let mut state = IGNORING.lock().unwrap_or_else(|e| e.into_inner());
-        if state.0 == 0 {
-            // SAFETY: installs SIG_IGN; the previous handlers are restored by the last drop.
-            unsafe {
-                state.1 = libc::signal(libc::SIGINT, libc::SIG_IGN);
-                state.2 = libc::signal(libc::SIGQUIT, libc::SIG_IGN);
-            }
-        }
-        state.0 += 1;
-        IgnoreInterrupts
-    }
-}
-
-impl Drop for IgnoreInterrupts {
-    fn drop(&mut self) {
-        let mut state = IGNORING.lock().unwrap_or_else(|e| e.into_inner());
-        state.0 -= 1;
-        if state.0 == 0 {
-            // SAFETY: restores the handlers the first guard replaced.
-            unsafe {
-                libc::signal(libc::SIGINT, state.1);
-                libc::signal(libc::SIGQUIT, state.2);
-            }
-        }
-    }
 }
 
 /// What [`perform`] did.
@@ -584,8 +496,10 @@ pub(crate) fn apply_env(cmd: &mut Command, change: &EnvChange) {
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
+    use std::fs;
     use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::time::Duration;
 
     use super::*;
@@ -1135,37 +1049,6 @@ mod tests {
             assert_eq!(l.record.fork_of, None);
             assert!(!l.record.injected);
         }
-    }
-
-    /// R3: a log that stayed open to the group or others after the attempt to tighten it (as
-    /// another user's file does: the mode cannot be changed) is refused, by the mode of the
-    /// open file; one that is the user's alone, or that is not a regular file, is not.
-    #[test]
-    fn a_log_that_is_not_private_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("launches.jsonl");
-        fs::write(&log, "").unwrap();
-        let open = || fs::OpenOptions::new().append(true).open(&log).unwrap();
-        for mode in [0o666, 0o644, 0o640, 0o602, 0o610] {
-            fs::set_permissions(&log, fs::Permissions::from_mode(mode)).unwrap();
-            let e = refuse_shared(&open(), &log).unwrap_err().to_string();
-            assert_eq!(
-                e,
-                format!(
-                    "{} can be accessed by the group or others (mode {mode:04o}) and was not \
-                     made private; nothing was appended",
-                    log.display()
-                )
-            );
-        }
-        fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).unwrap();
-        refuse_shared(&open(), &log).unwrap();
-        let null = fs::OpenOptions::new().append(true).open("/dev/null");
-        let e = refuse_shared(&null.unwrap(), Path::new("/dev/null")).unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            "/dev/null is not a regular file; nothing was appended"
-        );
     }
 
     /// R3: a FIFO in the log's place gets no line, with a reader (who would get the prompt)

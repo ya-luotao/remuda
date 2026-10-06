@@ -7,6 +7,7 @@
 // Each test file compiles its own copy of this module; not every file uses every helper.
 #![allow(dead_code)]
 
+pub mod homes;
 pub mod rollouts;
 pub mod transcripts;
 
@@ -596,7 +597,13 @@ impl Sandbox {
     /// `FAKE_CLAUDE_OUT`, `FAKE_CODEX_OUT`, `FAKE_CURL_OUT` and `TZ=UTC` (deterministic times) are
     /// set; `TYPESAFE_API_KEY` is not. The cwd is the sandbox work dir.
     pub fn remuda(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_remuda"));
+        Command::from_std(self.remuda_process())
+    }
+
+    /// [`Sandbox::remuda`] as a plain command, for a test that must have the process itself
+    /// (to signal it while it runs).
+    pub fn remuda_process(&self) -> std::process::Command {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"));
         cmd.env_clear()
             .env("HOME", self.home())
             .env("REMUDA_HOME", self.remuda_home())

@@ -16,6 +16,7 @@ use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::tracking::Listing;
 use crate::transcript::{
     FIRST_USER_TEXT_CAP, Head, Message, PREVIEW_CAP, Role, Tail, WINDOW, complete_lines, contains,
     one_line, read_at,
@@ -381,18 +382,19 @@ fn messages(lines: &[&[u8]]) -> Vec<Message> {
 /// last written before the best record found (none of its records can be newer). `None` when
 /// there is none.
 pub fn cached_rate_limits(home: &Path) -> Option<(Timestamp, Value)> {
-    let mut files = Vec::new();
-    index::list_rollouts(&home.join("sessions"), &mut files);
-    index::list_rollouts(&home.join("archived_sessions"), &mut files);
-    files.sort_by_key(|(_, _, stat)| std::cmp::Reverse(stat.mtime_ns));
+    let mut listing = Listing::default();
+    index::list_rollouts(&home.join("sessions"), &mut listing);
+    index::list_rollouts(&home.join("archived_sessions"), &mut listing);
+    let mut files = listing.into_files();
+    files.sort_by_key(|file| std::cmp::Reverse(file.stat.mtime_ns));
     let mut best: Option<(Timestamp, Value)> = None;
-    for (path, _, stat) in files.into_iter().take(RATE_LIMIT_FILES) {
+    for file in files.into_iter().take(RATE_LIMIT_FILES) {
         if let Some((at, _)) = &best
-            && stat.mtime_ns < at.as_nanosecond()
+            && file.stat.mtime_ns < at.as_nanosecond()
         {
             break;
         }
-        if let Some(found) = last_rate_limits(&path)
+        if let Some(found) = last_rate_limits(&file.path)
             && best.as_ref().is_none_or(|(at, _)| found.0 > *at)
         {
             best = Some(found);

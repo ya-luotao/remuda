@@ -8,6 +8,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use common::Sandbox;
+use common::homes::ClaudeHome;
 use predicates::prelude::*;
 use serde_json::Value;
 
@@ -51,32 +52,22 @@ fn names(dir: &Path) -> Vec<String> {
 /// what is never linked. `commands`, `rules`, `agent-memory` and `output-styles` are missing,
 /// and `agents` is a dangling link.
 fn source_home(dir: &Path) {
-    for sub in [
-        "projects",
-        "file-history",
-        "skills/review",
-        "hooks",
-        "plugins",
-        "sessions",
-        "todos",
-    ] {
-        fs::create_dir_all(dir.join(sub)).unwrap();
-    }
-    for (file, content) in [
-        (
-            "settings.json",
-            r#"{"model": "opus", "cleanupPeriodDays": 365}"#,
-        ),
-        ("CLAUDE.md", "be brief\n"),
-        ("keybindings.json", "{}"),
-        (".claude.json", "{}"),
-        ("history.jsonl", ""),
-        ("remote-settings.json", "{}"),
-        ("policy-limits.json", "{}"),
-    ] {
-        fs::write(dir.join(file), content).unwrap();
-    }
-    symlink(dir.join("nowhere"), dir.join("agents")).unwrap();
+    ClaudeHome::at(dir)
+        .dir("projects")
+        .dir("file-history")
+        .skill("review")
+        .dir("hooks")
+        .dir("plugins")
+        .dir("sessions")
+        .dir("todos")
+        .settings(r#"{"model": "opus", "cleanupPeriodDays": 365}"#)
+        .claude_md("be brief\n")
+        .file("keybindings.json", "{}")
+        .file(".claude.json", "{}")
+        .file("history.jsonl", "")
+        .file("remote-settings.json", "{}")
+        .file("policy-limits.json", "{}")
+        .dangling("agents");
 }
 
 /// What a home linked to [`source_home`] holds, sorted.
@@ -642,4 +633,54 @@ fn setup_refuses_a_name_that_would_leave_the_config_invalid() {
         ));
     assert_eq!(sb.read_config(), before);
     assert!(!sb.remuda_home().join("homes/codex/personal").exists());
+}
+
+/// R5, R6: while the login has the terminal, Ctrl-C and Ctrl-\ are the login's alone: remuda
+/// sits them out, waits for the login, and exits with its status. (Only remuda is signalled
+/// here: a terminal signals the login too, which decides for itself.)
+#[test]
+fn an_interrupt_during_the_login_does_not_end_remuda() {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    let sb = Sandbox::new();
+    common::write_executable(
+        &sb.bin().join("claude"),
+        "#!/bin/sh\n\
+         if [ \"$1\" = auth ] && [ \"$2\" = login ]; then\n\
+           echo $$ > \"$HOME/login.pid\"\n\
+           while [ ! -f \"$HOME/login.done\" ]; do sleep 0.05; done\n\
+           exit 7\n\
+         fi\n\
+         exit 0\n",
+    );
+    let mut cmd = sb.remuda_process();
+    cmd.args(["setup", "work"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: the closure only calls `signal`, which is async-signal-safe. Whatever started
+    // the tests may have left these ignored, and the test would then prove nothing.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let mut remuda = cmd.spawn().unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    while !sb.home().join("login.pid").exists() {
+        assert!(Instant::now() < until, "the login never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGINT] {
+        // SAFETY: kill(2) takes no pointers.
+        assert_eq!(unsafe { libc::kill(remuda.id() as libc::pid_t, signal) }, 0);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let early = remuda.try_wait().unwrap();
+    fs::write(sb.home().join("login.done"), "").unwrap();
+    let status = remuda.wait().unwrap();
+    assert_eq!(early, None, "remuda ended by the signal: {status:?}");
+    assert_eq!(status.code(), Some(7), "{status:?}");
 }

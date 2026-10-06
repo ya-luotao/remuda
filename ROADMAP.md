@@ -137,10 +137,6 @@ in 0.2.0.
 
 ## Known issues
 
-- A launch request whose running check is already in progress still launches after the check
-  passes, even if its account was removed in the meantime by another process (`remuda remove`
-  elsewhere; `D` in the TUI cancels a pending launch first). `pending` holds an `Account`. This
-  affects only a very narrow timing window.
 - The Configuration pane (R22) confines only the paths a plugin manifest names to the plugin
   directory. The plugin's own `hooks/hooks.json`, `.mcp.json`, and the files under `agents/`,
   `skills/`, and `commands/` are still opened when they are symlinks pointing outside it, which

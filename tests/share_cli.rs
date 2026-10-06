@@ -7,6 +7,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use common::homes::ClaudeHome;
 use common::{Invocation, Sandbox};
 use predicates::prelude::*;
 use serde_json::{Value, json};
@@ -27,34 +28,21 @@ struct Shared {
 
 fn shared() -> Shared {
     let sb = Sandbox::new();
-    let source = sb.home().join(".claude");
-    fs::create_dir_all(source.join("skills/review")).unwrap();
-    fs::create_dir_all(source.join("agents")).unwrap();
-    fs::create_dir_all(source.join("projects")).unwrap();
-    fs::write(source.join("CLAUDE.md"), "be brief\n").unwrap();
-    fs::write(
-        source.join("settings.json"),
-        format!(
+    let install = "plugins/cache/market/tools/1.0.0";
+    let source = ClaudeHome::at(sb.home().join(".claude"))
+        .skill("review")
+        .dir("agents")
+        .dir("projects")
+        .claude_md("be brief\n")
+        .settings(&format!(
             r#"{{"model": "opus", "cleanupPeriodDays": 365,
                 "hooks": {{"PreToolUse": [{HOOK}]}},
                 "enabledPlugins": {{"tools@market": true, "off@market": false}}}}"#
-        ),
-    )
-    .unwrap();
-    let plugin = source.join("plugins/cache/market/tools/1.0.0");
-    fs::create_dir_all(&plugin).unwrap();
-    fs::write(
-        source.join("plugins/installed_plugins.json"),
-        json!({
-            "version": 2,
-            "plugins": {
-                "tools@market": [{"scope": "user", "installPath": plugin, "version": "1.0.0"}],
-                "off@market": [{"scope": "user", "installPath": plugin}],
-            },
-        })
-        .to_string(),
-    )
-    .unwrap();
+        ))
+        .plugin("tools@market", install, Some("1.0.0"))
+        .plugin("off@market", install, None)
+        .into_path();
+    let plugin = source.join(install);
     let max = sb.make_claude_home("max");
     let solo = sb.make_claude_home("solo");
     let cx = sb.make_codex_home("cx");
@@ -849,6 +837,49 @@ fn settings_go_through_a_private_file() {
     let name = Path::new(&path).file_name().unwrap().to_str().unwrap();
     // One settings file, and the lock that guards the directory.
     assert_eq!(files, [".lock", name]);
+}
+
+/// R13, R18: `state/settings` is a directory of remuda's own. One that is a symlink is not
+/// written through: no settings file is written where it points, and none there is removed,
+/// however long unused; the launch goes on without shared settings and says why; the rest is
+/// still shared.
+#[test]
+fn a_symlinked_settings_directory_is_not_written_through() {
+    let s = shared();
+    let outside = s.sb.root().join("outside");
+    fs::create_dir(&outside).unwrap();
+    let old = outside.join(format!("{}.json", "a".repeat(64)));
+    fs::write(&old, "{}").unwrap();
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7_776_000);
+    let file = fs::File::options().write(true).open(&old).unwrap();
+    file.set_modified(long_ago).unwrap();
+    drop(file);
+    let link = s.sb.remuda_home().join("state/settings");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    symlink(&outside, &link).unwrap();
+    let before = snapshot(&outside);
+
+    s.sb.remuda()
+        .args(["run", "max", "-p", "hi"])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("settings from claude:default are not shared this time").and(
+                predicate::str::contains(format!(
+                    "{} is a symlink; remuda does not write through it",
+                    link.display()
+                )),
+            ),
+        );
+    let inv = s.sb.only_invocation();
+    assert_eq!(settings_of(&inv.args), None, "{:?}", inv.args);
+    assert!(
+        inv.args.iter().any(|a| a.starts_with("--add-dir=")),
+        "{:?}",
+        inv.args
+    );
+    assert_eq!(snapshot(&outside), before);
+    assert_eq!(fs::read_link(&link).unwrap(), outside);
 }
 
 /// R18: authentication keys of the source never reach a member.
