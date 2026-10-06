@@ -10,13 +10,14 @@ use clap::{Parser, Subcommand};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
+use crate::account_command::OnPath;
 use crate::identity::{self, Identity};
-use crate::index::{self, Index};
+use crate::index::{self, Index, RefreshStats};
 use crate::privacy::Aliases;
 use crate::provider::Provider;
 use crate::registry::{self, Account, Registry};
 use crate::stats::{self, Period};
-use crate::{Env, paths};
+use crate::{Env, owned, paths};
 use crate::{attribution, jev, launch, live, pick, probe, setup, text, transcript, tui, usage};
 
 #[derive(Debug, Parser)]
@@ -152,7 +153,9 @@ pub struct Context {
     pub env: Env,
     pub cwd: Option<PathBuf>,
     pub now: Timestamp,
-    /// The clock, for the TUI (which keeps running); commands use `now`.
+    /// The clock, for the TUI (which keeps running) and for a command that waits for an agent
+    /// (`pick`, `usage --live`): what the agent says is read when it has answered. Other
+    /// commands use `now`.
     pub clock: fn() -> Timestamp,
     pub tz: TimeZone,
     pub stdin_is_tty: bool,
@@ -260,18 +263,22 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
     let codex = program(ctx, Provider::Codex).ok();
     let sources = pick::Sources {
         env: &ctx.env,
-        now: ctx.now,
-        claude: claude.as_deref(),
-        codex: codex.as_deref(),
+        clock: ctx.clock,
+        agents: &OnPath {
+            claude: claude.as_deref(),
+            codex: codex.as_deref(),
+        },
         live: o.live,
         provider: only,
     };
-    let entries = pick::gather(&accounts, settings, &sources);
-    let candidates = pick::candidates(&entries, settings, ctx.now);
+    // Everything below reads the usage at `now`, the time it was all gathered: a live query
+    // may have taken a while (R23).
+    let (entries, now) = pick::gather(&accounts, settings, &sources);
+    let candidates = pick::candidates(&entries, settings, now);
     let feasible = pick::ranked(&candidates);
     if feasible.is_empty() {
         if o.json {
-            let report = pick::to_json(&entries, &candidates, None, settings, ctx.now);
+            let report = pick::to_json(&entries, &candidates, None, settings);
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
             print!("{}", pick::format_not_feasible(&entries, &candidates));
@@ -290,7 +297,7 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
     for account in &accounts {
         aliases.note(&account.qualified());
     }
-    let request = jev::request(&entries, &candidates, settings, &aliases, ctx.now, &ctx.tz);
+    let request = jev::request(&entries, &candidates, settings, &aliases, now, &ctx.tz);
     let key = ctx.env.get(jev::KEY_VAR).map(String::as_str);
     let skip = jev::skip_reason(o.offline, key, settings, &request);
     if o.print_request {
@@ -313,14 +320,14 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
     let decision = pick::decide(&candidates, &entries, settings, asked)
         .expect("a feasible candidate was found above");
     if o.json {
-        let report = pick::to_json(&entries, &candidates, Some(&decision), settings, ctx.now);
+        let report = pick::to_json(&entries, &candidates, Some(&decision), settings);
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(ExitCode::SUCCESS);
     }
     if !o.run {
         print!(
             "{}",
-            pick::format_text(&entries, &candidates, &decision, settings, ctx.now)
+            pick::format_text(&entries, &candidates, &decision, settings, now)
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -336,6 +343,9 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
         "remuda: pick: {}",
         pick::summary(&entries, &candidates, &decision)
     );
+    if let Some(hint) = pick::live_hint(&entries[chosen.entry], chosen) {
+        eprintln!("remuda: pick: usage unknown: {hint}");
+    }
     for notice in notices {
         eprintln!("remuda: {notice}");
     }
@@ -449,7 +459,7 @@ fn exec_plan(
     for notice in &plan.notices {
         eprintln!("remuda: {notice}");
     }
-    let log = state_dir(config).join("launches.jsonl");
+    let log = owned::launch_log(&owned::state_dir(config));
     if let Err(e) = launch::append_log(&log, &plan.record) {
         eprintln!(
             "remuda: warning: cannot write launch log {}: {e:#}",
@@ -458,11 +468,6 @@ fn exec_plan(
     }
     let err = launch::exec(program, plan);
     Err(anyhow::Error::new(err).context(format!("cannot run {}", program.display())))
-}
-
-/// `$REMUDA_HOME/state`, the sibling of `config.toml` (R3).
-fn state_dir(config: &Path) -> PathBuf {
-    config.with_file_name("state")
 }
 
 /// `remuda list`: identities are queried in parallel; failures degrade to the cached
@@ -479,12 +484,12 @@ fn list(config: &Path, timeout: Duration, ctx: &Context) -> Result<ExitCode> {
     if codex.is_none() && accounts.iter().any(|a| a.provider == Provider::Codex) {
         eprintln!("remuda: warning: `codex` not found on PATH; codex identities are unknown");
     }
+    let agents = OnPath {
+        claude: claude.as_deref(),
+        codex: codex.as_deref(),
+    };
     let results = probe::parallel(&accounts, |account| {
-        let program = match account.provider {
-            Provider::Claude => claude.as_deref(),
-            Provider::Codex => codex.as_deref(),
-        };
-        identity::identify(account, program, &ctx.env, timeout)
+        identity::identify(account, &agents, &ctx.env, timeout)
     });
     for warning in results.iter().filter_map(|(_, w)| w.as_ref()) {
         eprintln!("remuda: warning: {warning}");
@@ -533,12 +538,12 @@ fn usage(
             false => None,
         };
         let codex = program(ctx, Provider::Codex).ok();
+        let agents = OnPath {
+            claude: claude.as_deref(),
+            codex: codex.as_deref(),
+        };
         probe::parallel(&accounts, |account| {
-            let program = match account.provider {
-                Provider::Claude => claude.as_deref(),
-                Provider::Codex => codex.as_deref(),
-            };
-            usage::live_report(account, program, &ctx.tz, timeout)
+            usage::live_report(account, &agents, &ctx.tz, ctx.clock, timeout)
         })
     } else {
         accounts
@@ -625,20 +630,53 @@ impl IndexingProgress {
     }
 }
 
+/// More directories that could not be read than this are named up to it, the rest counted.
+const UNREADABLE_NAMED: usize = 5;
+
+/// What to say about the directories `refreshed` could not read (R8, R20), a line each: the
+/// directory, the error, and how many cached files (`session`, `transcript`) below it are
+/// still `shown` as they were. Beyond [`UNREADABLE_NAMED`] directories, one line for the rest.
+fn unreadable_lines(refreshed: &RefreshStats, file: &str, shown: &str) -> Vec<String> {
+    let kept = |n: usize, below: &str| match n {
+        0 => String::new(),
+        1 => format!("; 1 {file} {below} is {shown}"),
+        n => format!("; {n} {file}s {below} are {shown}"),
+    };
+    let (named, rest) = match refreshed.unreadable.len() {
+        n if n <= UNREADABLE_NAMED + 1 => (&refreshed.unreadable[..], &[][..]),
+        _ => refreshed.unreadable.split_at(UNREADABLE_NAMED),
+    };
+    let mut lines: Vec<String> = named
+        .iter()
+        .map(|u| format!("{u}{}", kept(u.kept, "below it")))
+        .collect();
+    if !rest.is_empty() {
+        lines.push(format!(
+            "cannot read {} more directories{}",
+            rest.len(),
+            kept(rest.iter().map(|u| u.kept).sum(), "below them")
+        ));
+    }
+    lines
+}
+
 /// `remuda sessions`: one index refresh (cached in `state/index.json`), live sessions and
 /// attribution, then the newest `limit` sessions (R5, R8, R9).
 fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
     let accounts = Registry::load(config)?.all(&ctx.env);
-    let state = state_dir(config);
+    let state = owned::state_dir(config);
     let cache = state.join("index.json");
     let mut index = Index::load(&cache);
-    let stores = index::stores(&accounts, &ctx.env);
+    let (stores, given) = index::resolve(&accounts, &ctx.env);
     let mut progress = IndexingProgress::new(ctx.stderr_is_tty, "indexing transcripts", "indexed");
     let mut stderr = std::io::stderr();
-    index::refresh(&mut index, &stores, |p| {
+    let refreshed = index::refresh_with(&mut index, &stores, &given, |p| {
         progress.report(p.done, p.total, &mut stderr)
     });
     progress.finish(index.entries.len(), &mut stderr);
+    for line in unreadable_lines(&refreshed, "session", "listed as last indexed") {
+        eprintln!("remuda: warning: {line}");
+    }
     if let Err(e) = index.save(&cache) {
         eprintln!(
             "remuda: warning: cannot write index cache {}: {e:#}",
@@ -651,12 +689,15 @@ fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
     let ps = launch::find_on_path("ps", path_var).ok();
     let live = live::collect(
         &accounts,
-        claude.as_deref(),
+        &OnPath {
+            claude: claude.as_deref(),
+            codex: None,
+        },
         ps.as_deref(),
         &ctx.env,
         live::TIMEOUT,
     );
-    let owners = attribution::collect(&accounts, &ctx.env, &state.join("launches.jsonl"), &live);
+    let owners = attribution::collect(&accounts, &ctx.env, &owned::launch_log(&state), &live);
 
     let mut rows = vec![
         ["TIME", "ACCOUNTS", "TITLE", "CWD"]
@@ -711,13 +752,13 @@ fn stats(
         Some(reference) => Some(registry.resolve(&reference)?.qualified()),
         None => None,
     };
-    let state = state_dir(config);
+    let state = owned::state_dir(config);
     let path = state.join("stats.json");
     let mut cache = stats::Cache::load(&path);
-    let sources = stats::sources(&accounts, &ctx.env);
+    let (sources, given) = stats::resolve(&accounts, &ctx.env);
     let mut progress = IndexingProgress::new(ctx.stderr_is_tty, "reading transcripts", "read");
     let mut stderr = std::io::stderr();
-    let refreshed = stats::refresh(&mut cache, &sources, |done, total| {
+    let refreshed = stats::refresh_with(&mut cache, &sources, &given, |done, total| {
         progress.report(done, total, &mut stderr)
     });
     progress.finish(cache.files.len(), &mut stderr);
@@ -727,7 +768,7 @@ fn stats(
             path.display()
         );
     }
-    let attribution = attribution::collect(&accounts, &ctx.env, &state.join("launches.jsonl"), &[]);
+    let attribution = attribution::collect(&accounts, &ctx.env, &owned::launch_log(&state), &[]);
     let report = stats::report(
         &cache,
         &sources,
@@ -741,6 +782,10 @@ fn stats(
         "{}",
         stats::format(report.table(period), filter.as_deref(), &ctx.tz)
     );
+    // On stdout, with the report: one that is piped must not pass for a complete one (R20).
+    for line in unreadable_lines(&refreshed, "transcript", "counted as last read") {
+        println!("Incomplete: {line}");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -844,7 +889,7 @@ fn open_tui(config: &Path, ctx: &Context, mode: tui::app::Mode) -> Result<Option
         tz: ctx.tz.clone(),
         clock: ctx.clock,
         config: config.to_path_buf(),
-        state_dir: state_dir(config),
+        state_dir: owned::state_dir(config),
         cwd: ctx.cwd.clone(),
         mode,
         private: false,
@@ -922,6 +967,62 @@ mod tests {
             .map(|r| r.iter().map(|c| c.to_string()).collect())
             .collect();
         format_table(&rows)
+    }
+
+    /// R8, R20: each directory that could not be read is named with what is kept below it;
+    /// past a handful, the rest are counted.
+    #[test]
+    fn unreadable_directories_are_named_up_to_a_handful() {
+        let unreadable = |i: usize, kept: usize, unresolved: bool| index::Unreadable {
+            path: format!("/s/p{i}").into(),
+            error: "denied".into(),
+            kept,
+            unresolved,
+        };
+        let refreshed = |kept: &[usize]| RefreshStats {
+            unreadable: kept
+                .iter()
+                .enumerate()
+                .map(|(i, &kept)| unreadable(i, kept, false))
+                .collect(),
+            ..RefreshStats::default()
+        };
+        // A store that could not be resolved is named the same way.
+        let unresolved = RefreshStats {
+            unreadable: vec![unreadable(0, 2, true), unreadable(1, 0, true)],
+            ..RefreshStats::default()
+        };
+        assert_eq!(
+            unreadable_lines(&unresolved, "session", "listed"),
+            [
+                "cannot read /s/p0: denied; 2 sessions below it are listed",
+                "cannot read /s/p1: denied",
+            ]
+        );
+        let lines = |kept: &[usize]| unreadable_lines(&refreshed(kept), "session", "listed");
+        assert!(lines(&[]).is_empty());
+        assert_eq!(
+            lines(&[0, 1, 2]),
+            [
+                "cannot read /s/p0: denied",
+                "cannot read /s/p1: denied; 1 session below it is listed",
+                "cannot read /s/p2: denied; 2 sessions below it are listed",
+            ]
+        );
+        assert_eq!(
+            lines(&[0; UNREADABLE_NAMED + 1]).len(),
+            UNREADABLE_NAMED + 1
+        );
+        let many = lines(&[1; UNREADABLE_NAMED + 3]);
+        assert_eq!(many.len(), UNREADABLE_NAMED + 1);
+        assert_eq!(
+            many[UNREADABLE_NAMED],
+            "cannot read 3 more directories; 3 sessions below them are listed"
+        );
+        assert_eq!(
+            lines(&[0; UNREADABLE_NAMED + 2])[UNREADABLE_NAMED],
+            "cannot read 2 more directories"
+        );
     }
 
     #[test]

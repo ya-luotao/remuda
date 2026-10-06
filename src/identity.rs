@@ -2,14 +2,12 @@
 //! `codex login status`; and codex's `account/read`, answered in a live usage query (R10).
 
 use std::fs;
-use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::Env;
-use crate::launch;
-use crate::probe::{self, Outcome};
+use crate::account_command::Runner;
 use crate::provider::Provider;
 use crate::registry::Account;
 
@@ -156,72 +154,58 @@ fn string(v: &Value, key: &str) -> Option<String> {
     v.get(key)?.as_str().map(str::to_string)
 }
 
+/// What a command that answered with something else is said to have done.
+const NOT_UNDERSTOOD: &str = "printed output remuda does not understand";
+
 /// Identity of `account` under the account's environment: `claude auth status --json`
-/// (falling back to its `.claude.json`) or `codex login status`. `program` is the provider's
-/// executable, `None` when it is not on PATH. Returns a warning when the command ran but could
-/// not be used.
+/// (falling back to its `.claude.json`) or `codex login status`, run by `agents`. Returns a
+/// warning when the command ran but could not be used; an agent that is not on PATH is no
+/// warning of its own.
 pub fn identify(
     account: &Account,
-    program: Option<&Path>,
+    agents: &dyn Runner,
     env: &Env,
     timeout: Duration,
 ) -> (Identity, Option<String>) {
     match account.provider {
-        Provider::Claude => identify_claude(account, program, env, timeout),
-        Provider::Codex => identify_codex(account, program, timeout),
+        Provider::Claude => identify_claude(account, agents, env, timeout),
+        Provider::Codex => identify_codex(account, agents, timeout),
     }
 }
 
-/// `codex login status`; codex's credentials (`auth.json`) are never read (R4).
+/// `codex login status`, which answers on stderr and exits 1 when not logged in; codex's
+/// credentials (`auth.json`) are never read (R4).
 fn identify_codex(
     account: &Account,
-    program: Option<&Path>,
+    agents: &dyn Runner,
     timeout: Duration,
 ) -> (Identity, Option<String>) {
-    let Some(program) = program else {
-        return (Identity::Unknown, None);
-    };
-    let change = launch::env_change(account);
-    let outcome = probe::run_captured(program, LOGIN_STATUS_ARGS, &change, timeout);
-    let why = match &outcome {
-        Outcome::Exited {
-            code: Some(_),
-            stdout,
-            stderr,
-        } => match parse_login_status(&format!("{stderr}\n{stdout}")) {
+    let failure = match agents.run(account, LOGIN_STATUS_ARGS, timeout) {
+        Err(failure) if failure.is_missing() => return (Identity::Unknown, None),
+        Err(failure) => failure,
+        Ok(output) => match parse_login_status(&format!("{}\n{}", output.stderr, output.stdout)) {
             Some(identity) => return (identity, None),
-            None if outcome.success_stdout().is_some() => {
-                "printed output remuda does not understand".to_string()
-            }
-            None => outcome.describe(timeout),
+            None if output.code == 0 => output.said(NOT_UNDERSTOOD),
+            None => output.failed(),
         },
-        _ => outcome.describe(timeout),
     };
-    let warning = format!(
-        "{}: `codex {}` {why}; identity unknown",
-        account.qualified(),
-        LOGIN_STATUS_ARGS.join(" ")
-    );
+    let warning = format!("{}: {failure}; identity unknown", account.qualified());
     (Identity::Unknown, Some(warning))
 }
 
 fn identify_claude(
     account: &Account,
-    program: Option<&Path>,
+    agents: &dyn Runner,
     env: &Env,
     timeout: Duration,
 ) -> (Identity, Option<String>) {
-    let failure = match program {
-        None => None,
-        Some(program) => {
-            let change = launch::env_change(account);
-            let outcome = probe::run_captured(program, AUTH_STATUS_ARGS, &change, timeout);
-            match outcome.success_stdout().map(parse_auth_status) {
-                Some(Some(identity)) => return (identity, None),
-                Some(None) => Some("printed output remuda does not understand".to_string()),
-                None => Some(outcome.describe(timeout)),
-            }
-        }
+    let failure = match agents.run_ok(account, AUTH_STATUS_ARGS, timeout) {
+        Ok(output) => match parse_auth_status(&output.stdout) {
+            Some(identity) => return (identity, None),
+            None => Some(output.said(NOT_UNDERSTOOD)),
+        },
+        Err(failure) if failure.is_missing() => None,
+        Err(failure) => Some(failure),
     };
 
     let cache = account.claude_json(env);
@@ -229,16 +213,12 @@ fn identify_claude(
         .as_deref()
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|text| parse_claude_json(&text));
-    let warning = failure.map(|why| {
+    let warning = failure.map(|failure| {
         let fallback = match (&cached, &cache) {
             (Some(_), Some(path)) => format!("showing the identity cached in {}", path.display()),
             _ => "identity unknown".to_string(),
         };
-        format!(
-            "{}: `claude {}` {why}; {fallback}",
-            account.qualified(),
-            AUTH_STATUS_ARGS.join(" ")
-        )
+        format!("{}: {failure}; {fallback}", account.qualified())
     });
     (cached.unwrap_or(Identity::Unknown), warning)
 }
@@ -246,6 +226,8 @@ fn identify_claude(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account_command::Scripted;
+    use crate::probe::Outcome;
 
     fn logged_in(
         email: Option<&str>,
@@ -411,5 +393,155 @@ mod tests {
         ] {
             assert_eq!(parse_claude_json(bad), None, "{bad:?}");
         }
+    }
+
+    fn codex_account() -> Account {
+        Account {
+            provider: crate::registry::CODEX,
+            name: "work".into(),
+            home: crate::registry::Home::Path("/c/work".into()),
+        }
+    }
+
+    const LOGIN: &str = "codex:work login status";
+    const AUTH: &str = "claude:max auth status --json";
+    const T: Duration = Duration::from_secs(15);
+
+    /// R10a: `codex login status` answers on stderr, and exits 1 when not logged in; an answer
+    /// that is not one, a failure or a timeout is a warning naming the command, and a codex
+    /// that is not on PATH no warning at all.
+    #[test]
+    fn codex_identity_is_what_login_status_says() {
+        let work = codex_account();
+        let env = Env::new();
+        let method = |m: &str| Identity::LoggedIn {
+            email: None,
+            org: None,
+            plan: None,
+            method: Some(m.into()),
+            cached: false,
+        };
+        let asked = |outcome: Outcome| {
+            let agents = Scripted::new().on(LOGIN, outcome);
+            let got = identify(&work, &agents, &env, T);
+            assert_eq!(agents.ran(), [LOGIN]);
+            got
+        };
+        assert_eq!(
+            asked(Scripted::exited(0, "", "Logged in using ChatGPT\n")),
+            (method("ChatGPT"), None)
+        );
+        assert_eq!(
+            asked(Scripted::exited(1, "", "Not logged in\n")),
+            (Identity::NotLoggedIn, None)
+        );
+        // Another version might answer on stdout.
+        assert_eq!(
+            asked(Scripted::exited(
+                0,
+                "Logged in using an API key - sk-***\n",
+                ""
+            )),
+            (method("API key"), None)
+        );
+        let warned = |outcome: Outcome| {
+            let (identity, warning) = asked(outcome);
+            assert_eq!(identity, Identity::Unknown);
+            warning.unwrap()
+        };
+        assert_eq!(
+            warned(Scripted::exited(0, "", "Welcome to codex\n")),
+            "codex:work: `codex login status` printed output remuda does not understand; \
+             identity unknown"
+        );
+        assert_eq!(
+            warned(Scripted::exited(2, "", "error: unrecognized subcommand\n")),
+            "codex:work: `codex login status` exited with status 2: error: unrecognized \
+             subcommand; identity unknown"
+        );
+        assert_eq!(
+            warned(Outcome::TimedOut),
+            "codex:work: `codex login status` timed out after 15s; identity unknown"
+        );
+        let agents = Scripted::new().without(Provider::Codex);
+        assert_eq!(identify(&work, &agents, &env, T), (Identity::Unknown, None));
+        assert!(agents.ran().is_empty());
+    }
+
+    /// R10a: `claude auth status --json`, and when it fails the identity cached in the home's
+    /// `.claude.json`, with a warning that says which command failed and how; without claude
+    /// on PATH the cached identity, and no warning of the account's own.
+    #[test]
+    fn claude_identity_falls_back_to_the_cached_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("max");
+        fs::create_dir(&home).unwrap();
+        let max = Account {
+            provider: crate::registry::CLAUDE,
+            name: "max".into(),
+            home: crate::registry::Home::Path(home.display().to_string()),
+        };
+        let env = Env::new();
+        let answer = r#"{"loggedIn": true, "email": "a@example.com", "orgName": "Org"}"#;
+        let agents = Scripted::new().on(AUTH, Scripted::exited(0, answer, ""));
+        assert_eq!(
+            identify(&max, &agents, &env, T),
+            (
+                logged_in(Some("a@example.com"), Some("Org"), None, false),
+                None
+            )
+        );
+
+        // No cache yet: unknown, and said so.
+        let failing = || Scripted::new().on(AUTH, Scripted::exited(1, "", "boom\n"));
+        assert_eq!(
+            identify(&max, &failing(), &env, T),
+            (
+                Identity::Unknown,
+                Some(
+                    "claude:max: `claude auth status --json` exited with status 1: boom; \
+                     identity unknown"
+                        .to_string()
+                )
+            )
+        );
+        let cache = home.join(".claude.json");
+        fs::write(
+            &cache,
+            r#"{"oauthAccount": {"emailAddress": "c@example.com"}}"#,
+        )
+        .unwrap();
+        let cached = logged_in(Some("c@example.com"), None, None, true);
+        let shown = format!("showing the identity cached in {}", cache.display());
+        assert_eq!(
+            identify(&max, &failing(), &env, T),
+            (
+                cached.clone(),
+                Some(format!(
+                    "claude:max: `claude auth status --json` exited with status 1: boom; {shown}"
+                ))
+            )
+        );
+        let agents = Scripted::new().on(AUTH, Outcome::TimedOut);
+        assert_eq!(
+            identify(&max, &agents, &env, T).1,
+            Some(format!(
+                "claude:max: `claude auth status --json` timed out after 15s; {shown}"
+            ))
+        );
+        let agents = Scripted::new().on(AUTH, Scripted::exited(0, "Logged in.\n", ""));
+        assert_eq!(
+            identify(&max, &agents, &env, T),
+            (
+                cached.clone(),
+                Some(format!(
+                    "claude:max: `claude auth status --json` printed output remuda does not \
+                     understand; {shown}"
+                ))
+            )
+        );
+        let agents = Scripted::new().without(Provider::Claude);
+        assert_eq!(identify(&max, &agents, &env, T), (cached, None));
+        assert!(agents.ran().is_empty());
     }
 }

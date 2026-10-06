@@ -8,6 +8,46 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ## [Unreleased]
 
+### Changed
+
+- On a file system without locks, or where the directory that holds the registry file
+  (`$REMUDA_HOME`, or where a symlinked `config.toml` points) cannot be opened for reading,
+  `remuda add`, `setup` and `remove` now refuse and change nothing, instead of writing
+  `config.toml` unlocked (SPEC R3); the file can still be edited by hand. Injected settings and shared instructions go on without a lock there, as before
+  (R18).
+- A `$REMUDA_HOME/state/settings` that is a symlink is refused, as a symlinked `shared`
+  already was (SPEC R13, R18): remuda removes old settings files in that directory, and used
+  to do so wherever the link pointed. Such a launch goes on without shared settings and says
+  so. `state/settings` is now created with mode 0700 and tightened like `state/`. A `state`
+  that is a symlink is still written through.
+- Temporary files are named `.remuda-<pid>-<32 hex digits>.tmp` everywhere (SPEC R3), the
+  rule copies under `shared/` included.
+- A usage window whose reset has passed since its usage was recorded is of unknown usage
+  everywhere, instead of three different things (SPEC R10, R23). `remuda pick` counted it as 0%
+  used, so an account cached four days ago, past every reset, was recommended as "100% left" ahead
+  of one cached nine minutes ago with 71% left. Such a window is now named (`reset since cached`),
+  never counted as headroom and never blocking; a pair with no known window left is feasible, of
+  unknown headroom, and ranks after every pair of known headroom, stale ones included. `pick`
+  still never queries live on its own: its output, and `--run` on stderr, say that `--live` asks
+  the agent. Live usage keeps its percentages whatever its reset times read as. The usage is read
+  once it is all gathered, not when remuda started: a window that resets while a live query runs
+  has reset, and a live answer shows its age (`live 40s ago`). **Changes `pick --json`:**
+  candidates gain `reset_passed`; `resets_at` is null unless the reset is ahead; `headroom` and
+  `binding` are null when no window that applies is known; each of `default_model_windows` gains
+  `reset_passed`, with `percent` and `resets_at` null past its reset. The state sent to Jev says
+  `usage unknown (reset since cached)` instead of `0% used`.
+- `remuda usage` prints `-` and `reset since cached (<time>)` for such a window instead of the
+  percentage and severity recorded before the reset; the Accounts view shows `reset` in its
+  place, draws no marker for it on the timeline (it drew one at `now`) and says `reset` in the
+  `next` summary, for a per-model window too. A live answer left on screen past a reset it
+  named reads the same way, and its reset wording is read from when it was said: `7pm` asked
+  at six is not tomorrow's by eight (SPEC R10).
+- `remuda pick --live` starts one codex process per codex account instead of two: the
+  `account/read` of the live query's `codex app-server` run says whether the account is logged
+  in, and `codex login status` runs only when it did not say (SPEC R23). A logged-out codex
+  account is therefore asked through `codex app-server` too, as `remuda usage --live` already
+  does. Without `--live` nothing changes.
+
 ### Fixed
 
 - TUI: a held key no longer starts a thread or an agent command for every repeat. `Enter` or
@@ -30,6 +70,60 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   again for the new list, and only those are shown (SPEC R11). Identities and cached usage are
   asked per account: `r` asks again the accounts that have answered while a slow one is still
   out, and no account is asked twice at once.
+- `remuda add`, `setup` and `remove` run at the same time no longer lose each other's changes
+  (eight concurrent `add`s could leave seven accounts, all exiting 0). The registry is read,
+  checked and written under an exclusive lock on the directory of the file being replaced:
+  `$REMUDA_HOME`, or where a symlinked `config.toml` points, so two `$REMUDA_HOME`s that
+  share one registry through a link take the same lock (SPEC R3).
+- A write that was killed (or cut off when the TUI quit) left its temporary file forever, a
+  `.stats.json.<uuid>.tmp` of tens of megabytes among them. A later write now removes the
+  temporary files of processes that are gone from the directory it writes in (SPEC R3): in
+  `state/`, the next cache saved or the next launch's line in the launch log; where a cache
+  that is a symlink points, the next cache saved there. Files that earlier
+  versions left in `state/` (`.<name>.<32 hex digits>.tmp`) are not removed: delete them once
+  by hand; everything in `state/` but `launches.jsonl` is rebuilt.
+- A session store, or a directory below one, that exists but could not be read (it could not be
+  listed: permission denied, an I/O error; or it could be listed but not searched, so that
+  nothing in it could be examined) was taken for an empty one: its sessions left `remuda
+  sessions` and History, its tokens left the statistics without a word, the emptied caches were
+  saved, and everything was read again once the directory was back (all of it, for the
+  statistics). Such a directory now says nothing about its transcripts: what the caches hold
+  below it stays as it was last read, the directories that can be read are read as usual, and
+  the result says it is incomplete, naming the directory and the error: a warning on stderr
+  from `remuda sessions`, an `Incomplete:` line after the table from `remuda stats`,
+  `incomplete: …` in the status line of History and Stats. The same goes for a store that
+  cannot be resolved, because the account's home, or a directory on the way to it or to the
+  target of a `projects` link, cannot be searched (a codex home's `archived_sessions`
+  included): it used to drop out of the list of stores, and everything indexed and counted
+  from it with it. The caches now remember the real path each store directory last resolved
+  to, and keep what they hold of that store while it cannot be resolved (the first run after
+  the upgrade writes `stats.json` once more to record it; the schema versions are unchanged).
+  A directory that no longer exists still means its transcripts are gone (SPEC R8, R20).
+- A transcript rewritten in place after it was listed and before it was read, larger and with an
+  mtime earlier than the cached one (a sync restoring an older copy, say), was read on from the
+  cached offset: the index and the statistics kept what the old content had given, and took the
+  file for unchanged from then on. It is now read whole, as R8 says of an mtime that moved
+  backward (SPEC R8, R20).
+- A live usage answer read only in part was taken for the whole of it: when claude worded one
+  line of `claude -p /usage` differently (a weekly limit that is used up, say), the other lines
+  alone were shown, and `remuda pick --live` could recommend the account as live and available.
+  A `Current session` / `Current week` line that cannot be read now makes the answer
+  unrecognized: it is shown as it is, and `pick` falls back to the cache with a note. The cached
+  `limits` list is treated the same: an entry that cannot be read is no longer dropped quietly,
+  the account then has no cached usage, and the notice says how many entries were not
+  recognized (SPEC R10).
+- An agent command that had exited while a process it started still held its output open was
+  reported as timed out, its output thrown away; and after a real timeout only the command
+  itself was killed, not what it had started. Every command remuda runs for its output now has
+  a process group of its own, as `codex app-server` already had: what it printed is taken once
+  it has exited (a process it left running is left alone), and the whole group is terminated
+  on a timeout. Outside the terminal's foreground process group, such a command ignores
+  SIGTTIN and SIGTTOU, so that one which touches the terminal is not stopped until its timeout
+  (SPEC R4).
+- Ctrl-C during `remuda usage --live` or `remuda pick --live` left a `codex app-server` that
+  did not notice its closed stdin, or anything it had started, running. remuda now passes
+  Ctrl-C, Ctrl-\ and a hangup on to the commands it is still running before it ends, the ones
+  it was in the middle of starting included (SPEC R4).
 - A member whose `projects` is a link to the source's (the layout `remuda setup` creates) had
   claude ask for permission on every auto-memory write: claude grants its memory directory by
   the literal path and then finds the resolved one under the source's `.claude/`, outside the
@@ -40,6 +134,15 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   `--settings`, sets the variable, or a settings file chooses `autoMemoryDirectory`; the R11
   check that asks for an `agent-memory` link next to a `projects` link now fires only in that
   last case, where the link is what shares it.
+
+### Security
+
+- Everything remuda keeps under `$REMUDA_HOME/shared/` (the item links and the rule copies)
+  is now created, replaced and removed through directory descriptors opened one level at a
+  time without following a symlink, as a home made by `setup` already was (SPEC R13, R18). A
+  process of the same user that replaced one of those directories with a symlink between
+  remuda's check and its write could redirect that write, and with it the removal of a
+  `*.md` file; it no longer can.
 
 ## [0.2.0] - 2026-10-03
 

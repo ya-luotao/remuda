@@ -110,6 +110,36 @@ switching to a different, logged-out account.
 - Writes are atomic (temporary file + rename) and preserve the user's comments and unknown keys
   (the comments of an account that `remove` deletes go with it, R14a). If `config.toml` is a
   symlink, writes go through the symlink.
+- `add`, `setup`, and `remove` read, check, and write `config.toml` under an exclusive lock on
+  the directory that holds the file being replaced (no lock file is created): `$REMUDA_HOME`
+  itself or, for a `config.toml` that is a symlink, the directory of the file it points at.
+  Every path to one registry so takes the same lock, two `$REMUDA_HOME`s that share one
+  through such a link included, and those that run at the same time each see the others'
+  changes: every account is kept, and a name asked for twice is given once, the other being
+  told it is taken (R14). `setup` takes the lock twice: for its
+  checks, before it creates the home, and again to register; it is not held in between, so
+  of two `setup`s of one name at once the second fails when it creates the home, which
+  exists by then (R13). On a file system without locks the three refuse and change nothing,
+  since a registry written without the lock could silently lose an account; `config.toml`
+  can still be edited by hand. The same holds where that directory cannot be opened for
+  reading (the user took their own read permission away): it cannot be locked. (Where `$REMUDA_HOME` does not exist yet there is nothing to
+  lock for the checks: a `setup` there learns it only when it registers, and the home it
+  created stays, R2.)
+- A write that is killed between creating its temporary file and the rename leaves that file
+  behind: `.remuda-<pid>-<32 hex digits>.tmp`, in the directory of the file being written
+  (for a `config.toml` or a cache that is a symlink: where it points). Those whose process no
+  longer exists are removed by a later write, and each write cleans one directory: a change
+  to the registry and a cache being saved, the directory their file is replaced in (their
+  own or, for a symlink, where it points); a line appended to the launch log, `state/`, the
+  directory the log is named in, and not where a log that is a symlink points; a new
+  settings file, `state/settings`; a launch that needs the shared instructions of R18,
+  `shared/claude/.claude`. So what a cache that is a symlink left where it points is removed
+  by the next cache saved there, not by a launch. One whose process may still be running is
+  being written and stays, whatever its age. A directory that cannot be listed (below)
+  keeps them until it can. This is the one name for everything
+  remuda writes and renames into place: the registry, the caches, the settings files, the
+  item links, and the rule copies of R18. A process ID that has since been given to another
+  process keeps its leftover until that one exits.
 - Loading validates strictly: an invalid name, a duplicate name, a claimed `default`, a named
   account whose `home` is not an absolute path, `share` on a codex account, a `[share.claude] from`
   that names no claude account, a `[prices."<model>"]` that is not a table, has a key other than
@@ -129,7 +159,10 @@ switching to a different, logged-out account.
   among them (R6), and the caches hold titles and directories. `state/` is created with mode
   0700 and its files with mode 0600. A `state/` or a launch log from before that the group or
   others could access is tightened by the next write there, and a cache is always replaced by a
-  file of mode 0600; nothing is ever loosened. Two modes are left as the user has them: that of
+  file of mode 0600; nothing is ever loosened. `state/settings` (R18) is created and
+  tightened like `state/`. A `state/` the user can search and write but not read (mode 0300,
+  say) is written in by name all the same, and keeps its mode: remuda opens it for that
+  alone, and only what needs to list it, the cleanup of leftovers above, waits. Two modes are left as the user has them: that of
   the directory a `state` symlink points at, and that of the file a symlink in `state/` points
   at; both are written through. The regular files remuda owns by name in a directory reached
   through a `state` symlink (the caches, the launch log) are its own all the same: created
@@ -187,6 +220,28 @@ the UI, not reported as an error:
     for `list` or the identities of the accounts view.
   - remuda calls only `initialize`, `account/rateLimits/read`, and `account/read`, never a method
     that changes anything (such as `account/rateLimitResetCredit/consume` or `account/logout`).
+- Every command remuda runs for its output (the identity, usage, and running-session commands
+  above, `claude logs`, `stop`, and `rm`, and likewise `ps` and `curl`) gets a timeout and a
+  process group of its own. At most 1024 of them run at a time: there is one per account, and
+  in R7's fallback one `ps` per file of a `sessions/` directory, and nothing else limits
+  either, so one more waits for another to be over, its timeout counting from its own start.
+  Once the command has exited, remuda takes what was printed by then, as soon as it has all
+  of it and without waiting for a process the command left holding its output open, whether
+  that process is silent or goes on printing, and leaves the process running: what an agent
+  starts on the side (an update, say) is the agent's business. If not all of it could be read
+  by the command's timeout (remuda itself was behind), the command counts as timed out: a part
+  of an answer is never taken for the answer.
+  On a timeout the whole group is terminated. (`codex app-server` serves until it is told to stop:
+  its group is terminated once it has answered as well.) Such a group is not the terminal's
+  foreground group, and two things follow:
+  - Ctrl-C, Ctrl-\, and a hangup do not reach it by themselves: remuda passes the signal on to
+    every group still running, then ends by it as it would have. Commands are started in
+    parallel, and a signal may come while some are being started: remuda then starts nothing
+    more, passes the signal on to each of those as soon as it runs, and ends by the signal
+    when the last of them has been told. A signal remuda was started ignoring stays ignored.
+  - A process that reads the terminal there, or changes its modes, would be stopped (SIGTTIN,
+    SIGTTOU) until its timeout. The command is started ignoring both: the read fails at once
+    (EIO) and the change goes through, as it would in the foreground.
 - Codex's `$CODEX_HOME/<name>.config.toml` is a configuration layer under the same login, **not**
   account isolation; remuda does not treat it as an account.
 
@@ -355,15 +410,56 @@ remuda help [<command>]                            help for remuda or a command
     first 1 MB is unchanged before and after a file grows). The offset is cached; when a file has
     grown and its mtime is not earlier than the cached one, only the new bytes are parsed. The whole
     file is rescanned when it shrinks, when its size is unchanged but its mtime changed, when its
-    mtime moves backward, or when its inode changed (the file was replaced).
+    mtime moves backward, or when its inode changed (the file was replaced). The file is checked
+    again once it is open, since it may have changed after it was listed: it is read incrementally
+    only if it is then still larger than cached, the same inode, and its mtime not earlier.
   - When the tail window contains no complete record (the file ends with one very long line), the
     window grows by ×4, up to 4 MB.
   - Known limitation: when a large file's only `ai-title` is in the middle and the tail window does
     contain complete records, the title is not found and the first user text is used instead.
   - Only complete lines are parsed: a final line still being written is left for the next scan.
     Lines cut by a window boundary are discarded.
+  - **A directory that is gone and one that cannot be read are different things.** A store, or a
+    directory below it, that no longer exists has no transcripts: their entries drop out of the
+    index. One that exists but cannot be read says nothing about the transcripts below it: it
+    cannot be listed (permission denied, an I/O error: any error other than the directory not
+    existing, also one met partway through the listing), or it can be listed but what it lists
+    cannot be examined (a directory that may be read but not searched gives names and nothing
+    else). The entries that store has below it stay in the index and in its cache as they were
+    last indexed, the directories that can be read are indexed as usual, and the refresh says it
+    is incomplete, naming the directory (once, not again for what is below it) and the error.
+    `remuda sessions` still lists those sessions and warns on stderr; the TUI says so in the
+    status line. Nothing is read again once the directory can be read and its transcripts have
+    not changed. The entries of a store that is no longer listed drop out all the same, also
+    where they lie below a directory another store cannot read. A single transcript that cannot
+    be opened or read is left out, as before; so is one that is a symlink to somewhere out of
+    reach, which is one transcript and not a directory (the entry the index had for it drops
+    out, and nothing is reported), while a project directory that is such a symlink is a
+    directory that cannot be read.
+  - **Nor is a store that cannot be resolved a store that is gone.** A store is known by the
+    realpath of `projects`. When that cannot be found because the home, or a directory on the
+    way to it or to the target of a link, cannot be searched or read (any error other than the
+    directory not existing), the store may be there, and the path the home gives does not say
+    which entries are its. The index therefore remembers, for each store directory as its
+    home gives it (the whole path, `<home>/projects`), the real path it last resolved to. The
+    entries last indexed from that store stay in the index and in its cache as they were, the
+    stores that could be listed are indexed as usual, and the refresh says it is incomplete,
+    naming the directory as the home gives it and the error, as above. Nothing else stays for
+    it: the entries of a store that is gone, or whose account left the registry, drop out as
+    they always did, whatever cannot be resolved beside them; and where another account lists
+    the same store, its entries are that listing's. It is the directory that is remembered,
+    not the account's name: an account registered again under the same name with another home
+    takes over nothing of the old home's store, and one registered again under another name
+    with the same home keeps what that home's store had. When nothing is remembered of the
+    directory (it never resolved, or the cache was written before this was kept, or deleted),
+    there is nothing to tell its entries by: they drop out, and the store is reported all the
+    same. Meanwhile the store is not among the stores listed: a
+    codex rollout kept this way shows no account (R17). A `projects` that does not exist is no
+    store, as before.
 - Cache: `$REMUDA_HOME/state/index.json`, with a schema version; on a version mismatch it is
-  rebuilt. Written atomically; may be deleted at any time (R3).
+  rebuilt. Written atomically; may be deleted at any time (R3). Beside the entries it holds the
+  real path each store directory last resolved to (see above); a cache without that is read as
+  it is, the schema version being that of the entries.
 - The index is built in the background: the UI does not wait for it and shows progress and the rows
   obtained so far while it builds.
 - The list hides "noise" sessions by default: those whose first user text starts with
@@ -421,9 +517,11 @@ appeared in no `history.jsonl`.
        with `{"refreshToken": false}`, and answers both (about a second or two). The rate limits
        are the usage; `account/read` also gives the account's email and plan (R10a).
 - Claude's live source produces only human-readable text (`--output-format json` merely places the
-  same text in `result`). remuda parses only the `Current session` / `Current week (…)` lines; if
-  it cannot parse them it displays the text as-is and never crashes. This format is not a public
-  interface and may change between versions.
+  same text in `result`). remuda parses only the lines that start with `Current session` or
+  `Current week`. If there is none, or one of them cannot be parsed, it displays the text as-is
+  and never crashes: an answer read only in part is not used, because the line left out may be
+  the limit that is used up. This format is not a public interface and may change between
+  versions.
 - **Codex, cached** (verified on 0.155.1 against 1456 real rollouts): each model turn appends
   `{"timestamp", "type": "event_msg", "payload": {"type": "token_count", "rate_limits": {…}}}`.
   `rate_limits` (may be null) holds `limit_id`, `limit_name`, and the windows `primary` and
@@ -454,13 +552,47 @@ appeared in no `history.jsonl`.
   unchanged after consecutive runs); the two sources are displayed separately.
 - remuda makes no network requests of its own, except the one request of `remuda pick` (R23), and
   never reads credentials to call the agent's usage endpoint directly.
-- The cache formats are undocumented and parsed on a best-effort basis: unrecognized formats
-  degrade to missing rows, and parsing never crashes.
+- The cache formats are undocumented and parsed on a best-effort basis, and parsing never
+  crashes; a cache that is not recognized is no cached usage. Claude's `limits` list is read
+  whole or not at all: an entry without a `kind` or a numeric `percent` makes the cache unusable
+  (the notice says how many entries were not recognized) instead of leaving the entries around
+  it to stand for the account's usage. The older `five_hour` / `seven_day` fields are read only
+  when there is no `limits` list or it is empty, and one of them that is there without a
+  numeric `utilization` makes the cache unusable too. What an entry may leave out is read
+  leniently: an unknown `kind` is shown under its own name, and a missing severity, model name,
+  or reset time is not shown.
 - `remuda usage [--live]` prints the same information as plain text for direct use from the shell;
   a codex account's live header also shows its email and plan.
 - The live sources provide no severity: 75% is marked as a warning and 90% as critical. Claude's
   live reset times are localized text; the timeline makes a best effort to parse them into instants
-  and otherwise uses the cached reset time of the same limit. Codex reports instants.
+  and otherwise (wording it cannot read, or no reset told) uses the cached reset time of the same
+  limit, if that is still ahead. A reset that was read is never replaced by the cached one,
+  whatever it comes to below. Codex reports instants.
+- **Usage is read at an instant.** A percentage is what an agent said at some time: the cache
+  time, or the time a live query answered (not the time it was started: a query may take as long
+  as its timeout; nor the time the answer is first shown: in the TUI it may wait behind a
+  foreground agent). Every place that shows or uses it (`remuda usage`, the table and the
+  timeline, `remuda pick`) reads it against the current time in the same way; a command that
+  waits for an agent takes the current time after the wait (`remuda usage --live` when each
+  answer arrives, `remuda pick` as R23 says):
+  - Reset wording is read as the next such time after it was said, not after now.
+  - A window whose reset fell after its usage was recorded and is not after now has **reset
+    since**: the percentage recorded is obsolete, and what the window holds now is unknown until
+    there is new data (0% used would only be a lower bound). No percentage and no severity are
+    shown for it. `remuda usage` prints `-` and `reset since cached` with the reset time; the
+    table shows `reset` in place of the percentage; the timeline draws no marker for it (its
+    next reset is unknown) and says `reset` after the window's letter in the `next` summary,
+    for a per-model window too (the legend still names its letter; the axis gives way to a
+    longer summary). A live answer that stays on screen past a reset it named is read the same
+    way. R23 says what `pick` makes of it.
+  - A reset that was already behind when the usage was recorded (live wording read into the
+    past, a cache that records one) says nothing: the percentage stands, and no reset instant
+    is shown or drawn for it, not the cached one of the same limit either. This is decided
+    against the recording, before the current time is looked at: a clock that runs behind the
+    cache does not turn such a reset into one ahead. `remuda usage --live` still prints
+    claude's wording as it is. So the answer of a live query, read when it arrives, always
+    keeps its percentages.
+  - A reset in the past is never shown as a time ahead, nor drawn on the timeline.
 
 ## R10a. Identity
 
@@ -545,18 +677,24 @@ The complete set of remuda's write operations:
 
 - `$REMUDA_HOME/config.toml`, `$REMUDA_HOME/state/**`, `$REMUDA_HOME/shared/**` (R18).
   Where the user put a symlink: a `config.toml`, a `state`, or a file in `state/` that is a
-  symlink is written through (R3); where it points, remuda touches only its own files (the
+  symlink (a cache, the launch log) is written through (R3); where it points, remuda touches
+  only its own files (the
   registry, the caches, the launch log, the settings files of R18). Modes there (R3): the
   directory a `state` symlink points at keeps its mode, and so does the file that a
   `config.toml` or a file in `state/` that is itself a symlink points at; a regular file
   remuda owns by name in a directory reached through a `state` symlink is still created with
   mode 0600, and the launch log there tightened to it. A launch log that is a symlink to a
   file others can access, or that is not a regular file, is not appended to (R3).
-  Below `shared`, remuda also replaces and removes links and rule copies, so it writes there
-  only below real directories: a `shared` or `shared/claude` that is a symlink, or that exists
-  and is not a directory, is refused before anything is created, replaced, or removed, and the
-  launch goes on without shared instructions (R18). What remains is the instant between that
-  check and the write (R18).
+  Below `shared` and in `state/settings`, remuda also replaces and removes what it keeps
+  there (links, rule copies, settings files), so it writes there only below real directories:
+  a `shared`, `shared/claude`, or `state/settings` that is a symlink, or that exists and is
+  not a directory, is refused before anything is created, replaced, or removed, and the
+  launch goes on without shared instructions, or without shared settings (R18). These
+  directories are reached as `setup` reaches a new home (below): `$REMUDA_HOME` is opened as
+  given (and `state` as R3 says), each level below is opened relative to the directory above
+  without following a symlink, and every file or link is created, replaced, or removed by
+  its name through the descriptor of the directory it is in. A symlink put at one of these
+  paths after remuda opened the directory redirects nothing (R18).
 - `$REMUDA_HOME/homes/<provider>/<name>/` created by `setup`: the directory itself and, for a
   claude account that is a member of `[share.claude]`, the symlinks of R18 in it, made once,
   while the directory is still empty, before the account is registered and logged in (login is
@@ -846,7 +984,8 @@ not see the sessions in the source's store (R11, R16).
   source does not have (missing, or a dangling link) gets no entry. remuda brings the directory to
   that state before a launch that needs it, and writes nothing when it already is: a missing link
   is created, one with another target is replaced atomically (a temporary link in the same
-  directory, renamed into place), and one for an item the source no longer has is removed. An
+  directory, renamed into place; one that a killed remuda left behind is removed by the next
+  launch, R3), and one for an item the source no longer has is removed. An
   entry named like an item that is not a symlink, or a `.claude` that is neither a directory nor
   a symlink, is never replaced: nothing is changed, and the launch goes on without shared
   instructions and says so. `shared` and `shared/claude` are directories of remuda's own, made
@@ -867,13 +1006,19 @@ not see the sessions in the source's store (R11, R16).
   and the rename leaves no `.claude` (and an inert temporary directory, which is not touched)
   until the next member launch creates it. A remuda from before this layout, still running,
   refuses the directory ("is not a symlink") and launches without shared instructions, saying
-  so, until it is restarted. Residual: a `shared`, `shared/claude`, or `.claude` that is a
-  symlink when remuda looks is refused (or, for `.claude`, migrated), but the checks and the
-  writes are by path, so a process of the same user that replaced one of them with a
-  symlink in the instant between remuda's check and its write could redirect that write; remuda
-  never creates such a symlink, and such a process can already write there itself. The same
-  holds for the rule copies and their directories, where the redirected operation could also
-  replace or remove a `*.md` file.
+  so, until it is restarted. Residual: none by path below `$REMUDA_HOME`. A `shared`,
+  `shared/claude`, or `.claude` that is a symlink is refused (or, for `.claude`, migrated),
+  and so is `rules` or a directory of the copies that is one; each is opened relative to the
+  directory above without following a symlink, and the links and the copies are created,
+  replaced, and removed through the descriptor of the directory they are in (R13). A process
+  of the same user that puts a symlink at one of these paths, or moves the directory away,
+  after remuda opened it redirects no write: the write lands in the directory remuda opened,
+  and the next launch treats the symlink as it does any it finds there (refused; migrated
+  for `.claude`). What remains is `$REMUDA_HOME`
+  itself, opened as the path the user gave; the source's items, whose existence is read by
+  path a moment before each link is made; and the reading that decides what to copy or
+  remove under `rules`, which is by path: a path replaced at that moment can make remuda copy
+  a rule again or give up with an error, not write or remove anything elsewhere.
   Basis (verified on 2.1.282): with the environment variable set, `--add-dir=<dir>` loads
   `<dir>/.claude/CLAUDE.md` and the skills, commands, and agents under `<dir>/.claude/` with their
   plain names, through per-item symlinks exactly as through a whole-home `.claude` symlink: a
@@ -901,11 +1046,13 @@ not see the sessions in the source's store (R11, R16).
   brings it to that state together with the item links, before a launch that needs it, and
   writes nothing when it already is:
   - a copy that is missing or whose content differs is written read-only (mode 0400) under a
-    temporary name in its directory (`.<32 hex digits>.tmp`, not a rule's name) and renamed
-    into place; directories are made one level at a time, never through a link;
+    temporary name in its directory (R3: `.remuda-<pid>-<32 hex digits>.tmp`, not a rule's
+    name) and renamed into place; directories are made one level at a time, never through a
+    link;
   - a regular `*.md` file there that the source no longer has is removed, and so is a temporary
-    file a write cut short left behind, and then the directories that leaves empty, `rules`
-    included. A file reached under another spelling of a rule's name (a file system that
+    file a write cut short left behind (every one there is, under the lock below, whichever
+    process made it; `.<32 hex digits>.tmp`, the name earlier versions used, counts as one),
+    and then the directories that leaves empty, `rules` included. A file reached under another spelling of a rule's name (a file system that
     ignores case) is that rule's copy and stays;
   - a rule that became a directory of rules, or the reverse, replaces the copy of the other
     kind: the removals come first, and a directory in a copy's place goes when they leave it
@@ -1003,7 +1150,11 @@ not see the sessions in the source's store (R11, R16).
   when the content is unchanged; files not used for 30 days are removed when a new one is written,
   under an exclusive lock on `state/settings/.lock` (a regular file) that reuse also takes, so a
   file is never removed between being chosen and being passed; on a filesystem that does not
-  support locking, remuda proceeds without the lock). claude reads the file once at startup and keeps its
+  support locking, remuda proceeds without the lock). `state/settings` is a directory of
+  remuda's own, the user's alone (R3): remuda removes files there, so one that is a symlink,
+  or that exists and is not a directory, is refused as a `shared` that is one is (R13):
+  nothing is written or removed where it points, and the launch goes on without shared
+  settings and says so. claude reads the file once at startup and keeps its
   content (2.1.281 bundle).
   This keeps settings values out of the process list and away from per-argument size limits.
   `autoMemoryDirectory` is added to the same JSON when auto-memory is injected. If the user's
@@ -1267,12 +1418,25 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   per model over everything. Counts below 1,000 are shown whole, others in K, M, B, or T, with
   one decimal below 100 (`1.2M`, `93.3B`, `118K`).
 - **Only transcripts that exist count**: tokens of transcripts deleted since (claude deletes those
-  older than `cleanupPeriodDays`) are no longer counted.
+  older than `cleanupPeriodDays`) are no longer counted. A transcript below a directory that
+  exists but cannot be read (R8) is not known to be deleted: its counts stay in the cache and in
+  the report as they were last read, and the report says that it is incomplete, naming the
+  directory and how many transcripts below it are counted that way. A directory that no longer
+  exists has no transcripts. The same goes for a store, or a codex home's `archived_sessions`,
+  whose path cannot be resolved (R8): the cache remembers the real path each of them last
+  resolved to, by the directory as its home gives it and not by the account's name, the
+  transcripts last read from that directory stay counted as last read, and the
+  report names the directory as the home gives it. Nothing else stays for it: what was counted
+  from a directory that is gone (a home's `sessions`, say, while its `archived_sessions` cannot
+  be resolved) or whose account left the registry is no longer counted. A codex rollout kept
+  this way is counted as unattributed while that lasts: the accounts of its home are not known.
 - **Cache**: `$REMUDA_HOME/state/stats.json`, with a schema version, rebuilt on a mismatch,
   written atomically, deletable at any time (R3). For each transcript it holds what was counted
   from it (a 64-bit FNV-1a hash of each request's key, its timestamp, model, counts with the
   cache write by lifetime, and whether it used fast mode or US-only inference), how far the
-  transcript was read, and, for codex, the last total and model. Transcripts are read like the
+  transcript was read, and, for codex, the last total and model. Beside the transcripts it
+  holds the real path each store and `archived_sessions` last resolved to (R8), which a cache
+  written before that was kept lacks and is read without. Transcripts are read like the
   index (R8): an unchanged file is not read again, a grown one only from its last complete line,
   any other one whole; only complete lines are parsed. Records of one message read in two
   refreshes merge by their key. The first computation reads every transcript whole (measured:
@@ -1282,11 +1446,14 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   (default `all`) with a COST column, then a line saying the cost is ≈ API list price and the
   prices' date, and a line naming the models not priced, if any. With an account, it prints only
   the sections that include that account, and no overall section. Reading progress goes to
-  stderr, as for `sessions`.
+  stderr, as for `sessions`. A directory that could not be read is named in an `Incomplete:` line
+  on stdout, after the table and the lines that follow it, so that a report that is piped does
+  not pass for a complete one.
 - **TUI**: view `4`, Stats. The statistics are computed in the background the first time the
   view opens, and again on each `r` after that, with reading progress shown; `r` also reads the
   prices in `config.toml` again (when they cannot be read, the built-in prices are used and the
-  status line says so). `t` in the view cycles the period (all, today, 7 days, 30 days).
+  status line says so). A directory that could not be read is named in the status line too
+  (`incomplete: …`). `t` in the view cycles the period (all, today, 7 days, 30 days).
   The title says the cost is ≈ API list price, and the status line gives the prices' date unless it shows an error. Above
   the table, a chart shows the period over time: a bar per hour (today), per day (7 and 30 days),
   or, for all, per day from the first request with a timestamp (at most 3,660 days back), else
@@ -1453,25 +1620,52 @@ It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4)
   with its reason: excluded; not of `--provider`; claude with neither `oauthAccount` in its
   `.claude.json` nor a usage cache; codex without `codex` on PATH, or whose `codex login status`
   says it is not logged in (a status that cannot be read is noted, not blocking); or a window
-  that applies with less than `min_headroom` percent left (default 10).
+  that applies, of known usage, with less than `min_headroom` percent left (default 10). With
+  `--live`, a codex account's one `codex app-server` run (R10) answers both: its `account/read`
+  says whether the account is logged in, and `codex login status` runs only when that did not
+  say (the run failed, or `account/read` failed or was not recognized).
 - **Windows.** A usage row (R10) without a parenthesized name, or with `(all models)`, applies to
   every model. `<window> (<name>)` applies to the claude models of that family
   (`claude-<family>-…`; a bare alias is its own family) and to the codex model with that id,
   ignoring case; one that matches no configured model is ignored. Without `models`, the agent's
   default model is unknown: the `default` pair shows its account's per-model windows (in the
   output, in `--json` as `default_model_windows`, and in the request, marked as applying only if
-  that model is of their family) but is never made infeasible by them. A window whose reset
-  instant has passed counts as 0% used (reset since cached). Headroom is the least percent left over the
-  windows that apply; without usage data a pair is feasible, of unknown headroom. Cached codex
-  usage has no per-model limits (R10): they are shown as unknown.
+  that model is of their family) but is never made infeasible by them. A window that has reset
+  since its usage was cached (R10) is of unknown usage: after its reset remuda knows nothing
+  about it, and 0% used is only a lower bound. It is named (`reset since cached`), never counted,
+  and never makes a pair infeasible: `min_headroom` is checked against known percentages only,
+  so a window that is known and exhausted still blocks a pair whose other windows have reset.
+  Headroom is the least percent left over the windows that apply and are known. A pair with no
+  such window, because there is no usage data or because each window that applies has reset
+  since, is feasible, of unknown headroom. Live usage is recorded when its query answers: a
+  reset time it names that reads as behind then (R10) leaves its percentage as told. Cached
+  codex usage has no per-model limits (R10): they are shown as unknown.
+- **The instant.** A recommendation reads every account's usage at one instant: the time once
+  all of it is gathered, logins checked and live queries answered or failed. It is not the time
+  remuda started: a live query may take as long as its timeout, and a window that resets while
+  it runs has reset. Feasibility, headroom, staleness, and every time in the output and in the
+  request (the time to a reset, the data's age) count from that instant. A live answer is
+  recorded when it arrives; when another account's slower query outlasts a reset it named, that
+  window has reset since it was asked (`reset since asked`, without the hint to `--live`). The
+  round trip to Jev (at most 10 s) and the launch come after that instant and do not move it.
 - **Staleness.** Cached usage older than `stale_after` minutes (default 120), or of unknown age,
   is stale; it is marked, and breaks ties (below). Staleness never makes a window feasible: a used
-  percentage only grows until its reset. `--live` queries every candidate account first (R10;
-  `--timeout` per query, default 90); a failed query falls back to the cache, with a note.
+  percentage only grows until its reset. Staleness and a reset since are independent: staleness
+  is the age of all of an account's usage, a reset since is one window's. Usage that is not
+  stale can hold a window that has reset since, and the windows of stale usage whose resets are
+  ahead stay known, at the percentage recorded. `--live` queries every candidate account first
+  (R10; `--timeout` per query, default 90); a failed query falls back to the cache, with a note.
+  remuda never queries live on its own, not before `--run` either (a live query lets the agent
+  reach its provider and write in its home): where the recommended pair has a window that has
+  reset since, the output names it and, for cached usage, says that `--live` asks the agent.
 - **Rules.** Feasible pairs rank by: known headroom before unknown; the model's position in
   `models`; headroom in 10-point bands, higher first (90% left and more is one band); fresh before
-  stale; the binding window's reset, sooner first; `prefer` order; registry order. The rules'
-  effort is `default_effort`, or none.
+  stale; the binding window's reset, sooner first; `prefer` order; registry order. Headroom
+  known from stale usage is still known: such a pair ranks before every pair of unknown
+  headroom, so usage whose resets have all passed never outranks usage that says something.
+  Pairs of unknown headroom, without usage data or past every reset, rank among themselves by
+  the same rules (a pair without usage data is not stale). The rules' effort is
+  `default_effort`, or none.
 - **When Jev is asked.** Only with `TYPESAFE_API_KEY` in remuda's environment, without
   `--offline`, with `notes`, and with a choice to make (two feasible pairs, or a provider with two
   or more `efforts` and a feasible pair). Otherwise the rules decide, and the reason is `offline`,
@@ -1483,13 +1677,15 @@ It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4)
   holding a quote, a backslash, or a control character is not sent.
   - Questions: `launch`, a Choice over the feasible pairs (the rules' best 255 when there are
     more), named `<alias> / <model>` (`default` for the agent's default) and described by the
-    binding window and the data's age, asked only when there are two or more; and
+    binding window, the windows that have reset since (of unknown usage), and the data's
+    age, asked only when there are two or more; and
     `effort_<provider>`, a Score over `efforts`, for each provider with at least two and a
     feasible pair. The criteria are a JSON object, so their order carries no meaning.
   - State: plain text with the local weekday and time (no time zone), the rules already applied,
     each account with a feasible pair under its alias (`<provider>:account-<n>`, numbered per
     provider in registry order as in R21; `default` stays `default`), its usage (source, age,
-    staleness, and each window that applies with its percentage and time to reset), the models,
+    staleness, and each window that applies with its percentage and time to reset, or as
+    `usage unknown (reset since cached)`), the models,
     the notes, and an empty task. In the notes, each qualified name is replaced by its alias: a
     provider, `:`, and the longest run of name characters (`[A-Za-z0-9_-]`) after it, wherever
     the character before it is not an ASCII letter or digit (so also right after CJK text, `-`,
@@ -1509,20 +1705,28 @@ It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4)
   (`jev_error`), and the message holds at most 200 characters of the response and never the key.
 - **Output.** The account, model, and effort (and whether the effort is Jev's); what decided and
   why, with Jev's confidence; the rules' choice when Jev's differs; the binding window and its
-  reset; the data's age; the exclusions; the `remuda run <account> <options>` command; and every pair that is not feasible,
+  reset (`unknown` when no window that applies is known); the windows that have reset since,
+  with the hint to `--live` when the usage is cached; the data's age; the exclusions; the
+  `remuda run <account> <options>` command; and every pair that is not feasible,
   with its reason. `--json` prints `account`, `provider`, `model`, `effort`, `decided_by` (`jev`,
   `jev_account`, `rules`), `reason`, `effort_by` (`jev`, `rules`; null without an effort), `jev`
   (`model`, `confidence`, `effort_confidence`, `effort_error`, `error`; null when not asked),
   `command`, and `candidates` (`account`, `model`, `feasible`, `why_not`, `headroom`, `binding`,
-  `resets_at`, `default_model_windows`, `source`, `fetched_at`, `age_seconds`, `stale`,
-  `rules_rank`, `jev_probability`). `--print-request` prints the body a send would use and sends
-  nothing (no key needed). With nothing feasible: the reasons, exit 1.
+  `resets_at`, `reset_passed`, `default_model_windows`, `source`, `fetched_at`, `age_seconds`,
+  `stale`, `rules_rank`, `jev_probability`). `headroom` and `binding` are null when the headroom
+  is unknown; `resets_at` is the binding window's reset, null unless it is ahead: never an
+  instant in the past; `reset_passed` is true when a window that applies has reset since.
+  Each of `default_model_windows` has `label`, `percent`, `resets_at`, and `reset_passed`, with
+  `percent` and `resets_at` null when its reset has passed. `--print-request` prints the body a
+  send would use and sends nothing (no key needed). With nothing feasible: the reasons, exit 1.
 - **`--run`.** Launches the recommendation exactly as `remuda run <account> <options> <args>`
   (R6, R17, R18), `<args>` being those after `--`: claude gets `--model <m> --effort <e>`, codex
   `-m <m> -c model_reasoning_effort=<e>` (verified: codex 0.156.1 accepts both before a
   subcommand), before the user's arguments; the launch log records them among its `args`. An
   option the user's arguments already set (claude `--model`, `--effort`; codex `-m`, `--model`,
-  `-c`/`--config model_reasoning_effort=…`) is not injected, and remuda says so on stderr.
+  `-c`/`--config model_reasoning_effort=…`) is not injected, and remuda says so on stderr. So
+  does it when a window of the launched pair has reset since (with the hint to `--live` when
+  the usage is cached); it launches all the same.
   Arguments that do not start a new session (R6's classification for claude; `resume` or `fork`
   first for codex) are refused before anything is sent. `--json` and `--print-request` do not
   combine with `--run`.

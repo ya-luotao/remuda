@@ -4,18 +4,22 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
 use std::time::Duration;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::{Value, json};
 
+use crate::account_command::{Parsed, Runner};
 use crate::identity::{self, Identity};
-use crate::provider::app_server::{self, ACCOUNT_READ, RATE_LIMITS_READ};
+use crate::provider::app_server::{ACCOUNT_READ, RATE_LIMITS_READ};
 use crate::provider::{Provider, codex};
 use crate::registry::Account;
-use crate::{Env, launch, probe, text};
+use crate::{Env, text};
+
+pub mod snapshot;
+
+pub use snapshot::{Reading, Reset, Snapshot, Source, Window};
 
 /// When a limit resets.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,10 +45,12 @@ pub struct CachedUsage {
 }
 
 /// Parses `cachedUsageUtilization` out of a `.claude.json`. `Err` is a short notice for the
-/// user (malformed file, no cache, no recognizable limits).
+/// user (malformed file, no cache, no recognizable limits, a limit that cannot be read).
 ///
-/// Prefers `utilization.limits[]`; falls back to `five_hour` / `seven_day` when `limits`
-/// yields nothing. Rows that do not look as expected are dropped, never fatal.
+/// Prefers `utilization.limits[]`; falls back to `five_hour` / `seven_day` when there is no
+/// such list or it is empty. A limit that cannot be read (no `kind`, no numeric `percent`)
+/// makes the cache unusable: the limits that could be read are not all of the account's, and
+/// the one left out may be the one that is used up (R10).
 pub fn parse_cached(claude_json: &str) -> Result<CachedUsage, String> {
     let v: Value =
         serde_json::from_str(claude_json).map_err(|_| "malformed .claude.json".to_string())?;
@@ -56,29 +62,48 @@ pub fn parse_cached(claude_json: &str) -> Result<CachedUsage, String> {
         .and_then(Value::as_i64)
         .and_then(|ms| Timestamp::from_millisecond(ms).ok());
     let utilization = cache.get("utilization").unwrap_or(&Value::Null);
-    let mut rows: Vec<UsageRow> = utilization
-        .get("limits")
-        .and_then(Value::as_array)
-        .map(|limits| limits.iter().filter_map(limit_row).collect())
-        .unwrap_or_default();
-    if rows.is_empty() {
-        rows = [("five_hour", "Session"), ("seven_day", "Week (all models)")]
-            .into_iter()
-            .filter_map(|(key, label)| {
-                let window = utilization.get(key)?;
-                Some(UsageRow {
+    let limits = cached_limits(utilization);
+    let listed = limits.items.len() + limits.unrecognized;
+    let rows = match limits.complete() {
+        Ok(rows) => rows,
+        Err(0) => match cached_windows(utilization).complete() {
+            Ok(rows) => rows,
+            Err(0) => return Err("no usage limits in the cache".to_string()),
+            Err(_) => return Err("usage limits in the cache not recognized".to_string()),
+        },
+        Err(unread) => {
+            return Err(format!(
+                "{unread} of {listed} usage limits in the cache not recognized"
+            ));
+        }
+    };
+    Ok(CachedUsage { fetched_at, rows })
+}
+
+/// The rows of `utilization.limits[]`: each of its entries is a limit, read or not.
+fn cached_limits(utilization: &Value) -> Parsed<UsageRow> {
+    let limits = utilization.get("limits").and_then(Value::as_array);
+    Parsed::of(limits.into_iter().flatten().map(limit_row))
+}
+
+/// The rows of the older `five_hour` / `seven_day` fields: one that is there (not null) is a
+/// window, read or not.
+fn cached_windows(utilization: &Value) -> Parsed<UsageRow> {
+    let windows = [("five_hour", "Session"), ("seven_day", "Week (all models)")];
+    Parsed::of(windows.into_iter().filter_map(|(key, label)| {
+        let window = utilization.get(key).filter(|w| !w.is_null())?;
+        Some(
+            window
+                .get("utilization")
+                .and_then(Value::as_f64)
+                .map(|percent| UsageRow {
                     label: label.to_string(),
-                    percent: window.get("utilization")?.as_f64()?,
+                    percent,
                     severity: None,
                     resets: resets_at(window),
-                })
-            })
-            .collect();
-    }
-    if rows.is_empty() {
-        return Err("no usage limits in the cache".to_string());
-    }
-    Ok(CachedUsage { fetched_at, rows })
+                }),
+        )
+    }))
 }
 
 fn limit_row(limit: &Value) -> Option<UsageRow> {
@@ -204,9 +229,19 @@ pub fn codex_live_rows(result: &Value) -> Vec<UsageRow> {
     rows
 }
 
-/// Parses the `Current session` / `Current week (...)` lines of `claude -p /usage`.
-pub fn parse_live(stdout: &str) -> Vec<UsageRow> {
-    stdout.lines().filter_map(live_row).collect()
+/// The start of each line of `claude -p /usage` that is a usage window.
+const LIVE_LINES: [&str; 2] = ["Current session", "Current week"];
+
+/// Parses the `Current session` / `Current week (...)` lines of `claude -p /usage`. A line that
+/// starts like one and cannot be read is counted, not dropped: the caller must not take the
+/// rest for the account's usage (R10).
+pub fn parse_live(stdout: &str) -> Parsed<UsageRow> {
+    let lines = stdout.lines().filter(|line| {
+        LIVE_LINES
+            .iter()
+            .any(|start| line.trim().starts_with(start))
+    });
+    Parsed::of(lines.map(live_row))
 }
 
 fn live_row(line: &str) -> Option<UsageRow> {
@@ -240,7 +275,11 @@ pub fn format_time(ts: Timestamp, tz: &TimeZone) -> String {
 
 /// `45s ago`, `3m ago`, `2h ago`, `3d ago` (floored; a future time counts as `0s ago`).
 pub fn format_age(then: Timestamp, now: Timestamp) -> String {
-    let secs = (now.as_second() - then.as_second()).max(0);
+    format_ago((now.as_second() - then.as_second()).max(0))
+}
+
+/// [`format_age`] of an age in seconds.
+pub fn format_ago(secs: i64) -> String {
     match secs {
         s if s < 60 => format!("{s}s ago"),
         s if s < 3600 => format!("{}m ago", s / 60),
@@ -254,33 +293,33 @@ pub const WARN_AT: f64 = 75.0;
 /// ... and from this one critical (R10).
 pub const CRIT_AT: f64 = 90.0;
 
-/// The reported severity, else one derived from the percentage (live rows carry none).
-pub fn severity(r: &UsageRow) -> &str {
-    match r.severity.as_deref() {
-        Some(s) => s,
-        None if r.percent >= CRIT_AT => "critical",
-        None if r.percent >= WARN_AT => "warning",
-        None => "normal",
-    }
-}
-
-/// Indented, aligned rows: label, percent, `!`/`!!` for warning/critical ([`severity`]),
-/// reset time.
-pub fn format_rows(rows: &[UsageRow], tz: &TimeZone) -> String {
-    let cells: Vec<(&str, String, &str, String)> = rows
+/// Indented, aligned rows of `reading`'s windows: label, percent, `!`/`!!` for warning/critical
+/// ([`Window::severity`]), reset time. A window whose reset has passed since the usage was
+/// recorded has `-` for its percent and says so (R10).
+pub fn format_rows(reading: &Reading, tz: &TimeZone) -> String {
+    let cells: Vec<(&str, String, &str, String)> = reading
+        .windows
         .iter()
-        .map(|r| {
-            let mark = match severity(r) {
+        .map(|w| {
+            let mark = match w.severity() {
                 "warning" => "!",
                 "critical" => "!!",
                 _ => "",
             };
-            let resets = match &r.resets {
-                Some(Resets::At(ts)) => format!("resets {}", format_time(*ts, tz)),
-                Some(Resets::Text(text)) => format!("resets {text}"),
-                None => String::new(),
+            let (percent, resets) = match (w.used(), w.reset, &w.wording) {
+                (None, Reset::Passed(at), _) => (
+                    "-".to_string(),
+                    format!("{} ({})", w.reset_since(), format_time(at, tz)),
+                ),
+                (None, _, _) => ("-".to_string(), String::new()),
+                (Some(used), _, Some(text)) => (format_percent(used), format!("resets {text}")),
+                (Some(used), Reset::Ahead(at), None) => (
+                    format_percent(used),
+                    format!("resets {}", format_time(at, tz)),
+                ),
+                (Some(used), _, None) => (format_percent(used), String::new()),
             };
-            (r.label.as_str(), format_percent(r.percent), mark, resets)
+            (w.label.as_str(), percent, mark, resets)
         })
         .collect();
     let label_w = cells.iter().map(|c| text::width(c.0)).max().unwrap_or(0);
@@ -347,11 +386,12 @@ pub fn cached_report(account: &Account, env: &Env, tz: &TimeZone, now: Timestamp
     match cached_usage(account, env) {
         Err(notice) => format!("{name}  no cached usage ({notice})\n"),
         Ok(cached) => {
-            let when = match cached.fetched_at {
-                Some(at) => format!("cached {} ({})", format_age(at, now), format_time(at, tz)),
-                None => "cached (time unknown)".to_string(),
+            let reading = Snapshot::cached(&cached).at(now);
+            let when = match (reading.age_text(), reading.fetched_at) {
+                (Some(age), Some(at)) => format!("cached {age} ({})", format_time(at, tz)),
+                _ => "cached (time unknown)".to_string(),
             };
-            format!("{name}  {when}\n{}", format_rows(&cached.rows, tz))
+            format!("{name}  {when}\n{}", format_rows(&reading, tz))
         }
     }
 }
@@ -383,47 +423,66 @@ impl From<LiveUsage> for LiveResult {
     }
 }
 
-/// Queries `account`'s usage live with its agent `program` (R10): `claude -p /usage`, or
+/// Queries `account`'s usage live through its agent (R10): `claude -p /usage`, or
 /// `codex app-server`. `Err` says why the query failed.
 pub fn live_usage(
     account: &Account,
-    program: &Path,
+    agents: &dyn Runner,
     timeout: Duration,
 ) -> Result<LiveResult, String> {
     match account.provider {
-        Provider::Claude => live_claude(account, program, timeout).map(LiveResult::from),
-        Provider::Codex => live_codex(account, program, timeout),
+        Provider::Claude => live_claude(account, agents, timeout).map(LiveResult::from),
+        Provider::Codex => {
+            let live = live_codex(account, agents, timeout)?;
+            Ok(LiveResult {
+                usage: live.usage?,
+                identity: live
+                    .login
+                    .filter(|identity| matches!(identity, Identity::LoggedIn { .. })),
+            })
+        }
     }
 }
 
 /// Runs `claude -p /usage --no-session-persistence` for `account` (R10): never through
-/// `launch::prepare`, so no `--session-id` is injected and nothing is logged.
-fn live_claude(account: &Account, program: &Path, timeout: Duration) -> Result<LiveUsage, String> {
-    let change = launch::env_change(account);
-    let outcome = probe::run_captured(program, LIVE_USAGE_ARGS, &change, timeout);
-    let Some(stdout) = outcome.success_stdout() else {
-        return Err(format!(
-            "`claude {}` {}",
-            LIVE_USAGE_ARGS.join(" "),
-            outcome.describe(timeout)
-        ));
-    };
-    let rows = parse_live(stdout);
-    Ok(if rows.is_empty() {
-        LiveUsage::Unrecognized(stdout.to_string())
-    } else {
-        LiveUsage::Rows(rows)
+/// `launch::prepare`, so no `--session-id` is injected and nothing is logged. An answer with a
+/// usage line that cannot be read is not recognized as a whole: its other lines are not the
+/// account's usage.
+fn live_claude(
+    account: &Account,
+    agents: &dyn Runner,
+    timeout: Duration,
+) -> Result<LiveUsage, String> {
+    let output = agents
+        .run_ok(account, LIVE_USAGE_ARGS, timeout)
+        .map_err(|failure| failure.to_string())?;
+    Ok(match parse_live(&output.stdout).complete() {
+        Ok(rows) => LiveUsage::Rows(rows),
+        Err(_) => LiveUsage::Unrecognized(output.stdout),
     })
+}
+
+/// What one `codex app-server` run told about an account (R4, R10): the two things it is
+/// asked, each answered or not on its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexLive {
+    /// The usage, or why `account/rateLimits/read` gave none: its error is the query's failure.
+    pub usage: Result<LiveUsage, String>,
+    /// Whether the account is logged in, and as whom, as `account/read` said; `None` when it
+    /// failed or was not recognized.
+    pub login: Option<Identity>,
 }
 
 /// One `codex app-server` run in `account`'s environment (R4, R10), asking
 /// `account/rateLimits/read` (without the reset-credit lookup) and `account/read` (without a
-/// token refresh). The rate limits are the query: their error is its failure. The identity is
-/// extra: it is dropped when `account/read` fails, is not recognized, or names no logged-in
-/// account.
-fn live_codex(account: &Account, program: &Path, timeout: Duration) -> Result<LiveResult, String> {
-    let answers = app_server::call(
-        program,
+/// token refresh). `Err` when the run itself gave no answers. A caller that needs both the
+/// usage and the login state gets them from this one run.
+pub fn live_codex(
+    account: &Account,
+    agents: &dyn Runner,
+    timeout: Duration,
+) -> Result<CodexLive, String> {
+    let answers = agents.requests(
         account,
         &[
             (RATE_LIMITS_READ, json!({"excludeResetCreditDetails": true})),
@@ -434,43 +493,33 @@ fn live_codex(account: &Account, program: &Path, timeout: Duration) -> Result<Li
     let [limits, read]: [Result<Value, String>; 2] = answers
         .try_into()
         .map_err(|_| "`codex app-server` did not answer each request".to_string())?;
-    let limits = limits?;
-    let identity = read
-        .ok()
-        .as_ref()
-        .and_then(identity::parse_account_read)
-        .filter(|identity| matches!(identity, Identity::LoggedIn { .. }));
-    let rows = codex_live_rows(&limits);
-    let usage = if rows.is_empty() {
-        LiveUsage::Unrecognized(
-            serde_json::to_string_pretty(&limits).unwrap_or_else(|_| limits.to_string()),
-        )
-    } else {
-        LiveUsage::Rows(rows)
-    };
-    Ok(LiveResult { usage, identity })
+    let usage = limits.map(|limits| {
+        let rows = codex_live_rows(&limits);
+        if rows.is_empty() {
+            LiveUsage::Unrecognized(
+                serde_json::to_string_pretty(&limits).unwrap_or_else(|_| limits.to_string()),
+            )
+        } else {
+            LiveUsage::Rows(rows)
+        }
+    });
+    let login = read.ok().as_ref().and_then(identity::parse_account_read);
+    Ok(CodexLive { usage, login })
 }
 
-/// `remuda usage --live` block for one account; `false` when the query failed (R10). `program`
-/// is the account's agent, `None` when it is not on PATH. The header names the identity the
-/// query told (codex: email and plan).
+/// `remuda usage --live` block for one account; `false` when the query failed (R10), which an
+/// agent that is not on PATH is too. The header names the identity the query told (codex: email
+/// and plan). The rows are read when they are answered, by `clock`: the query may take as long
+/// as `timeout`.
 pub fn live_report(
     account: &Account,
-    program: Option<&Path>,
+    agents: &dyn Runner,
     tz: &TimeZone,
+    clock: fn() -> Timestamp,
     timeout: Duration,
 ) -> (String, bool) {
     let name = account.qualified();
-    let Some(program) = program else {
-        return (
-            format!(
-                "{name}  error: `{}` not found on PATH\n",
-                account.provider.program()
-            ),
-            false,
-        );
-    };
-    match live_usage(account, program, timeout) {
+    match live_usage(account, agents, timeout) {
         Err(e) => (format!("{name}  error: {e}\n"), false),
         Ok(LiveResult { usage, identity }) => {
             let who = identity.as_ref().map(who_and_plan).unwrap_or_default();
@@ -485,10 +534,14 @@ pub fn live_report(
                         true,
                     )
                 }
-                LiveUsage::Rows(rows) => (
-                    format!("{name}  live{who}\n{}", format_rows(&rows, tz)),
-                    true,
-                ),
+                LiveUsage::Rows(rows) => {
+                    let now = clock();
+                    let reading = Snapshot::live(&rows, now).at(now);
+                    (
+                        format!("{name}  live{who}\n{}", format_rows(&reading, tz)),
+                        true,
+                    )
+                }
             }
         }
     }
@@ -504,78 +557,11 @@ fn who_and_plan(identity: &Identity) -> String {
     }
 }
 
-/// When a limit resets, as an instant: [`Resets::At`] as is; claude's wording
-/// (`Sep 24 at 3:19am (Asia/Shanghai)`, `3am (UTC)`) parsed best-effort, as the next such
-/// time around `now`. `None` when the wording is not recognized.
-pub fn reset_instant(resets: &Resets, now: Timestamp) -> Option<Timestamp> {
-    match resets {
-        Resets::At(ts) => Some(*ts),
-        Resets::Text(text) => parse_reset_text(text, now),
-    }
-}
-
-fn parse_reset_text(text: &str, now: Timestamp) -> Option<Timestamp> {
-    let (rest, zone) = text.trim().strip_suffix(')')?.rsplit_once(" (")?;
-    let zone = TimeZone::get(zone).ok()?;
-    let (date, time) = match rest.split_once(" at ") {
-        Some((date, time)) => (Some(date.trim()), time.trim()),
-        None => (None, rest.trim()),
-    };
-    let time = time.to_ascii_lowercase();
-    let (clock, pm) = match (time.strip_suffix("am"), time.strip_suffix("pm")) {
-        (Some(c), _) => (c, false),
-        (_, Some(c)) => (c, true),
-        _ => return None,
-    };
-    let (hour, minute) = match clock.split_once(':') {
-        Some((h, m)) => (h.parse::<i8>().ok()?, m.parse::<i8>().ok()?),
-        None => (clock.parse::<i8>().ok()?, 0),
-    };
-    if !(1..=12).contains(&hour) {
-        return None;
-    }
-    let hour = hour % 12 + if pm { 12 } else { 0 };
-    let today = now.to_zoned(zone.clone()).date();
-    let at = |d: jiff::civil::Date| -> Option<Timestamp> {
-        Some(
-            d.at(hour, minute, 0, 0)
-                .to_zoned(zone.clone())
-                .ok()?
-                .timestamp(),
-        )
-    };
-    match date {
-        None => {
-            let t = at(today)?;
-            if t >= now {
-                Some(t)
-            } else {
-                at(today.tomorrow().ok()?)
-            }
-        }
-        Some(date) => {
-            let (month, day) = date.split_once(' ')?;
-            const MONTHS: [&str; 12] = [
-                "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-            ];
-            let month = month.get(..3)?.to_ascii_lowercase();
-            let month = MONTHS.iter().position(|m| *m == month)? as i8 + 1;
-            let day: i8 = day.trim().parse().ok()?;
-            // The nearest year that does not put the reset more than a day in the past.
-            let year = today.year();
-            let this = at(jiff::civil::Date::new(year, month, day).ok()?)?;
-            if this.as_second() >= now.as_second() - 86_400 {
-                Some(this)
-            } else {
-                at(jiff::civil::Date::new(year + 1, month, day).ok()?)
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account_command::Scripted;
+    use crate::probe::Outcome;
 
     const CACHE: &str = r#"{"numStartups": 2, "cachedUsageUtilization": {
       "fetchedAtMs": 1790176749528, "accountUuid": "00000000-0000-0000-0000-000000000000",
@@ -657,15 +643,14 @@ mod tests {
         );
     }
 
+    /// R10: a limit is read leniently in what it may leave out or say anew: an unknown kind, no
+    /// scope, no severity, a reset time that is not one.
     #[test]
-    fn cached_limits_degrade_quietly() {
+    fn cached_limits_are_read_leniently() {
         let limits = r#"{"limits": [
             {"kind": "session", "percent": 12.5, "severity": "normal", "resets_at": null},
             {"kind": "monthly_thing", "group": "monthly", "percent": 3, "severity": "novel"},
             {"kind": "weekly_scoped", "percent": 50, "scope": {"surface": "x"}},
-            {"kind": "weekly_all", "percent": "lots"},
-            {"percent": 1},
-            "garbage",
             {"kind": "weekly_all", "percent": 40, "resets_at": "not a time"}]}"#;
         let cached = parse_cached(&cache_with(limits)).unwrap();
         assert_eq!(
@@ -677,6 +662,56 @@ mod tests {
                 row("Week (all models)", 40.0, None, None),
             ]
         );
+    }
+
+    /// R10 (review #14): a limit that cannot be read is counted, and makes the cache unusable:
+    /// the limits around it are not all of the account's, and the one left out may be the one
+    /// that is used up. The older fields do not stand in for the list.
+    #[test]
+    fn a_cached_limit_that_cannot_be_read_spoils_the_cache() {
+        let session = r#"{"kind": "session", "percent": 12}"#;
+        let old = r#""five_hour": {"utilization": 34}, "seven_day": {"utilization": 76}"#;
+        for unread in [
+            r#"{"kind": "weekly_all", "percent": "lots"}"#,
+            r#"{"kind": "weekly_scoped", "scope": {"model": {"display_name": "Fable"}}}"#,
+            r#"{"percent": 100}"#,
+            r#""garbage""#,
+        ] {
+            let utilization: Value =
+                serde_json::from_str(&format!(r#"{{"limits": [{session}, {unread}], {old}}}"#))
+                    .unwrap();
+            assert_eq!(
+                cached_limits(&utilization),
+                Parsed {
+                    items: vec![row("Session", 12.0, None, None)],
+                    unrecognized: 1
+                },
+                "{unread}"
+            );
+            assert_eq!(
+                parse_cached(&cache_with(&utilization.to_string())),
+                Err("1 of 2 usage limits in the cache not recognized".to_string()),
+                "{unread}"
+            );
+        }
+        // Nothing of the list can be read: still not the older fields.
+        let none = format!(r#"{{"limits": [{{"percent": 1}}, 7], {old}}}"#);
+        assert_eq!(
+            parse_cached(&cache_with(&none)),
+            Err("2 of 2 usage limits in the cache not recognized".to_string())
+        );
+        // The older fields: a window that is there without a number.
+        for unread in [
+            r#"{"five_hour": {"resets_at": null}, "seven_day": {"utilization": 76}}"#,
+            r#"{"five_hour": {"utilization": 34}, "seven_day": {"utilization": "most"}}"#,
+            r#"{"five_hour": 34}"#,
+        ] {
+            assert_eq!(
+                parse_cached(&cache_with(unread)),
+                Err("usage limits in the cache not recognized".to_string()),
+                "{unread}"
+            );
+        }
     }
 
     #[test]
@@ -869,83 +904,239 @@ mod tests {
     fn parses_live_output() {
         assert_eq!(
             parse_live(LIVE),
-            [
-                row(
-                    "Session",
-                    9.0,
-                    None,
-                    text("Sep 24 at 3:19am (Asia/Shanghai)")
-                ),
-                row(
-                    "Week (all models)",
-                    74.0,
-                    None,
-                    text("Sep 29 at 11:59am (Asia/Shanghai)")
-                ),
-                row(
-                    "Week (Fable)",
-                    85.0,
-                    None,
-                    text("Sep 29 at 11:59am (Asia/Shanghai)")
-                ),
-            ]
+            Parsed {
+                items: vec![
+                    row(
+                        "Session",
+                        9.0,
+                        None,
+                        text("Sep 24 at 3:19am (Asia/Shanghai)")
+                    ),
+                    row(
+                        "Week (all models)",
+                        74.0,
+                        None,
+                        text("Sep 29 at 11:59am (Asia/Shanghai)")
+                    ),
+                    row(
+                        "Week (Fable)",
+                        85.0,
+                        None,
+                        text("Sep 29 at 11:59am (Asia/Shanghai)")
+                    ),
+                ],
+                unrecognized: 0
+            }
         );
         assert_eq!(
-            parse_live("Current session: 0% used\n"),
+            parse_live("  Current session: 0% used\n").items,
             [row("Session", 0.0, None, None)]
         );
-        for junk in [
-            "",
-            "hello\n",
-            "Current session: lots used\n",
-            "Current week (x: 5% used\n",
-        ] {
-            assert!(parse_live(junk).is_empty(), "{junk:?}");
+        // Neither a usage line nor like one.
+        for other in ["", "hello\n", "Currently: 5% used\n", "session: 5% used\n"] {
+            let parsed = parse_live(other);
+            assert_eq!(
+                (parsed.items.len(), parsed.unrecognized),
+                (0, 0),
+                "{other:?}"
+            );
         }
     }
 
+    /// R10 (review #14): a line that starts like a usage line and cannot be read is counted,
+    /// so that the lines around it are not taken for the account's usage.
     #[test]
-    fn reset_text_becomes_an_instant() {
-        let now = ts("2026-09-23T18:00:00Z"); // Sep 24 02:00 in Shanghai
-        let parse = |t: &str| reset_instant(&Resets::Text(t.into()), now);
-        assert_eq!(
-            parse("Sep 24 at 3:19am (Asia/Shanghai)"),
-            Some(ts("2026-09-23T19:19:00Z"))
-        );
-        assert_eq!(
-            parse("Sep 29 at 11:59am (Asia/Shanghai)"),
-            Some(ts("2026-09-29T03:59:00Z"))
-        );
-        assert_eq!(
-            parse("Sep 29 at 12pm (UTC)"),
-            Some(ts("2026-09-29T12:00:00Z"))
-        );
-        assert_eq!(
-            parse("Sep 29 at 12:30am (UTC)"),
-            Some(ts("2026-09-29T00:30:00Z"))
-        );
-        // No date: the next such time.
-        assert_eq!(parse("7pm (UTC)"), Some(ts("2026-09-23T19:00:00Z")));
-        assert_eq!(parse("5pm (UTC)"), Some(ts("2026-09-24T17:00:00Z")));
-        // Around New Year: January is next year.
-        let dec = ts("2026-12-30T00:00:00Z");
-        assert_eq!(
-            reset_instant(&Resets::Text("Jan 2 at 1am (UTC)".into()), dec),
-            Some(ts("2027-01-02T01:00:00Z"))
-        );
-        for junk in [
-            "",
-            "soon",
-            "Sep 24 at 3:19am",
-            "Sep 24 at 3:19am (Not/AZone)",
-            "Sep 24 at 13am (UTC)",
-            "Foo 24 at 3am (UTC)",
-            "Sep 24 at 3:xxam (UTC)",
+    fn a_usage_line_that_cannot_be_read_is_counted() {
+        for unread in [
+            "Current session: lots used\n",
+            "Current week (x: 5% used\n",
+            "Current week: 5% used\n",
+            "Current session \u{b7} 5% used\n",
+            "  Current week (all models): limit reached \u{b7} resets 3am (UTC)\n",
         ] {
-            assert_eq!(parse(junk), None, "{junk:?}");
+            let parsed = parse_live(unread);
+            assert_eq!(
+                (parsed.items.len(), parsed.unrecognized),
+                (0, 1),
+                "{unread:?}"
+            );
+            assert_eq!(parsed.complete(), Err(1), "{unread:?}");
         }
-        let at = ts("2026-09-25T05:00:00Z");
-        assert_eq!(reset_instant(&Resets::At(at), now), Some(at));
+        // The week is used up, and said in words this version does not know.
+        let drifted = LIVE.replace(
+            "Current week (all models): 74% used",
+            "Current week (all models): limit reached",
+        );
+        let parsed = parse_live(&drifted);
+        let labels: Vec<&str> = parsed.items.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, ["Session", "Week (Fable)"]);
+        assert_eq!(parsed.unrecognized, 1);
+        assert_eq!(parsed.complete(), Err(1));
+    }
+
+    fn claude_account(name: &str) -> Account {
+        Account {
+            provider: crate::registry::CLAUDE,
+            name: name.into(),
+            home: crate::registry::Home::Path(format!("/h/{name}")),
+        }
+    }
+
+    fn codex_account(name: &str) -> Account {
+        Account {
+            provider: crate::registry::CODEX,
+            name: name.into(),
+            home: crate::registry::Home::Path(format!("/c/{name}")),
+        }
+    }
+
+    const USAGE: &str = "claude:max -p /usage --no-session-persistence";
+    const T: Duration = Duration::from_secs(90);
+
+    /// R10: `claude -p /usage` answers rows; a failure says the command and why; a claude that
+    /// is not on PATH is the query's failure.
+    #[test]
+    fn live_claude_usage_is_the_commands_answer() {
+        let max = claude_account("max");
+        let agents = Scripted::new().on(USAGE, Scripted::exited(0, LIVE, ""));
+        let result = live_usage(&max, &agents, T).unwrap();
+        assert_eq!(result.identity, None);
+        assert_eq!(result.usage, LiveUsage::Rows(parse_live(LIVE).items));
+        assert_eq!(agents.ran(), [USAGE]);
+
+        let agents = Scripted::new().on(USAGE, Outcome::TimedOut);
+        assert_eq!(
+            live_usage(&max, &agents, T),
+            Err("`claude -p /usage --no-session-persistence` timed out after 90s".to_string())
+        );
+        let agents = Scripted::new().on(USAGE, Scripted::exited(1, "", "Not logged in\n"));
+        assert_eq!(
+            live_usage(&max, &agents, T),
+            Err(
+                "`claude -p /usage --no-session-persistence` exited with status 1: Not logged in"
+                    .to_string()
+            )
+        );
+        let agents = Scripted::new().without(Provider::Claude);
+        assert_eq!(
+            live_usage(&max, &agents, T),
+            Err("`claude` not found on PATH".to_string())
+        );
+        assert_eq!(
+            live_report(&max, &agents, &TimeZone::UTC, Timestamp::now, T),
+            (
+                "claude:max  error: `claude` not found on PATH\n".to_string(),
+                false
+            )
+        );
+        assert!(agents.ran().is_empty());
+    }
+
+    /// R10 (review #14): the week is used up and its line no longer reads `<N>% used`: the
+    /// answer is not recognized, whole; the session line alone would show the account as
+    /// available.
+    #[test]
+    fn a_live_answer_read_in_part_is_not_recognized() {
+        let max = claude_account("max");
+        let drifted = LIVE.replace(
+            "Current week (all models): 74% used",
+            "Current week (all models): limit reached",
+        );
+        let agents = Scripted::new().on(USAGE, Scripted::exited(0, &drifted, ""));
+        assert_eq!(
+            live_usage(&max, &agents, T),
+            Ok(LiveUsage::Unrecognized(drifted.clone()).into())
+        );
+        let (report, ok) = live_report(&max, &agents, &TimeZone::UTC, Timestamp::now, T);
+        assert!(ok);
+        assert!(
+            report.starts_with("claude:max  live (output not recognized; shown as is)\n"),
+            "{report}"
+        );
+        assert!(
+            report.contains("    Current week (all models): limit reached"),
+            "{report}"
+        );
+        // No usage line at all is not recognized either, as before.
+        let agents = Scripted::new().on(USAGE, Scripted::exited(0, "Usage is unavailable.\n", ""));
+        assert_eq!(
+            live_usage(&max, &agents, T),
+            Ok(LiveUsage::Unrecognized("Usage is unavailable.\n".into()).into())
+        );
+    }
+
+    /// R10: one `codex app-server` run answers the rate limits and the identity; the identity
+    /// is extra, the rate limits are the query.
+    #[test]
+    fn live_codex_usage_is_one_app_server_run() {
+        let work = codex_account("work");
+        let limits =
+            json!({"rateLimits": {"primary": {"usedPercent": 4, "windowDurationMins": 300}}});
+        let read =
+            json!({"account": {"type": "chatgpt", "email": "c@example.com", "planType": "plus"}});
+        let session = vec![row("Session", 4.0, None, None)];
+        let agents =
+            Scripted::new().app_server_says("codex:work", Ok(vec![Ok(limits.clone()), Ok(read)]));
+        let result = live_usage(&work, &agents, T).unwrap();
+        assert_eq!(result.usage, LiveUsage::Rows(session.clone()));
+        assert_eq!(
+            result.identity.as_ref().map(Identity::who).as_deref(),
+            Some("c@example.com")
+        );
+        assert_eq!(
+            agents.ran(),
+            ["codex:work app-server account/rateLimits/read account/read"]
+        );
+        // `account/read` fails, or names nobody: the usage all the same.
+        for read in [
+            Err("`codex app-server` account/read: no".to_string()),
+            Ok(json!({"account": null})),
+            Ok(json!("?")),
+        ] {
+            let agents =
+                Scripted::new().app_server_says("codex:work", Ok(vec![Ok(limits.clone()), read]));
+            assert_eq!(
+                live_usage(&work, &agents, T),
+                Ok(LiveUsage::Rows(session.clone()).into())
+            );
+        }
+        // The rate limits fail: the query does.
+        let denied = "`codex app-server` account/rateLimits/read: authentication required";
+        let agents = Scripted::new().app_server_says(
+            "codex:work",
+            Ok(vec![Err(denied.to_string()), Ok(json!({"account": null}))]),
+        );
+        assert_eq!(live_usage(&work, &agents, T), Err(denied.to_string()));
+        let agents = Scripted::new().app_server_says(
+            "codex:work",
+            Err("`codex app-server` timed out after 90s".into()),
+        );
+        assert_eq!(
+            live_usage(&work, &agents, T),
+            Err("`codex app-server` timed out after 90s".to_string())
+        );
+        let agents = Scripted::new().app_server_says("codex:work", Ok(vec![Ok(limits)]));
+        assert_eq!(
+            live_usage(&work, &agents, T),
+            Err("`codex app-server` did not answer each request".to_string())
+        );
+        // No window to show: the result as it is.
+        let agents = Scripted::new().app_server_says(
+            "codex:work",
+            Ok(vec![Ok(json!({"rateLimits": null})), Ok(json!({}))]),
+        );
+        assert_eq!(
+            live_usage(&work, &agents, T),
+            Ok(LiveUsage::Unrecognized("{\n  \"rateLimits\": null\n}".into()).into())
+        );
+        let agents = Scripted::new().without(Provider::Codex);
+        assert_eq!(
+            live_report(&work, &agents, &TimeZone::UTC, Timestamp::now, T),
+            (
+                "codex:work  error: `codex` not found on PATH\n".to_string(),
+                false
+            )
+        );
     }
 
     #[test]
@@ -970,16 +1161,25 @@ mod tests {
         }
     }
 
+    /// A live answer's rows as text, read when they were answered.
+    fn live_text(rows: &[UsageRow]) -> String {
+        let now = ts("2026-09-23T12:00:00Z");
+        format_rows(&Snapshot::live(rows, now).at(now), &TimeZone::UTC)
+    }
+
+    fn normalized(out: &str) -> Vec<String> {
+        out.lines()
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect()
+    }
+
     #[test]
     fn formats_rows_with_markers() {
-        let rows = parse_cached(CACHE).unwrap().rows;
-        let out = format_rows(&rows, &TimeZone::UTC);
-        let normalized: Vec<String> = out
-            .lines()
-            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect();
+        let cached = parse_cached(CACHE).unwrap();
+        let fetched = cached.fetched_at.unwrap();
+        let out = format_rows(&Snapshot::cached(&cached).at(fetched), &TimeZone::UTC);
         assert_eq!(
-            normalized,
+            normalized(&out),
             [
                 "Session 34% resets Sep 23 15:39",
                 "Week (all models) 77% ! resets Sep 25 04:59",
@@ -990,66 +1190,87 @@ mod tests {
         // Percent columns line up.
         let pct_end: Vec<usize> = out.lines().map(|l| l.find('%').unwrap()).collect();
         assert!(pct_end.windows(2).all(|w| w[0] == w[1]), "{out}");
-        let live = format_rows(&parse_live(LIVE), &TimeZone::UTC);
+        let live = live_text(&parse_live(LIVE).items);
         assert!(live.contains("9%"), "{live}");
         assert!(
             live.contains("resets Sep 24 at 3:19am (Asia/Shanghai)"),
             "{live}"
         );
         // Labels align by display width (a double-width model name).
-        let wide = format_rows(
-            &[
-                row("Week (模型)", 5.0, None, None),
-                row("Session", 7.0, None, None),
-            ],
-            &TimeZone::UTC,
-        );
+        let wide = live_text(&[
+            row("Week (模型)", 5.0, None, None),
+            row("Session", 7.0, None, None),
+        ]);
         let pct_col: Vec<usize> = wide
             .lines()
             .map(|l| text::width(&l[..l.find('%').unwrap()]))
             .collect();
         assert_eq!(pct_col[0], pct_col[1], "{wide}");
-        let fractional = format_rows(&[row("X", 12.5, None, None)], &TimeZone::UTC);
+        let fractional = live_text(&[row("X", 12.5, None, None)]);
         assert_eq!(fractional.trim(), "X  12.5%");
     }
 
+    /// R10: a window whose reset has passed since the cache was written has no percentage (and
+    /// no marker): it says when it reset. The others read as recorded.
     #[test]
-    fn live_rows_are_marked_at_75_and_90_percent() {
-        assert_eq!((WARN_AT, CRIT_AT), (75.0, 90.0));
-        let live = |percent| row("Session", percent, None, None);
-        for (percent, want) in [
-            (0.0, "normal"),
-            (74.9, "normal"),
-            (75.0, "warning"),
-            (89.9, "warning"),
-            (90.0, "critical"),
-            (100.0, "critical"),
-        ] {
-            assert_eq!(severity(&live(percent)), want, "{percent}%");
-        }
-        // A reported severity (cached rows) wins over the percentage.
+    fn a_passed_reset_is_said_instead_of_the_old_percentage() {
+        let cached = parse_cached(CACHE).unwrap();
+        // After the session's reset (Sep 23 15:39), before the week's.
+        let reading = Snapshot::cached(&cached).at(ts("2026-09-24T00:00:00Z"));
+        let out = format_rows(&reading, &TimeZone::UTC);
         assert_eq!(
-            severity(&row("Session", 95.0, Some("normal"), None)),
-            "normal"
+            normalized(&out),
+            [
+                "Session - reset since cached (Sep 23 15:39)",
+                "Week (all models) 77% ! resets Sep 25 04:59",
+                "Week (Fable) 100% !! resets Sep 25 04:59",
+            ]
+        );
+        // The `-` ends where the percentages do.
+        let ends: Vec<usize> = out
+            .lines()
+            .map(|l| {
+                l.find(" - ")
+                    .map_or_else(|| l.find('%').unwrap(), |i| i + 1)
+            })
+            .collect();
+        assert!(ends.windows(2).all(|w| w[0] == w[1]), "{out}");
+        // Every reset passed: the exhausted per-model week is not marked critical any more.
+        let later = Snapshot::cached(&cached).at(ts("2026-10-01T00:00:00Z"));
+        assert_eq!(
+            normalized(&format_rows(&later, &TimeZone::UTC)),
+            [
+                "Session - reset since cached (Sep 23 15:39)",
+                "Week (all models) - reset since cached (Sep 25 04:59)",
+                "Week (Fable) - reset since cached (Sep 25 04:59)",
+            ]
+        );
+        // A live answer naming a reset already behind keeps its percentage, and its wording.
+        let now = ts("2026-09-24T00:00:00Z");
+        let rows = [row("Session", 95.0, None, text("Sep 23 at 11pm (UTC)"))];
+        let live = format_rows(&Snapshot::live(&rows, now).at(now), &TimeZone::UTC);
+        assert_eq!(
+            normalized(&live),
+            ["Session 95% !! resets Sep 23 at 11pm (UTC)"]
+        );
+        // The same answer, asked before that reset and read after it.
+        let asked = ts("2026-09-23T20:00:00Z");
+        let aged = format_rows(&Snapshot::live(&rows, asked).at(now), &TimeZone::UTC);
+        assert_eq!(
+            normalized(&aged),
+            ["Session - reset since asked (Sep 23 23:00)"]
         );
     }
 
     #[test]
     fn live_rows_get_the_same_markers_in_text() {
-        let out = format_rows(
-            &[
-                row("Session", 74.0, None, None),
-                row("Week (all models)", 75.0, None, None),
-                row("Week (Fable)", 90.0, None, None),
-            ],
-            &TimeZone::UTC,
-        );
-        let normalized: Vec<String> = out
-            .lines()
-            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect();
+        let out = live_text(&[
+            row("Session", 74.0, None, None),
+            row("Week (all models)", 75.0, None, None),
+            row("Week (Fable)", 90.0, None, None),
+        ]);
         assert_eq!(
-            normalized,
+            normalized(&out),
             [
                 "Session 74%",
                 "Week (all models) 75% !",

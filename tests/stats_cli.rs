@@ -592,6 +592,241 @@ fn stats_warns_when_the_cache_cannot_be_written() {
     );
 }
 
+/// R20, R8 (review #10): a store that exists but cannot be read is not one whose transcripts
+/// were deleted. The report keeps their counts as last read and says on stdout that it is
+/// incomplete, naming the store; the cache is left as it was.
+#[test]
+fn stats_says_when_a_store_cannot_be_read_and_keeps_its_counts() {
+    let s = setup();
+    claude_fixtures(&s);
+    let complete = stats(&s.sb, &[]);
+    assert!(!complete.contains("Incomplete"), "{complete}");
+    let cache = s.sb.remuda_home().join("state/stats.json");
+    let saved = fs::read(&cache).unwrap();
+    let written = fs::metadata(&cache).unwrap().modified().unwrap();
+    let files = |path: &Path| -> usize {
+        let v: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let below = |p: &&String| p.starts_with(s.native.canonicalize().unwrap().to_str().unwrap());
+        v["files"].as_object().unwrap().keys().filter(below).count()
+    };
+    let cached = files(&cache);
+    assert!(cached > 1);
+
+    let store = s.native.canonicalize().unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o000)).unwrap();
+    let out =
+        s.sb.remuda()
+            .arg("stats")
+            .assert()
+            .success()
+            .stderr("")
+            .get_output()
+            .clone();
+    let filtered = stats(&s.sb, &["max"]);
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let line = stdout
+        .strip_prefix(complete.as_str())
+        .unwrap_or_else(|| panic!("the same report, then the line:\n{stdout}"));
+    let said = format!("Incomplete: cannot read {}: ", store.display());
+    assert!(line.starts_with(&said), "{line}");
+    assert!(
+        line.ends_with(&format!(
+            "; {cached} transcripts below it are counted as last read\n"
+        )),
+        "{line}"
+    );
+    assert_eq!(line.lines().count(), 1, "{line}");
+    assert!(
+        filtered.ends_with(line),
+        "also for one account:\n{filtered}"
+    );
+    assert_eq!(fs::read(&cache).unwrap(), saved);
+    assert_eq!(
+        fs::metadata(&cache).unwrap().modified().unwrap(),
+        written,
+        "the cache is not rewritten"
+    );
+
+    // Readable again: the report is complete, and nothing was read again.
+    assert_eq!(stats(&s.sb, &[]), complete);
+    assert_eq!(fs::metadata(&cache).unwrap().modified().unwrap(), written);
+}
+
+/// R20, R8 (review #10): a project directory that can be listed but not searched is not one
+/// whose transcripts were deleted either: the same report, one `Incomplete:` line naming it,
+/// and the cache left as it was, so that nothing is read again afterwards.
+#[test]
+fn stats_says_when_a_project_cannot_be_searched_and_keeps_its_counts() {
+    let s = setup();
+    claude_fixtures(&s);
+    let complete = stats(&s.sb, &[]);
+    let cache = s.sb.remuda_home().join("state/stats.json");
+    let saved = fs::read(&cache).unwrap();
+    let written = fs::metadata(&cache).unwrap().modified().unwrap();
+    let project = s.native.canonicalize().unwrap().join("-w-proj");
+    let v: Value = serde_json::from_slice(&saved).unwrap();
+    let below = |p: &&String| Path::new(p.as_str()).starts_with(&project);
+    let cached = v["files"].as_object().unwrap().keys().filter(below).count();
+    assert!(cached > 2, "top-level and subagent transcripts: {cached}");
+
+    fs::set_permissions(&project, fs::Permissions::from_mode(0o444)).unwrap();
+    let out = stats(&s.sb, &[]);
+    fs::set_permissions(&project, fs::Permissions::from_mode(0o755)).unwrap();
+    let line = out
+        .strip_prefix(complete.as_str())
+        .unwrap_or_else(|| panic!("the same report, then the line:\n{out}"));
+    assert_eq!(line.lines().count(), 1, "{line}");
+    assert!(
+        line.starts_with(&format!("Incomplete: cannot read {}: ", project.display())),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(&format!(
+            "; {cached} transcripts below it are counted as last read\n"
+        )),
+        "{line}"
+    );
+    assert_eq!(fs::read(&cache).unwrap(), saved);
+
+    assert_eq!(stats(&s.sb, &[]), complete);
+    assert_eq!(
+        fs::metadata(&cache).unwrap().modified().unwrap(),
+        written,
+        "nothing was read again: the cache is not rewritten"
+    );
+}
+
+/// R20, R8 (review #10): a home that cannot be searched does not make its store an absent
+/// one. The store cannot be resolved: its transcripts stay counted as last read, the report
+/// says so naming the store as the home gives it, and the cache is left as it was.
+#[test]
+fn stats_says_when_a_store_cannot_be_resolved_and_keeps_its_counts() {
+    let s = setup();
+    claude_fixtures(&s);
+    let complete = stats(&s.sb, &[]);
+    let cache = s.sb.remuda_home().join("state/stats.json");
+    let saved = fs::read(&cache).unwrap();
+    let written = fs::metadata(&cache).unwrap().modified().unwrap();
+
+    fs::set_permissions(&s.team, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = stats(&s.sb, &[]);
+    fs::set_permissions(&s.team, fs::Permissions::from_mode(0o755)).unwrap();
+    // The tokens are all there; whose they are is another matter (the home's `history.jsonl`
+    // cannot be read either).
+    assert_eq!(block(&out, "overall"), block(&complete, "overall"));
+    let line = out.lines().last().unwrap();
+    assert!(
+        line.starts_with(&format!(
+            "Incomplete: cannot read {}: ",
+            s.team.join("projects").display()
+        )),
+        "{out}"
+    );
+    assert!(
+        line.ends_with("; 1 transcript below it is counted as last read"),
+        "{line}"
+    );
+    assert_eq!(out.matches("Incomplete:").count(), 1, "{out}");
+    assert_eq!(fs::read(&cache).unwrap(), saved);
+
+    assert_eq!(stats(&s.sb, &[]), complete);
+    assert_eq!(
+        fs::metadata(&cache).unwrap().modified().unwrap(),
+        written,
+        "nothing was read again: the cache is not rewritten"
+    );
+}
+
+/// R20, R8 (review #10): while one store cannot be resolved, a store that is gone is still
+/// gone. Its tokens are no longer counted and leave the cache; only those of the store that
+/// cannot be resolved stay, with the `Incomplete:` line.
+#[test]
+fn a_store_that_is_gone_stops_counting_while_another_cannot_be_resolved() {
+    let s = setup();
+    claude_fixtures(&s);
+    stats(&s.sb, &[]);
+    let cache = s.sb.remuda_home().join("state/stats.json");
+    let saved = |cache: &Path| -> Vec<String> {
+        let v: Value = serde_json::from_slice(&fs::read(cache).unwrap()).unwrap();
+        v["files"].as_object().unwrap().keys().cloned().collect()
+    };
+    assert!(saved(&cache).len() > 2);
+
+    fs::remove_dir_all(&s.native).unwrap();
+    fs::set_permissions(&s.team, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = stats(&s.sb, &[]);
+    fs::set_permissions(&s.team, fs::Permissions::from_mode(0o755)).unwrap();
+    // What is left is the one message of team's store.
+    assert_eq!(
+        block(&out, "overall"),
+        ["claude-test 11 0 0 11 - 22 -", "total 11 0 0 11 - 22 -"],
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .last()
+            .is_some_and(|l| l.starts_with("Incomplete: cannot read ")
+                && l.ends_with("; 1 transcript below it is counted as last read")),
+        "{out}"
+    );
+    let left = saved(&cache);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].contains(S_T), "{left:?}");
+}
+
+/// R20, R8 (review #10): an account removed and registered again under the same name with
+/// another home, whose store cannot be resolved before it was read, does not keep what was
+/// counted from the old home: the tokens leave the report and the saved cache, on this run
+/// and the next, and the new store is named with nothing kept below it.
+#[test]
+fn an_account_registered_again_with_another_home_does_not_keep_the_old_counts() {
+    let sb = Sandbox::new();
+    let (old, new) = (sb.make_claude_home("p/old"), sb.make_claude_home("p/new"));
+    write(
+        &old.join("projects"),
+        &format!("{S_A}.jsonl"),
+        &message(S_A, "msg_old", cl::usage(10, 10, 0, 0)),
+    );
+    write(
+        &new.join("projects"),
+        &format!("{S_B}.jsonl"),
+        &message(S_B, "msg_new", cl::usage(20, 20, 0, 0)),
+    );
+    sb.register(&[("work", &old)]);
+    let first = stats(&sb, &[]);
+    assert_eq!(block(&first, "overall")[0], "claude-test 10 0 0 10 - 20 -");
+    let cache = sb.remuda_home().join("state/stats.json");
+    let saved = |cache: &Path| -> usize {
+        let v: Value = serde_json::from_slice(&fs::read(cache).unwrap()).unwrap();
+        v["files"].as_object().unwrap().len()
+    };
+    assert_eq!(saved(&cache), 1);
+
+    sb.register(&[("work", &new)]);
+    fs::set_permissions(&new, fs::Permissions::from_mode(0o000)).unwrap();
+    let runs = [stats(&sb, &[]), stats(&sb, &[])];
+    let left = saved(&cache);
+    fs::set_permissions(&new, fs::Permissions::from_mode(0o755)).unwrap();
+    for out in &runs {
+        assert_eq!(block(out, "overall"), ["no tokens"], "{out}");
+        let line = out.lines().last().unwrap();
+        assert!(
+            line.starts_with(&format!(
+                "Incomplete: cannot read {}: ",
+                new.join("projects").display()
+            )),
+            "{out}"
+        );
+        assert!(!line.contains("below it"), "nothing is kept: {line}");
+    }
+    assert_eq!(left, 0, "the saved cache does not keep the old home's");
+
+    let out = stats(&sb, &[]);
+    assert_eq!(block(&out, "overall")[0], "claude-test 20 0 0 20 - 40 -");
+    assert!(!out.contains("Incomplete"), "{out}");
+}
+
 /// R5: an account that does not resolve is an error.
 #[test]
 fn stats_unknown_account_fails() {

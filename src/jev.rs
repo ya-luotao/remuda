@@ -10,11 +10,11 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::{Map, Value, json};
 
-use crate::pick::{self, Answers, Asked, Candidate, Config, Entry, Reason, Source};
+use crate::pick::{self, Answers, Asked, Candidate, Config, Entry, Reason};
 use crate::privacy::{self, Aliases};
 use crate::probe::{self, Outcome};
 use crate::provider::Provider;
-use crate::usage;
+use crate::usage::{self, Source};
 
 pub const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 /// The model asked; the response names the version that answered.
@@ -144,34 +144,33 @@ pub fn request(
     }
 }
 
-/// An option's description: its binding window, the per-model windows that may apply to the
-/// agent's default model, and how old the data is.
+/// An option's description: its binding window, the windows of unknown usage (reset since
+/// cached), the per-model windows that may apply to the agent's default model, and how old the
+/// data is.
 fn option_text(entry: &Entry, c: &Candidate, config: &Config, now: Timestamp) -> String {
-    let Some(binding) = &c.binding else {
-        return "no usage data".to_string();
+    let unknown = pick::reset_passed_text(c);
+    let limit = match (&c.binding, unknown) {
+        (Some(binding), None) => format!("tightest: {}", pick::binding_text(binding, now)),
+        (Some(binding), Some(unknown)) => format!(
+            "tightest: {}; usage unknown: {unknown}",
+            pick::binding_text(binding, now)
+        ),
+        (None, Some(unknown)) => format!("usage unknown: {unknown}"),
+        (None, None) => return "no usage data".to_string(),
     };
     let also: String = c
         .default_model_windows
         .iter()
         .map(|w| format!("; also: {}", pick::used_text(w, now)))
         .collect();
-    let age = match entry.usage.as_ref().map(|u| (u.source, u.fetched_at)) {
-        Some((Source::Live, _)) => "live".to_string(),
-        Some((Source::Cached, Some(at))) => {
-            let age = usage::format_age(at, now);
-            format!("{} old", age.trim_end_matches(" ago"))
-        }
+    let age = match entry.usage.as_ref().map(|u| (u.source, u.age_text())) {
+        Some((Source::Live, Some(age))) => format!("live, {} old", age.trim_end_matches(" ago")),
+        Some((Source::Live, None)) => "live".to_string(),
+        Some((Source::Cached, Some(age))) => format!("{} old", age.trim_end_matches(" ago")),
         _ => "of unknown age".to_string(),
     };
-    let stale = if entry.stale(config, now) {
-        " (stale)"
-    } else {
-        ""
-    };
-    format!(
-        "tightest: {}{also}; data {age}{stale}",
-        pick::binding_text(binding, now)
-    )
+    let stale = if entry.stale(config) { " (stale)" } else { "" };
+    format!("{limit}{also}; data {age}{stale}")
 }
 
 /// The state Jev reads (R23): the local time, the rules already applied, each account with an
@@ -198,7 +197,8 @@ pub fn state_text(
     ));
     out.push_str(&format!(
         "rules already enforced (every option satisfies them): at least {}% left on each \
-         window that applies; excluded accounts are not listed.\n",
+         window that applies and whose usage is known (one that reset since it was cached is \
+         unknown: not checked); excluded accounts are not listed.\n",
         config.min_headroom
     ));
     let mut listed: Vec<usize> = Vec::new();
@@ -216,12 +216,13 @@ pub fn state_text(
             "\naccount {} ({provider})\n",
             aliases.qualified(&entry.account.qualified())
         ));
-        let data = match entry.usage.as_ref().map(|u| (u.source, u.fetched_at)) {
+        let data = match entry.usage.as_ref().map(|u| (u.source, u.age_text())) {
             None => "unknown (no usage data)".to_string(),
-            Some((Source::Live, _)) => "live, just now".to_string(),
-            Some((Source::Cached, at)) => {
-                let when = at.map_or("time unknown".to_string(), |at| usage::format_age(at, now));
-                let fresh = if entry.stale(config, now) {
+            Some((Source::Live, Some(age))) => format!("live, {age}"),
+            Some((Source::Live, None)) => "live".to_string(),
+            Some((Source::Cached, age)) => {
+                let when = age.unwrap_or_else(|| "time unknown".to_string());
+                let fresh = if entry.stale(config) {
                     "stale: may be higher now"
                 } else {
                     "fresh"
@@ -248,18 +249,17 @@ pub fn state_text(
             if !applies {
                 continue;
             }
-            let when = if w.reset_passed {
-                " (reset since cached)".to_string()
-            } else {
-                w.resets_at
-                    .map(|at| format!(", resets in {}", pick::format_in(at, now)))
-                    .unwrap_or_default()
+            let state = match w.used() {
+                Some(used) => format!(
+                    "{} used{}",
+                    usage::format_percent(used),
+                    w.resets_at()
+                        .map(|at| format!(", resets in {}", pick::format_in(at, now)))
+                        .unwrap_or_default()
+                ),
+                None => format!("usage unknown ({})", w.reset_since()),
             };
-            out.push_str(&format!(
-                "  {}: {} used{when}{maybe}\n",
-                w.label,
-                usage::format_percent(w.percent)
-            ));
+            out.push_str(&format!("  {}: {state}{maybe}\n", w.label));
         }
         if entry.usage.is_some() && entry.per_model_unknown() {
             out.push_str("  per-model limits: unknown (codex reports them only live)\n");
@@ -529,8 +529,9 @@ fn scrub(text: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pick::{Choices, Usage, Window};
+    use crate::pick::Choices;
     use crate::registry::{Account, Home};
+    use crate::usage::{CachedUsage, Reading, Resets, Snapshot, UsageRow};
 
     const NOW: &str = "2026-09-26T18:05:00Z";
 
@@ -538,18 +539,26 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn window(label: &str, model: Option<&str>, percent: f64, resets: &str) -> Window {
-        Window {
+    fn row(label: &str, percent: f64, resets: &str) -> UsageRow {
+        UsageRow {
             label: label.into(),
-            model: model.map(str::to_string),
             percent,
-            resets_at: Some(ts(resets)),
-            reset_passed: false,
+            severity: None,
+            resets: Some(Resets::At(ts(resets))),
         }
     }
 
-    fn fixture() -> (Vec<Entry>, Config, Aliases) {
+    /// `rows`, cached `age` before [`NOW`] and read then.
+    fn cached(age: jiff::SignedDuration, rows: Vec<UsageRow>) -> Reading {
         let now = ts(NOW);
+        let cached = CachedUsage {
+            fetched_at: Some(now - age),
+            rows,
+        };
+        Snapshot::cached(&cached).at(now)
+    }
+
+    fn fixture() -> (Vec<Entry>, Config, Aliases) {
         let account = |provider, name: &str| Account {
             provider,
             name: name.into(),
@@ -559,30 +568,23 @@ mod tests {
             Entry {
                 account: account(Provider::Claude, "max"),
                 blocked: None,
-                usage: Some(Usage {
-                    source: Source::Cached,
-                    fetched_at: Some(now - jiff::SignedDuration::from_mins(25)),
-                    windows: vec![
-                        window("Session", None, 34.0, "2026-09-26T19:25:00Z"),
-                        window("Week (all models)", None, 77.0, "2026-09-28T21:05:00Z"),
-                        window("Week (Fable)", Some("Fable"), 100.0, "2026-09-28T21:05:00Z"),
+                usage: Some(cached(
+                    jiff::SignedDuration::from_mins(25),
+                    vec![
+                        row("Session", 34.0, "2026-09-26T19:25:00Z"),
+                        row("Week (all models)", 77.0, "2026-09-28T21:05:00Z"),
+                        row("Week (Fable)", 100.0, "2026-09-28T21:05:00Z"),
                     ],
-                }),
+                )),
                 notes: vec!["no /Users/you/.max/.claude.json".into()],
             },
             Entry {
                 account: account(Provider::Codex, "work"),
                 blocked: None,
-                usage: Some(Usage {
-                    source: Source::Cached,
-                    fetched_at: Some(now - jiff::SignedDuration::from_hours(5)),
-                    windows: vec![window(
-                        "Week (all models)",
-                        None,
-                        40.0,
-                        "2026-09-30T18:05:00Z",
-                    )],
-                }),
+                usage: Some(cached(
+                    jiff::SignedDuration::from_hours(5),
+                    vec![row("Week (all models)", 40.0, "2026-09-30T18:05:00Z")],
+                )),
                 notes: Vec::new(),
             },
         ];
@@ -622,7 +624,8 @@ mod tests {
              what effort.\n\
              local time: Sat 18:05\n\
              rules already enforced (every option satisfies them): at least 10% left on each \
-             window that applies; excluded accounts are not listed.\n\
+             window that applies and whose usage is known (one that reset since it was cached \
+             is unknown: not checked); excluded accounts are not listed.\n\
              \n\
              account claude:account-1 (claude)\n\
              \x20 usage: cached 25m ago (fresh)\n\
@@ -700,6 +703,79 @@ mod tests {
 
     /// R23: the key and body survive curl's config quoting; a key that cannot be quoted is
     /// refused.
+    /// R23: a window that reset since it was cached goes out as unknown, never as 0% used; in
+    /// an option's description it is named after the tightest known window, or alone.
+    #[test]
+    fn windows_past_their_reset_are_described_as_unknown() {
+        let (mut entries, mut config, aliases) = fixture();
+        let now = ts(NOW);
+        // max: the session reset an hour ago. work: its only window reset yesterday.
+        entries[0].usage = Some(cached(
+            jiff::SignedDuration::from_hours(3),
+            vec![
+                row("Session", 100.0, "2026-09-26T17:05:00Z"),
+                row("Week (all models)", 77.0, "2026-09-28T21:05:00Z"),
+                row("Week (Fable)", 100.0, "2026-09-26T17:05:00Z"),
+            ],
+        ));
+        entries[1].usage = Some(cached(
+            jiff::SignedDuration::from_hours(30),
+            vec![row("Week (all models)", 100.0, "2026-09-25T18:05:00Z")],
+        ));
+        let c = pick::candidates(&entries, &config, now);
+        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC);
+        let state = r.body["state"].as_str().unwrap();
+        for line in [
+            "  usage: cached 3h ago (stale: may be higher now)\n",
+            "  Session: usage unknown (reset since cached)\n",
+            "  Week (all models): 77% used, resets in 2d3h\n",
+            "  Week (Fable): usage unknown (reset since cached)\n",
+            "  usage: cached 1d ago (stale: may be higher now)\n\
+             \x20 Week (all models): usage unknown (reset since cached)\n",
+        ] {
+            assert!(state.contains(line), "{line:?} in:\n{state}");
+        }
+        assert!(!state.contains(": 0% used"), "{state}");
+        let criteria = &r.body["questions"]["launch"]["criteria"];
+        assert_eq!(
+            criteria["claude:account-1 / claude-opus-5-5"],
+            "tightest: Week (all models) 23% left, resets in 2d3h; usage unknown: Session: \
+             reset since cached; data 3h old (stale)"
+        );
+        // Fable's own week reset too: both of its unknown windows are named.
+        assert_eq!(
+            criteria["claude:account-1 / claude-fable-5-1"],
+            "tightest: Week (all models) 23% left, resets in 2d3h; usage unknown: Session, \
+             Week (Fable): reset since cached; data 3h old (stale)"
+        );
+        assert_eq!(
+            criteria["codex:account-1 / gpt-6-astra"],
+            "usage unknown: Week (all models): reset since cached; data 1d old (stale)"
+        );
+        // Known headroom first: the pair of unknown headroom is offered last.
+        let offered: Vec<&str> = r.offered.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(offered.last(), Some(&"codex:account-1 / gpt-6-astra"));
+
+        // Without models, a per-model window past its reset is still one that may apply.
+        config.claude.models.clear();
+        let c = pick::candidates(&entries, &config, now);
+        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC);
+        let state = r.body["state"].as_str().unwrap();
+        assert!(
+            state.contains(
+                "  Week (Fable): usage unknown (reset since cached) (per-model; applies only \
+                 if the agent's default model is in this family)\n"
+            ),
+            "{state}"
+        );
+        assert_eq!(
+            r.body["questions"]["launch"]["criteria"]["claude:account-1 / default"],
+            "tightest: Week (all models) 23% left, resets in 2d3h; usage unknown: Session: \
+             reset since cached; also: Week (Fable) usage unknown (reset since cached); data \
+             3h old (stale)"
+        );
+    }
+
     #[test]
     fn curl_config_quotes_the_body() {
         let body = r#"{"state":"a \"q\"\nb\\c é"}"#;

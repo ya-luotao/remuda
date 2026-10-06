@@ -12,7 +12,7 @@ use crate::index::{self, Index};
 use crate::pricing::Prices;
 use crate::provider::{Provider, codex};
 use crate::registry::{self, Account, Registry};
-use crate::{account_config, attribution, checks, identity, live, stats, transcript, usage};
+use crate::{account_config, attribution, checks, identity, live, owned, stats, transcript, usage};
 
 use super::Deps;
 use super::app::{self, Effect, Event, LaunchRequest, Marked, PREVIEW_MESSAGES};
@@ -42,12 +42,8 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
         Effect::Identities(accounts) => {
             for account in accounts {
                 answer(&deps, &tx, move |deps| {
-                    let (identity, _warning) = identity::identify(
-                        &account,
-                        deps.program(account.provider),
-                        &deps.env,
-                        IDENTITY_TIMEOUT,
-                    );
+                    let (identity, _warning) =
+                        identity::identify(&account, &deps.agents(), &deps.env, IDENTITY_TIMEOUT);
                     Event::Identity { account, identity }
                 });
             }
@@ -63,14 +59,12 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
         Effect::LiveUsage(accounts) => {
             for account in accounts {
                 answer(&deps, &tx, move |deps| {
-                    let result = match deps.program(account.provider) {
-                        Some(program) => usage::live_usage(&account, program, LIVE_USAGE_TIMEOUT),
-                        None => Err(format!(
-                            "`{}` not found on PATH",
-                            account.provider.program()
-                        )),
-                    };
-                    Event::LiveUsage { account, result }
+                    let result = usage::live_usage(&account, &deps.agents(), LIVE_USAGE_TIMEOUT);
+                    Event::LiveUsage {
+                        account,
+                        result,
+                        answered_at: (deps.clock)(),
+                    }
                 });
             }
         }
@@ -78,7 +72,7 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
             thread::spawn(move || {
                 let sessions = live::collect(
                     &deps.accounts,
-                    deps.claude.as_deref(),
+                    &deps.agents(),
                     deps.ps.as_deref(),
                     &deps.env,
                     live::TIMEOUT,
@@ -88,7 +82,7 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
         }
         Effect::Attribution => {
             thread::spawn(move || {
-                let log = deps.state_dir.join("launches.jsonl");
+                let log = owned::launch_log(&deps.state_dir);
                 let base = attribution::collect(&deps.accounts, &deps.env, &log, &[]);
                 let _ = tx.send(Event::Attribution(base));
             });
@@ -112,10 +106,7 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
             });
         }
         Effect::Logs { account, short_id } => answer(&deps, &tx, move |deps| {
-            let result = match &deps.claude {
-                Some(claude) => live::logs(claude, &account, &short_id, live::LOGS_TIMEOUT),
-                None => Err("`claude` not found on PATH".to_string()),
-            };
+            let result = live::logs(&deps.agents(), &account, &short_id, live::LOGS_TIMEOUT);
             Event::Logs {
                 account,
                 short_id,
@@ -127,10 +118,7 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
             verb,
             short_id,
         } => answer(&deps, &tx, move |deps| {
-            let result = match &deps.claude {
-                Some(claude) => live::control(claude, &account, verb, &short_id, CONTROL_TIMEOUT),
-                None => Err("`claude` not found on PATH".to_string()),
-            };
+            let result = live::control(&deps.agents(), &account, verb, &short_id, CONTROL_TIMEOUT);
             Event::ControlDone {
                 verb,
                 short_id,
@@ -255,7 +243,7 @@ fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Opt
     let accounts = union(&[&accounts, &deps.accounts, &deps.seen]);
     let found = live::collect_report(
         &accounts,
-        deps.claude.as_deref(),
+        &deps.agents(),
         deps.ps.as_deref(),
         &deps.env,
         live::TIMEOUT,
@@ -320,11 +308,11 @@ fn refresh_index(deps: &Deps, tx: &Sender<Event>) {
     let _ = tx.send(Event::IndexLoaded(
         index.entries.values().cloned().collect(),
     ));
-    let stores = index::stores(&deps.accounts, &deps.env);
+    let (stores, given) = index::resolve(&deps.accounts, &deps.env);
     let _ = tx.send(Event::Stores(stores.clone()));
     let mut batch = Vec::new();
     let mut last = Instant::now();
-    index::refresh(&mut index, &stores, |p| {
+    let refreshed = index::refresh_with(&mut index, &stores, &given, |p| {
         if let Some(entry) = p.entry {
             batch.push(entry.clone());
         }
@@ -337,7 +325,12 @@ fn refresh_index(deps: &Deps, tx: &Sender<Event>) {
             });
         }
     });
-    let error = index.save(&cache).err().map(|e| format!("{e:#}"));
+    // A directory that could not be read first (R8), then a cache that could not be written.
+    let mut errors: Vec<String> = refreshed.incomplete().into_iter().collect();
+    if let Err(e) = index.save(&cache) {
+        errors.push(format!("index cache: {e:#}"));
+    }
+    let error = (!errors.is_empty()).then(|| errors.join(" · "));
     let _ = tx.send(Event::IndexDone {
         entries: index.entries.into_values().collect(),
         error,
@@ -361,19 +354,20 @@ fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
     };
     let path = deps.state_dir.join("stats.json");
     let mut cache = stats::Cache::load(&path);
-    let sources = stats::sources(&deps.accounts, &deps.env);
+    let (sources, given) = stats::resolve(&deps.accounts, &deps.env);
     let mut last = Instant::now();
-    let refreshed = stats::refresh(&mut cache, &sources, |done, total| {
+    let refreshed = stats::refresh_with(&mut cache, &sources, &given, |done, total| {
         if done == 0 || done == total || last.elapsed() >= PROGRESS_EVERY {
             last = Instant::now();
             let _ = tx.send(Event::StatsProgress { done, total });
         }
     });
+    errors.extend(refreshed.incomplete());
     if let Err(e) = cache.save_if_changed(&path, &refreshed) {
         errors.push(format!("stats cache: {e:#}"));
     }
     errors.extend(prices_error);
-    let log = deps.state_dir.join("launches.jsonl");
+    let log = owned::launch_log(&deps.state_dir);
     let attribution = attribution::collect(&deps.accounts, &deps.env, &log, &[]);
     let report = stats::report(
         &cache,
@@ -427,13 +421,18 @@ mod tests {
             ps: None,
             seen: vec![],
             tz: TimeZone::UTC,
-            clock: jiff::Timestamp::now,
+            clock: answered,
             config: root.join("config.toml"),
             state_dir: root.join("state"),
             cwd: None,
             mode: crate::tui::app::Mode::Browse,
             private: false,
         })
+    }
+
+    /// The workers' clock: when a live query answers (R10).
+    fn answered() -> jiff::Timestamp {
+        "2026-09-24T12:00:40Z".parse().unwrap()
     }
 
     fn collect(effect: Effect, deps: &Arc<Deps>, until: impl Fn(&Event) -> bool) -> Vec<Event> {
@@ -524,6 +523,115 @@ mod tests {
         let again = collect(Effect::Stats, &deps, done);
         assert_eq!(again.last(), events.last());
         assert_eq!(fs::metadata(&cache).unwrap().modified().unwrap(), written);
+    }
+
+    /// R8, R20 (review #10): a store that exists but cannot be read is told with the result,
+    /// and what was cached of it stays: the sessions listed, the tokens counted.
+    #[test]
+    fn a_store_that_cannot_be_read_is_told_and_keeps_what_was_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let transcript = dir.path().join("max/projects/-w/s1.jsonl");
+        let mut text = fs::read_to_string(&transcript).unwrap();
+        text.push_str(
+            "{\"type\":\"assistant\",\"timestamp\":\"2026-09-24T10:03:00Z\",\
+             \"message\":{\"id\":\"msg_1\",\"model\":\"claude-test\",\"role\":\"assistant\",\
+             \"content\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":40}}}\n",
+        );
+        fs::write(&transcript, text).unwrap();
+        let indexed = |e: &Event| matches!(e, Event::IndexDone { .. });
+        let counted = |e: &Event| matches!(e, Event::Stats { .. });
+        collect(Effect::RefreshIndex, &deps, indexed);
+        let complete = collect(Effect::Stats, &deps, counted);
+
+        let store = dir.path().join("max/projects");
+        let chmod = |mode| fs::set_permissions(&store, fs::Permissions::from_mode(mode)).unwrap();
+        chmod(0o000);
+        let index = collect(Effect::RefreshIndex, &deps, indexed);
+        let stats = collect(Effect::Stats, &deps, counted);
+        chmod(0o755);
+        let said = |error: &Option<String>| {
+            let error = error.as_deref().expect("an incomplete refresh says so");
+            assert!(
+                error.starts_with("incomplete: cannot read ") && error.contains("max/projects: "),
+                "{error}"
+            );
+        };
+        let Some(Event::IndexDone { entries, error }) = index.last() else {
+            panic!("{index:?}")
+        };
+        assert_eq!(entries.len(), 2);
+        said(error);
+        let (Some(Event::Stats { report, error }), Some(Event::Stats { report: before, .. })) =
+            (stats.last(), complete.last())
+        else {
+            panic!("{stats:?}")
+        };
+        assert_eq!(report, before);
+        assert_eq!(report.files, 2);
+        said(error);
+
+        // Readable again: nothing more to say.
+        let index = collect(Effect::RefreshIndex, &deps, indexed);
+        let stats = collect(Effect::Stats, &deps, counted);
+        assert!(matches!(
+            index.last(),
+            Some(Event::IndexDone { error: None, .. })
+        ));
+        assert!(matches!(
+            stats.last(),
+            Some(Event::Stats { error: None, .. })
+        ));
+    }
+
+    /// R8, R20 (review #10): a home that cannot be searched: its store cannot be resolved,
+    /// which is told with the result, and what was cached of it stays.
+    #[test]
+    fn a_store_that_cannot_be_resolved_is_told_and_keeps_what_was_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let indexed = |e: &Event| matches!(e, Event::IndexDone { .. });
+        let counted = |e: &Event| matches!(e, Event::Stats { .. });
+        collect(Effect::RefreshIndex, &deps, indexed);
+        collect(Effect::Stats, &deps, counted);
+
+        let home = dir.path().join("max");
+        let chmod = |mode| fs::set_permissions(&home, fs::Permissions::from_mode(mode)).unwrap();
+        chmod(0o000);
+        let index = collect(Effect::RefreshIndex, &deps, indexed);
+        let stats = collect(Effect::Stats, &deps, counted);
+        chmod(0o755);
+        let said = |error: &Option<String>| {
+            let error = error.as_deref().expect("an incomplete refresh says so");
+            let store = home.join("projects");
+            assert!(
+                error.starts_with(&format!("incomplete: cannot read {}: ", store.display())),
+                "{error}"
+            );
+        };
+        assert!(
+            index.contains(&Event::Stores(vec![])),
+            "no store is listed: {index:?}"
+        );
+        let Some(Event::IndexDone { entries, error }) = index.last() else {
+            panic!("{index:?}")
+        };
+        assert_eq!(entries.len(), 2);
+        said(error);
+        let Some(Event::Stats { report, error }) = stats.last() else {
+            panic!("{stats:?}")
+        };
+        assert_eq!(report.files, 2);
+        said(error);
+
+        // Resolved again: nothing more to say.
+        let index = collect(Effect::RefreshIndex, &deps, indexed);
+        assert!(matches!(
+            index.last(),
+            Some(Event::IndexDone { entries, error: None }) if entries.len() == 2
+        ));
     }
 
     /// R20, R3: each computation prices with `config.toml` as it is then; prices that cannot be
@@ -731,7 +839,8 @@ mod tests {
             events,
             [Event::LiveUsage {
                 account: max,
-                result: Err("`claude` not found on PATH".into())
+                result: Err("`claude` not found on PATH".into()),
+                answered_at: answered(),
             }]
         );
     }
@@ -913,7 +1022,8 @@ mod tests {
             without,
             [Event::LiveUsage {
                 account: work.clone(),
-                result: Err("`codex` not found on PATH".into())
+                result: Err("`codex` not found on PATH".into()),
+                answered_at: answered(),
             }]
         );
         let codex = crate::probe::script(
@@ -950,7 +1060,10 @@ mod tests {
                         resets: None,
                     }]),
                     identity: Some(identity),
-                })
+                }),
+                // Stamped by the worker when the query answered, not by whoever reads the
+                // event later.
+                answered_at: answered(),
             }]
         );
     }
