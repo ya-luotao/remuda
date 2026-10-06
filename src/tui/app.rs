@@ -740,6 +740,8 @@ pub struct App {
     pub(super) index_again: bool,
     pub(super) attribution_again: bool,
     pub(super) live_again: bool,
+    /// The checks likewise: the account list changed while they ran.
+    pub(super) checks_again: bool,
     /// `Ctrl-P`: the screen is drawn from [`super::privacy::redacted`] (R21).
     pub private: bool,
     /// Every account name seen, with its private-mode alias.
@@ -799,6 +801,7 @@ impl App {
             index_again: false,
             attribution_again: false,
             live_again: false,
+            checks_again: false,
             private: false,
             aliases,
         }
@@ -1681,7 +1684,10 @@ impl App {
         }
         fx.push(Effect::Identities);
         fx.push(Effect::CachedUsage);
-        if !self.checks_in_flight {
+        // Checks that are running may have read the list from before: once more when they end.
+        if self.checks_in_flight {
+            self.checks_again = true;
+        } else {
             self.checks_in_flight = true;
             fx.push(Effect::Checks);
         }
@@ -2585,6 +2591,10 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             }
             app.checks = Some(checks);
             app.checks_in_flight = false;
+            if std::mem::take(&mut app.checks_again) {
+                app.checks_in_flight = true;
+                fx.push(Effect::Checks);
+            }
         }
         Event::Preview { path, result } => {
             if app.preview.loading.as_ref() == Some(&path) {

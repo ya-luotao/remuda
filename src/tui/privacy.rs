@@ -435,6 +435,7 @@ pub fn redacted(app: &App) -> App {
         index_again,
         attribution_again,
         live_again,
+        checks_again,
         private,
         aliases: _,
     } = app;
@@ -494,6 +495,7 @@ pub fn redacted(app: &App) -> App {
         index_again: *index_again,
         attribution_again: *attribution_again,
         live_again: *live_again,
+        checks_again: *checks_again,
         private: *private,
         // Its keys are the names private mode hides; nothing drawn needs them.
         aliases: Aliases::default(),

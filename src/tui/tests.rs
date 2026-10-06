@@ -2416,6 +2416,49 @@ fn a_refresh_reads_the_registry_whatever_is_still_running() {
     assert_eq!(keys(&mut app, &[Key::Char('r')]), [Effect::ReadAccounts]);
 }
 
+/// R16, R11: checks that are running when the account list changes may have read the list
+/// from before: they are not doubled, and run once more when they end, so a new account gets
+/// its checks and those of an account that is gone do not stay.
+#[test]
+fn checks_run_once_more_when_the_account_list_changed_meanwhile() {
+    let mut app = app();
+    app.start();
+    assert!(app.checks_in_flight);
+    let fx = update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("max"), account("new")]),
+    );
+    assert!(!fx.contains(&Effect::Checks), "not two at once: {fx:?}");
+    // The answer for the old list is shown meanwhile, and the checks start again.
+    let old = Check {
+        account: Some("claude:team".into()),
+        message: "home does not exist".into(),
+    };
+    assert_eq!(
+        update(&mut app, Event::Checks(vec![old.clone()])),
+        [Effect::Checks]
+    );
+    assert_eq!(app.checks, Some(vec![old]));
+    assert!(app.checks_in_flight);
+    // Their answer is for the list as it is: nothing more to start.
+    assert_eq!(update(&mut app, Event::Checks(vec![])), []);
+    assert_eq!(app.checks, Some(vec![]));
+    assert!(!app.checks_in_flight);
+
+    // `r` while they run does not ask for another run, and no change does not either.
+    keys(&mut app, &[Key::Char('r')]);
+    keys(&mut app, &[Key::Char('r')]);
+    update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("max"), account("new")]),
+    );
+    assert_eq!(update(&mut app, Event::Checks(vec![])), []);
+    // The list changes while nothing runs: started at once, as before.
+    let fx = update(&mut app, Event::Accounts(vec![account("default")]));
+    assert!(fx.contains(&Effect::Checks), "{fx:?}");
+    assert_eq!(update(&mut app, Event::Checks(vec![])), []);
+}
+
 /// R16: the registry may change while an account is chosen for `remuda run` (a refresh reads
 /// it again): the rows follow it, and still only what choosing needs is read.
 #[test]

@@ -1555,6 +1555,55 @@ fn a_refresh_reads_the_registry_while_earlier_answers_are_still_queued() {
     );
 }
 
+/// R10, R16, without a terminal: `u` while an account is chosen for `remuda run`, where nothing
+/// else reads the registry. One account was removed and another registered again with another
+/// home meanwhile: the registry is read before anything is asked, the rows follow it, and
+/// `claude -p /usage` runs for the account still listed only, not in the homes that left.
+#[test]
+fn live_usage_is_not_asked_in_a_home_that_left_the_registry() {
+    let sb = Sandbox::new();
+    let (deps, max, team) = two_accounts(&sb);
+    let moved = sb.make_claude_home("q/max");
+    for home in [
+        None,
+        Some(home_of(&max)),
+        Some(home_of(&team)),
+        Some(&*moved),
+    ] {
+        sb.set_live_usage(home, "Current session: 0% used\n");
+    }
+    let mut tui = Headless::start(&sb, deps);
+    tui.app.mode = Mode::PickForRun;
+    sb.register(&[("max", &moved)]);
+    let default = Account::default_for(Provider::Claude);
+    assert_eq!(
+        tui.apply(Event::Key(Key::Char('u'))),
+        [Effect::LiveUsage(vec![
+            default.clone(),
+            max.clone(),
+            team.clone()
+        ])],
+        "the app still shows the old rows"
+    );
+    // Until the rows are the registry's, the account still listed has its usage, and the
+    // identities read for the new list have answered (later than any query started by `u`).
+    tui.run_until(|app| {
+        app.accounts.len() == 2
+            && app.accounts[0].live.is_some()
+            && app.accounts.iter().all(|a| a.identity.is_some())
+    });
+    let moved = named("max", moved.to_str().unwrap());
+    assert_eq!(tui.told, [vec![default, moved.clone()]], "one event");
+    assert_eq!(tui.app.accounts[1].account, moved);
+    let asked: Vec<Option<String>> = sb
+        .invocations()
+        .into_iter()
+        .filter(|inv| inv.args.first().map(String::as_str) == Some("-p"))
+        .map(|inv| inv.config_dir)
+        .collect();
+    assert_eq!(asked, [None], "only the native login was asked");
+}
+
 /// R17: codex has no running-session source: a codex resume is not checked against claude's
 /// (the TUI asks the user instead); only its directory is checked.
 #[test]

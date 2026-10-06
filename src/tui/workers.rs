@@ -73,19 +73,27 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
             });
         }
         Effect::LiveUsage(which) => {
-            for account in which {
-                let (deps, tx) = (Arc::clone(&deps), tx.clone());
-                thread::spawn(move || {
-                    let result = match deps.program(account.provider) {
-                        Some(program) => usage::live_usage(&account, program, LIVE_USAGE_TIMEOUT),
-                        None => Err(format!(
-                            "`{}` not found on PATH",
-                            account.provider.program()
-                        )),
-                    };
-                    let _ = tx.send(Event::LiveUsage { account, result });
-                });
-            }
+            thread::spawn(move || {
+                // Only the accounts still listed, home and all, are asked: one that left the
+                // registry since the app chose them is not queried in its old home (its row
+                // goes with the change this read tells).
+                let listed = deps.listing.read(&tx).accounts;
+                for account in which.into_iter().filter(|a| listed.contains(a)) {
+                    let (deps, tx) = (Arc::clone(&deps), tx.clone());
+                    thread::spawn(move || {
+                        let result = match deps.program(account.provider) {
+                            Some(program) => {
+                                usage::live_usage(&account, program, LIVE_USAGE_TIMEOUT)
+                            }
+                            None => Err(format!(
+                                "`{}` not found on PATH",
+                                account.provider.program()
+                            )),
+                        };
+                        let _ = tx.send(Event::LiveUsage { account, result });
+                    });
+                }
+            });
         }
         Effect::Live => {
             thread::spawn(move || {
@@ -422,6 +430,11 @@ mod tests {
 
     /// `max` is registered (two transcripts in its home); the native login has no home.
     fn deps(root: &std::path::Path) -> Arc<Deps> {
+        deps_with(root, "")
+    }
+
+    /// [`deps`] with `more` in the registry after `max`.
+    fn deps_with(root: &std::path::Path, more: &str) -> Arc<Deps> {
         let home = root.join("max");
         let project = home.join("projects/-w");
         fs::create_dir_all(&project).unwrap();
@@ -433,7 +446,7 @@ mod tests {
         )]
         .into();
         let config = root.join("config.toml");
-        fs::write(&config, registered(root)).unwrap();
+        fs::write(&config, registered(root) + more).unwrap();
         Arc::new(Deps {
             listing: Arc::new(Listing::open(config, env.clone()).unwrap()),
             env,
@@ -886,9 +899,13 @@ mod tests {
             name: "work".into(),
             home: Home::Path(dir.path().join("work").display().to_string()),
         };
+        let registered = format!(
+            "[[account]]\nprovider = \"codex\"\nname = \"work\"\nhome = \"{}\"\n",
+            work.home
+        );
         let without = collect(
             Effect::LiveUsage(vec![work.clone()]),
-            &deps(dir.path()),
+            &deps_with(dir.path(), &registered),
             |_| true,
         );
         assert_eq!(
@@ -909,7 +926,7 @@ mod tests {
         );
         let deps = Arc::new(Deps {
             codex: Some(codex),
-            ..Deps::clone(&deps(dir.path()))
+            ..Deps::clone(&deps_with(dir.path(), &registered))
         });
         let events = collect(Effect::LiveUsage(vec![work.clone()]), &deps, |_| true);
         let identity = crate::identity::Identity::LoggedIn {
@@ -954,6 +971,50 @@ mod tests {
         assert_eq!(
             events,
             [Event::Accounts(vec![Account::default_for(CLAUDE), max])]
+        );
+    }
+
+    /// R10, R16: live usage is asked of the accounts the app chose that the registry still
+    /// lists, home and all: the change is told first, and an account that left the registry
+    /// or is registered again with another home is not queried in its old home.
+    #[test]
+    fn live_usage_asks_only_accounts_still_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let (default, max) = (Account::default_for(CLAUDE), max(&deps));
+        let gone = Account {
+            provider: CLAUDE,
+            name: "team".into(),
+            home: Home::Path("/p/team".into()),
+        };
+        let moved = Account {
+            home: Home::Path("/p/elsewhere".into()),
+            ..max.clone()
+        };
+        fs::write(
+            deps.listing.config(),
+            "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/p/elsewhere\"\n",
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        // The app's rows from before the change, the ones to skip first.
+        let which = vec![gone, max, default.clone()];
+        spawn(Effect::LiveUsage(which), &deps, &tx);
+        let wait = Duration::from_secs(10);
+        assert_eq!(
+            rx.recv_timeout(wait).unwrap(),
+            Event::Accounts(vec![default.clone(), moved])
+        );
+        assert_eq!(
+            rx.recv_timeout(wait).unwrap(),
+            Event::LiveUsage {
+                account: default,
+                result: Err("`claude` not found on PATH".into())
+            }
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "nothing for the accounts no longer listed"
         );
     }
 

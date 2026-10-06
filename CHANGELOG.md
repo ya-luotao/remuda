@@ -10,17 +10,17 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Fixed
 
-- The TUI went on launching as an account that `remuda remove` had taken out of the registry
-  in another terminal: a new session, a fork, a resume or an attach as that account still
-  started; a setup, a removal or a resume in place read `config.toml` again, and then only the
-  list on screen followed. The TUI now reads the registry before every launch (in the check
-  before it, and once more when it starts), on every refresh, and whenever it starts work that
-  goes over the accounts, so the list on screen follows a change made elsewhere, and the
-  statistics, once computed, are computed again for the new list (SPEC R20). Nothing is
-  launched as an account no longer listed: the TUI says "<account> is no longer registered"
-  and keeps the terminal (SPEC R16). The same holds for `remuda run` without an account: an
-  account removed while the picker was open is not launched once chosen, and remuda exits with
-  an error.
+- The TUI went on launching as an account that `remuda remove` had taken out of the registry in
+  another terminal: a new session, a fork, a resume or an attach as that account still started; a
+  setup, a removal or a resume in place read `config.toml` again, and then only the list on
+  screen followed. The TUI now reads the registry before every launch (in the check before it,
+  and once more when it starts), on every refresh, and whenever it starts work that goes over the
+  accounts, so the list on screen follows a change made elsewhere; the checks and, once computed,
+  the statistics are done again for the new list (SPEC R11, R20), and live usage (`u`) is asked
+  only of accounts still listed (SPEC R10). Nothing is launched as an account no longer listed:
+  the TUI says "<account> is no longer registered" and keeps the terminal (SPEC R16). The same
+  holds for `remuda run` without an account: an account removed while the picker was open is not
+  launched once chosen, and remuda exits with an error.
 - A member whose `projects` is a link to the source's (the layout `remuda setup` creates) had
   claude ask for permission on every auto-memory write: claude grants its memory directory by
   the literal path and then finds the resolved one under the source's `.claude/`, outside the

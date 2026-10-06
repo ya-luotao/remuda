@@ -411,7 +411,8 @@ appeared in no `history.jsonl`.
      `resets_at`. Codex: the rate limits in its rollouts (below). The cache time is always shown.
   2. **Live** (refreshed on demand), run in the account's environment, so that the agent itself
      queries with that account's credentials. Accounts are queried in parallel; the default
-     timeout is 90 seconds.
+     timeout is 90 seconds. In the TUI the registry is read first, and only the accounts it
+     still lists are queried (R16).
      - Claude: `claude -p /usage --no-session-persistence`. Basis (verified on 2.1.280): `/usage`
        is a local command that supports non-interactive use and does not call the model (0
        tokens, no cost); with `--no-session-persistence` it leaves no transcript. It takes
@@ -681,16 +682,16 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
   - on every refresh (`r`), also while what the refresh would start is still running;
   - after a setup and after a removal from the TUI, whatever their outcome.
 
-  A list that changed replaces the one on screen, and everything shown per account is read
-  again (the statistics too, once they have been computed, R20); the same list again changes
-  nothing. Nothing is launched as an account the registry no longer lists: the launch is
-  refused with "<account> is no longer registered" (a new session's form shows it; otherwise
-  a notice), and the terminal is not handed over. An account of the same name with another
-  home is another account (R2): "<account> is now registered with another home". A
-  new-session form and a codex resume prompt hold the
-  account they were opened for, home and all: when the list changes under them, they are
-  refused the same way rather than started in the other home. While `config.toml` cannot be
-  read, the accounts stay as last read, every launch is refused with the reason, shared
+  A list that changed replaces the one on screen, and everything shown per account is read again
+  (the statistics too, once they have been computed, R20); the same list again changes nothing.
+  Checks (R11) that are running when the list changes are not doubled: they run once more when
+  they end. Nothing is launched as an account the registry no longer lists: the launch is refused
+  with "<account> is no longer registered" (a new session's form shows it; otherwise a notice),
+  and the terminal is not handed over. An account of the same name with another home is another
+  account (R2): "<account> is now registered with another home". A new-session form and a codex
+  resume prompt hold the account they were opened for, home and all: when the list changes under
+  them, they are refused the same way rather than started in the other home. While `config.toml`
+  cannot be read, the accounts stay as last read, every launch is refused with the reason, shared
   configuration counts as unknown (R18, R22) and prices as the built-in ones (R20). An account
   that left the registry while the TUI runs is still asked for its running sessions before a
   resume in place.
