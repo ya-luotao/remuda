@@ -4632,10 +4632,23 @@ fn secret_app() -> App {
     );
     update(
         &mut app,
-        Event::Checks(vec![Check {
-            account: Some("claude:zqalpha".into()),
-            message: format!("home {ZQ_HOME}/.zqhomes/zqalpha is not readable"),
-        }]),
+        Event::Checks(vec![
+            Check {
+                account: Some("claude:zqalpha".into()),
+                message: Marked::default()
+                    .words("home ")
+                    .path(format!("{ZQ_HOME}/.zqhomes/zqchk (old), x"))
+                    .words(" does not exist"),
+            },
+            // A name read from a file: text from elsewhere.
+            Check {
+                account: Some("claude:zqalpha".into()),
+                message: Marked::default()
+                    .words("enabled plugin ")
+                    .text("zqtools/zqplugin@zqmarket")
+                    .words(" has no user install whose path exists: it is not shared"),
+            },
+        ]),
     );
     update(
         &mut app,
@@ -4668,9 +4681,10 @@ fn secret_app() -> App {
                     ..zq_entry(CLAUDE, ZQ_D, "unused", 0)
                 },
             ],
-            error: Some(format!(
+            // As the worker tells it: the error of the system, whole.
+            error: Some(Marked::from(format!(
                 "zqalpha: cannot write {ZQ_HOME}/.remuda/state/index.json"
-            )),
+            ))),
         },
     );
     let mut attribution = Attribution::default();
@@ -4738,7 +4752,19 @@ fn secret_app() -> App {
                     .to_vec(),
                 files: 3,
             },
-            error: Some(format!("cannot write {ZQ_HOME}/.remuda/state/stats.json")),
+            error: Some(
+                Marked::default()
+                    .words("stats cache: ")
+                    .text(format!(
+                        "zqalpha: cannot write {ZQ_HOME}/.remuda/state/stats.json"
+                    ))
+                    .words(" · ")
+                    .words("prices: ")
+                    .text(format!(
+                        "cannot read {ZQ_HOME}/.remuda/config.toml: zqdenied"
+                    ))
+                    .words(" (built-in prices used)"),
+            ),
         },
     );
     app
@@ -4787,28 +4813,43 @@ fn secret_states() -> Vec<SecretState> {
     let state = |name, set: fn(&mut App), shows| SecretState { name, set, shows };
     vec![
         state("accounts", |app| drop(keys(app, &[Key::Char('1')])), "zqme"),
+        // Each message that comes in its pieces (a check, a problem of the configuration, the
+        // error of a cache) is on screen: the path in it, the name read from a file, the
+        // system's error.
+        state(
+            "accounts checks: a path",
+            |app| drop(keys(app, &[Key::Char('1')])),
+            "zqchk",
+        ),
+        state(
+            "accounts checks: a name from a file",
+            |app| drop(keys(app, &[Key::Char('1')])),
+            "zqplugin@zqmarket",
+        ),
+        state(
+            "accounts index error",
+            |app| drop(keys(app, &[Key::Char('1')])),
+            "index cache: zqalpha",
+        ),
         state(
             "accounts configuration",
-            |app| {
-                // Expanded: all of it shows at 80×24.
-                let keys_ = [
-                    Key::Char('1'),
-                    Key::Char('j'),
-                    Key::Char('p'),
-                    Key::Char('p'),
-                ];
-                keys(app, &keys_);
-                let request = app.config.request;
-                update(
-                    app,
-                    Event::Config {
-                        request,
-                        account: zq_account(CLAUDE, "zqalpha"),
-                        result: Ok(Box::new(zq_config_view())),
-                    },
-                );
-            },
+            open_zq_config,
             "Configuration · zqalpha",
+        ),
+        state(
+            "accounts configuration problems: a path",
+            open_zq_config,
+            "zqcfg",
+        ),
+        state(
+            "accounts configuration problems: the system's error",
+            open_zq_config,
+            "zqalpha: cannot read",
+        ),
+        state(
+            "accounts configuration problems: a path first",
+            open_zq_config,
+            "zqinst.json",
         ),
         state(
             "live",
@@ -4873,6 +4914,11 @@ fn secret_states() -> Vec<SecretState> {
             "zqanswer",
         ),
         state("stats", |app| drop(keys(app, &[Key::Char('4')])), "zqalpha"),
+        state(
+            "stats error",
+            |app| drop(keys(app, &[Key::Char('4')])),
+            "stats cache: zqalpha",
+        ),
         state(
             "search",
             |app| {
@@ -5171,7 +5217,7 @@ fn secret_states() -> Vec<SecretState> {
                         error: Some(
                             Marked::default()
                                 .path(dir.display())
-                                .text(" does not exist"),
+                                .words(" does not exist"),
                         ),
                     },
                 );
@@ -5285,6 +5331,26 @@ fn secret_states() -> Vec<SecretState> {
     ]
 }
 
+/// The Configuration pane of zqalpha, expanded (all of it shows at 80×24) and loaded.
+fn open_zq_config(app: &mut App) {
+    let keys_ = [
+        Key::Char('1'),
+        Key::Char('j'),
+        Key::Char('p'),
+        Key::Char('p'),
+    ];
+    keys(app, &keys_);
+    let request = app.config.request;
+    update(
+        app,
+        Event::Config {
+            request,
+            account: zq_account(CLAUDE, "zqalpha"),
+            result: Ok(Box::new(zq_config_view())),
+        },
+    );
+}
+
 /// A picker for the claude session A.
 fn pick(app: &mut App, action: PickFor) {
     keys(app, &[Key::Char('3')]);
@@ -5349,7 +5415,7 @@ fn private_mode_masks_remudas_own_paths_whole() {
     let [Effect::CheckLaunch { check, request }] = fx.as_slice() else {
         panic!("{fx:?}")
     };
-    let refused = Marked::default().path(&dir).text(" does not exist");
+    let refused = Marked::default().path(&dir).words(" does not exist");
     let checked = Event::LaunchChecked {
         check: *check,
         request: request.clone(),
@@ -5408,6 +5474,125 @@ fn private_mode_masks_remudas_own_paths_whole() {
     );
 }
 
+/// R21: a message that remuda puts together is masked piece by piece wherever it shows: a
+/// check, a problem of the Configuration pane, the error of a cache. Each path in it is
+/// masked whole, and what the message says between and after its paths stays readable (once
+/// a check's line was hidden from its first path on, and with it what to do about it).
+#[test]
+fn private_mode_keeps_what_a_message_says_around_its_paths() {
+    let mut app = secret_app();
+    update(&mut app, Event::Resize(160, 40));
+    let home = format!("{ZQ_HOME}/.zqhomes/zq, (old): alpha");
+    let link = |said: Marked, item: &str| {
+        said.words(" (")
+            .path(format!("{home}/{item}"))
+            .words(" -> ")
+            .path(format!("{ZQ_HOME}/.claude/{item}"))
+            .words(")")
+    };
+    update(
+        &mut app,
+        Event::Checks(vec![
+            Check {
+                account: None,
+                message: Marked::default()
+                    .words("ANTHROPIC_API_KEY is set: it overrides every account's /login"),
+            },
+            Check {
+                account: Some("claude:zqalpha".into()),
+                message: Marked::default()
+                    .words("home ")
+                    .path(&home)
+                    .words(" does not exist"),
+            },
+            Check {
+                account: Some("claude:zqalpha".into()),
+                message: link(
+                    Marked::default().words(
+                        "shares projects with claude:default through a symlink but not \
+                         file-history: /rewind does not find the file backups of a session \
+                         resumed from another account; link it too",
+                    ),
+                    "file-history",
+                ),
+            },
+            Check {
+                account: Some("claude:zqalpha".into()),
+                message: link(
+                    Marked::default()
+                        .words("not sharing sessions with claude:default: it does not see the sessions in ")
+                        .path(ZQ_STORE)
+                        .words(" and cannot resume them; link projects to share them"),
+                    "projects",
+                ),
+            },
+        ]),
+    );
+    keys(&mut app, &[Key::Char('1')]);
+    let open = text(&app);
+    assert!(open.contains("zq, (old): alpha does not exist"), "{open}");
+    app.private = true;
+    let all = text(&app);
+    // On screen (long ones are wrapped there).
+    for said in [
+        "! ANTHROPIC_API_KEY is set: it overrides every account's /login",
+        "! account-1: home ~/•••/••• does not exist",
+        "/rewind does not find the file backups of a session resumed from",
+        "another account; link it too (~/•••/•••/••• -> ~/•••/•••)",
+        "and cannot resume them; link projects to share them",
+    ] {
+        assert!(all.contains(said), "{said}:\n{all}");
+    }
+    assert!(!all.to_lowercase().contains("zq"), "{all}");
+    // Whole, as private mode keeps them.
+    let copy = super::privacy::redacted(&app);
+    let checks: Vec<&str> = copy
+        .checks
+        .iter()
+        .flatten()
+        .map(|c| c.message.as_str())
+        .collect();
+    assert_eq!(
+        checks,
+        [
+            "ANTHROPIC_API_KEY is set: it overrides every account's /login",
+            "home ~/•••/••• does not exist",
+            "shares projects with claude:default through a symlink but not file-history: \
+             /rewind does not find the file backups of a session resumed from another \
+             account; link it too (~/•••/•••/••• -> ~/•••/•••)",
+            "not sharing sessions with claude:default: it does not see the sessions in \
+             ~/•••/••• and cannot resume them; link projects to share them (~/•••/•••/••• -> \
+             ~/•••/•••)",
+        ]
+    );
+
+    // The same for the errors of the caches (the system's part of each is hidden from its
+    // first path on, alone) and for the problems of the Configuration pane.
+    assert_eq!(
+        copy.index_error.as_deref(),
+        Some("account-1: cannot write ~/•••/•••/•••")
+    );
+    assert_eq!(
+        copy.stats.error.as_deref(),
+        Some(
+            "stats cache: account-1: cannot write ~/•••/•••/••• · prices: cannot read \
+             ~/•••/••• (built-in prices used)"
+        )
+    );
+    app.private = false;
+    open_zq_config(&mut app);
+    app.private = true;
+    let all = text(&app);
+    for said in [
+        "! cannot read ~/•••/•••: account-1: cannot read ~/•••/•••/•••; shared configuration \
+         unknown",
+        "! ~/•••/•••/•••/••• is not in a recognized format",
+    ] {
+        assert!(all.contains(said), "{said}:\n{all}");
+    }
+    assert!(!all.to_lowercase().contains("zq"), "{all}");
+}
+
 /// R21: a message from elsewhere hides its own line from its first path on, and nothing of
 /// the messages around it: the launch it belongs to, the warnings after it.
 #[test]
@@ -5431,23 +5616,33 @@ fn private_mode_masks_a_message_from_elsewhere_alone() {
         "new session as account-1: cannot run claude: cannot run ~/•••/••• · cannot write \
          the launch log /•••/••• · warning: claude:account-1 reads 2 settings of claude:default"
     );
-    // A slash command remuda's own messages name is not a path (the rest of its line stays);
-    // a path after it is.
+    // In a message nobody vouches for, a `/name` that reads like a slash command of Claude is
+    // a path like any other: its line is hidden from there on.
+    let said = "zqalpha: /rewind finds no backup; see /login or ./zqdir/x for more";
     app.notice = Some(Notice {
-        text: "zqalpha: /rewind finds no backup; see /login or ./zqdir/x for more".into(),
+        text: said.into(),
+        level: Level::Warn,
+    });
+    assert_eq!(private_notice(&app), "account-1: /•••/•••/•••/•••");
+    // The same said by remuda, the directory marked as the path it is: only that is hidden.
+    app.notice = Some(Notice {
+        text: Marked::default()
+            .words("zqalpha: /rewind finds no backup; see /login or ")
+            .path("./zqdir/x y")
+            .words(" for more"),
         level: Level::Warn,
     });
     assert_eq!(
         private_notice(&app),
-        "account-1: /rewind finds no backup; see /login or •••/•••/•••"
+        "account-1: /rewind finds no backup; see /login or •••/•••/••• for more"
     );
 }
 
-/// R21: any other `/name` is a path, masked with the rest of its line: a home of one
-/// component, the first component of a path with a blank in it, a name that only starts like
-/// a command. And a path the TUI knows is masked even when it reads like a command.
+/// R21: in text from elsewhere every `/name` is a path, masked with the rest of its line: a
+/// home of one component, the first component of a path with a blank in it, and a name that
+/// reads like a slash command of Claude, whatever the TUI knows of it.
 #[test]
-fn private_mode_masks_every_slash_name_but_claudes_commands() {
+fn private_mode_masks_every_slash_name_in_text_from_elsewhere() {
     let said = |app: &mut App, text: &str| {
         app.notice = Some(Notice {
             text: text.into(),
@@ -5476,8 +5671,10 @@ fn private_mode_masks_every_slash_name_but_claudes_commands() {
     // The first component of a path with a blank in it; a name of one component.
     assert_eq!(said(&mut app, "no /zqMy Disk/zqsecret here"), "no /•••/•••");
     assert_eq!(said(&mut app, "no /zqsecret here"), "no /•••");
-    // Only the whole command is one.
+    // A command's name, and what only starts like one.
     for name in [
+        "/login",
+        "/rewind",
         "/loginx",
         "/login-zqsecret",
         "/login_zq",
@@ -5489,21 +5686,24 @@ fn private_mode_masks_every_slash_name_but_claudes_commands() {
             masked.starts_with("see /•••") && !masked.contains("zq"),
             "{name}: {masked}"
         );
-        assert!(!masked.contains("login"), "{name}: {masked}");
+        assert!(
+            !masked.contains("login") && !masked.contains("rewind"),
+            "{name}: {masked}"
+        );
+        assert!(!masked.contains("account-1"), "{name}: {masked}");
     }
     assert_eq!(
         said(&mut app, "see /login, (/rewind) or `/login`. for zqalpha"),
-        "see /login, (/rewind) or `/login`. for account-1"
+        "see /•••/•••/•••"
     );
 
-    // A path the TUI knows that reads like a command: the directory remuda started in, a
-    // home, a store, a typed directory.
+    // A directory may be named like a command: the one remuda started in, a home, a store, a
+    // typed one. Nothing has to know it for the name to be hidden.
     let mut app = secret_app();
-    assert_eq!(said(&mut app, "start in /rewind."), "start in /rewind.");
+    assert_eq!(said(&mut app, "start in /rewind."), "start in /•••");
     app.cwd = Some(PathBuf::from("/rewind"));
     assert_eq!(said(&mut app, "start in /rewind."), "start in /•••");
     app.cwd = Some(PathBuf::from(ZQ_CWD));
-    assert_eq!(said(&mut app, "home `/login`!"), "home `/login`!");
     app.accounts[1].account.home = Home::Path("/login/".into());
     assert_eq!(said(&mut app, "home `/login`!"), "home `/•••");
     app.accounts[1].account.home = Home::Path(format!("{ZQ_HOME}/.zqhomes/zqalpha"));
@@ -5889,9 +6089,19 @@ fn zq_config_view() -> crate::account_config::ConfigView {
             origin: Origin::Shared,
             files: Some(2),
         },
-        problems: vec![format!(
-            "zqalpha: cannot read {ZQ_HOME}/.zqhomes/zqalpha/settings.json"
-        )],
+        problems: vec![
+            Marked::default()
+                .words("cannot read ")
+                .path(format!("{ZQ_HOME}/.remuda/zqcfg (old).toml"))
+                .words(": ")
+                .text(format!(
+                    "zqalpha: cannot read {ZQ_HOME}/.zqhomes/zqalpha/settings.json"
+                ))
+                .words("; shared configuration unknown"),
+            Marked::default()
+                .path(format!("{ZQ_HOME}/.zqhomes/zqalpha/plugins/zqinst.json"))
+                .words(" is not in a recognized format"),
+        ],
         ..ConfigView::default()
     }
 }

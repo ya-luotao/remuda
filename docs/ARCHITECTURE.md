@@ -111,13 +111,13 @@ The exceptions, all for a type or a small helper:
 | `account_config` | What an account's sessions load and where each item comes from | R22 |
 | `pick` | `[pick]`; candidates, windows and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options | R3, R23 |
 | `jev` | The request to Jev (aliased state, Choice and Score questions), `curl` transport, response parsing | R23 |
-| `privacy` | Account-name aliases, whole-word aliasing of names in free text, and aliasing of every `provider:name` in the `pick` notes | R21, R23 |
+| `privacy` | `Marked`, a message in the pieces it was put together from (remuda's words, a path, text from elsewhere); account-name aliases, whole-word aliasing of names in free text, and aliasing of every `provider:name` in the `pick` notes | R21, R23 |
 | `text` | Terminal text measured in display columns | – |
 | `tui` | Terminal ownership, the event loop, foreground launches | R16 |
 | `tui::app` | All TUI state and the pure `update(app, event) -> effects` | R8, R16, R17, R20–R22 |
 | `tui::workers` | Runs each background effect on a thread and sends back events | R7–R11, R20, R22 |
 | `tui::render` | Draws the state; views, overlays, key reference | – |
-| `tui::privacy` | Private mode: the redacted copy of the state that is drawn; aliases from `privacy` | R21 |
+| `tui::privacy` | Private mode: the redacted copy of the state that is drawn; a `Marked` message masked piece by piece; aliases from `privacy` | R21 |
 | `tui::timeline` | The shared seven-day reset timeline | R10 |
 | `tui::search` | Fuzzy ranking of History rows | R8 |
 
@@ -251,9 +251,21 @@ an `Event`.
   which names are aliased and personal fields masked. `privacy::Snapshot` keeps that copy until
   the app changes, since making it for every frame is too slow for a large index. Every
   field of the state is destructured there, so a new field does not compile until it is decided
-  how private mode shows it (R21). A notice or a form's error is an `app::Marked`: the pieces it
-  was put together from, each path marked (`.path()`), so that a path is masked whole and a
-  message from elsewhere (`.text()`, a piece of its own) is masked without reaching the next.
+  how private mode shows it (R21).
+- A message remuda puts together for the screen is a `privacy::Marked`, made where the message
+  is made: a notice or a form's error (`tui::app`), a check (`checks`), a problem of the
+  Configuration pane (`account_config`), the error of a cache (`tui::workers`). It reads as one
+  string and keeps its pieces: remuda's own words (`.words()`), each path (`.path()`), each
+  text from elsewhere (`.text()`: an error of the system, an agent's output, a name read from
+  a file). `tui::privacy::Scrubber` masks a path whole, looks for no path in remuda's words,
+  and only in text from elsewhere falls back to hiding a line from its first path on, which
+  never reaches the next piece. A plain string is text from elsewhere (`From<&str>`): that
+  words are remuda's own is always said, so an entry not yet made of pieces is masked the
+  careful way. A message is also an error (`Err(message.into())`, or `message.because(cause)`
+  where a context would go): it prints as the same string, so the command line does not change,
+  and `Marked::from_error` gives the TUI the pieces of every message in the chain, the causes
+  nobody marked staying one text. `share::read_settings` tells its errors this way, which is
+  how a settings problem of the Configuration pane keeps its reason in private mode.
 
 ## Shared configuration
 
@@ -380,6 +392,7 @@ cargo run --release --example codex_timing -- [<codex home>]
 | Support another agent CLI | SPEC R4, `provider` (every `match Provider`), `index`, `usage`, `identity` |
 | Read a new field from transcripts | `transcript` (index) or `stats` (counts); bump the cache's `SCHEMA_VERSION` |
 | Add a TUI action | `tui::app` (`Key` → `Effect`), `tui::workers` (the effect), `tui::render`, `tui::privacy` |
-| Add something shown on screen | `tui::app` state, `tui::render`, and its case in `tui::privacy::redacted`; a path in a notice goes in with `Marked::path` |
+| Add something shown on screen | `tui::app` state, `tui::render`, and its case in `tui::privacy::redacted` |
+| Add or change a message with a path in it (a check, a notice, a problem) | Build it as `privacy::Marked` where it is made: `.words()` for what remuda says, `.path()` for each path, `.text()` for anything read from a file or a child; the tests of `checks` and `account_config` fail on a path formatted into words. An error the TUI shows: return the message as the error and read it with `Marked::from_error`; `tests/private_messages.rs` draws the result |
 | Add a model price | SPEC R20 table and `pricing` |
 | Change what `remuda pick` sends to Jev | SPEC R23, `jev::request` and `jev::state_text`; the privacy test in `tests/pick_cli.rs` |

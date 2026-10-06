@@ -8,7 +8,30 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ## [Unreleased]
 
+### Changed
+
+- Private mode (SPEC R21) no longer guesses where the paths are in what remuda itself says. A
+  check in the Accounts view and a problem in the Configuration pane now say which of their
+  parts are paths, as notices and form errors already did: each path is masked whole, whatever
+  characters it holds, and what the message says before, between and after its paths stays
+  readable. Text remuda did not write (an agent's output, an error of the system, a plugin
+  name read from a file) is masked as before, each line from its first path to its end, and
+  now by itself: it no longer hides what remuda says after it. So the error of the statistics
+  cache keeps what remuda says around each of the system's errors in it (`stats cache: … ·
+  prices: … (built-in prices used)`); the error of the index cache is the system's, whole, and
+  is masked as it was.
+- In text remuda did not write, `/login` and `/rewind` are now paths like any other `/name`
+  in private mode (a directory may have such a name); they stay readable where remuda's own
+  messages name them.
+
 ### Fixed
+
+- In private mode a check lost everything after its first path: `home <path> does not exist`
+  showed as `home ~/•••`, and of a check that ends with the link to make (`… link it too
+  (<home>/file-history -> <source>/file-history)`) the two ends ran together as one path. The
+  same held for the problems of the Configuration pane (SPEC R21, R22): a settings file that
+  is not a JSON object now shows as `~/•••/••• is not a JSON object`, and one that cannot be
+  read keeps the system's reason after the masked file.
 
 - A member whose `projects` is a link to the source's (the layout `remuda setup` creates) had
   claude ask for permission on every auto-memory write: claude grants its memory directory by

@@ -1,11 +1,213 @@
-//! Account names as private mode shows them (SPEC R21): [`Aliases`] numbers the accounts per
-//! provider, [`alias_words`] replaces names with their aliases in free text, and
-//! [`alias_qualified`] every `provider:name` of a text, registered or not (R23).
+//! What the library knows for private mode (SPEC R21): [`Marked`] is a message remuda puts
+//! together, in the pieces it was made of, so that a path in it is masked as the path it is;
+//! [`Aliases`] numbers the accounts per provider, [`alias_words`] replaces names with their
+//! aliases in free text, and [`alias_qualified`] every `provider:name` of a text, registered or
+//! not (R23).
 
 use std::collections::BTreeMap;
+use std::fmt::{self, Display};
+use std::ops::Deref;
 
 use crate::provider::Provider;
 use crate::registry::DEFAULT_NAME;
+
+/// What a piece of a [`Marked`] message is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Piece {
+    /// Words remuda wrote itself: literals, with the account names, the numbers and remuda's own
+    /// names for things (`file-history`, `settings.json`) in them. Never a path, and nothing
+    /// read from a file or a child.
+    Words,
+    /// One path, whole, whatever characters it holds.
+    Path,
+    /// Text from elsewhere (an agent's output, a system error, a name read from a file), or
+    /// text whose origin is not known.
+    Text,
+}
+
+/// A message remuda puts together for a person to read (a notice, a form's error, a check, a
+/// problem of the Configuration pane, the error of a cache), in the pieces it was made of. It
+/// reads as one string, the same one `format!` would give. Private mode (R21) masks it piece
+/// by piece: a path whole, where it ends being known; remuda's own words without looking for
+/// paths in them; and only in text from elsewhere what must be guessed, which never reaches
+/// into the next piece.
+///
+/// A string becomes a message as [`Piece::Text`]: saying that words are remuda's own
+/// ([`Marked::words`]) is always a step of its own. When in doubt, [`Marked::text`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Marked {
+    text: String,
+    /// Where each piece ends in `text`, and what it is.
+    pieces: Vec<(usize, Piece)>,
+}
+
+impl Marked {
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// With `words` after it: what remuda itself says ([`Piece::Words`]).
+    pub fn words(self, words: impl AsRef<str>) -> Self {
+        self.piece(words.as_ref(), Piece::Words)
+    }
+
+    /// With the path `path` after it.
+    pub fn path(self, path: impl Display) -> Self {
+        self.piece(&path.to_string(), Piece::Path)
+    }
+
+    /// With `text` after it, as a piece of its own: a message from elsewhere, or one remuda
+    /// cannot vouch for ([`Piece::Text`]).
+    pub fn text(self, text: impl AsRef<str>) -> Self {
+        self.piece(text.as_ref(), Piece::Text)
+    }
+
+    /// With the pieces of `other` after it.
+    pub fn join(mut self, other: &Marked) -> Self {
+        for (piece, kind) in other.pieces() {
+            self = self.piece(piece, kind);
+        }
+        self
+    }
+
+    fn piece(mut self, piece: &str, kind: Piece) -> Self {
+        if !piece.is_empty() {
+            self.text.push_str(piece);
+            self.pieces.push((self.text.len(), kind));
+        }
+        self
+    }
+
+    /// This message as an error that `cause` caused. It reads as the message alone, and
+    /// `cause` follows in its chain, as with a context of `anyhow`: `{:#}` gives
+    /// `<message>: <cause>`. [`Marked::from_error`] finds the pieces again, those of `cause`
+    /// too when it is a message itself (one returned with `.into()`, or by `because`): the
+    /// cause is kept as the error it is.
+    pub fn because(self, cause: impl Into<anyhow::Error>) -> anyhow::Error {
+        anyhow::Error::new(Caused {
+            said: self,
+            cause: cause.into(),
+        })
+    }
+
+    /// What `error` says with its causes, the string that `{error:#}` gives byte for byte, in
+    /// pieces. A cause that is a message (returned as an error with `.into()` or
+    /// [`Marked::because`]), wherever it is in the chain, keeps its pieces, with remuda's `: `
+    /// before and after it. Every other cause is text from elsewhere, and causes of that kind
+    /// that follow each other stay one text, `: ` included: an error nobody marked is one
+    /// piece, masked as it was as a string.
+    pub fn from_error(error: &anyhow::Error) -> Marked {
+        let mut said = Marked::default();
+        // The causes nobody marked that follow each other, so far. One that says nothing
+        // still has its `: `, so this is not told from the text being empty.
+        let mut text: Option<String> = None;
+        for (i, cause) in error.chain().enumerate() {
+            let marked = cause
+                .downcast_ref::<Marked>()
+                .or_else(|| cause.downcast_ref::<Caused>().map(|c| &c.said));
+            match (marked, &mut text) {
+                (Some(marked), _) => {
+                    said = said.text(text.take().unwrap_or_default());
+                    if i > 0 {
+                        said = said.words(": ");
+                    }
+                    said = said.join(marked);
+                }
+                (None, Some(text)) => {
+                    text.push_str(": ");
+                    text.push_str(&cause.to_string());
+                }
+                (None, None) => {
+                    if i > 0 {
+                        said = said.words(": ");
+                    }
+                    text = Some(cause.to_string());
+                }
+            }
+        }
+        said.text(text.unwrap_or_default())
+    }
+
+    /// Each piece in order, and what it is.
+    pub fn pieces(&self) -> impl Iterator<Item = (&str, Piece)> {
+        let mut start = 0;
+        self.pieces.iter().map(move |(end, kind)| {
+            let piece = &self.text[start..*end];
+            start = *end;
+            (piece, *kind)
+        })
+    }
+}
+
+impl From<String> for Marked {
+    fn from(text: String) -> Self {
+        Marked::default().text(text)
+    }
+}
+
+impl From<&str> for Marked {
+    fn from(text: &str) -> Self {
+        Marked::default().text(text)
+    }
+}
+
+impl Deref for Marked {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl Display for Marked {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// A message is an error as it is: `Err(message.into())` where a function returns
+/// `anyhow::Result`. It prints as the string it reads as, so what the command line shows does
+/// not change, and [`Marked::from_error`] gives the TUI its pieces back.
+impl std::error::Error for Marked {}
+
+/// [`Marked::because`]: a message, and the error that caused it.
+#[derive(Debug)]
+struct Caused {
+    said: Marked,
+    /// As the error it is, not boxed again: its own type is what [`Marked::from_error`]
+    /// knows a message by.
+    cause: anyhow::Error,
+}
+
+impl Display for Caused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Display::fmt(&self.said, f)
+    }
+}
+
+impl std::error::Error for Caused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
+impl PartialEq<str> for Marked {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for Marked {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<String> for Marked {
+    fn eq(&self, other: &String) -> bool {
+        self.text == *other
+    }
+}
 
 /// Aliases of account names (`claude:max` → `claude:account-2`), per provider in the order the
 /// accounts were first noted; `default` stays itself. Grow-only: an alias never changes once
@@ -149,6 +351,338 @@ fn qualified_name(text: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R21: a message reads as the one string `format!` would give, and keeps the pieces it
+    /// was made of: remuda's words, each path, each text from elsewhere.
+    #[test]
+    fn a_message_reads_as_one_string_and_keeps_its_pieces() {
+        let said = Marked::default()
+            .words("cannot read ")
+            .path("/h/a, b (old)/config.toml")
+            .words(": ")
+            .text("No such file or directory (os error 2)")
+            .words("; shared configuration unknown");
+        let whole = "cannot read /h/a, b (old)/config.toml: No such file or directory (os error \
+                     2); shared configuration unknown";
+        assert_eq!(said.as_str(), whole);
+        assert_eq!(said.to_string(), whole);
+        assert_eq!(format!("! {said}"), format!("! {whole}"));
+        assert_eq!(&*said, whole);
+        assert_eq!(said, whole);
+        assert_eq!(said, whole.to_string());
+        assert_eq!(
+            said.pieces().collect::<Vec<_>>(),
+            [
+                ("cannot read ", Piece::Words),
+                ("/h/a, b (old)/config.toml", Piece::Path),
+                (": ", Piece::Words),
+                ("No such file or directory (os error 2)", Piece::Text),
+                ("; shared configuration unknown", Piece::Words),
+            ]
+        );
+        // Joined, each piece is what it was.
+        let joined = Marked::default().words("x: ").join(&said);
+        assert_eq!(joined.as_str(), format!("x: {whole}"));
+        assert_eq!(
+            joined.pieces().map(|(_, kind)| kind).collect::<Vec<_>>(),
+            [
+                Piece::Words,
+                Piece::Words,
+                Piece::Path,
+                Piece::Words,
+                Piece::Text,
+                Piece::Words
+            ]
+        );
+        // An empty piece is none.
+        assert_eq!(
+            Marked::default()
+                .words("")
+                .path("")
+                .text("")
+                .pieces()
+                .count(),
+            0
+        );
+        assert_eq!(Marked::default().as_str(), "");
+    }
+
+    /// R21: a string says nothing of who wrote it, so as a message it is text from elsewhere:
+    /// private mode looks for paths in it. That words are remuda's own is always said.
+    #[test]
+    fn a_string_is_text_from_elsewhere_until_said_otherwise() {
+        let text = [("see /login", Piece::Text)];
+        assert_eq!(
+            Marked::from("see /login").pieces().collect::<Vec<_>>(),
+            text
+        );
+        assert_eq!(
+            Marked::from("see /login".to_string())
+                .pieces()
+                .collect::<Vec<_>>(),
+            text
+        );
+        assert_eq!(
+            Marked::default()
+                .text("see /login")
+                .pieces()
+                .collect::<Vec<_>>(),
+            text
+        );
+        assert_eq!(
+            Marked::default()
+                .words("see /login")
+                .pieces()
+                .collect::<Vec<_>>(),
+            [("see /login", Piece::Words)]
+        );
+        // The same string, and not the same message.
+        assert_ne!(
+            Marked::default().words("see /login"),
+            Marked::from("see /login")
+        );
+    }
+
+    /// R21: an error keeps the pieces of the messages in its chain, and reads as `anyhow`
+    /// prints it, whichever way: with a message in place of a string nothing that is printed
+    /// changes.
+    #[test]
+    fn an_error_keeps_the_pieces_of_its_messages() {
+        use anyhow::Context;
+        let io = || std::io::Error::other("Permission denied (os error 13)");
+        let said = || {
+            Marked::default()
+                .words("cannot read ")
+                .path("/h/a: b/c.json")
+        };
+        // A message with a cause prints as a context does.
+        let plain = anyhow::Error::from(io()).context("cannot read /h/a: b/c.json");
+        let marked = said().because(io());
+        for (new, old) in [
+            (format!("{marked}"), format!("{plain}")),
+            (format!("{marked:#}"), format!("{plain:#}")),
+            (format!("{marked:?}"), format!("{plain:?}")),
+        ] {
+            assert_eq!(new, old);
+        }
+        // Nobody marked `plain`: one text, the string it prints as.
+        assert_eq!(
+            Marked::from_error(&plain).pieces().collect::<Vec<_>>(),
+            [(
+                "cannot read /h/a: b/c.json: Permission denied (os error 13)",
+                Piece::Text
+            )]
+        );
+        let pieces = [
+            ("cannot read ", Piece::Words),
+            ("/h/a: b/c.json", Piece::Path),
+            (": ", Piece::Words),
+            ("Permission denied (os error 13)", Piece::Text),
+        ];
+        assert_eq!(
+            Marked::from_error(&marked).pieces().collect::<Vec<_>>(),
+            pieces
+        );
+        // A message alone is an error as it is.
+        let alone: anyhow::Error = Marked::default()
+            .path("/h/a: b/c.json")
+            .words(" is not a JSON object")
+            .into();
+        assert_eq!(alone.to_string(), "/h/a: b/c.json is not a JSON object");
+        assert_eq!(format!("{alone:#}"), alone.to_string());
+        assert_eq!(
+            format!("{alone:?}"),
+            format!(
+                "{:?}",
+                anyhow::anyhow!("/h/a: b/c.json is not a JSON object")
+            )
+        );
+        assert_eq!(
+            Marked::from_error(&alone).pieces().collect::<Vec<_>>(),
+            [
+                ("/h/a: b/c.json", Piece::Path),
+                (" is not a JSON object", Piece::Words)
+            ]
+        );
+        // Under contexts nobody marked: those stay one text, `: ` included, and the message
+        // keeps its pieces after remuda's `: `.
+        let deep = Err::<(), _>(said().because(io()))
+            .context("cannot plan the launch")
+            .context("cannot start /bin/x")
+            .unwrap_err();
+        let told = Marked::from_error(&deep);
+        assert_eq!(told.as_str(), format!("{deep:#}"));
+        let mut expected = vec![
+            ("cannot start /bin/x: cannot plan the launch", Piece::Text),
+            (": ", Piece::Words),
+        ];
+        expected.extend(pieces);
+        assert_eq!(told.pieces().collect::<Vec<_>>(), expected);
+    }
+
+    /// R21: a message keeps its pieces wherever it is in the chain of an error, also as the
+    /// cause of another message, at any depth: `because` keeps its cause as the error it is.
+    #[test]
+    fn a_message_that_causes_a_message_keeps_its_pieces() {
+        use anyhow::Context;
+        let file = "/h/a: b/settings.json";
+        let inner = || -> anyhow::Error {
+            Marked::default()
+                .path(file)
+                .words(" is not a JSON object")
+                .into()
+        };
+        let kept = [
+            ("cannot plan", Piece::Words),
+            (": ", Piece::Words),
+            (file, Piece::Path),
+            (" is not a JSON object", Piece::Words),
+        ];
+        // A message returned as an error, then the cause of another message.
+        let outer = Marked::default().words("cannot plan").because(inner());
+        let plain = inner().context("cannot plan");
+        for (new, old) in [
+            (format!("{outer}"), format!("{plain}")),
+            (format!("{outer:#}"), format!("{plain:#}")),
+            (format!("{outer:?}"), format!("{plain:?}")),
+        ] {
+            assert_eq!(new, old);
+        }
+        let told = Marked::from_error(&outer);
+        assert_eq!(told.as_str(), format!("{outer:#}"));
+        assert_eq!(told.pieces().collect::<Vec<_>>(), kept);
+        // Under a context nobody marked, the same message keeps them too.
+        assert_eq!(
+            Marked::from_error(&plain).pieces().collect::<Vec<_>>(),
+            [
+                ("cannot plan", Piece::Text),
+                (": ", Piece::Words),
+                (file, Piece::Path),
+                (" is not a JSON object", Piece::Words),
+            ]
+        );
+        // Two messages with causes, one in the other, and the system's error at the end.
+        let io = std::io::Error::other("Permission denied (os error 13)");
+        let read = Marked::default()
+            .words("cannot read ")
+            .path(file)
+            .because(io);
+        let deep = Marked::default()
+            .words("cannot plan the launch of ")
+            .text("tools/x@market")
+            .because(read);
+        let told = Marked::from_error(&deep);
+        assert_eq!(told.as_str(), format!("{deep:#}"));
+        assert_eq!(
+            told.pieces().collect::<Vec<_>>(),
+            [
+                ("cannot plan the launch of ", Piece::Words),
+                ("tools/x@market", Piece::Text),
+                (": ", Piece::Words),
+                ("cannot read ", Piece::Words),
+                (file, Piece::Path),
+                (": ", Piece::Words),
+                ("Permission denied (os error 13)", Piece::Text),
+            ]
+        );
+        assert_eq!(deep.chain().count(), 3);
+        // And a third level, with contexts between and around them.
+        let deeper = Err::<(), _>(
+            Marked::default().words("no launch").because(
+                Err::<(), _>(deep)
+                    .context("while starting /bin/x")
+                    .unwrap_err(),
+            ),
+        )
+        .context("outermost")
+        .unwrap_err();
+        let told = Marked::from_error(&deeper);
+        assert_eq!(told.as_str(), format!("{deeper:#}"));
+        assert_eq!(
+            told.pieces()
+                .filter(|(_, kind)| *kind == Piece::Path)
+                .collect::<Vec<_>>(),
+            [(file, Piece::Path)]
+        );
+        assert_eq!(
+            told.pieces().map(|(_, kind)| kind).collect::<Vec<_>>(),
+            [
+                Piece::Text,  // outermost
+                Piece::Words, // `: `
+                Piece::Words, // no launch
+                Piece::Words, // `: `
+                Piece::Text,  // while starting /bin/x
+                Piece::Words, // `: `
+                Piece::Words, // cannot plan the launch of
+                Piece::Text,  // the plugin
+                Piece::Words, // `: `
+                Piece::Words, // cannot read
+                Piece::Path,
+                Piece::Words, // `: `
+                Piece::Text,  // the system's error
+            ]
+        );
+    }
+
+    /// `from_error` is `{:#}` byte for byte, whatever the causes say: one that says nothing
+    /// still has its `: `, marked or not, first, last or in the middle.
+    #[test]
+    fn an_error_reads_the_same_in_pieces_when_a_cause_says_nothing() {
+        use anyhow::Context;
+        let leaf = || std::io::Error::other("leaf");
+        let said = |words: &str| Marked::default().words(words);
+        let cases: Vec<(anyhow::Error, &str)> = vec![
+            (anyhow::anyhow!("leaf").context(""), ": leaf"),
+            (Marked::default().because(leaf()), ": leaf"),
+            (anyhow::anyhow!("").context("top"), "top: "),
+            (said("top").because(anyhow::anyhow!("")), "top: "),
+            (said("top").because(Marked::default()), "top: "),
+            (anyhow::anyhow!("").context(""), ": "),
+            (Marked::default().because(Marked::default()), ": "),
+            (anyhow::Error::from(Marked::default()), ""),
+            (anyhow::anyhow!(""), ""),
+            (
+                anyhow::anyhow!("leaf").context("").context("top"),
+                "top: : leaf",
+            ),
+            (
+                said("top").because(Marked::default().because(leaf())),
+                "top: : leaf",
+            ),
+            (
+                said("top").because(anyhow::anyhow!("leaf").context("")),
+                "top: : leaf",
+            ),
+            (
+                Err::<(), _>(Marked::default().because(leaf()))
+                    .context("")
+                    .context("top")
+                    .unwrap_err(),
+                "top: : : leaf",
+            ),
+            (
+                Err::<(), _>(said("mid").because(anyhow::anyhow!("")))
+                    .context("")
+                    .unwrap_err(),
+                ": mid: ",
+            ),
+        ];
+        for (error, whole) in cases {
+            assert_eq!(format!("{error:#}"), whole, "{error:?}");
+            let told = Marked::from_error(&error);
+            assert_eq!(told.as_str(), whole, "{:?}", told);
+            // No piece is lost or doubled on the way: they add up to the string.
+            let pieces: String = told.pieces().map(|(piece, _)| piece).collect();
+            assert_eq!(pieces, whole);
+        }
+        // Causes nobody marked that follow each other are still one text, an empty one among
+        // them or not.
+        let unmarked = anyhow::anyhow!("leaf /a/b").context("").context("top /c");
+        assert_eq!(
+            Marked::from_error(&unmarked).pieces().collect::<Vec<_>>(),
+            [("top /c: : leaf /a/b", Piece::Text)]
+        );
+    }
 
     #[test]
     fn aliases_are_per_provider_stable_and_never_the_name() {

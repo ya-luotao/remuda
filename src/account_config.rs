@@ -13,6 +13,7 @@ use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 use crate::Env;
+use crate::privacy::Marked;
 use crate::registry::{Account, Sharing};
 use crate::share::{self, Installs, MEMORY_KEY, Plan, Skip};
 
@@ -51,8 +52,9 @@ pub struct ConfigView {
     /// Where the memory of user-scope subagents goes; `files` counts the agents that have one.
     pub agent_memory: Memory,
     pub mcp: Mcp,
-    /// What could not be read; first, what would fail a launch.
-    pub problems: Vec<String>,
+    /// What could not be read; first, what would fail a launch. Each in its pieces: a path
+    /// remuda names is a piece of its own, and so is an error of the system (R21).
+    pub problems: Vec<Marked>,
 }
 
 /// The account's part in shared configuration (R18).
@@ -284,20 +286,29 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         ..ConfigView::default()
     };
     let Some(home) = account.home_dir(env) else {
-        view.problems.push("HOME is not set".to_string());
+        view.problems
+            .push(Marked::default().words("HOME is not set"));
         return view;
     };
     if !home.is_dir() {
-        view.problems
-            .push(format!("home {} does not exist", home.display()));
+        view.problems.push(
+            Marked::default()
+                .words("home ")
+                .path(home.display())
+                .words(" does not exist"),
+        );
     }
     let project = share::Project::locate(cwd);
     let layers = project.settings(env);
     let plan = match share::plan(sharing, account, &[], cwd, env) {
         Ok(plan) => plan,
         Err(e) => {
-            view.problems
-                .insert(0, format!("sessions of this account fail to start: {e:#}"));
+            view.problems.insert(
+                0,
+                Marked::default()
+                    .words("sessions of this account fail to start: ")
+                    .join(&Marked::from_error(&e)),
+            );
             Plan::default()
         }
     };
@@ -309,9 +320,9 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         match share::read_settings(&own_path) {
             Ok(own) => own,
             Err(e) => {
-                let problem = format!("{e:#}");
+                let problem = Marked::from_error(&e);
                 // A launch fails on it too: said once.
-                if !view.problems.iter().any(|p| p.ends_with(&problem)) {
+                if !view.problems.iter().any(|p| p.ends_with(problem.as_str())) {
                     view.problems.push(problem);
                 }
                 Map::new()
@@ -354,7 +365,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         None => ClaudeJson::default(),
         Some(bytes) => serde_json::from_slice::<ClaudeJson>(&bytes).unwrap_or_else(|_| {
             view.problems
-                .push(".claude.json is not in a recognized format".to_string());
+                .push(Marked::default().words(".claude.json is not in a recognized format"));
             ClaudeJson::default()
         }),
     };
@@ -428,8 +439,11 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
     // Plugins: the home's, then the source's.
     let installs = share::installed_plugins(&home);
     if let Installs::Unrecognized(path) = &installs {
-        view.problems
-            .push(format!("{} is not in a recognized format", path.display()));
+        view.problems.push(
+            Marked::default()
+                .path(path.display())
+                .words(" is not in a recognized format"),
+        );
     }
     // The source's, when the launch injects from it (a member).
     let source_installs = match &from {
@@ -1276,7 +1290,40 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::privacy::Piece;
     use crate::registry::{CLAUDE, Home};
+
+    /// [`super::read`], with its problems checked (R21): remuda's own words in them hold no
+    /// path, so one formatted into the words of any problem fails the test that produces it.
+    fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env) -> ConfigView {
+        let view = super::read(account, sharing, cwd, env);
+        for problem in &view.problems {
+            for (piece, kind) in problem.pieces() {
+                assert!(
+                    kind != Piece::Words || !piece.contains('/'),
+                    "{piece:?} in {problem:?}"
+                );
+            }
+        }
+        view
+    }
+
+    /// Each problem with `<>` for a path and `{}` for text from elsewhere (an error of the
+    /// system): what is left is what private mode leaves readable (R21).
+    fn shapes(view: &ConfigView) -> Vec<String> {
+        view.problems
+            .iter()
+            .map(|p| {
+                p.pieces()
+                    .map(|(piece, kind)| match kind {
+                        Piece::Words => piece,
+                        Piece::Path => "<>",
+                        Piece::Text => "{}",
+                    })
+                    .collect()
+            })
+            .collect()
+    }
 
     const ORG: &str = "00000000-0000-4000-8000-00000000000a";
     const ACCT: &str = "00000000-0000-4000-8000-00000000000b";
@@ -2038,6 +2085,128 @@ mod tests {
             &f.env,
         );
         assert_eq!(view.problems.len(), 1, "{:?}", view.problems);
+    }
+
+    /// R21, R22: a problem says which of its pieces is a path, and which is an error that
+    /// came from elsewhere: private mode masks the one whole and hides the other from its
+    /// first path on, and what remuda says around them stays readable.
+    #[test]
+    fn problems_mark_their_paths_and_the_errors_from_elsewhere() {
+        let f = fx();
+        // A home that does not exist.
+        let gone = f.root.join("gone, (old)");
+        let view = read(&named("gone", &gone), &Sharing::default(), None, &f.env);
+        assert_eq!(
+            view.problems,
+            [format!("home {} does not exist", gone.display())]
+        );
+        assert_eq!(shapes(&view), ["home <> does not exist"]);
+        let paths = |view: &ConfigView| -> Vec<String> {
+            view.problems
+                .iter()
+                .flat_map(|p| p.pieces())
+                .filter(|(_, kind)| *kind == Piece::Path)
+                .map(|(piece, _)| piece.to_string())
+                .collect()
+        };
+        assert_eq!(paths(&view), [gone.display().to_string()]);
+
+        // A plugin list that is not recognized, and a `.claude.json` that is not either.
+        let max = f.root.join("max");
+        let list = max.join("plugins/installed_plugins.json");
+        write(&list, "[]");
+        write(&max.join(".claude.json"), "{");
+        let view = read(&named("max", &max), &Sharing::default(), None, &f.env);
+        assert_eq!(
+            shapes(&view),
+            [
+                ".claude.json is not in a recognized format",
+                "<> is not in a recognized format"
+            ]
+        );
+        assert_eq!(paths(&view), [list.display().to_string()]);
+
+        // What fails a launch keeps the pieces `share` gave it, after remuda's own words: a
+        // settings file of the source that is not a JSON object is a path, and what is wrong
+        // with it stays readable.
+        let src = f.root.join("src, (old)");
+        write(&src.join("settings.json"), "[]");
+        let view = read(
+            &named("max", &max),
+            &sharing(&named("src", &src)),
+            None,
+            &f.env,
+        );
+        assert_eq!(
+            shapes(&view)[0],
+            "sessions of this account fail to start: <> is not a JSON object"
+        );
+        assert_eq!(
+            view.problems[0],
+            format!(
+                "sessions of this account fail to start: {} is not a JSON object",
+                src.join("settings.json").display()
+            )
+        );
+        assert_eq!(
+            paths(&view)[0],
+            src.join("settings.json").display().to_string()
+        );
+        // The home's own settings: said once when a launch fails on them too, and by
+        // themselves otherwise. The file is a path either way.
+        write(&src.join("settings.json"), "{}");
+        write(&max.join("settings.json"), "1");
+        let view = read(
+            &named("max", &max),
+            &sharing(&named("src", &src)),
+            None,
+            &f.env,
+        );
+        let own = max.join("settings.json").display().to_string();
+        assert_eq!(
+            shapes(&view),
+            [
+                "sessions of this account fail to start: <> is not a JSON object",
+                ".claude.json is not in a recognized format",
+                "<> is not in a recognized format"
+            ]
+        );
+        assert_eq!(paths(&view)[0], own);
+        let view = read(&named("max", &max), &Sharing::default(), None, &f.env);
+        assert_eq!(
+            shapes(&view)[0],
+            "<> is not a JSON object",
+            "{:?}",
+            view.problems
+        );
+        assert_eq!(paths(&view)[0], own);
+        // One that cannot be read: the file is a path, the system's reason a text of its own.
+        fs::remove_file(src.join("settings.json")).unwrap();
+        fs::create_dir(src.join("settings.json")).unwrap();
+        fs::remove_file(max.join("settings.json")).unwrap();
+        let view = read(
+            &named("max", &max),
+            &sharing(&named("src", &src)),
+            None,
+            &f.env,
+        );
+        assert_eq!(
+            shapes(&view)[0],
+            "sessions of this account fail to start: cannot read <>: {}"
+        );
+        assert_eq!(
+            paths(&view)[0],
+            src.join("settings.json").display().to_string()
+        );
+
+        // Without `$HOME` the native login has no home.
+        let view = read(
+            &Account::default_for(CLAUDE),
+            &Sharing::default(),
+            None,
+            &Env::default(),
+        );
+        assert_eq!(shapes(&view), ["HOME is not set"]);
     }
 
     /// R18, R22: the pane shows what the launch injects: `--add-dir`, each `--plugin-dir`,

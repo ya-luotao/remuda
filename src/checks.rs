@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::Env;
 use crate::index::Store;
+use crate::privacy::Marked;
 use crate::registry::{Account, CLAUDE, Home, Sharing};
 use crate::share::{self, Installs};
 
@@ -17,7 +18,27 @@ use crate::share::{self, Installs};
 pub struct Check {
     /// `provider:name` of the account concerned; `None` for machine-wide problems.
     pub account: Option<String>,
-    pub message: String,
+    /// What to tell, in its pieces: each path in it is a piece of its own, and so is each name
+    /// read from a file (a plugin, a settings key), so private mode masks those and leaves
+    /// what the message says around them (R21).
+    pub message: Marked,
+}
+
+/// A message that starts with remuda's own `words`.
+fn say(words: impl AsRef<str>) -> Marked {
+    Marked::default().words(words)
+}
+
+/// `message` with `names` after it, each a piece of its own (they are read from a file),
+/// `, ` between them.
+fn listed(mut message: Marked, names: &[String]) -> Marked {
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            message = message.words(", ");
+        }
+        message = message.text(name);
+    }
+    message
 }
 
 pub const API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
@@ -50,7 +71,9 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
     if env.get(API_KEY_VAR).is_some_and(|v| !v.is_empty()) {
         checks.push(Check {
             account: None,
-            message: format!("{API_KEY_VAR} is set: it overrides every account's /login"),
+            message: say(format!(
+                "{API_KEY_VAR} is set: it overrides every account's /login"
+            )),
         });
     }
     // Claude and codex homes alike: only directory listings and `lstat`/`stat`/`readlink`, so
@@ -63,18 +86,17 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
         if matches!(account.home, Home::Path(_)) && !home.is_dir() {
             checks.push(Check {
                 account: Some(qualified),
-                message: format!("home {} does not exist", home.display()),
+                message: say("home ").path(home.display()).words(" does not exist"),
             });
             continue;
         }
         for (link, target) in dangling_symlinks(&home) {
             checks.push(Check {
                 account: Some(qualified.clone()),
-                message: format!(
-                    "dangling symlink {} -> {}",
-                    link.display(),
-                    target.display()
-                ),
+                message: say("dangling symlink ")
+                    .path(link.display())
+                    .words(" -> ")
+                    .path(target.display()),
             });
         }
     }
@@ -95,14 +117,13 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
         if !missing.is_empty() {
             checks.push(Check {
                 account: None,
-                message: format!(
-                    "projects {} is shared by {}, but {} {} no cleanupPeriodDays in settings.json \
-                     (the default 30-day cleanup deletes everyone's sessions)",
-                    store.path.display(),
+                message: say("projects ").path(store.path.display()).words(format!(
+                    " is shared by {}, but {} {} no cleanupPeriodDays in settings.json \
+                         (the default 30-day cleanup deletes everyone's sessions)",
                     store.accounts.join(", "),
                     missing.join(", "),
                     if missing.len() == 1 { "has" } else { "have" },
-                ),
+                )),
             });
         }
     }
@@ -130,7 +151,7 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
     if !accounts.iter().any(|a| a.qualified() == name) {
         checks.push(Check {
             account: Some(name),
-            message: "[share.claude] from names this account, which is not registered".into(),
+            message: say("[share.claude] from names this account, which is not registered"),
         });
         return checks;
     }
@@ -143,9 +164,9 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             .map_or(source.home.to_string(), |d| d.display().to_string());
         checks.push(Check {
             account: Some(name.clone()),
-            message: format!(
-                "home {home} of the shared configuration source does not exist: nothing is shared"
-            ),
+            message: say("home ")
+                .path(home)
+                .words(" of the shared configuration source does not exist: nothing is shared"),
         });
     }
     let installs = from.as_deref().map(share::installed_plugins);
@@ -170,23 +191,22 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             {
                 checks.push(Check {
                     account: Some(account.qualified()),
-                    message: format!(
-                        "{} is not in a recognized format: plugins from {name} are not shared \
-                         with this account",
-                        path.display()
-                    ),
+                    message: Marked::default().path(path.display()).words(format!(
+                        " is not in a recognized format: plugins from {name} are not shared \
+                         with this account"
+                    )),
                 });
             }
             let items = share::instructions(from, &home);
             if items.partial() {
                 checks.push(Check {
                     account: Some(account.qualified()),
-                    message: format!(
+                    message: say(format!(
                         "shares {} with {name} through symlinks but not {}: the shared ones \
                          load twice (with the injected --add-dir); link the others too, or none",
                         items.shared.join(", "),
                         items.missing.join(", ")
-                    ),
+                    )),
                 });
             }
             rules_injected |= items.missing.contains(&share::RULES);
@@ -209,23 +229,25 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             if let Some(other) = other {
                 checks.push(Check {
                     account: Some(account.qualified()),
-                    message: format!(
+                    message: say(format!(
                         "{item} is a symlink to that of {}: {breaks}; each account needs its own",
                         other.qualified()
-                    ),
+                    )),
                 });
             }
         }
         let Some(from) = &from else {
             continue;
         };
-        // `<home>/<item> -> <source home>/<item>`: the link that would share `item`.
-        let link = |item: &str| {
-            format!(
-                "{} -> {}",
-                home.join(item).display(),
-                from.join(item).display()
-            )
+        // `message` with ` (<home>/<item> -> <source home>/<item>)` after it: the link that
+        // would share `item`.
+        let link = |message: Marked, item: &str| {
+            message
+                .words(" (")
+                .path(home.join(item).display())
+                .words(" -> ")
+                .path(from.join(item).display())
+                .words(")")
         };
         let projects = from.join("projects");
         if share::resolves_to(&home.join("projects"), &projects) {
@@ -234,11 +256,13 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             {
                 checks.push(Check {
                     account: Some(account.qualified()),
-                    message: format!(
-                        "shares projects with {name} through a symlink but not {FILE_HISTORY}: \
-                         /rewind does not find the file backups of a session resumed from \
-                         another account; link it too ({})",
-                        link(FILE_HISTORY)
+                    message: link(
+                        say(format!(
+                            "shares projects with {name} through a symlink but not \
+                             {FILE_HISTORY}: /rewind does not find the file backups of a session \
+                             resumed from another account; link it too"
+                        )),
+                        FILE_HISTORY,
                     ),
                 });
             }
@@ -255,14 +279,16 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             {
                 checks.push(Check {
                     account: Some(account.qualified()),
-                    message: format!(
-                        "shares projects with {name} through a symlink but not {}, and a \
-                         settings file chooses {}, so a launch does not redirect memory: the \
-                         memory of user-scope subagents is not shared with this account; link \
-                         it too ({})",
+                    message: link(
+                        say(format!(
+                            "shares projects with {name} through a symlink but not {}, and a \
+                             settings file chooses {}, so a launch does not redirect memory: the \
+                             memory of user-scope subagents is not shared with this account; \
+                             link it too",
+                            share::AGENT_MEMORY,
+                            share::MEMORY_KEY,
+                        )),
                         share::AGENT_MEMORY,
-                        share::MEMORY_KEY,
-                        link(share::AGENT_MEMORY)
                     ),
                 });
             }
@@ -270,11 +296,13 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             // Not an error: memory is still shared by injection (R18). Sessions are not.
             checks.push(Check {
                 account: Some(account.qualified()),
-                message: format!(
-                    "not sharing sessions with {name}: it does not see the sessions in {} and \
-                     cannot resume them; link projects to share them ({})",
-                    projects.display(),
-                    link("projects")
+                message: link(
+                    say(format!(
+                        "not sharing sessions with {name}: it does not see the sessions in "
+                    ))
+                    .path(projects.display())
+                    .words(" and cannot resume them; link projects to share them"),
+                    "projects",
                 ),
             });
         }
@@ -300,11 +328,10 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
                 };
                 checks.push(Check {
                     account: Some(account.qualified()),
-                    message: format!(
-                        "{} must stay a symlink: {held} {plugins} of {name} {are} installed \
-                         through it and {stop} loading for every account without it",
-                        through.display()
-                    ),
+                    message: Marked::default().path(through.display()).words(format!(
+                        " must stay a symlink: {held} {plugins} of {name} {are} installed \
+                         through it and {stop} loading for every account without it"
+                    )),
                 });
             }
         }
@@ -315,13 +342,17 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             if !withheld.is_empty() {
                 checks.push(Check {
                     account: Some(account.qualified()),
-                    message: format!(
-                        "{SETTINGS} is that of {name} through a symlink, and it sets \
-                         authentication settings ({}): this account reads them through the \
-                         link; remove the link (the rest is then injected at launch), or move \
-                         them out of that {SETTINGS}",
-                        withheld.join(", ")
-                    ),
+                    message: listed(
+                        say(format!(
+                            "{SETTINGS} is that of {name} through a symlink, and it sets \
+                             authentication settings ("
+                        )),
+                        &withheld,
+                    )
+                    .words(format!(
+                        "): this account reads them through the link; remove the link (the \
+                         rest is then injected at launch), or move them out of that {SETTINGS}"
+                    )),
                 });
             }
         } else {
@@ -334,56 +365,52 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
     if rules_injected {
         let scoped = share::scoped_rules(&from.join(share::RULES));
         if !scoped.is_empty() {
-            let files: Vec<String> = scoped.iter().map(|p| p.display().to_string()).collect();
+            let mut message = say(
+                "rules limited to paths are not applied in accounts that get the rules at \
+                 launch (claude ignores `paths` in an added directory): ",
+            );
+            for (i, file) in scoped.iter().enumerate() {
+                if i > 0 {
+                    message = message.words(", ");
+                }
+                message = message.path(file.display());
+            }
             checks.push(Check {
                 account: Some(name.clone()),
-                message: format!(
-                    "rules limited to paths are not applied in accounts that get the rules at \
-                     launch (claude ignores `paths` in an added directory): {}",
-                    files.join(", ")
-                ),
+                message,
             });
         }
     }
     // Withheld where settings are injected: not said when every member links the file, and
     // said of the others when some do (those are named above).
     if !withheld.is_empty() && (settings_linked == 0 || settings_injected > 0) {
-        let message = if settings_linked == 0 {
-            format!(
-                "settings keys withheld from shared configuration (authentication is never \
-                 shared): {}",
-                withheld.join(", ")
-            )
+        let said = if settings_linked == 0 {
+            "settings keys withheld from shared configuration (authentication is never shared): "
         } else {
-            format!(
-                "settings keys withheld from the accounts that get settings at launch \
-                 (authentication is never injected): {}",
-                withheld.join(", ")
-            )
+            "settings keys withheld from the accounts that get settings at launch \
+             (authentication is never injected): "
         };
         checks.push(Check {
             account: Some(name.clone()),
-            message,
+            message: listed(say(said), &withheld),
         });
     }
     let plugins = share::enabled_plugins(&settings);
     match installs {
         Installs::Unrecognized(path) => checks.push(Check {
             account: Some(name),
-            message: format!(
-                "{} is not in a recognized format: plugins are not shared",
-                path.display()
-            ),
+            message: Marked::default()
+                .path(path.display())
+                .words(" is not in a recognized format: plugins are not shared"),
         }),
         installs => {
             for plugin in plugins {
                 if installs.install_path(&plugin).is_none() {
                     checks.push(Check {
                         account: Some(name.clone()),
-                        message: format!(
-                            "enabled plugin {plugin} has no user install whose path exists: \
-                             it is not shared"
-                        ),
+                        message: say("enabled plugin ")
+                            .text(&plugin)
+                            .words(" has no user install whose path exists: it is not shared"),
                     });
                 }
             }
@@ -437,10 +464,65 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::symlink;
 
-    use super::sharing as sharing_checks;
     use super::*;
     use crate::index;
+    use crate::privacy::Piece;
     use crate::registry::CODEX;
+
+    /// [`super::run`], every message of it [`marked_right`].
+    fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
+        let checks = super::run(accounts, env, stores);
+        marked_right(&checks);
+        checks
+    }
+
+    /// [`super::sharing`], every message of it [`marked_right`].
+    fn sharing_checks(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check> {
+        let checks = super::sharing(accounts, env, sharing);
+        marked_right(&checks);
+        checks
+    }
+
+    /// R21: no path hides in what a message gives as words or as a name: remuda's words hold
+    /// no `/` but that of the two slash commands they name, and nothing outside a path piece
+    /// holds the directory the fixtures are in. Every test here runs its checks through this,
+    /// so a path formatted into the words of any message fails the test that produces it.
+    fn marked_right(checks: &[Check]) {
+        let tmp = std::env::temp_dir();
+        let tmp = tmp.to_string_lossy();
+        let tmp = tmp.trim_end_matches('/');
+        for check in checks {
+            for (piece, kind) in check.message.pieces() {
+                match kind {
+                    Piece::Path => continue,
+                    Piece::Words => {
+                        let said = piece.replace("/login", "").replace("/rewind", "");
+                        assert!(!said.contains('/'), "{piece:?} in {check:?}");
+                    }
+                    Piece::Text => {}
+                }
+                assert!(!piece.contains(tmp), "{piece:?} in {check:?}");
+            }
+        }
+    }
+
+    /// Each message with `<>` for a path and `{}` for a name read from a file: what is left is
+    /// what private mode leaves readable (R21).
+    fn shapes(checks: &[Check]) -> Vec<String> {
+        checks
+            .iter()
+            .map(|c| {
+                c.message
+                    .pieces()
+                    .map(|(piece, kind)| match kind {
+                        Piece::Words => piece,
+                        Piece::Path => "<>",
+                        Piece::Text => "{}",
+                    })
+                    .collect()
+            })
+            .collect()
+    }
 
     struct Fixture {
         _dir: tempfile::TempDir,
@@ -512,6 +594,11 @@ mod tests {
                 "ANTHROPIC_API_KEY is set: it overrides every account's /login"
             )]
         );
+        // All of it is remuda's words: the slash command in it is not taken for a path.
+        assert_eq!(
+            shapes(&got),
+            ["ANTHROPIC_API_KEY is set: it overrides every account's /login"]
+        );
         f.env.insert(API_KEY_VAR.into(), String::new());
         assert_eq!(run(&[], &f.env, &[]), []);
     }
@@ -563,6 +650,22 @@ mod tests {
                 ),
             ]
         );
+        // The link and its target are a path each; what is said around them is not.
+        assert_eq!(
+            shapes(&got),
+            [
+                "dangling symlink <> -> <>",
+                "home <> does not exist",
+                "dangling symlink <> -> <>"
+            ]
+        );
+        let paths: Vec<&str> = got[1]
+            .message
+            .pieces()
+            .filter(|(_, kind)| *kind == Piece::Path)
+            .map(|(piece, _)| piece)
+            .collect();
+        assert_eq!(paths, [gone.display().to_string()]);
     }
 
     /// R11 for codex homes: a registered home that does not exist and dangling top-level
@@ -685,6 +788,10 @@ mod tests {
                 .as_str()
             )]
         );
+        assert_eq!(
+            shapes(&got),
+            ["home <> of the shared configuration source does not exist: nothing is shared"]
+        );
         let got = sharing_checks(&accounts[..1], &f.env, &sharing_from(named("gone", &gone)));
         assert_eq!(
             messages(&got),
@@ -722,6 +829,24 @@ mod tests {
                 "rules limited to paths are not applied in accounts that get the rules at launch \
                  (claude ignores `paths` in an added directory): lang/rust.md"
             )]
+        );
+        // Each file is a path, and a second one is a path of its own.
+        fs::write(
+            native.join("rules/lang/go, old.md"),
+            "---\npaths: \"**/*.go\"\n---\nno panic",
+        )
+        .unwrap();
+        let got = sharing_checks(&accounts, &f.env, &sharing);
+        assert_eq!(
+            shapes(&got),
+            [
+                "rules limited to paths are not applied in accounts that get the rules at launch \
+              (claude ignores `paths` in an added directory): <>, <>"
+            ]
+        );
+        assert!(
+            got[0].message.ends_with("lang/go, old.md, lang/rust.md"),
+            "{got:?}"
         );
         symlink(native.join("rules"), max.join("rules")).unwrap();
         assert_eq!(sharing_checks(&accounts, &f.env, &sharing), []);
@@ -821,6 +946,12 @@ mod tests {
                 (Some("claude:team"), not_sharing(&native, &team).as_str()),
             ]
         );
+        // The store and both ends of the link are paths; what to do about it stays readable.
+        assert_eq!(
+            shapes(&sharing_checks(&accounts, &f.env, &sharing))[0],
+            "not sharing sessions with claude:default: it does not see the sessions in <> and \
+             cannot resume them; link projects to share them (<> -> <>)"
+        );
         symlink(native.join("projects"), max.join("projects")).unwrap();
         fs::remove_dir(team.join("projects")).unwrap();
         // Through another member's link is the source's store too.
@@ -856,6 +987,14 @@ mod tests {
                 )
                 .as_str()
             )]
+        );
+        assert_eq!(
+            shapes(&sharing_checks(&accounts, &f.env, &sharing)),
+            [
+                "shares projects with claude:default through a symlink but not file-history: \
+                 /rewind does not find the file backups of a session resumed from another \
+                 account; link it too (<> -> <>)"
+            ]
         );
         fs::remove_dir(max.join("file-history")).unwrap();
         symlink(native.join("file-history"), max.join("file-history")).unwrap();
@@ -1092,6 +1231,13 @@ mod tests {
                 .as_str()
             )]
         );
+        assert_eq!(
+            shapes(&sharing_checks(&accounts, &f.env, &sharing)),
+            [
+                "<> must stay a symlink: 1 plugin of claude:default is installed through it \
+                 and stops loading for every account without it"
+            ]
+        );
         write(
             &max.join("plugins/cache/m/a"),
             &max.join("plugins/cache/m/b"),
@@ -1197,6 +1343,13 @@ mod tests {
                 .as_str()
             )]
         );
+        assert_eq!(
+            shapes(&got),
+            [
+                "<> is not in a recognized format: plugins from claude:default are not shared \
+              with this account"
+            ]
+        );
     }
 
     /// R11, R18: authentication keys in the source's settings are listed as withheld.
@@ -1222,6 +1375,14 @@ mod tests {
                 "settings keys withheld from shared configuration (authentication is never \
                  shared): apiKeyHelper, env.ANTHROPIC_AUTH_TOKEN"
             )]
+        );
+        // The keys are read from a file: each is a piece of its own.
+        assert_eq!(
+            shapes(&got),
+            [
+                "settings keys withheld from shared configuration (authentication is never \
+              shared): {}, {}"
+            ]
         );
     }
 
@@ -1258,6 +1419,10 @@ mod tests {
                 Some("claude:default"),
                 "enabled plugin gone@m has no user install whose path exists: it is not shared"
             )]
+        );
+        assert_eq!(
+            shapes(&sharing_checks(&accounts, &f.env, &sharing)),
+            ["enabled plugin {} has no user install whose path exists: it is not shared"]
         );
         fs::write(&file, r#"{"version": 1}"#).unwrap();
         assert_eq!(
@@ -1314,6 +1479,14 @@ mod tests {
                 )
                 .as_str()
             )]
+        );
+        assert_eq!(
+            shapes(&got),
+            [
+                "projects <> is shared by claude:default, claude:max, claude:team, but \
+                 claude:team has no cleanupPeriodDays in settings.json (the default 30-day \
+                 cleanup deletes everyone's sessions)"
+            ]
         );
 
         // Codex accounts sharing a `sessions` store are no concern of cleanupPeriodDays.

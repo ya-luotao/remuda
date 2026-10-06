@@ -207,10 +207,12 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                             let mut view = read(&registry::Sharing::default());
                             view.problems.insert(
                                 0,
-                                format!(
-                                    "cannot read {}: {e:#}; shared configuration unknown",
-                                    deps.config.display()
-                                ),
+                                Marked::default()
+                                    .words("cannot read ")
+                                    .path(deps.config.display())
+                                    .words(": ")
+                                    .join(&Marked::from_error(&e))
+                                    .words("; shared configuration unknown"),
                             );
                             view
                         }
@@ -244,7 +246,7 @@ fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Opt
                 "cannot confirm that session {} is not running: cannot read the registry: ",
                 app::short_id(&id)
             );
-            return Some(Marked::from(said).text(format!("{e:#}")));
+            return Some(Marked::default().words(said).join(&Marked::from_error(&e)));
         }
     };
     if accounts != deps.accounts {
@@ -270,14 +272,14 @@ fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Opt
     }
     // Each account's reason is a piece of its own: what private mode masks in one does not
     // reach the next (R21).
-    let mut said = Marked::from(format!(
+    let mut said = Marked::default().words(format!(
         "cannot confirm that session {} is not running: ",
         app::short_id(&id)
     ));
     for (i, u) in found.unknown.iter().enumerate() {
         let sep = if i == 0 { "" } else { "; " };
         said = said
-            .text(format!("{sep}{}: ", app::short_account(&u.account)))
+            .words(format!("{sep}{}: ", app::short_account(&u.account)))
             .text(&u.reason);
     }
     Some(said)
@@ -300,12 +302,14 @@ fn check_dir(dir: &Path) -> Option<Marked> {
     let path = || Marked::default().path(dir.display());
     match std::fs::metadata(dir) {
         Ok(meta) if meta.is_dir() => None,
-        Ok(_) => Some(path().text(" is not a directory")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(path().text(" does not exist")),
+        Ok(_) => Some(path().words(" is not a directory")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(path().words(" does not exist")),
         Err(e) => Some(
-            Marked::from("cannot use ")
+            Marked::default()
+                .words("cannot use ")
                 .join(&path())
-                .text(format!(": {e}")),
+                .words(": ")
+                .text(e.to_string()),
         ),
     }
 }
@@ -335,7 +339,8 @@ fn refresh_index(deps: &Deps, tx: &Sender<Event>) {
             });
         }
     });
-    let error = index.save(&cache).err().map(|e| format!("{e:#}"));
+    // The error of the system, with the path in it: one text, unless a cause says its pieces.
+    let error = index.save(&cache).err().map(|e| Marked::from_error(&e));
     let _ = tx.send(Event::IndexDone {
         entries: index.entries.into_values().collect(),
         error,
@@ -349,12 +354,17 @@ fn refresh_index(deps: &Deps, tx: &Sender<Event>) {
 /// told). Leaving the TUI does not wait for it: the thread ends with the process, the cache
 /// unsaved.
 fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<Marked> = Vec::new();
     let (prices, prices_error) = match Registry::load(&deps.config) {
         Ok(registry) => (registry.prices, None),
         Err(e) => (
             Prices::default(),
-            Some(format!("prices: {e:#} (built-in prices used)")),
+            Some(
+                Marked::default()
+                    .words("prices: ")
+                    .join(&Marked::from_error(&e))
+                    .words(" (built-in prices used)"),
+            ),
         ),
     };
     let path = deps.state_dir.join("stats.json");
@@ -368,7 +378,11 @@ fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
         }
     });
     if let Err(e) = cache.save_if_changed(&path, &refreshed) {
-        errors.push(format!("stats cache: {e:#}"));
+        errors.push(
+            Marked::default()
+                .words("stats cache: ")
+                .join(&Marked::from_error(&e)),
+        );
     }
     errors.extend(prices_error);
     let log = deps.state_dir.join("launches.jsonl");
@@ -382,7 +396,13 @@ fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
         (deps.clock)(),
         &deps.tz,
     );
-    let error = (!errors.is_empty()).then(|| errors.join(" · "));
+    // Each error is told by itself: what private mode hides in one does not reach the next.
+    let error = errors.iter().fold(None, |said: Option<Marked>, error| {
+        Some(match said {
+            Some(said) => said.words(" · ").join(error),
+            None => error.clone(),
+        })
+    });
     let _ = tx.send(Event::Stats { report, error });
 }
 
@@ -394,6 +414,7 @@ mod tests {
     use jiff::tz::TimeZone;
 
     use super::*;
+    use crate::privacy::Piece;
     use crate::registry::{Account, CLAUDE, Home};
 
     fn user(text: &str, minute: u32) -> String {
@@ -432,6 +453,18 @@ mod tests {
             mode: crate::tui::app::Mode::Browse,
             private: false,
         })
+    }
+
+    /// `said` with `<>` for a path and `{}` for text from elsewhere: what is left is what
+    /// private mode leaves readable (R21).
+    fn shape(said: &Marked) -> String {
+        said.pieces()
+            .map(|(piece, kind)| match kind {
+                Piece::Words => piece,
+                Piece::Path => "<>",
+                Piece::Text => "{}",
+            })
+            .collect()
     }
 
     fn collect(effect: Effect, deps: &Arc<Deps>, until: impl Fn(&Event) -> bool) -> Vec<Event> {
@@ -567,6 +600,51 @@ mod tests {
         );
         assert!(error.contains("config.toml"), "{error}");
         assert_eq!((unpriced.pico_usd, unpriced.unpriced_tokens), (0, 443));
+        // R21: the reason is the system's (it names the registry); what follows it is
+        // remuda's and stays readable in private mode.
+        assert_eq!(shape(&error), "prices: {} (built-in prices used)");
+    }
+
+    /// R21: an error of a cache is told in its pieces. What the system says (it names the
+    /// file) is text from elsewhere, each error by itself, so what private mode hides in one
+    /// does not reach the next; the index's is the system's whole.
+    #[test]
+    fn cache_errors_are_told_in_their_pieces() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        // Nothing can be written under a `state` that is a file.
+        fs::write(&deps.state_dir, "").unwrap();
+        fs::write(&deps.config, "prices = 1\n").unwrap();
+
+        let events = collect(Effect::Stats, &deps, |e| matches!(e, Event::Stats { .. }));
+        let Some(Event::Stats {
+            error: Some(error), ..
+        }) = events.last()
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(
+            shape(error),
+            "stats cache: {} · prices: {} (built-in prices used)"
+        );
+        let told: Vec<&str> = error
+            .pieces()
+            .filter(|(_, kind)| *kind == Piece::Text)
+            .map(|(piece, _)| piece)
+            .collect();
+        assert_eq!(told.len(), 2, "{told:?}");
+        assert!(told[1].contains("config.toml"), "{told:?}");
+
+        let events = collect(Effect::RefreshIndex, &deps, |e| {
+            matches!(e, Event::IndexDone { .. })
+        });
+        let Some(Event::IndexDone {
+            error: Some(error), ..
+        }) = events.last()
+        else {
+            panic!("{events:?}")
+        };
+        assert_eq!(shape(error), "{}");
     }
 
     #[test]
@@ -628,7 +706,7 @@ mod tests {
             Some(
                 Marked::default()
                     .path(gone.display())
-                    .text(" does not exist")
+                    .words(" does not exist")
             )
         );
         assert_eq!(
@@ -636,7 +714,7 @@ mod tests {
             Some(
                 Marked::default()
                     .path(file.display())
-                    .text(" is not a directory")
+                    .words(" is not a directory")
             )
         );
     }
@@ -787,6 +865,16 @@ mod tests {
             view.problems[0].ends_with("; shared configuration unknown"),
             "{:?}",
             view.problems
+        );
+        // R21: the registry is a path, the reason is the system's, the rest remuda's words.
+        assert_eq!(
+            shape(&view.problems[0]),
+            "cannot read <>: {}; shared configuration unknown"
+        );
+        let config = deps.config.display().to_string();
+        assert_eq!(
+            view.problems[0].pieces().nth(1),
+            Some((config.as_str(), Piece::Path))
         );
 
         let work = Account {

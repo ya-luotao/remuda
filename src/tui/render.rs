@@ -323,7 +323,7 @@ fn status_line(app: &App) -> Line<'static> {
             spans.push(stats_status(app));
             if let Some(e) = &app.stats.error {
                 spans.push(sep());
-                spans.push(Span::styled(e.clone(), CRIT));
+                spans.push(Span::styled(e.to_string(), CRIT));
             }
             return Line::from(spans);
         }
@@ -839,7 +839,7 @@ fn checks_view(app: &App, f: &mut Frame, area: Rect) {
     if let Some(checks) = &app.checks {
         problems.extend(checks.iter().map(|c| match &c.account {
             Some(a) => format!("{}: {}", short(a), c.message),
-            None => c.message.clone(),
+            None => c.message.to_string(),
         }));
     }
     for a in &app.accounts {

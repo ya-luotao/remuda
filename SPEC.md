@@ -1318,32 +1318,40 @@ status and hint lines, notices, the help box) shows:
 - **Session content**: titles, first messages, session names, preview messages, background
   session logs, search text, and the descriptions in the configuration pane (R22) are shown as
   `•••`.
-- **Free text** (notices, errors, check messages, the description of a pending launch): account
-  names are replaced by their aliases, as whole words (ASCII letters, digits, `_`, and `-` make a
-  word, so a name right next to CJK text or full-width punctuation is replaced too); emails,
-  organization names, live session names, the search text, and the values typed in the open form
-  (as typed, without the blanks around them, and as an error quotes them) are masked; text in
-  `“…”` is masked; and each word with an `@` is masked. Paths in it are masked in two ways:
-  - A path remuda itself puts in a notice or in a form's error (a launch directory, a store, a
-    home) is masked whole, as a path above, whatever characters it holds; what the message says
-    after it stays.
-  - In any other text (an agent's output, an error of the system, a check message), where a path
-    ends cannot be told: a path may hold blanks, `: `, `, `, quotes, and brackets. So each line is
-    masked from its first path to its end, as one path. A path starts in the first word that
-    holds a `/`: at the `/` or `~/` itself when it begins the word or follows a quote, a bracket,
-    `=`, or `:` in it; otherwise after the last quote, bracket, or `=` in the word, or at its
-    start, and the rest is a relative path (`./a/b`, `a/b`, `key=a/b`). A `/` and a single name
-    is a path like any other (`/tmp`; the `/My` of `/My Disk/x`). This may hide what follows a
-    path on its line (the reason of an error, say), and never shows part of one.
-  - Only Claude's slash commands that remuda's own messages name, `/login` and `/rewind`, are
-    not paths, and only as whole words: nothing but punctuation follows the command in its word
-    (`/loginx`, `/login-x`, `/login.x`, and `/login/x` are paths).
-  - A path the TUI knows (`$HOME`, a home, a store, the directory remuda started in, a directory
-    typed in the open form) starts a path wherever it occurs as whole components, even within a
-    word. One that is named like one of those commands, or lies under such a name, makes that
-    name a path again: with a home `/login` or `/login/me`, `/login` is masked.
-  - A notice made of several messages (the result of a launch and each of its warnings) is
-    masked message by message: what one hides does not reach the next.
+- **Messages and free text** (notices, errors, check messages, the problems of the configuration
+  pane, the description of a pending launch): account names are replaced by their aliases, as
+  whole words (ASCII letters, digits, `_`, and `-` make a word, so a name right next to CJK text
+  or full-width punctuation is replaced too); emails, organization names, live session names,
+  the search text, and the values typed in the open form (as typed, without the blanks around
+  them, and as an error quotes them) are masked; text in `“…”` is masked; and each word with an
+  `@` is masked. Paths are masked in two ways, by who wrote the text they are in:
+  - A message remuda puts together says which of its parts are paths, which are its own words,
+    and which came from elsewhere. So it is with a notice and a form's error (a launch
+    directory, a store, a home), a check message (R11: a home, a link and its target, a store,
+    a file), and a problem of the configuration pane (R22: a home, a file, the registry, a
+    settings file that cannot be read or is not a JSON object). Each path in it is masked
+    whole, as a path above, whatever characters it holds. What remuda says before, between,
+    and after its paths stays: the reason (`… is not a JSON object`), what to do about it, and
+    a slash command of Claude that its words name (`/login`, `/rewind`). remuda's own words are
+    not searched for paths.
+  - In text remuda did not write (an agent's output, an error of the system, a name read from a
+    file, such as a plugin's), or cannot tell who wrote, where a path ends cannot be told: a
+    path may hold blanks, `: `, `, `, quotes, and brackets. So each line is masked from its
+    first path to its end, as one path. A path starts in the first word that holds a `/`: at
+    the `/` or `~/` itself when it begins the word or follows a quote, a bracket, `=`, or `:` in
+    it; otherwise after the last quote, bracket, or `=` in the word, or at its start, and the
+    rest is a relative path (`./a/b`, `a/b`, `key=a/b`). A `/` and a single name is a path like
+    any other (`/tmp`; the `/My` of `/My Disk/x`), one that reads like a slash command too
+    (`/login` may be a directory). This may hide what follows a path on its line (the reason of
+    an error, say), and never shows part of one.
+  - A message is masked part by part: what is hidden in a text from elsewhere ends with that
+    text, and does not reach what the message says after it (the result of a launch and each
+    of its warnings; the system's error inside a problem and what remuda says after it). An
+    error that is shown with its causes keeps the parts of each cause that remuda wrote as a
+    message (the settings file above, and the system's reason after it when the file cannot
+    be read); the causes nobody marked stay one text, masked as above. So the error of the
+    index cache is the system's, whole; that of the statistics cache names each thing that
+    failed in remuda's words and gives the system's error for it, each masked by itself.
 
 Numbers (usage percentages, reset times, token counts, costs, and the Stats chart), model names,
 plans, login methods, providers, session IDs, pids, and times stay visible, and so do the names
@@ -1375,7 +1383,8 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   step that decides a launch's injection for a new session in that directory, without the
   launch's writes (the `.claude` item links and the settings file), so the pane cannot disagree
   with a launch. A settings file that would fail the launch (not a JSON object) is shown as a
-  problem.
+  problem, in the words of the launch's own error (R18); private mode masks the file in it and
+  keeps the rest (R21).
 - **Origins.** Each item is tagged *own* (in the account's home), *shared from <source>*
   (injected at launch, R18), *already the source's* (the home's item, or a plugin's install,
   resolves by realpath to the source's, so nothing is injected for it, R12), or *not shared*
@@ -1435,7 +1444,8 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   settings keys, `env` variables, MCP servers, and an agent's model, effort, and tools);
   descriptions are masked as `•••`; paths (link targets, install and memory directories, the
   directory in the title) are masked as in R21; the source account is shown by its alias;
-  problems are free text.
+  problems are messages (R21): a path remuda names in one is masked whole, and the system's
+  error in it from its first path to the end of its line.
 
 ## R23. Recommendation (`pick`)
 
