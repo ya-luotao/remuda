@@ -13,26 +13,40 @@
 //! signal that finds a start under way does not end remuda at once. It is remembered; nothing
 //! new starts; each start under way tells its own group as soon as it has one; and the last of
 //! them ends remuda by the signal, once the handler is done telling the groups it knew.
+//!
+//! The handler reads the groups from a table of fixed size, without a lock. No command runs
+//! outside it: one that finds the table full waits for a place.
 
 use std::sync::Once;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::time::Duration;
 
 /// What a terminal sends its foreground process group, each ending a process by default:
 /// Ctrl-C, Ctrl-\ and a hangup.
 const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP];
 
-/// How many process groups can be watched at once: a query per account, and a `ps` per file of
-/// a `sessions/` directory, all in parallel. One more is told of a signal that is ending
-/// remuda when it starts, and not of a later one (it is still terminated when its run times
-/// out).
-const SLOTS: usize = 1024;
+/// How many commands remuda runs at a time, each in a watched process group. Nothing else
+/// bounds them: there is one per account at once (`list`, `usage --live`, `pick`, the TUI's
+/// refreshes), and in the fallback of R7 a `ps` per file of every `sessions/` directory, and
+/// neither the registry nor a directory has a limit. One more waits for a place
+/// ([`State::place`]), so that no command ever runs without being watched: a place is
+/// a slot of a table the handler can read without a lock.
+const PLACES: usize = 1024;
 
-/// What the handler and the threads that start commands share. Atomics only, each read and
-/// written in one total order (`SeqCst`): the handler may run on any thread at any moment, and
-/// takes no lock.
-struct State {
-    /// The watched process groups; 0 is a free slot.
-    groups: [AtomicI32; SLOTS],
+/// What a taken slot holds until its command runs: no process group (1 would name every
+/// process, and is never signalled).
+const TAKEN: libc::pid_t = 1;
+
+/// How often a command that waits for a place looks for one.
+const POLL: Duration = Duration::from_millis(10);
+
+/// What the handler and the threads that start commands share, for at most `N` commands at a
+/// time. Atomics only, each read and written in one total order (`SeqCst`): the handler may
+/// run on any thread at any moment, and takes no lock.
+struct State<const N: usize> {
+    /// The process groups of the commands: 0 is a free slot, [`TAKEN`] one whose command is
+    /// being started.
+    groups: [AtomicI32; N],
     /// Live [`Held`] guards.
     held: AtomicUsize,
     /// Starts under way: begun, and their process group not yet watched.
@@ -43,13 +57,13 @@ struct State {
     telling: AtomicUsize,
 }
 
-static STATE: State = State::new();
+static STATE: State<PLACES> = State::new();
 static INSTALL: Once = Once::new();
 
-impl State {
-    const fn new() -> State {
+impl<const N: usize> State<N> {
+    const fn new() -> Self {
         State {
-            groups: [const { AtomicI32::new(0) }; SLOTS],
+            groups: [const { AtomicI32::new(0) }; N],
             held: AtomicUsize::new(0),
             starting: AtomicUsize::new(0),
             ending: AtomicI32::new(0),
@@ -88,6 +102,29 @@ impl State {
         self.starting.load(Ordering::SeqCst) == 0
     }
 
+    /// Takes a free slot, if there is one.
+    fn take(&self) -> Option<usize> {
+        self.groups.iter().position(|slot| {
+            slot.compare_exchange(0, TAKEN, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        })
+    }
+
+    /// A place for one more command: a slot, waited for while every one is taken (each is
+    /// given back when its command is over, which its timeout sees to). `None` when remuda
+    /// is ending: nothing starts any more.
+    fn place(&self) -> Option<usize> {
+        loop {
+            if self.ending.load(Ordering::SeqCst) != 0 {
+                return None;
+            }
+            if let Some(slot) = self.take() {
+                return Some(slot);
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
     /// A start begins. `false` when remuda is ending: the caller starts nothing. Either way
     /// the caller says when the start is over ([`State::start_over`]).
     fn start(&self) -> bool {
@@ -95,25 +132,21 @@ impl State {
         self.ending.load(Ordering::SeqCst) == 0
     }
 
-    /// Watches the process group led by process `pid`, from now until [`State::unwatch`]:
-    /// the slot it took (`None` when there is none left, or `pid` is no group to signal). A
+    /// The command of `slot` runs, as process `pid`, leading its group: the group is watched
+    /// from now until [`State::give_back`] (a `pid` that names no group to signal is not). A
     /// signal remuda is already ending by goes to the group here: the handler may have read
-    /// the slots before this one was written.
-    fn watch(&self, pid: u32) -> Option<usize> {
+    /// the slot before the group was written.
+    fn watch(&self, slot: usize, pid: u32) {
         // 0 and 1 would name remuda's own group and every process.
-        let pgid = libc::pid_t::try_from(pid).ok().filter(|pgid| *pgid > 1)?;
-        let slot = self.groups.iter().position(|slot| {
-            slot.compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-        });
-        let ending = self.ending.load(Ordering::SeqCst);
-        if ending != 0 {
-            signal_group(pgid, ending);
-        }
-        slot
+        let Some(pgid) = libc::pid_t::try_from(pid).ok().filter(|pgid| *pgid > 1) else {
+            return;
+        };
+        self.groups[slot].store(pgid, Ordering::SeqCst);
+        signal_group(pgid, self.ending.load(Ordering::SeqCst));
     }
 
-    fn unwatch(&self, slot: usize) {
+    /// The command of `slot` is over, or was never started: the slot is free again.
+    fn give_back(&self, slot: usize) {
         self.groups[slot].store(0, Ordering::SeqCst);
     }
 
@@ -129,38 +162,53 @@ impl State {
     }
 }
 
-/// `signal` to process group `pgid`; a free slot (0) is nobody.
+/// `signal` to process group `pgid`; no signal (0: remuda is not ending) and no group (a free
+/// or a taken slot) are nothing to do.
 fn signal_group(pgid: libc::pid_t, signal: libc::c_int) {
-    if pgid > 1 {
+    if pgid > TAKEN && signal != 0 {
         // SAFETY: kill(2) takes no pointers; a negative pid names the process group.
         unsafe { libc::kill(-pgid, signal) };
     }
 }
 
-/// A command about to be started in a process group of its own. Dropped without
-/// [`Starting::started`], nothing was started.
-pub struct Starting(());
+/// A command about to be started in a process group of its own, with its place among the
+/// watched ones. Dropped without [`Starting::started`], nothing was started.
+pub struct Starting {
+    /// Given back on drop unless the command runs and [`Watched`] has it.
+    slot: Option<usize>,
+}
 
 /// Before a command is started in a process group of its own: `None` when a signal is ending
 /// remuda, and nothing may be started any more. The command is remuda's to tell of such a
 /// signal from here on, though its group is known only once it runs ([`Starting::started`]).
+/// When as many commands run as remuda watches at a time, this waits for one to be over.
 pub fn starting() -> Option<Starting> {
     install();
+    let slot = STATE.place()?;
+    let began = STATE.start();
     // Dropped right away when remuda is ending: that start is over too.
-    let starting = Starting(());
-    STATE.start().then_some(starting)
+    let starting = Starting { slot: Some(slot) };
+    began.then_some(starting)
 }
 
 impl Starting {
     /// The command runs, as process `pid`, leading its group: the group is watched until the
     /// guard is dropped, and has been told already if a signal came while it was started.
-    pub fn started(self, pid: u32) -> Watched {
-        Watched(STATE.watch(pid))
+    pub fn started(mut self, pid: u32) -> Watched {
+        let slot = self
+            .slot
+            .take()
+            .expect("a start has its slot until it is over");
+        STATE.watch(slot, pid);
+        Watched(slot)
     }
 }
 
 impl Drop for Starting {
     fn drop(&mut self) {
+        if let Some(slot) = self.slot {
+            STATE.give_back(slot);
+        }
         if let Some(signal) = STATE.start_over() {
             end_by(signal);
         }
@@ -168,13 +216,11 @@ impl Drop for Starting {
 }
 
 /// A process group the terminal's signals are passed on to, until this is dropped.
-pub struct Watched(Option<usize>);
+pub struct Watched(usize);
 
 impl Drop for Watched {
     fn drop(&mut self) {
-        if let Some(slot) = self.0 {
-            STATE.unwatch(slot);
-        }
+        STATE.give_back(self.0);
     }
 }
 
@@ -259,7 +305,7 @@ mod tests {
             .unwrap()
     }
 
-    fn watched(state: &State, pid: u32) -> bool {
+    fn watched<const N: usize>(state: &State<N>, pid: u32) -> bool {
         let pgid = libc::pid_t::try_from(pid).unwrap();
         state
             .groups
@@ -278,11 +324,43 @@ mod tests {
         assert!(!watched(&STATE, child.id()));
         child.kill().unwrap();
         child.wait().unwrap();
-        let state = State::new();
+        // A taken slot holds no group until its command runs, nor for a pid that names none.
+        let state = State::<2>::new();
+        let slot = state.take().unwrap();
         for pid in [0, 1, u32::MAX] {
-            assert_eq!(state.watch(pid), None, "{pid}");
+            state.watch(slot, pid);
+            assert_eq!(state.groups[slot].load(Ordering::SeqCst), TAKEN, "{pid}");
         }
+        state.give_back(slot);
         assert!(state.groups.iter().all(|g| g.load(Ordering::SeqCst) == 0));
+    }
+
+    /// R4 (GitHub review round 1): no command runs unwatched. With every place taken, one
+    /// more waits until a command is over, and then has that place; it does not wait once
+    /// remuda is ending, when nothing starts any more.
+    #[test]
+    fn a_command_waits_for_a_place() {
+        let state = State::<2>::new();
+        let (first, second) = (state.take().unwrap(), state.take().unwrap());
+        assert_ne!(first, second);
+        assert_eq!(state.take(), None, "a third command had a place");
+        let waited = std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                let start = Instant::now();
+                (state.place(), start.elapsed())
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(!waiting.is_finished(), "started without a place");
+            state.give_back(first);
+            waiting.join().unwrap()
+        });
+        assert_eq!(waited.0, Some(first));
+        assert!(waited.1 >= Duration::from_millis(200), "{:?}", waited.1);
+        // Full again, and remuda is ending: no place, at once.
+        state.ending.store(libc::SIGTERM, Ordering::SeqCst);
+        assert_eq!(state.place(), None);
+        state.give_back(second);
+        assert_eq!(state.place(), None, "started while remuda was ending");
     }
 
     /// R4: the signal goes to every member of a watched group, and with no start under way
@@ -304,9 +382,10 @@ mod tests {
                 other => panic!("no pid: {other:?}"),
             }
         };
-        let state = State::new();
+        let state = State::<4>::new();
+        let slot = state.place().unwrap();
         assert!(state.start());
-        assert!(state.watch(child.id()).is_some());
+        state.watch(slot, child.id());
         assert_eq!(state.start_over(), None);
         assert!(state.signalled(libc::SIGTERM), "nothing is starting");
         assert!(!child.wait().unwrap().success());
@@ -323,21 +402,25 @@ mod tests {
     /// to be over ends remuda by that signal.
     #[test]
     fn a_signal_during_a_start_reaches_the_command_once_it_runs() {
-        let state = State::new();
+        let state = State::<4>::new();
         // Two commands are being started: forked, say, their groups not known yet.
+        let (slot, other) = (state.place().unwrap(), state.place().unwrap());
         assert!(state.start());
         assert!(state.start());
         let mut first = sleeper();
         assert!(!state.signalled(libc::SIGTERM), "remuda ended over a start");
         assert_eq!(state.ending.load(Ordering::SeqCst), libc::SIGTERM);
-        // Nothing new starts, and that start is not the last one under way.
+        // Nothing new starts: there is no place any more, and a start that had its place
+        // before the signal is refused, without being the last one under way.
+        assert_eq!(state.place(), None);
         assert!(!state.start());
         assert_eq!(state.start_over(), None);
-        // The first runs: it is told, though the handler never saw its group.
-        assert!(state.watch(first.id()).is_some());
+        // The first runs: it is told, though the handler found no group in its slot.
+        state.watch(slot, first.id());
         assert_eq!(first.wait().unwrap().signal(), Some(libc::SIGTERM));
         assert_eq!(state.start_over(), None, "a start is still under way");
         // The second could not be started at all: its start is over, and it was the last.
+        state.give_back(other);
         assert_eq!(state.start_over(), Some(libc::SIGTERM));
         // A later signal does not change what remuda ends by.
         assert!(state.signalled(libc::SIGHUP));
@@ -349,7 +432,7 @@ mod tests {
     /// running. The handler ends remuda itself when it is done.
     #[test]
     fn remuda_does_not_end_while_the_groups_are_being_told() {
-        let state = State::new();
+        let state = State::<4>::new();
         assert!(state.start());
         // A handler is among the groups, on another thread: remuda is ending by its signal.
         state.telling.store(1, Ordering::SeqCst);
@@ -361,27 +444,11 @@ mod tests {
         assert_eq!(state.telling.load(Ordering::SeqCst), 0);
     }
 
-    /// R4: a group there was no slot left for is still told of the signal remuda is ending by.
-    #[test]
-    fn a_group_without_a_slot_is_told_when_it_starts() {
-        let state = State::new();
-        for slot in &state.groups {
-            // A pid no process has: its group takes the slot and gets no signal.
-            slot.store(libc::pid_t::MAX, Ordering::SeqCst);
-        }
-        assert!(state.start());
-        let mut child = sleeper();
-        assert!(!state.signalled(libc::SIGTERM));
-        assert_eq!(state.watch(child.id()), None);
-        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
-        assert_eq!(state.start_over(), Some(libc::SIGTERM));
-    }
-
     /// R6: with a foreground child, Ctrl-C and Ctrl-\ are sat out, and remuda is not ending:
     /// commands still start. A hangup never is sat out.
     #[test]
     fn interrupts_are_sat_out_while_held() {
-        let state = State::new();
+        let state = State::<4>::new();
         state.held.store(1, Ordering::SeqCst);
         for signal in [libc::SIGINT, libc::SIGQUIT] {
             assert!(state.sat_out(signal));

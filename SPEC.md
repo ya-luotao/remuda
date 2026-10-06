@@ -189,10 +189,14 @@ the UI, not reported as an error:
     that changes anything (such as `account/rateLimitResetCredit/consume` or `account/logout`).
 - Every command remuda runs for its output (the identity, usage, and running-session commands
   above, `claude logs`, `stop`, and `rm`, and likewise `ps` and `curl`) gets a timeout and a
-  process group of its own. Once the command has exited, remuda takes what it printed without
-  waiting for a process the command left holding its output open, and leaves that process
-  running: what an agent starts on the side (an update, say) is the agent's business. On a
-  timeout the whole group is terminated. (`codex app-server` serves until it is told to stop:
+  process group of its own. At most 1024 of them run at a time: there is one per account, and
+  in R7's fallback one `ps` per file of a `sessions/` directory, and nothing else limits
+  either, so one more waits for another to be over, its timeout counting from its own start.
+  Once the command has exited, remuda takes what was printed by then, as soon as it has all
+  of it and without waiting for a process the command left holding its output open, whether
+  that process is silent or goes on printing, and leaves the process running: what an agent
+  starts on the side (an update, say) is the agent's business.
+  On a timeout the whole group is terminated. (`codex app-server` serves until it is told to stop:
   its group is terminated once it has answered as well.) Such a group is not the terminal's
   foreground group, and two things follow:
   - Ctrl-C, Ctrl-\, and a hangup do not reach it by themselves: remuda passes the signal on to
