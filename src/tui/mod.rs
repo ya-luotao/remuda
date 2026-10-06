@@ -35,6 +35,7 @@ use jiff::tz::TimeZone;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+use crate::account_command::OnPath;
 use crate::provider::Provider;
 use crate::registry::{Account, Registry};
 use crate::{Env, launch, paths, setup};
@@ -71,6 +72,14 @@ impl Deps {
         match provider {
             Provider::Claude => self.claude.as_deref(),
             Provider::Codex => self.codex.as_deref(),
+        }
+    }
+
+    /// What runs the agents' commands for an account: the executables found on `PATH`.
+    pub fn agents(&self) -> OnPath<'_> {
+        OnPath {
+            claude: self.claude.as_deref(),
+            codex: self.codex.as_deref(),
         }
     }
 }

@@ -43,12 +43,8 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
             for account in &deps.accounts {
                 let (deps, tx, account) = (Arc::clone(&deps), tx.clone(), account.clone());
                 thread::spawn(move || {
-                    let (identity, _warning) = identity::identify(
-                        &account,
-                        deps.program(account.provider),
-                        &deps.env,
-                        IDENTITY_TIMEOUT,
-                    );
+                    let (identity, _warning) =
+                        identity::identify(&account, &deps.agents(), &deps.env, IDENTITY_TIMEOUT);
                     let _ = tx.send(Event::Identity { account, identity });
                 });
             }
@@ -68,13 +64,7 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
             for account in which {
                 let (deps, tx) = (Arc::clone(&deps), tx.clone());
                 thread::spawn(move || {
-                    let result = match deps.program(account.provider) {
-                        Some(program) => usage::live_usage(&account, program, LIVE_USAGE_TIMEOUT),
-                        None => Err(format!(
-                            "`{}` not found on PATH",
-                            account.provider.program()
-                        )),
-                    };
+                    let result = usage::live_usage(&account, &deps.agents(), LIVE_USAGE_TIMEOUT);
                     let _ = tx.send(Event::LiveUsage { account, result });
                 });
             }
@@ -83,7 +73,7 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
             thread::spawn(move || {
                 let sessions = live::collect(
                     &deps.accounts,
-                    deps.claude.as_deref(),
+                    &deps.agents(),
                     deps.ps.as_deref(),
                     &deps.env,
                     live::TIMEOUT,
@@ -118,10 +108,7 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
         }
         Effect::Logs { account, short_id } => {
             thread::spawn(move || {
-                let result = match &deps.claude {
-                    Some(claude) => live::logs(claude, &account, &short_id, live::LOGS_TIMEOUT),
-                    None => Err("`claude` not found on PATH".to_string()),
-                };
+                let result = live::logs(&deps.agents(), &account, &short_id, live::LOGS_TIMEOUT);
                 let _ = tx.send(Event::Logs { short_id, result });
             });
         }
@@ -131,12 +118,8 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
             short_id,
         } => {
             thread::spawn(move || {
-                let result = match &deps.claude {
-                    Some(claude) => {
-                        live::control(claude, &account, verb, &short_id, CONTROL_TIMEOUT)
-                    }
-                    None => Err("`claude` not found on PATH".to_string()),
-                };
+                let result =
+                    live::control(&deps.agents(), &account, verb, &short_id, CONTROL_TIMEOUT);
                 let _ = tx.send(Event::ControlDone {
                     verb,
                     short_id,
@@ -253,7 +236,7 @@ fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Opt
     let accounts = union(&[&accounts, &deps.accounts, &deps.seen]);
     let found = live::collect_report(
         &accounts,
-        deps.claude.as_deref(),
+        &deps.agents(),
         deps.ps.as_deref(),
         &deps.env,
         live::TIMEOUT,

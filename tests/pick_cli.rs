@@ -690,6 +690,87 @@ fn nothing_feasible_exits_1_with_the_reasons() {
     assert!(sb.curl_invocations().is_empty());
 }
 
+/// Why `account` is not feasible, from the `not feasible:` lines of the report.
+fn why_not<'a>(out: &'a Out, account: &str) -> &'a str {
+    out.stdout
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix(account))
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("no `{account}` in:\n{}", out.stdout))
+}
+
+/// With `--live`, one `codex app-server` run per codex account answers its usage and whether
+/// it is logged in (`account/read`): `codex login status` runs only for an account whose
+/// server did not say.
+#[test]
+fn live_asks_codex_once() {
+    let sb = Sandbox::new();
+    sb.install_codex();
+    let work = sb.make_codex_home("c/work");
+    sb.set_codex_account(
+        Some(&work),
+        r#"{"account": {"type": "chatgpt", "email": "cx@example.com", "planType": "pro"}}"#,
+    );
+    sb.set_codex_rate_limits(
+        Some(&work),
+        r#"{"rateLimits": {"limitId": "codex", "primary":
+            {"usedPercent": 30, "windowDurationMins": 10080, "resetsAt": 1790414559}}}"#,
+    );
+    // Logged out: the fake's `account/read` answers `account: null`, as a logged-out home's.
+    let out_home = sb.make_codex_home("c/out");
+    // A codex without app-server, logged in.
+    let old = sb.make_codex_home("c/old");
+    sb.set_codex_without_app_server(Some(&old));
+    sb.set_codex_login(Some(&old), "Logged in using ChatGPT");
+    configure(
+        &sb,
+        &[
+            ("codex", "work", &work),
+            ("codex", "out", &out_home),
+            ("codex", "old", &old),
+        ],
+        "[pick]\nexclude = [\"claude:default\", \"codex:default\"]\n",
+    );
+    let out = pick(&sb, false, &["--live"]);
+    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
+    assert_eq!(field(&out, "account"), "codex:work");
+    assert_eq!(field(&out, "usage"), "live");
+    assert_eq!(
+        why_not(&out, "codex:out"),
+        "not logged in (`codex app-server` account/read)"
+    );
+    let runs = |home: &Path| -> Vec<Vec<String>> {
+        sb.codex_invocations()
+            .into_iter()
+            .filter(|i| i.codex_home.as_deref() == home.to_str())
+            .map(|i| i.args)
+            .collect()
+    };
+    assert_eq!(runs(&work), [["app-server"]]);
+    assert_eq!(runs(&out_home), [["app-server"]]);
+    assert_eq!(
+        runs(&old),
+        [vec!["app-server"], vec!["login", "status"]],
+        "the server did not say: `codex login status` does"
+    );
+    // Without `--live`, `codex login status` alone, as before.
+    let before = sb.codex_invocations().len();
+    let out = pick(&sb, false, &[]);
+    assert_eq!(
+        why_not(&out, "codex:out"),
+        "not logged in (`codex login status`)"
+    );
+    let after: Vec<Vec<String>> = sb.codex_invocations()[before..]
+        .iter()
+        .map(|i| i.args.clone())
+        .collect();
+    assert_eq!(after.len(), 3, "{after:?}");
+    assert!(
+        after.iter().all(|args| args == &["login", "status"]),
+        "{after:?}"
+    );
+}
+
 /// `--live` asks each agent first; a failed query falls back to the cache, with a note.
 #[test]
 fn live_usage_first() {
@@ -741,6 +822,37 @@ fn live_usage_first() {
             .count(),
         6,
         "each claude account, `default` included, once per run"
+    );
+}
+
+/// R10, R23 (review #14): a live answer read only in part is not the account's usage. Here
+/// the week is used up, in words this version does not read: the cache decides, with a note,
+/// instead of the session line alone (95% left) standing for the account.
+#[test]
+fn a_live_answer_read_in_part_falls_back_to_the_cache() {
+    let (sb, max, _) = two_accounts("");
+    sb.set_live_usage(
+        Some(&max),
+        "Current session: 5% used\nCurrent week (all models): limit reached\n",
+    );
+    let out = pick(&sb, false, &["--live", "--json"]);
+    let v: Value = serde_json::from_str(&out.stdout).unwrap();
+    let max = v["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["account"] == "claude:max")
+        .unwrap_or_else(|| panic!("no claude:max: {v:#}"));
+    assert_eq!(max["source"], "cached");
+    assert_eq!(max["binding"], "Week (all models)");
+    assert_eq!(max["headroom"], 60.0);
+    let out = pick(&sb, false, &["--live"]);
+    assert_eq!(field(&out, "account"), "claude:max");
+    assert!(
+        out.stdout
+            .contains("live output not recognized; using cached usage"),
+        "{}",
+        out.stdout
     );
 }
 

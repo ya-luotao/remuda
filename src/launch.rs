@@ -11,6 +11,7 @@ use anyhow::{Result, bail};
 use serde::Serialize;
 
 use crate::Env;
+use crate::interrupt;
 use crate::provider::Provider;
 use crate::registry::{self, Account, Home, Sharing};
 use crate::share::{self, Injected, Shared};
@@ -474,9 +475,9 @@ fn command(program: &Path, args: &[String], change: &EnvChange, cwd: Option<&Pat
 /// Runs `program args...` in the foreground (inherited stdio) under the inherited
 /// environment plus `change`, in `cwd` (`None`: remuda's own), and waits for it.
 ///
-/// Like `system(3)`: while the child runs, remuda ignores SIGINT and SIGQUIT (Ctrl-C and
-/// Ctrl-\ go to the whole foreground process group), and the child gets their default
-/// actions back.
+/// Like `system(3)`: while the child runs, remuda sits SIGINT and SIGQUIT out (Ctrl-C and
+/// Ctrl-\ go to the whole foreground process group; [`interrupt::hold`]), and the child gets
+/// their default actions back.
 pub fn run_foreground(
     program: &Path,
     args: &[String],
@@ -496,45 +497,8 @@ fn foreground(mut cmd: Command) -> io::Result<ExitStatus> {
             Ok(())
         });
     }
-    let _ignored = IgnoreInterrupts::new();
+    let _held = interrupt::hold();
     cmd.status()
-}
-
-/// SIGINT and SIGQUIT ignored for as long as any guard lives; the previous actions come back
-/// when the last one is dropped (overlapping guards on several threads nest correctly).
-struct IgnoreInterrupts;
-
-/// Live guards, and the actions to restore after the last one.
-static IGNORING: std::sync::Mutex<(usize, libc::sighandler_t, libc::sighandler_t)> =
-    std::sync::Mutex::new((0, 0, 0));
-
-impl IgnoreInterrupts {
-    fn new() -> Self {
-        let mut state = IGNORING.lock().unwrap_or_else(|e| e.into_inner());
-        if state.0 == 0 {
-            // SAFETY: installs SIG_IGN; the previous handlers are restored by the last drop.
-            unsafe {
-                state.1 = libc::signal(libc::SIGINT, libc::SIG_IGN);
-                state.2 = libc::signal(libc::SIGQUIT, libc::SIG_IGN);
-            }
-        }
-        state.0 += 1;
-        IgnoreInterrupts
-    }
-}
-
-impl Drop for IgnoreInterrupts {
-    fn drop(&mut self) {
-        let mut state = IGNORING.lock().unwrap_or_else(|e| e.into_inner());
-        state.0 -= 1;
-        if state.0 == 0 {
-            // SAFETY: restores the handlers the first guard replaced.
-            unsafe {
-                libc::signal(libc::SIGINT, state.1);
-                libc::signal(libc::SIGQUIT, state.2);
-            }
-        }
-    }
 }
 
 /// What [`perform`] did.

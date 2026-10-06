@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::launch::{self, EnvChange};
+use crate::account_command::{Parsed, Runner};
+use crate::launch::EnvChange;
 use crate::probe::Outcome;
 use crate::registry::Account;
 use crate::{Env, probe, text};
@@ -93,19 +94,15 @@ impl LiveSession {
 
 /// Parses `claude agents --json` (a JSON array); `None` when the output is not one.
 /// Interactive entries are identified by `pid`, background ones by their short `id` (they
-/// have no pid); entries with neither are dropped. Unknown fields are ignored.
-pub fn parse_agents(stdout: &str, account: &str) -> Option<Vec<LiveSession>> {
+/// have no pid); an entry with neither is not a session remuda can name, and is counted as
+/// unrecognized. Unknown fields are ignored.
+pub fn parse_agents(stdout: &str, account: &str) -> Option<Parsed<LiveSession>> {
     let v: Value = serde_json::from_str(stdout).ok()?;
     let entries = v.as_array()?;
-    Some(
-        entries
-            .iter()
-            .filter_map(|e| {
-                let session = from_json(e, account, pid_of(e), Source::Agents);
-                (session.pid.is_some() || session.short_id.is_some()).then_some(session)
-            })
-            .collect(),
-    )
+    Some(Parsed::of(entries.iter().map(|e| {
+        let session = from_json(e, account, pid_of(e), Source::Agents);
+        (session.pid.is_some() || session.short_id.is_some()).then_some(session)
+    })))
 }
 
 fn pid_of(v: &Value) -> Option<u32> {
@@ -256,17 +253,17 @@ pub fn same_start(a: &str, b: &str) -> bool {
 }
 
 /// Live sessions of every account, queried in parallel. Per account: `claude agents --json`
-/// under the account's environment; if claude is missing, fails, times out or prints
-/// something else, the account's `sessions/` directory, verified with `ps`. With neither
+/// under the account's environment, run by `agents`; if claude is missing, fails, times out or
+/// prints something else, the account's `sessions/` directory, verified with `ps`. With neither
 /// claude nor ps, an account contributes nothing ([`collect_report`] says which).
 pub fn collect(
     accounts: &[Account],
-    claude: Option<&Path>,
+    agents: &dyn Runner,
     ps: Option<&Path>,
     env: &Env,
     timeout: Duration,
 ) -> Vec<LiveSession> {
-    collect_report(accounts, claude, ps, env, timeout).sessions
+    collect_report(accounts, agents, ps, env, timeout).sessions
 }
 
 /// What [`collect_report`] found.
@@ -292,7 +289,7 @@ pub struct Unknown {
 /// file could be read ([`read_session_files_checked`]).
 pub fn collect_report(
     accounts: &[Account],
-    claude: Option<&Path>,
+    agents: &dyn Runner,
     ps: Option<&Path>,
     env: &Env,
     timeout: Duration,
@@ -300,20 +297,14 @@ pub fn collect_report(
     let accounts: Vec<&Account> = accounts.iter().filter(|a| a.provider.has_live()).collect();
     let per_account = probe::parallel(&accounts, |account| {
         let qualified = account.qualified();
-        let agents = match claude {
-            Some(claude) => {
-                let change = launch::env_change(account);
-                let outcome = probe::run_captured(claude, AGENTS_ARGS, &change, timeout);
-                match outcome
-                    .success_stdout()
-                    .map(|out| parse_agents(out, &qualified))
-                {
-                    Some(Some(sessions)) => return Ok(sessions),
-                    Some(None) => "`claude agents --json` printed no session list".to_string(),
-                    None => format!("`claude agents --json` {}", outcome.describe(timeout)),
-                }
-            }
-            None => "`claude` not found on PATH".to_string(),
+        let no_answer = match agents.run_ok(account, AGENTS_ARGS, timeout) {
+            // An entry that is not recognized does not unsay the others: the sessions that
+            // can be named are the answer.
+            Ok(output) => match parse_agents(&output.stdout, &qualified) {
+                Some(parsed) => return Ok(parsed.items),
+                None => output.said("printed no session list"),
+            },
+            Err(failure) => failure,
         };
         let fallback = match (ps, sessions_dir(account, env)) {
             (None, _) => Err("no `ps` to check its sessions/ directory".to_string()),
@@ -353,7 +344,7 @@ pub fn collect_report(
         };
         fallback.map_err(|why| Unknown {
             account: qualified.clone(),
-            reason: format!("{agents}, and {why}"),
+            reason: format!("{no_answer}, and {why}"),
         })
     });
     let mut collection = Collection::default();
@@ -408,19 +399,18 @@ impl Control {
 /// `claude logs <short_id>` under the account's environment, as plain text; a malformed id
 /// is refused without running anything (the raw output
 /// is terminal bytes: see [`text::terminal_text`]). Only the end of a long output is shown
-/// (`LOGS_TAIL`), and the text says so first. `Err` says why it failed.
+/// (`LOGS_TAIL`), and the text says so first. `Err` says why it failed: claude reports that on
+/// stdout as well.
 pub fn logs(
-    claude: &Path,
+    agents: &dyn Runner,
     account: &Account,
     short_id: &str,
     timeout: Duration,
 ) -> Result<String, String> {
     check_short_id(short_id)?;
-    let change = launch::env_change(account);
-    let outcome = probe::run_captured(claude, &["logs", short_id], &change, timeout);
-    match outcome.success_stdout() {
-        Some(out) => Ok(tail_text(out, LOGS_TAIL)),
-        None => Err(failure(&outcome, timeout)),
+    match agents.run_ok(account, &["logs", short_id], timeout) {
+        Ok(output) => Ok(tail_text(&output.stdout, LOGS_TAIL)),
+        Err(failure) => Err(failure.reason_or_stdout()),
     }
 }
 
@@ -449,37 +439,20 @@ fn tail_text(raw: &str, max: usize) -> String {
 }
 
 /// `claude stop|rm <short_id>` under the account's environment; its output (trimmed), or
-/// why it failed (a malformed id is refused without running anything).
+/// why it failed, which claude reports on stdout as well (a malformed id is refused without
+/// running anything).
 pub fn control(
-    claude: &Path,
+    agents: &dyn Runner,
     account: &Account,
     verb: Control,
     short_id: &str,
     timeout: Duration,
 ) -> Result<String, String> {
     check_short_id(short_id)?;
-    let change = launch::env_change(account);
-    let outcome = probe::run_captured(claude, &[verb.command(), short_id], &change, timeout);
-    match outcome.success_stdout() {
-        Some(out) => Ok(text::terminal_text(out).trim().to_string()),
-        None => Err(failure(&outcome, timeout)),
+    match agents.run_ok(account, &[verb.command(), short_id], timeout) {
+        Ok(output) => Ok(text::terminal_text(&output.stdout).trim().to_string()),
+        Err(failure) => Err(failure.reason_or_stdout()),
     }
-}
-
-/// [`Outcome::describe`], falling back to stdout when a failing command wrote nothing to
-/// stderr.
-fn failure(outcome: &Outcome, timeout: Duration) -> String {
-    if let Outcome::Exited {
-        code: Some(code),
-        stdout,
-        stderr,
-    } = outcome
-        && stderr.trim().is_empty()
-        && let Some(line) = stdout.lines().map(str::trim).find(|l| !l.is_empty())
-    {
-        return format!("exited with status {code}: {line}");
-    }
-    outcome.describe(timeout)
 }
 
 #[cfg(test)]
@@ -489,6 +462,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+    use crate::account_command::Scripted;
     use crate::registry::CLAUDE;
 
     /// R7: only the end of a long `claude logs` output is converted, from a line's start, and
@@ -555,9 +529,12 @@ mod tests {
         let mut second = session("claude:max", Some(102), Source::Agents);
         second.kind = Some("bg".into());
         second.status = Some("dreaming".into());
-        assert_eq!(got, [first, second]);
+        assert_eq!(got.items, [first, second]);
+        // The four that have neither a pid nor a short id are counted, not forgotten.
+        assert_eq!(got.unrecognized, 4);
 
-        assert_eq!(parse_agents("[]", "a"), Some(vec![]));
+        let none = parse_agents("[]", "a").unwrap();
+        assert_eq!((none.items.len(), none.unrecognized), (0, 0));
         assert_eq!(parse_agents("", "a"), None);
         assert_eq!(parse_agents("{\"pid\": 1}", "a"), None);
         assert_eq!(parse_agents("No sessions.\n", "a"), None);
@@ -588,7 +565,8 @@ mod tests {
         done.kind = Some("background".into());
         done.session_id = Some("f35a30d1-eebf".into());
         done.status = Some("wins-over-state".into());
-        assert_eq!(got, [blocked.clone(), done]);
+        assert_eq!(got.items, [blocked.clone(), done]);
+        assert_eq!(got.unrecognized, 2);
         assert!(blocked.is_background());
         assert!(!blocked.is_inactive());
         assert_eq!(
@@ -637,11 +615,146 @@ mod tests {
             assert!(!is_short_id(bad), "{bad:?}");
         }
         let account = Account::default_for(CLAUDE);
-        let nowhere = Path::new("/nonexistent/claude");
-        let err = logs(nowhere, &account, "--all", TIMEOUT).unwrap_err();
+        let agents = Scripted::new();
+        let err = logs(&agents, &account, "--all", TIMEOUT).unwrap_err();
         assert_eq!(err, "\"--all\" is not a background session id");
-        let err = control(nowhere, &account, Control::Remove, "-f", TIMEOUT).unwrap_err();
+        let err = control(&agents, &account, Control::Remove, "-f", TIMEOUT).unwrap_err();
         assert_eq!(err, "\"-f\" is not a background session id");
+        assert!(agents.ran().is_empty());
+    }
+
+    fn named(name: &str) -> Account {
+        Account {
+            provider: CLAUDE,
+            name: name.into(),
+            home: crate::registry::Home::Path(format!("/nonexistent/{name}")),
+        }
+    }
+
+    /// R7: each account's `claude agents --json --all` is the answer; one that gives none is
+    /// named with the command and why, next to why the fallback gave none either.
+    #[test]
+    fn agents_answers_per_account_and_failures_say_the_command() {
+        let (max, team, slow, odd) = (named("max"), named("team"), named("slow"), named("odd"));
+        let agents = Scripted::new()
+            .on(
+                "claude:max agents --json --all",
+                Scripted::exited(0, r#"[{"pid": 11, "sessionId": "s-max"}]"#, ""),
+            )
+            .on(
+                "claude:team agents --json --all",
+                Scripted::exited(2, "", "error: unknown command 'agents'\n"),
+            )
+            .on("claude:slow agents --json --all", Outcome::TimedOut)
+            .on(
+                "claude:odd agents --json --all",
+                Scripted::exited(0, "No sessions.\n", ""),
+            );
+        let accounts = [max, team, slow, odd];
+        let got = collect_report(&accounts, &agents, None, &Env::new(), TIMEOUT);
+        let ids: Vec<Option<&str>> = got
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_deref())
+            .collect();
+        assert_eq!(ids, [Some("s-max")]);
+        let unknown: Vec<(&str, &str)> = got
+            .unknown
+            .iter()
+            .map(|u| (u.account.as_str(), u.reason.as_str()))
+            .collect();
+        let no_ps = "and no `ps` to check its sessions/ directory";
+        assert_eq!(
+            unknown,
+            [
+                (
+                    "claude:team",
+                    &*format!(
+                        "`claude agents --json --all` exited with status 2: error: unknown \
+                         command 'agents', {no_ps}"
+                    )
+                ),
+                (
+                    "claude:slow",
+                    &*format!("`claude agents --json --all` timed out after 5s, {no_ps}")
+                ),
+                (
+                    "claude:odd",
+                    &*format!("`claude agents --json --all` printed no session list, {no_ps}")
+                ),
+            ]
+        );
+        // Without claude nothing runs, and the reason names it.
+        let agents = Scripted::new().without(CLAUDE);
+        let got = collect_report(&accounts[..1], &agents, None, &Env::new(), TIMEOUT);
+        assert_eq!(
+            got.unknown[0].reason,
+            format!("`claude` not found on PATH, {no_ps}")
+        );
+        assert!(agents.ran().is_empty());
+    }
+
+    /// R7: an entry remuda cannot name does not unsay the sessions it can: they are the
+    /// account's answer.
+    #[test]
+    fn sessions_next_to_an_unrecognized_entry_are_kept() {
+        let agents = Scripted::new().on(
+            "claude:max agents --json --all",
+            Scripted::exited(
+                0,
+                r#"[{"pid": 11, "sessionId": "s-max"}, {"kind": "new"}]"#,
+                "",
+            ),
+        );
+        let got = collect_report(&[named("max")], &agents, None, &Env::new(), TIMEOUT);
+        assert_eq!(got.sessions.len(), 1);
+        assert!(got.unknown.is_empty(), "{:?}", got.unknown);
+    }
+
+    /// R7: `claude logs|stop|rm` report their errors on stdout as well; a failure says why
+    /// without the command, which the caller names.
+    #[test]
+    fn background_commands_say_why_from_either_stream() {
+        let max = named("max");
+        let agents = Scripted::new()
+            .on(
+                "claude:max logs 0badf00d",
+                Scripted::exited(1, "Couldn't read logs for 0badf00d\n", ""),
+            )
+            .on(
+                "claude:max rm 0badf00d",
+                Scripted::exited(1, "on stdout\n", "Refusing: 2 unpushed commits\n"),
+            )
+            .on(
+                "claude:max stop 0badf00d",
+                Scripted::exited(0, "\u{1b}[32mStopped 0badf00d\u{1b}[0m\n", ""),
+            )
+            .on("claude:max logs 0badf00e", Outcome::TimedOut);
+        assert_eq!(
+            logs(&agents, &max, "0badf00d", LOGS_TIMEOUT),
+            Err("exited with status 1: Couldn't read logs for 0badf00d".to_string())
+        );
+        assert_eq!(
+            control(&agents, &max, Control::Remove, "0badf00d", TIMEOUT),
+            Err("exited with status 1: Refusing: 2 unpushed commits".to_string())
+        );
+        assert_eq!(
+            control(&agents, &max, Control::Stop, "0badf00d", TIMEOUT),
+            Ok("Stopped 0badf00d".to_string())
+        );
+        assert_eq!(
+            logs(&agents, &max, "0badf00e", LOGS_TIMEOUT),
+            Err("timed out after 15s".to_string())
+        );
+        let agents = Scripted::new().without(CLAUDE);
+        assert_eq!(
+            logs(&agents, &max, "0badf00d", LOGS_TIMEOUT),
+            Err("`claude` not found on PATH".to_string())
+        );
+        assert_eq!(
+            control(&agents, &max, Control::Stop, "0badf00d", TIMEOUT),
+            Err("`claude` not found on PATH".to_string())
+        );
     }
 
     #[test]
