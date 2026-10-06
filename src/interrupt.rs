@@ -78,15 +78,18 @@ impl<const N: usize> State<N> {
     }
 
     /// The handler's part: unless `signal` is sat out, remuda is ending by it from now on, and
-    /// the watched groups get it. `true` when remuda ends now; `false` when it is sat out, or
-    /// when a start is under way, which then ends remuda ([`State::start_over`]).
+    /// the watched groups get it. `true` when remuda ends now; `false` when it is sat out,
+    /// when a start is under way, which then ends remuda ([`State::start_over`]), or when
+    /// another handler is still telling the groups (two signals at once, on two threads, or
+    /// one over the other on one thread), which then ends it when it is done.
     ///
     /// The order matters, here and in the functions below: `ending` is written before the
     /// groups and `starting` are read, and a start writes its group, or lowers `starting`,
     /// before it reads `ending`. So of a signal and a start, at least one sees the other.
-    /// Likewise `telling` is lowered before `starting` is read, and a start lowers `starting`
-    /// before it reads `telling`: remuda is ended by one of the two, and by neither while the
-    /// groups are still being told.
+    /// Likewise each handler lowers `telling` before it reads `telling` and `starting`, and a
+    /// start lowers `starting` before it reads `telling`: whichever of them lowers its count
+    /// last finds both at nothing and ends remuda, and none does while groups are still
+    /// being told.
     fn signalled(&self, signal: libc::c_int) -> bool {
         if self.sat_out(signal) {
             return false;
@@ -99,7 +102,7 @@ impl<const N: usize> State<N> {
             signal_group(slot.load(Ordering::SeqCst), signal);
         }
         self.telling.fetch_sub(1, Ordering::SeqCst);
-        self.starting.load(Ordering::SeqCst) == 0
+        self.telling.load(Ordering::SeqCst) == 0 && self.starting.load(Ordering::SeqCst) == 0
     }
 
     /// Takes a free slot, if there is one.
@@ -269,8 +272,9 @@ fn install() {
     });
 }
 
-/// The handler: unless the signal is sat out, the watched groups get it, and then remuda does,
-/// at once or when the last start under way is over.
+/// The handler: unless the signal is sat out, the watched groups get it, and then remuda does:
+/// at once, or when the last start under way is over, or when another handler that is telling
+/// the groups is done.
 extern "C" fn on_signal(signal: libc::c_int) {
     if STATE.signalled(signal) {
         end_by(signal);
@@ -442,6 +446,33 @@ mod tests {
         state.telling.store(0, Ordering::SeqCst);
         assert!(state.signalled(libc::SIGTERM));
         assert_eq!(state.telling.load(Ordering::SeqCst), 0);
+    }
+
+    /// R4 (GitHub review round 2): two signals may be handled at once, on two threads (Ctrl-C,
+    /// and the terminal going right after it). The handler that is done first does not end
+    /// remuda under the other, which has groups left to tell: a command that ignores the
+    /// first signal would be left running. The last one ends remuda.
+    #[test]
+    fn a_handler_does_not_end_remuda_under_another() {
+        let state = State::<4>::new();
+        let slot = state.place().unwrap();
+        assert!(state.start());
+        let mut child = sleeper();
+        state.watch(slot, child.id());
+        assert_eq!(state.start_over(), None);
+        // Another handler is among the groups, on another thread.
+        state.telling.store(1, Ordering::SeqCst);
+        assert!(
+            !state.signalled(libc::SIGTERM),
+            "ended under another handler"
+        );
+        assert_eq!(state.telling.load(Ordering::SeqCst), 1);
+        // This one did its part: the group it knew was told.
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+        // The other is done, and nobody else is telling: it ends remuda.
+        state.telling.store(0, Ordering::SeqCst);
+        assert!(state.signalled(libc::SIGHUP));
+        assert_eq!(state.ending.load(Ordering::SeqCst), libc::SIGTERM);
     }
 
     /// R6: with a foreground child, Ctrl-C and Ctrl-\ are sat out, and remuda is not ending:
