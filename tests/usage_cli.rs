@@ -31,17 +31,18 @@ fn cache_json(age_secs: u128, utilization: &str) -> String {
     )
 }
 
+/// The resets are in 2099: ahead whenever this runs.
 const LIMITS: &str = r#"{
-  "five_hour": {"utilization": 34, "resets_at": "2026-09-23T15:40:00.292773+00:00"},
-  "seven_day": {"utilization": 76, "resets_at": "2026-09-25T05:00:00.632368+00:00"},
+  "five_hour": {"utilization": 34, "resets_at": "2099-09-23T15:40:00.292773+00:00"},
+  "seven_day": {"utilization": 76, "resets_at": "2099-09-25T05:00:00.632368+00:00"},
   "seven_day_opus": null, "extra_usage": {"is_enabled": false},
   "limits": [
     {"kind": "session", "group": "session", "percent": 34, "severity": "normal",
-     "resets_at": "2026-09-23T15:39:59.632347+00:00", "scope": null, "is_active": false},
+     "resets_at": "2099-09-23T15:39:59.632347+00:00", "scope": null, "is_active": false},
     {"kind": "weekly_all", "group": "weekly", "percent": 77, "severity": "warning",
-     "resets_at": "2026-09-25T04:59:59.632368+00:00", "scope": null, "is_active": false},
+     "resets_at": "2099-09-25T04:59:59.632368+00:00", "scope": null, "is_active": false},
     {"kind": "weekly_scoped", "group": "weekly", "percent": 100, "severity": "critical",
-     "resets_at": "2026-09-25T04:59:59.632532+00:00",
+     "resets_at": "2099-09-25T04:59:59.632532+00:00",
      "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": true}]}"#;
 
 struct Setup {
@@ -114,6 +115,40 @@ fn cached_usage_for_every_account_without_running_claude() {
     assert!(
         sb.invocations().is_empty(),
         "cached usage must not run claude"
+    );
+}
+
+/// R10: a window whose reset has passed since the cache was written shows no percentage (and no
+/// severity): what it holds now is unknown. One whose reset is ahead reads as recorded.
+#[test]
+fn cached_usage_past_a_reset_says_so() {
+    let Setup { sb, max, .. } = setup();
+    let at = |offset_secs: i64| {
+        jiff::Timestamp::from_second((now_ms() / 1000) as i64 + offset_secs).unwrap()
+    };
+    // Cached two hours ago: the session, then critical, reset an hour ago.
+    let (session, week) = (at(-3600), at(2 * 86_400));
+    let limits = format!(
+        r#"{{"limits": [
+            {{"kind": "session", "percent": 97, "severity": "critical", "resets_at": "{session}"}},
+            {{"kind": "weekly_all", "percent": 77, "severity": "warning", "resets_at": "{week}"}}]}}"#
+    );
+    sb.write_claude_json(Some(&max), &cache_json(7200, &limits));
+    let out = stdout_of(sb.remuda().args(["usage", "max"]).assert().success());
+    let b = blocks(&out);
+    assert!(b[0].0.starts_with("claude:max cached 2h ago ("), "{out}");
+    let utc = |t: jiff::Timestamp| {
+        t.to_zoned(jiff::tz::TimeZone::UTC)
+            .strftime("%b %-d %H:%M")
+            .to_string()
+    };
+    assert_eq!(
+        b[0].1,
+        [
+            format!("Session - reset since cached ({})", utc(session)),
+            format!("Week (all models) 77% ! resets {}", utc(week)),
+        ],
+        "{out}"
     );
 }
 

@@ -24,7 +24,7 @@ use crate::registry::{self, Account, CLAUDE, CODEX, Home};
 use crate::setup;
 use crate::stats::{self, Period};
 use crate::transcript::Message;
-use crate::usage::{CachedUsage, LiveResult, LiveUsage, UsageRow};
+use crate::usage::{CachedUsage, LiveResult, LiveUsage, Reading, Snapshot, UsageRow};
 
 use super::{render, search};
 
@@ -122,6 +122,9 @@ pub enum Event {
     LiveUsage {
         account: Account,
         result: Result<LiveResult, String>,
+        /// When the query answered, by the worker's clock: the event may wait in the queue
+        /// (a foreground agent holds the loop), and its usage is recorded at this time (R10).
+        answered_at: Timestamp,
     },
     Live(Vec<LiveSession>),
     /// Launch log and `history.jsonl` attribution (live sessions are merged in by the app).
@@ -410,7 +413,7 @@ pub struct AccountState {
     pub cached: Option<Result<CachedUsage, String>>,
     /// The cached usage is being read.
     pub cached_pending: bool,
-    /// The last live query: rows and when they arrived, or why it failed.
+    /// The last live query: rows and when the query answered, or why it failed.
     pub live: Option<Result<(Vec<UsageRow>, Timestamp), String>>,
     pub live_pending: bool,
 }
@@ -434,6 +437,23 @@ impl AccountState {
             (Some(Ok((rows, _))), _) => rows,
             (_, Some(Ok(cached))) => &cached.rows,
             _ => &[],
+        }
+    }
+
+    /// The usage to show, read at `now` (R10): [`AccountState::rows`] with when they were
+    /// said. A live window that tells no reset remuda can read takes the cached one, while it
+    /// is ahead.
+    pub fn usage_at(&self, now: Timestamp) -> Option<Reading> {
+        match (&self.live, &self.cached) {
+            (Some(Ok((rows, at))), cached) => {
+                let live = Snapshot::live(rows, *at);
+                Some(match cached {
+                    Some(Ok(cached)) => live.with_resets_of(cached).at(now),
+                    _ => live.at(now),
+                })
+            }
+            (_, Some(Ok(cached))) => Some(Snapshot::cached(cached).at(now)),
+            _ => None,
         }
     }
 }
@@ -2500,8 +2520,11 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 a.cached_pending = false;
             }
         }
-        Event::LiveUsage { account, result } => {
-            let now = app.now;
+        Event::LiveUsage {
+            account,
+            result,
+            answered_at,
+        } => {
             if let Some(a) = app.row_mut(&account) {
                 a.live_pending = false;
                 a.live = Some(match result {
@@ -2512,7 +2535,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                             a.identity = Some(identity);
                         }
                         match usage {
-                            LiveUsage::Rows(rows) => Ok((rows, now)),
+                            LiveUsage::Rows(rows) => Ok((rows, answered_at)),
                             LiveUsage::Unrecognized(_) => Err("output not recognized".to_string()),
                         }
                     }

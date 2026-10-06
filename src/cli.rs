@@ -152,7 +152,9 @@ pub struct Context {
     pub env: Env,
     pub cwd: Option<PathBuf>,
     pub now: Timestamp,
-    /// The clock, for the TUI (which keeps running); commands use `now`.
+    /// The clock, for the TUI (which keeps running) and for a command that waits for an agent
+    /// (`pick`, `usage --live`): what the agent says is read when it has answered. Other
+    /// commands use `now`.
     pub clock: fn() -> Timestamp,
     pub tz: TimeZone,
     pub stdin_is_tty: bool,
@@ -260,18 +262,20 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
     let codex = program(ctx, Provider::Codex).ok();
     let sources = pick::Sources {
         env: &ctx.env,
-        now: ctx.now,
+        clock: ctx.clock,
         claude: claude.as_deref(),
         codex: codex.as_deref(),
         live: o.live,
         provider: only,
     };
-    let entries = pick::gather(&accounts, settings, &sources);
-    let candidates = pick::candidates(&entries, settings, ctx.now);
+    // Everything below reads the usage at `now`, the time it was all gathered: a live query
+    // may have taken a while (R23).
+    let (entries, now) = pick::gather(&accounts, settings, &sources);
+    let candidates = pick::candidates(&entries, settings, now);
     let feasible = pick::ranked(&candidates);
     if feasible.is_empty() {
         if o.json {
-            let report = pick::to_json(&entries, &candidates, None, settings, ctx.now);
+            let report = pick::to_json(&entries, &candidates, None, settings);
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
             print!("{}", pick::format_not_feasible(&entries, &candidates));
@@ -290,7 +294,7 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
     for account in &accounts {
         aliases.note(&account.qualified());
     }
-    let request = jev::request(&entries, &candidates, settings, &aliases, ctx.now, &ctx.tz);
+    let request = jev::request(&entries, &candidates, settings, &aliases, now, &ctx.tz);
     let key = ctx.env.get(jev::KEY_VAR).map(String::as_str);
     let skip = jev::skip_reason(o.offline, key, settings, &request);
     if o.print_request {
@@ -313,14 +317,14 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
     let decision = pick::decide(&candidates, &entries, settings, asked)
         .expect("a feasible candidate was found above");
     if o.json {
-        let report = pick::to_json(&entries, &candidates, Some(&decision), settings, ctx.now);
+        let report = pick::to_json(&entries, &candidates, Some(&decision), settings);
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(ExitCode::SUCCESS);
     }
     if !o.run {
         print!(
             "{}",
-            pick::format_text(&entries, &candidates, &decision, settings, ctx.now)
+            pick::format_text(&entries, &candidates, &decision, settings, now)
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -336,6 +340,9 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
         "remuda: pick: {}",
         pick::summary(&entries, &candidates, &decision)
     );
+    if let Some(hint) = pick::live_hint(&entries[chosen.entry], chosen) {
+        eprintln!("remuda: pick: usage unknown: {hint}");
+    }
     for notice in notices {
         eprintln!("remuda: {notice}");
     }
@@ -533,7 +540,7 @@ fn usage(
                 Provider::Claude => claude.as_deref(),
                 Provider::Codex => codex.as_deref(),
             };
-            usage::live_report(account, program, &ctx.tz, timeout)
+            usage::live_report(account, program, &ctx.tz, ctx.clock, timeout)
         })
     } else {
         accounts

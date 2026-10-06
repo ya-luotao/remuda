@@ -75,7 +75,11 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                             account.provider.program()
                         )),
                     };
-                    let _ = tx.send(Event::LiveUsage { account, result });
+                    let _ = tx.send(Event::LiveUsage {
+                        account,
+                        result,
+                        answered_at: (deps.clock)(),
+                    });
                 });
             }
         }
@@ -431,13 +435,18 @@ mod tests {
             ps: None,
             seen: vec![],
             tz: TimeZone::UTC,
-            clock: jiff::Timestamp::now,
+            clock: answered,
             config: root.join("config.toml"),
             state_dir: root.join("state"),
             cwd: None,
             mode: crate::tui::app::Mode::Browse,
             private: false,
         })
+    }
+
+    /// The workers' clock: when a live query answers (R10).
+    fn answered() -> jiff::Timestamp {
+        "2026-09-24T12:00:40Z".parse().unwrap()
     }
 
     fn collect(effect: Effect, deps: &Arc<Deps>, until: impl Fn(&Event) -> bool) -> Vec<Event> {
@@ -844,7 +853,8 @@ mod tests {
             events,
             [Event::LiveUsage {
                 account: max,
-                result: Err("`claude` not found on PATH".into())
+                result: Err("`claude` not found on PATH".into()),
+                answered_at: answered(),
             }]
         );
     }
@@ -947,7 +957,8 @@ mod tests {
             without,
             [Event::LiveUsage {
                 account: work.clone(),
-                result: Err("`codex` not found on PATH".into())
+                result: Err("`codex` not found on PATH".into()),
+                answered_at: answered(),
             }]
         );
         let codex = crate::probe::script(
@@ -984,7 +995,10 @@ mod tests {
                         resets: None,
                     }]),
                     identity: Some(identity),
-                })
+                }),
+                // Stamped by the worker when the query answered, not by whoever reads the
+                // event later.
+                answered_at: answered(),
             }]
         );
     }
