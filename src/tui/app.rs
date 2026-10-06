@@ -636,7 +636,8 @@ pub struct ConfigPane {
     pub loading: bool,
 }
 
-/// The Stats view (R20): computed the first time it opens, then on each `r`.
+/// The Stats view (R20): computed the first time it opens, then on each `r` and when the
+/// account list changes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatsState {
     /// The last report; kept while the next one is computed.
@@ -1686,6 +1687,11 @@ impl App {
         }
         if self.mode == Mode::Browse {
             self.refresh_sessions(fx);
+        }
+        // The statistics are per account too (R20). A computation that is running is not
+        // doubled: it answers for the accounts as they are when it ends.
+        if self.stats.requested {
+            self.request_stats(fx);
         }
         // Read again at the end of the update: a setup or a removal may have changed it.
         self.config.account = None;

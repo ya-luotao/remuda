@@ -4070,6 +4070,49 @@ fn stats_app() -> App {
     app
 }
 
+/// R16, R20: the statistics are per account: once the view has been opened, a changed account
+/// list computes them again, whichever view is shown; a computation that is running is not
+/// doubled (it answers for the accounts as they are when it ends), and statistics never asked
+/// for are not computed.
+#[test]
+fn a_changed_account_list_computes_the_statistics_again() {
+    let mut app = stats_app();
+    keys(&mut app, &[Key::Char('1')]);
+    assert!(!app.stats.in_flight);
+    let stats = |fx: &[Effect]| fx.iter().filter(|e| **e == Effect::Stats).count();
+    let fx = update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("max")]),
+    );
+    assert_eq!(stats(&fx), 1, "{fx:?}");
+    assert!(app.stats.in_flight);
+    assert!(
+        app.stats.report.is_some(),
+        "the last report stays meanwhile"
+    );
+    // Changed again while that runs: not a second computation at once.
+    let fx = update(&mut app, Event::Accounts(vec![account("default")]));
+    assert_eq!(stats(&fx), 0, "{fx:?}");
+    // The same accounts again change nothing.
+    update(
+        &mut app,
+        Event::Stats {
+            report: stats_report(),
+            error: None,
+        },
+    );
+    let fx = update(&mut app, Event::Accounts(vec![account("default")]));
+    assert_eq!(fx, []);
+
+    // The view was never opened: nothing to compute again.
+    let mut app = idle_app();
+    let fx = update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("max")]),
+    );
+    assert_eq!(stats(&fx), 0, "{fx:?}");
+}
+
 fn squeezed(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }

@@ -74,32 +74,56 @@ impl Listing {
     /// the last list told is the one held.
     pub fn read(&self, tx: &Sender<Event>) -> Reading {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let registry = match Registry::load(&self.config) {
-            Ok(registry) => registry,
-            Err(e) => {
-                return Reading {
-                    accounts: state.accounts.clone(),
-                    seen: union(&[&state.accounts, &state.seen]),
-                    sharing: Sharing::default(),
-                    prices: Prices::default(),
-                    unreadable: Some(format!("{e:#}")),
-                };
-            }
-        };
+        let registry = self.load(&mut state, tx);
+        let accounts = state.accounts.clone();
+        let seen = union(&[&accounts, &state.seen]);
+        match registry {
+            Ok(registry) => Reading {
+                accounts,
+                seen,
+                sharing: registry.sharing,
+                prices: registry.prices,
+                unreadable: None,
+            },
+            Err(why) => Reading {
+                accounts,
+                seen,
+                sharing: Sharing::default(),
+                prices: Prices::default(),
+                unreadable: Some(why),
+            },
+        }
+    }
+
+    /// Answers long work done over `accounts` (those of the [`Reading`] it started from):
+    /// reads the registry once more and sends `result`, unless it lists other accounts by
+    /// now. Then nothing is sent but the change, and the caller does the work again: the app
+    /// is not given a result for accounts it no longer shows. The check and the send are one
+    /// step, so a change found later is told after `result`, and the app starts the work
+    /// again itself. Whether `result` was sent.
+    pub fn answer(&self, tx: &Sender<Event>, accounts: &[Account], result: Event) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // A registry that cannot be read keeps its accounts: the result is theirs.
+        let _ = self.load(&mut state, tx);
+        if state.accounts != accounts {
+            return false;
+        }
+        let _ = tx.send(result);
+        true
+    }
+
+    /// The registry as it is now, or why it cannot be read. A list that differs from the one
+    /// held replaces it and is told.
+    fn load(&self, state: &mut State, tx: &Sender<Event>) -> Result<Registry, String> {
+        let registry = Registry::load(&self.config).map_err(|e| format!("{e:#}"))?;
         let accounts = registry.all(&self.env);
         if accounts != state.accounts {
             state.seen = union(&[&state.seen, &accounts]);
             state.accounts = accounts.clone();
             // A send error means the TUI has quit.
-            let _ = tx.send(Event::Accounts(accounts.clone()));
+            let _ = tx.send(Event::Accounts(accounts));
         }
-        Reading {
-            seen: union(&[&accounts, &state.seen]),
-            accounts,
-            sharing: registry.sharing,
-            prices: registry.prices,
-            unreadable: None,
-        }
+        Ok(registry)
     }
 }
 
@@ -352,6 +376,37 @@ mod tests {
         // While the registry cannot be read, the same accounts are asked.
         fs::write(listing.config(), "not toml [").unwrap();
         assert_eq!(listing.read(&tx).seen, [default(), max, team, work]);
+    }
+
+    /// R16, R20: the result of long work is for the accounts it started from: sent while the
+    /// registry still lists them, held back (and the change told instead) once it does not.
+    #[test]
+    fn a_result_for_accounts_that_changed_meanwhile_is_not_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (max, team) = (account("max", "/p/max"), account("team", "/p/team"));
+        let listing = listing(dir.path(), &[&max, &team]);
+        let (tx, rx) = mpsc::channel();
+        let result = || Event::Resize(1, 1);
+        let started = listing.read(&tx).accounts;
+        assert!(listing.answer(&tx, &started, result()));
+        assert_eq!(told(&rx), [result()]);
+
+        // The registry changes while the work runs: the change is told, the result is not.
+        register(listing.config(), &[&max]);
+        assert!(!listing.answer(&tx, &started, result()));
+        assert_eq!(told(&rx), [Event::Accounts(vec![default(), max.clone()])]);
+        // The app already knows of the change: still not sent.
+        assert!(!listing.answer(&tx, &started, result()));
+        assert_eq!(told(&rx), []);
+        // Done again from the list as it is, the work is answered.
+        let again = listing.read(&tx).accounts;
+        assert!(listing.answer(&tx, &again, result()));
+        assert_eq!(told(&rx), [result()]);
+
+        // A registry that cannot be read keeps its accounts: their result is sent.
+        fs::write(listing.config(), "not toml [").unwrap();
+        assert!(listing.answer(&tx, &again, result()));
+        assert_eq!(told(&rx), [result()]);
     }
 
     /// R2: a home is the registry's string, byte for byte: a trailing `/`, `//` and `.` stay.

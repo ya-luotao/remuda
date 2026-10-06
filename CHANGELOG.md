@@ -15,7 +15,8 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   started; a setup, a removal or a resume in place read `config.toml` again, and then only the
   list on screen followed. The TUI now reads the registry before every launch (in the check
   before it, and once more when it starts), on every refresh, and whenever it starts work that
-  goes over the accounts, so the list on screen follows a change made elsewhere. Nothing is
+  goes over the accounts, so the list on screen follows a change made elsewhere, and the
+  statistics, once computed, are computed again for the new list (SPEC R20). Nothing is
   launched as an account no longer listed: the TUI says "<account> is no longer registered"
   and keeps the terminal (SPEC R16). The same holds for `remuda run` without an account: an
   account removed while the picker was open is not launched once chosen, and remuda exits with

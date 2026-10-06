@@ -15,6 +15,7 @@ use crate::registry;
 use crate::{account_config, attribution, checks, identity, live, stats, transcript, usage};
 
 use super::Deps;
+use super::accounts::Reading;
 use super::app::{self, Effect, Event, LaunchRequest, Marked, PREVIEW_MESSAGES};
 
 /// `claude auth status` / `codex login status` per account; the same default as `remuda list`.
@@ -332,11 +333,23 @@ fn refresh_index(deps: &Deps, tx: &Sender<Event>) {
 /// report, and at most every [`PROGRESS_EVERY`] in between), saved if that changed it, then
 /// the report with attribution from the launch log and `history.jsonl`, for the accounts and
 /// with the prices of `config.toml` as it is now (the built-in ones when it cannot be read,
-/// which is told). Leaving the TUI does not wait for it: the thread ends with the process, the
-/// cache unsaved.
+/// which is told). The accounts may change while the transcripts are read (a cold run is
+/// long): the report is for the accounts the registry lists when it ends, computed again if
+/// they are not the ones it started from. Leaving the TUI does not wait for it: the thread ends
+/// with the process, the cache unsaved.
 fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
+    loop {
+        let reading = deps.listing.read(tx);
+        let result = stats_for(deps, tx, &reading);
+        if deps.listing.answer(tx, &reading.accounts, result) {
+            return;
+        }
+    }
+}
+
+/// One computation of [`compute_stats`], from one reading of the registry.
+fn stats_for(deps: &Deps, tx: &Sender<Event>, reading: &Reading) -> Event {
     let mut errors: Vec<String> = Vec::new();
-    let reading = deps.listing.read(tx);
     let prices_error = reading
         .unreadable
         .as_ref()
@@ -368,7 +381,7 @@ fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
         &deps.tz,
     );
     let error = (!errors.is_empty()).then(|| errors.join(" · "));
-    let _ = tx.send(Event::Stats { report, error });
+    Event::Stats { report, error }
 }
 
 #[cfg(test)]
@@ -572,6 +585,63 @@ mod tests {
         );
         assert!(error.contains("config.toml"), "{error}");
         assert_eq!((unpriced.pico_usd, unpriced.unpriced_tokens), (0, 443));
+    }
+
+    /// The registry [`a_clock_that_unregisters`] empties, once.
+    static UNREGISTER: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+    /// The report reads the clock when the transcripts have been read: this one empties the
+    /// registry then, as `remuda remove` in another terminal would while the statistics are
+    /// computed.
+    fn a_clock_that_unregisters() -> jiff::Timestamp {
+        if let Some(config) = UNREGISTER.lock().unwrap().take() {
+            fs::write(config, "").unwrap();
+        }
+        jiff::Timestamp::now()
+    }
+
+    /// R16, R20: the accounts change while the statistics are computed: the report for the
+    /// accounts it started from is not sent; the change is told, and the report that arrives
+    /// is for the accounts the registry lists then.
+    #[test]
+    fn stats_are_for_the_accounts_listed_when_they_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = Arc::new(Deps {
+            clock: a_clock_that_unregisters,
+            ..Deps::clone(&deps(dir.path()))
+        });
+        *UNREGISTER.lock().unwrap() = Some(deps.listing.config().to_path_buf());
+        let events = collect(Effect::Stats, &deps, |e| matches!(e, Event::Stats { .. }));
+        let default = Account::default_for(CLAUDE);
+        let told: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(e, Event::Accounts(_) | Event::Stats { .. }))
+            .collect();
+        let [Event::Accounts(accounts), Event::Stats { report, error }] = told.as_slice() else {
+            panic!("one change, then one report: {events:?}")
+        };
+        assert_eq!(accounts, &[default]);
+        assert_eq!(error, &None);
+        let sections: Vec<String> = report
+            .table(stats::Period::All)
+            .sections
+            .iter()
+            .map(|s| s.accounts.join("+"))
+            .collect();
+        assert_eq!(sections, ["claude:default"], "max is gone from it");
+        // Computed twice: max's two transcripts were read, then none.
+        let read: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(e, Event::StatsProgress { done: 0, .. }))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                &Event::StatsProgress { done: 0, total: 2 },
+                &Event::StatsProgress { done: 0, total: 0 }
+            ]
+        );
+        assert!(UNREGISTER.lock().unwrap().is_none(), "the clock was read");
     }
 
     #[test]

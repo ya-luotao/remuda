@@ -682,11 +682,12 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
   - after a setup and after a removal from the TUI, whatever their outcome.
 
   A list that changed replaces the one on screen, and everything shown per account is read
-  again; the same list again changes nothing. Nothing is launched as an account the registry no
-  longer lists: the launch is refused with "<account> is no longer registered" (a new
-  session's form shows it; otherwise a notice), and the terminal is not handed over. An
-  account of the same name with another home is another account (R2): "<account> is now
-  registered with another home". A new-session form and a codex resume prompt hold the
+  again (the statistics too, once they have been computed, R20); the same list again changes
+  nothing. Nothing is launched as an account the registry no longer lists: the launch is
+  refused with "<account> is no longer registered" (a new session's form shows it; otherwise
+  a notice), and the terminal is not handed over. An account of the same name with another
+  home is another account (R2): "<account> is now registered with another home". A
+  new-session form and a codex resume prompt hold the
   account they were opened for, home and all: when the list changes under them, they are
   refused the same way rather than started in the other home. While `config.toml` cannot be
   read, the accounts stay as last read, every launch is refused with the reason, shared
@@ -1313,7 +1314,9 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
 - **TUI**: view `4`, Stats. The statistics are computed in the background the first time the
   view opens, and again on each `r` after that, with reading progress shown; `r` also reads the
   prices in `config.toml` again (when they cannot be read, the built-in prices are used and the
-  status line says so). `t` in the view cycles the period (all, today, 7 days, 30 days).
+  status line says so). Once computed, they are computed again when the account list changes
+  (R16); a computation running then is not doubled, and what it shows when it ends is for the
+  accounts listed then. `t` in the view cycles the period (all, today, 7 days, 30 days).
   The title says the cost is ≈ API list price, and the status line gives the prices' date unless it shows an error. Above
   the table, a chart shows the period over time: a bar per hour (today), per day (7 and 30 days),
   or, for all, per day from the first request with a timestamp (at most 3,660 days back), else

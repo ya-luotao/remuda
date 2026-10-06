@@ -255,8 +255,11 @@ an `Event`.
   asks for a read of its own (`ReadAccounts`), which nothing still running holds back. A read
   that finds another list than the last one sends one `Event::Accounts` before it returns, so
   the app rebuilds its rows ahead of any result for the new list, and results for an account
-  that is gone find no row. What a `config.toml` that cannot be read means (the last accounts,
-  nothing shared, built-in prices, no launch) is decided there once, in `Reading`.
+  that is gone find no row. A result that is not per account but for the whole list (the
+  statistics) goes out through `Listing::answer`, which holds it back when the list changed
+  while it was computed; the worker then computes it again. What a `config.toml` that cannot
+  be read means (the last accounts, nothing shared, built-in prices, no launch) is decided
+  there once, in `Reading`.
 - In private mode, `render` does not draw `App` itself but `privacy::redacted(app)`, a copy in
   which names are aliased and personal fields masked. `privacy::Snapshot` keeps that copy until
   the app changes, since making it for every frame is too slow for a large index. Every
