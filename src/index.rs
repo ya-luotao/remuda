@@ -1,22 +1,20 @@
 //! Session index over claude transcript stores and codex rollout stores, cached in
 //! `$REMUDA_HOME/state/index.json` (SPEC R8, R17).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
-use std::thread;
 
 use anyhow::Result;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::Env;
 use crate::provider::{Provider, codex};
-use crate::registry::{self, Account};
+use crate::registry::Account;
+use crate::tracking::{self, Files, Listed, Listing, Stat};
+pub use crate::tracking::{RefreshStats, Unreadable};
 use crate::transcript::{self, Head, Tail, WINDOW, complete_lines, read_at};
+use crate::{Env, owned};
 
 /// Bump whenever [`Entry`] or the scanning rules change: a mismatching cache is rebuilt.
 ///
@@ -97,6 +95,14 @@ pub struct Index {
     pub schema_version: u32,
     /// Keyed by transcript path.
     pub entries: BTreeMap<PathBuf, Entry>,
+    /// The real path of each store when it was last indexed, by the directory as its home
+    /// gives it ([`Given::path`]): which entries are a store's while it cannot be resolved
+    /// (R8). By the whole path, so that an account given another home does not take over what
+    /// its name had, and one given another name keeps what its home has. Absent from a cache
+    /// written before it was kept, which is read as remembering nothing; neither [`Entry`] nor
+    /// the scanning rules changed, so the schema version did not.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stores: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl Default for Index {
@@ -104,6 +110,7 @@ impl Default for Index {
         Index {
             schema_version: SCHEMA_VERSION,
             entries: BTreeMap::new(),
+            stores: BTreeMap::new(),
         }
     }
 }
@@ -117,18 +124,6 @@ pub struct Progress<'a> {
     pub total: usize,
     pub bytes_read: u64,
     pub entry: Option<&'a Entry>,
-}
-
-/// What a [`refresh`] did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RefreshStats {
-    /// Transcripts present after the refresh.
-    pub files: usize,
-    pub reused: usize,
-    pub incremental: usize,
-    pub cold: usize,
-    pub removed: usize,
-    pub bytes_read: u64,
 }
 
 impl Index {
@@ -152,7 +147,7 @@ impl Index {
     /// Writes the cache atomically, as a file of `$REMUDA_HOME/state`: readable by the user
     /// alone, in a directory made or tightened to be (R3).
     pub fn save(&self, path: &Path) -> Result<()> {
-        registry::write_private(path, &serde_json::to_vec(self)?)
+        owned::save_cache(path, &serde_json::to_vec(self)?)
     }
 
     /// Entries newest first: by `ts_last` (else mtime), then path.
@@ -167,23 +162,76 @@ impl Index {
     }
 }
 
+/// A directory an account's home gives as its session store (or, for the statistics, as a
+/// source), and what resolving it found. One that does not exist is not given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Given {
+    pub provider: Provider,
+    /// The directory as the account's home gives it: not a real path, and what a cache
+    /// remembers the directory by ([`Index::stores`]).
+    pub path: PathBuf,
+    /// `provider:name` of the account.
+    pub account: String,
+    /// Its real path. Or, when that cannot be found because the home or a directory on the
+    /// way cannot be searched or read, the system's error as text: the directory is not known
+    /// to be missing, and the files a cache has of it are those of the real path it last
+    /// resolved to (R8).
+    pub real: Result<PathBuf, String>,
+}
+
+impl Given {
+    /// As given and the error, when it could not be resolved.
+    pub(crate) fn unresolved(&self) -> Option<(&Path, &str)> {
+        let error = self.real.as_ref().err()?;
+        Some((&self.path, error))
+    }
+}
+
+impl tracking::Resolved for Given {
+    fn given(&self) -> &Path {
+        &self.path
+    }
+
+    fn real(&self) -> Option<&Path> {
+        self.real.as_deref().ok()
+    }
+}
+
 /// Session stores of `accounts`: the realpath of each account's `projects` (claude) or
 /// `sessions` (codex) directory, in its home or the native one (`$HOME/.claude`, `$HOME/.codex`)
 /// for `default`. Missing directories are skipped; accounts sharing a store are grouped so it
-/// is scanned once.
+/// is scanned once. A directory that may be there and cannot be resolved is left out too:
+/// [`resolve`] tells of those.
 pub fn stores(accounts: &[Account], env: &Env) -> Vec<Store> {
+    resolve(accounts, env).0
+}
+
+/// The session stores of `accounts` ([`stores`]), and each directory a home gives as its
+/// store with what resolving it found, in registry order: those that resolved, to a store of
+/// the list, and those that may be there and whose real path cannot be found. For
+/// [`refresh_with`], which remembers the former and keeps what the index has of the latter
+/// (R8). A directory that does not exist is in neither.
+pub fn resolve(accounts: &[Account], env: &Env) -> (Vec<Store>, Vec<Given>) {
     let mut stores: Vec<Store> = Vec::new();
+    let mut given: Vec<Given> = Vec::new();
     for account in accounts {
         let Some(home) = account.home_dir(env) else {
             continue;
         };
         let provider = account.provider;
-        let Ok(real) = fs::canonicalize(home.join(provider.store_dir())) else {
-            continue;
+        let path = home.join(provider.store_dir());
+        let real = match tracking::real_dir(&path) {
+            Ok(None) => continue,
+            Ok(Some(real)) => Ok(real),
+            Err(error) => Err(error),
         };
-        if !real.is_dir() {
-            continue;
-        }
+        given.push(Given {
+            provider,
+            path,
+            account: account.qualified(),
+            real: real.clone(),
+        });
+        let Ok(real) = real else { continue };
         let names = (provider == Provider::Codex).then(|| home.join("session_index.jsonl"));
         match stores
             .iter_mut()
@@ -201,38 +249,16 @@ pub fn stores(accounts: &[Account], env: &Env) -> Vec<Store> {
             }),
         }
     }
-    stores
+    (stores, given)
 }
 
-/// Size, mtime and inode of a transcript as listed.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Stat {
-    pub(crate) size: u64,
-    pub(crate) mtime_ns: i128,
-    pub(crate) ino: u64,
-}
-
-impl Stat {
-    pub(crate) fn of(meta: &fs::Metadata) -> Stat {
-        Stat {
-            size: meta.len(),
-            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-            ino: meta.ino(),
-        }
-    }
-}
-
-/// A transcript or rollout that has to be read.
+/// A transcript or rollout to scan cold.
 struct Job {
     provider: Provider,
     path: PathBuf,
     /// From the file name; a rollout's own record may name another.
     session_id: String,
     store: PathBuf,
-    /// Index into the stores given to [`refresh`].
-    store_index: usize,
-    /// Present when [`refresh`] decided on an incremental scan; `None` means cold.
-    cached: Option<Entry>,
 }
 
 /// The largest head window of a rollout. Measured on 1441 real rollouts (498 of them `cli` or
@@ -240,72 +266,151 @@ struct Job {
 /// 441 (the p99 of its offset is ~800 KB), 4 MB for 444 at 100 MB more read per cold index.
 pub const CODEX_HEAD_CAP: u64 = 1024 * 1024;
 
-/// Worker threads for reading transcripts (IO bound).
-const WORKERS: usize = 8;
+/// A store as [`refresh`] tracks it: with the thread names of its `session_index.jsonl` files
+/// (every home sharing it) as they are now (R17); none for claude.
+struct Named<'a> {
+    store: &'a Store,
+    names: HashMap<String, String>,
+}
+
+/// A directory the index tracks.
+enum Dir<'a> {
+    Store(Named<'a>),
+    /// One that may be a store and whose real path could not be found.
+    Unresolved {
+        given: &'a Given,
+        error: &'a str,
+        /// The real path it had when it was last indexed, if the index remembers one.
+        last: Option<&'a Path>,
+    },
+}
+
+/// How the index lists a store and reads one of its files ([`tracking::Files`]).
+struct Sessions;
+
+impl Files<Dir<'_>> for Sessions {
+    type Tracked = Entry;
+
+    fn list(&self, dir: &Dir<'_>, listing: &mut Listing) {
+        match dir {
+            Dir::Store(Named { store, .. }) => match store.provider {
+                Provider::Claude => list_projects(&store.path, listing),
+                Provider::Codex => list_rollouts(&store.path, listing),
+            },
+            Dir::Unresolved { given, error, .. } => listing.unresolved(&given.path, error),
+        }
+    }
+
+    fn stat(entry: &Entry) -> Stat {
+        Stat {
+            size: entry.size,
+            mtime_ns: entry.mtime_ns,
+            ino: entry.ino,
+        }
+    }
+
+    /// Of a directory that could not be resolved: of the store it was when last indexed.
+    fn listed_under(entry: &Entry, dir: &Dir<'_>) -> bool {
+        let (store, provider) = match dir {
+            Dir::Store(Named { store, .. }) => (Some(store.path.as_path()), store.provider),
+            Dir::Unresolved { given, last, .. } => (*last, given.provider),
+        };
+        store == Some(entry.store.as_path()) && entry.provider == provider
+    }
+
+    /// Incrementally from the cached offset, or cold (head and tail windows).
+    fn read(
+        &self,
+        dir: &Dir<'_>,
+        listed: &Listed,
+        file: &File,
+        stat: Stat,
+        cached: Option<&Entry>,
+    ) -> Option<(Entry, u64)> {
+        // Nothing is listed for a directory that could not be resolved.
+        let Dir::Store(dir) = dir else { return None };
+        let (mut entry, bytes) = match cached {
+            Some(cached) => scan_incremental(file, stat, cached)?,
+            None => {
+                let job = Job {
+                    provider: dir.store.provider,
+                    path: listed.path.clone(),
+                    session_id: listed.session_id.clone(),
+                    store: dir.store.path.clone(),
+                };
+                scan_cold(&job, file, stat)?
+            }
+        };
+        if entry.provider == Provider::Codex {
+            entry.title = dir.names.get(&entry.session_id).cloned();
+        }
+        Some((entry, bytes))
+    }
+}
 
 /// Brings `index` up to date with `stores`: new files are scanned cold (head and tail
 /// windows), grown files incrementally, unchanged files reused; vanished files and files of
-/// stores no longer listed drop out. Codex titles are the thread names of the store's
-/// `session_index.jsonl` files (every home sharing it) as they are now, also for unchanged rollouts (R17). Never fails:
-/// unreadable files are skipped.
+/// stores no longer listed drop out, while those below a directory that exists but cannot be
+/// listed stay as they were, the directory being reported in [`RefreshStats::unreadable`] (R8).
+/// Codex titles are the thread names of the store's `session_index.jsonl` files (every home
+/// sharing it) as they are now, also for unchanged rollouts (R17). Never fails: unreadable
+/// files are skipped.
 pub fn refresh(
     index: &mut Index,
     stores: &[Store],
+    progress: impl FnMut(Progress<'_>),
+) -> RefreshStats {
+    track(index, stores, None, progress)
+}
+
+/// [`refresh`], given also what each home gives as its store ([`resolve`]). The index
+/// remembers the real path of each directory that resolved ([`Index::stores`]). For one that
+/// could not be resolved, the entries of the store it was when it was last indexed stay as
+/// they were, unless another account lists that store, and the directory is reported in
+/// [`RefreshStats::unreadable`]; the entries of any other store that is not listed drop out as
+/// usual (R8). [`refresh`] itself leaves what is remembered alone.
+pub fn refresh_with(
+    index: &mut Index,
+    stores: &[Store],
+    given: &[Given],
+    progress: impl FnMut(Progress<'_>),
+) -> RefreshStats {
+    track(index, stores, Some(given), progress)
+}
+
+fn track(
+    index: &mut Index,
+    stores: &[Store],
+    given: Option<&[Given]>,
     mut progress: impl FnMut(Progress<'_>),
 ) -> RefreshStats {
-    let mut stats = RefreshStats::default();
-    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut jobs: Vec<Job> = Vec::new();
-    let names: Vec<HashMap<String, String>> = stores
-        .iter()
-        .map(|s| codex::thread_names(&s.thread_names))
-        .collect();
-    for (store_index, store) in stores.iter().enumerate() {
-        for (path, session_id, stat) in list_store(store) {
-            if !seen.insert(path.clone()) {
-                continue;
-            }
-            let cached = index.entries.get(&path);
-            let cached = match cached {
-                Some(e)
-                    if e.ino == stat.ino
-                        && e.store == store.path
-                        && e.provider == store.provider =>
-                {
-                    Some(e)
-                }
-                _ => None,
-            };
-            let incremental = match cached {
-                Some(e) if e.size == stat.size && e.mtime_ns == stat.mtime_ns => {
-                    stats.reused += 1;
-                    continue;
-                }
-                Some(e) if stat.size > e.size && stat.mtime_ns >= e.mtime_ns => {
-                    stats.incremental += 1;
-                    cached.cloned()
-                }
-                _ => {
-                    stats.cold += 1;
-                    None
-                }
-            };
-            jobs.push(Job {
-                provider: store.provider,
-                path,
-                session_id,
-                store: store.path.clone(),
-                store_index,
-                cached: incremental,
-            });
-        }
-    }
-    let before = index.entries.len();
-    index.entries.retain(|path, _| seen.contains(path));
-    stats.removed = before - index.entries.len();
+    // As it was before this refresh: where each directory that cannot be resolved now was.
+    let remembered = index.stores.clone();
+    let named = stores.iter().map(|store| {
+        Dir::Store(Named {
+            store,
+            names: codex::thread_names(&store.thread_names),
+        })
+    });
+    let unresolved = given.unwrap_or_default().iter().filter_map(|given| {
+        let (path, error) = given.unresolved()?;
+        let last = remembered.get(path).map(PathBuf::as_path);
+        Some(Dir::Unresolved { given, error, last })
+    });
+    let dirs: Vec<Dir<'_>> = named.chain(unresolved).collect();
+    let mut stats = tracking::refresh(&mut index.entries, &dirs, &Sessions, |p| {
+        progress(Progress {
+            done: p.done,
+            total: p.total,
+            bytes_read: p.bytes_read,
+            entry: p.item,
+        })
+    });
     // Thread names change without the rollout changing.
-    for (store, names) in stores.iter().zip(&names) {
-        if store.provider == Provider::Codex {
+    for dir in &dirs {
+        if let Dir::Store(Named { store, names }) = dir
+            && store.provider == Provider::Codex
+        {
             for entry in index.entries.values_mut() {
                 if entry.store == store.path {
                     entry.title = names.get(&entry.session_id).cloned();
@@ -313,151 +418,48 @@ pub fn refresh(
             }
         }
     }
-
-    let total = jobs.len();
-    progress(Progress {
-        done: 0,
-        total,
-        bytes_read: 0,
-        entry: None,
-    });
-    let next = AtomicUsize::new(0);
-    let (tx, rx) = mpsc::channel::<(usize, Option<(Entry, u64)>)>();
-    thread::scope(|scope| {
-        for _ in 0..WORKERS.min(total) {
-            let tx = tx.clone();
-            let (jobs, next) = (&jobs, &next);
-            scope.spawn(move || {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(job) = jobs.get(i) else { break };
-                    if tx.send((i, scan(job))).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(tx);
-        for (done, (i, result)) in rx.into_iter().enumerate() {
-            let entry = match result {
-                Some((mut entry, bytes)) => {
-                    stats.bytes_read += bytes;
-                    if entry.provider == Provider::Codex {
-                        entry.title = names[jobs[i].store_index].get(&entry.session_id).cloned();
-                    }
-                    let path = entry.path.clone();
-                    index.entries.insert(path.clone(), entry);
-                    index.entries.get(&path)
-                }
-                // Vanished or unreadable since listing: drop it rather than keep a stale entry.
-                None => {
-                    index.entries.remove(&jobs[i].path);
-                    None
-                }
-            };
-            progress(Progress {
-                done: done + 1,
-                total,
-                bytes_read: stats.bytes_read,
-                entry,
-            });
-        }
-    });
-    stats.files = index.entries.len();
+    if let Some(given) = given {
+        stats.remembered = tracking::remember(&mut index.stores, given);
+    }
     stats
 }
 
-/// The files of a store with the session id their name gives, and their stat.
-fn list_store(store: &Store) -> Vec<(PathBuf, String, Stat)> {
-    match store.provider {
-        Provider::Claude => list_projects(&store.path),
-        Provider::Codex => {
-            let mut out = Vec::new();
-            list_rollouts(&store.path, &mut out);
-            out
-        }
-    }
-}
-
 /// `<sessions>/**/rollout-*.jsonl` (R17): `sessions/YYYY/MM/DD/` in practice. Symlinked
-/// directories below the store are not followed; unreadable entries and non-UTF-8 names are
-/// skipped.
-pub(crate) fn list_rollouts(dir: &Path, out: &mut Vec<(PathBuf, String, Stat)>) {
-    let Ok(listing) = fs::read_dir(dir) else {
-        return;
-    };
-    for item in listing.flatten() {
-        let path = item.path();
-        let Ok(kind) = item.file_type() else { continue };
-        if kind.is_dir() {
-            if item.file_name() != "archived_sessions" {
-                list_rollouts(&path, out);
+/// directories below the store are not followed; non-UTF-8 names are skipped. What cannot be
+/// listed or examined is the listing's to tell (R8).
+pub(crate) fn list_rollouts(dir: &Path, listing: &mut Listing) {
+    for item in listing.read_dir(dir) {
+        if item.is_dir() {
+            if item.name() != Some("archived_sessions") {
+                list_rollouts(item.path(), listing);
             }
             continue;
         }
-        let Some(id) = item
-            .file_name()
-            .to_str()
-            .and_then(codex::rollout_id)
-            .map(str::to_string)
-        else {
+        let Some(id) = item.name().and_then(codex::rollout_id).map(str::to_string) else {
             continue;
         };
-        match fs::metadata(&path) {
-            Ok(meta) if meta.is_file() => out.push((path, id, Stat::of(&meta))),
-            _ => {}
-        }
+        listing.file(&item, id);
     }
 }
 
-/// `<store>/*/*.jsonl`, top level of each project directory only (R8). Unreadable entries
-/// and non-UTF-8 names are skipped.
-fn list_projects(store: &Path) -> Vec<(PathBuf, String, Stat)> {
-    let mut out = Vec::new();
-    let Ok(projects) = fs::read_dir(store) else {
-        return out;
-    };
-    for project in projects.flatten() {
-        let dir = project.path();
-        if !fs::metadata(&dir).is_ok_and(|m| m.is_dir()) {
+/// `<store>/*/*.jsonl`, top level of each project directory only (R8). Non-UTF-8 names are
+/// skipped; what cannot be listed or examined is the listing's to tell.
+fn list_projects(store: &Path, listing: &mut Listing) {
+    for project in listing.read_dir(store) {
+        if !listing.is_dir(&project) {
             continue;
         }
-        let Ok(files) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            let Some(session_id) = path
-                .file_name()
-                .and_then(|n| n.to_str())
+        for file in listing.read_dir(project.path()) {
+            let Some(session_id) = file
+                .name()
                 .and_then(|n| n.strip_suffix(".jsonl"))
                 .filter(|s| !s.is_empty())
             else {
                 continue;
             };
             let session_id = session_id.to_string();
-            match fs::metadata(&path) {
-                Ok(meta) if meta.is_file() => out.push((path, session_id, Stat::of(&meta))),
-                _ => {}
-            }
+            listing.file(&file, session_id);
         }
-    }
-    out
-}
-
-/// Reads one transcript: incrementally from the cached offset, or cold. Returns the entry
-/// and the bytes read; `None` if the file cannot be read.
-fn scan(job: &Job) -> Option<(Entry, u64)> {
-    let file = File::open(&job.path).ok()?;
-    // Stat the open file: it may have changed since listing, and what we read must match.
-    // The listing's decision can only be downgraded here (to cold, if the file is no longer
-    // a grown version of the cached one), never upgraded.
-    let stat = Stat::of(&file.metadata().ok()?);
-    match &job.cached {
-        Some(cached) if stat.size > cached.size && stat.ino == cached.ino => {
-            scan_incremental(&file, stat, cached)
-        }
-        _ => scan_cold(job, &file, stat),
     }
 }
 

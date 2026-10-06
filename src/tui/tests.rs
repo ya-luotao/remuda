@@ -4937,7 +4937,7 @@ fn secret_app() -> App {
                 },
             ],
             error: Some(format!(
-                "zqalpha: cannot write {ZQ_HOME}/.remuda/state/index.json"
+                "index cache: zqalpha: cannot write {ZQ_HOME}/.remuda/state/index.json"
             )),
         },
     );
@@ -5415,6 +5415,45 @@ fn secret_states() -> Vec<SecretState> {
             "index error",
             |app| drop(keys(app, &[Key::Char('1')])),
             "index cache: zqalpha",
+        ),
+        // A directory the refresh could not read (R8, R20), one the app does not know.
+        state(
+            "index incomplete",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                let entries = app.index.entries.values().cloned().collect();
+                update(
+                    app,
+                    Event::IndexDone {
+                        entries,
+                        error: Some(
+                            "incomplete: cannot read /zqvol/zq disk/zqstore: Permission \
+                             denied (os error 13)"
+                                .into(),
+                        ),
+                    },
+                );
+            },
+            "cannot read /zqvol",
+        ),
+        state(
+            "statistics incomplete",
+            |app| {
+                keys(app, &[Key::Char('4')]);
+                let report = app.stats.report.clone().expect("a report");
+                update(
+                    app,
+                    Event::Stats {
+                        report,
+                        error: Some(
+                            "incomplete: cannot read /zqvol/zq disk/zqstore: Permission \
+                             denied (os error 13)"
+                                .into(),
+                        ),
+                    },
+                );
+            },
+            "cannot read /zqvol",
         ),
         state(
             "directory with brackets refused in the form",

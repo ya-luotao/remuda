@@ -8,11 +8,13 @@ pub mod account_config;
 pub mod attribution;
 pub mod checks;
 pub mod cli;
+pub mod home_items;
 pub mod identity;
 pub mod index;
 pub mod jev;
 pub mod launch;
 pub mod live;
+pub mod owned;
 pub mod paths;
 pub mod pick;
 pub mod pricing;
@@ -24,11 +26,17 @@ pub mod setup;
 pub mod share;
 pub mod stats;
 pub mod text;
+mod tracking;
 pub mod transcript;
 pub mod tui;
 pub mod usage;
 
 use std::collections::BTreeMap;
+
+/// The homes unit tests build: the same file the integration tests use.
+#[cfg(test)]
+#[path = "../tests/common/homes.rs"]
+mod test_homes;
 
 /// Snapshot of the process environment (UTF-8 entries only).
 pub type Env = BTreeMap<String, String>;

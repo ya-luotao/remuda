@@ -334,7 +334,7 @@ fn status_line(app: &App) -> Line<'static> {
     spans.push(index_status(app));
     if let Some(e) = &app.index_error {
         spans.push(sep());
-        spans.push(Span::styled(format!("index cache: {e}"), CRIT));
+        spans.push(Span::styled(e.clone(), CRIT));
     }
     Line::from(spans)
 }
