@@ -5,7 +5,6 @@
 //! [`crate::usage::snapshot`]'s to say.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -13,6 +12,7 @@ use jiff::Timestamp;
 use serde_json::{Value, json};
 use toml_edit::DocumentMut;
 
+use crate::account_command::Runner;
 use crate::identity::{self, Identity};
 use crate::launch::{self, Intent};
 use crate::provider::Provider;
@@ -808,8 +808,8 @@ pub struct Sources<'a> {
     /// Asked when a live query answers, and once more when everything is gathered: a query may
     /// take as long as its timeout, and a reset does not wait for it.
     pub clock: fn() -> Timestamp,
-    pub claude: Option<&'a Path>,
-    pub codex: Option<&'a Path>,
+    /// Runs the agents' commands: `codex login status`, the live queries.
+    pub agents: &'a dyn Runner,
     /// Query usage live (R10) instead of reading the cache; a failed query falls back to it.
     pub live: Option<Duration>,
     /// Only this provider's accounts are candidates.
@@ -817,8 +817,9 @@ pub struct Sources<'a> {
 }
 
 /// Each of `accounts` with its usage, or why it is blocked (R23): excluded, another provider,
-/// codex not logged in (`codex login status`), claude with neither `oauthAccount` in
-/// `.claude.json` nor a usage cache. Accounts are queried in parallel.
+/// codex not logged in (`codex login status`; with a live query, the `account/read` of its one
+/// `codex app-server` run, and `codex login status` only when that told nothing), claude with
+/// neither `oauthAccount` in `.claude.json` nor a usage cache. Accounts are queried in parallel.
 ///
 /// Also the instant of the recommendation: the time once every account has answered or failed.
 /// Each account's usage is read at that one instant, whenever its agent said it, and whatever
@@ -881,18 +882,34 @@ fn gather_one(
         entry.blocked = Some(format!("not a {only} account (--provider {only})"));
         return entry;
     }
-    let program = match provider {
-        Provider::Claude => sources.claude,
-        Provider::Codex => sources.codex,
-    };
+    // What the live query answered, when one is asked, and when the answer arrived: it is
+    // recorded then, not after whatever this account is asked next.
+    let mut live = None;
     if provider == Provider::Codex {
-        let Some(codex) = program else {
+        if !sources.agents.has(Provider::Codex) {
             entry.blocked = Some("`codex` not found on PATH".to_string());
             return entry;
+        }
+        // The live query's one `codex app-server` run says whether the account is logged in
+        // as well (`account/read`): `codex login status` is asked only when it did not.
+        let asked = sources.live.map(|timeout| {
+            let asked = usage::live_codex(account, sources.agents, timeout);
+            (asked, (sources.clock)())
+        });
+        let told = asked
+            .as_ref()
+            .and_then(|(asked, _)| asked.as_ref().ok())
+            .and_then(|live| live.login.clone());
+        let (login, source) = match told {
+            Some(identity) => ((identity, None), "`codex app-server` account/read"),
+            None => (
+                identity::identify(account, sources.agents, sources.env, LOGIN_TIMEOUT),
+                "`codex login status`",
+            ),
         };
-        match identity::identify(account, Some(codex), sources.env, LOGIN_TIMEOUT) {
+        match login {
             (Identity::NotLoggedIn, _) => {
-                entry.blocked = Some("not logged in (`codex login status`)".to_string());
+                entry.blocked = Some(format!("not logged in ({source})"));
                 return entry;
             }
             (Identity::Unknown, warning) => entry.notes.push(format!(
@@ -901,27 +918,22 @@ fn gather_one(
             )),
             (Identity::LoggedIn { .. }, _) => {}
         }
+        live = asked.map(|(asked, at)| (asked.and_then(|live| live.usage), at));
+    } else if let Some(timeout) = sources.live {
+        let asked = usage::live_usage(account, sources.agents, timeout).map(|live| live.usage);
+        live = Some((asked, (sources.clock)()));
     }
-    if let Some(timeout) = sources.live {
-        match program {
-            None => entry.notes.push(format!(
-                "`{}` not found on PATH; using cached usage",
-                provider.program()
-            )),
-            Some(program) => match usage::live_usage(account, program, timeout) {
-                Ok(result) => match result.usage {
-                    LiveUsage::Rows(rows) => {
-                        *said = Some(Said::Live(rows, (sources.clock)()));
-                    }
-                    LiveUsage::Unrecognized(_) => entry
-                        .notes
-                        .push("live output not recognized; using cached usage".to_string()),
-                },
-                Err(e) => entry
-                    .notes
-                    .push(format!("live query failed ({e}); using cached usage")),
-            },
+    match live {
+        None => {}
+        Some((Ok(LiveUsage::Rows(rows)), answered_at)) => {
+            *said = Some(Said::Live(rows, answered_at));
         }
+        Some((Ok(LiveUsage::Unrecognized(_)), _)) => entry
+            .notes
+            .push("live output not recognized; using cached usage".to_string()),
+        Some((Err(e), _)) => entry
+            .notes
+            .push(format!("live query failed ({e}); using cached usage")),
     }
     if said.is_none() {
         match usage::cached_usage(account, sources.env) {
@@ -1289,6 +1301,7 @@ pub fn to_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account_command::Scripted;
     use crate::registry::Home;
     use crate::usage::{CachedUsage, Resets, UsageRow};
 
@@ -1320,6 +1333,210 @@ mod tests {
         let none = parse(ACCOUNTS).unwrap();
         assert_eq!((none.min_headroom, none.stale_after), (10, 120));
         assert_eq!(none, Config::default());
+    }
+
+    /// What `gather` made of one account, and what it ran for it.
+    fn gathered(account: &Account, agents: &Scripted, live: bool) -> (Entry, Vec<String>) {
+        let env = Env::new();
+        let sources = Sources {
+            env: &env,
+            clock: || "2026-10-06T00:00:00Z".parse().unwrap(),
+            agents,
+            live: live.then_some(Duration::from_secs(90)),
+            provider: None,
+        };
+        let (mut entries, _) = gather(std::slice::from_ref(account), &Config::default(), &sources);
+        (entries.remove(0), agents.ran())
+    }
+
+    /// R23: with `--live`, a codex account's one `codex app-server` run answers its usage and
+    /// whether it is logged in; `codex login status` runs only when that run did not say, and
+    /// alone without `--live`. Either way the same accounts are blocked.
+    #[test]
+    fn a_live_codex_query_also_says_whether_the_account_is_logged_in() {
+        let work = Account {
+            provider: Provider::Codex,
+            name: "work".into(),
+            home: Home::Path("/nonexistent/work".into()),
+        };
+        const SERVER: &str = "codex:work app-server account/rateLimits/read account/read";
+        const STATUS: &str = "codex:work login status";
+        let limits =
+            json!({"rateLimits": {"primary": {"usedPercent": 4, "windowDurationMins": 300}}});
+        let chatgpt = json!({"account": {"type": "chatgpt", "email": "c@example.com"}});
+        let logged_in = Scripted::exited(0, "", "Logged in using ChatGPT\n");
+        let source = |entry: &Entry| entry.usage.as_ref().map(|u| u.source);
+
+        // Logged in, and the server answers both: one run.
+        let agents = Scripted::new()
+            .app_server_says("codex:work", Ok(vec![Ok(limits.clone()), Ok(chatgpt)]));
+        let (entry, ran) = gathered(&work, &agents, true);
+        assert_eq!(ran, [SERVER]);
+        assert_eq!(
+            (entry.blocked.as_deref(), source(&entry)),
+            (None, Some(Source::Live))
+        );
+
+        // A codex without app-server: `codex login status` says, and the cache is used.
+        let no_server = "`codex app-server` exited with status 2: error: unrecognized subcommand";
+        let agents = Scripted::new()
+            .app_server_says("codex:work", Err(no_server.to_string()))
+            .on(STATUS, logged_in.clone());
+        let (entry, ran) = gathered(&work, &agents, true);
+        assert_eq!(ran, [SERVER, STATUS]);
+        assert_eq!(entry.blocked, None);
+        assert_eq!(
+            entry.notes[0],
+            format!("live query failed ({no_server}); using cached usage")
+        );
+
+        // Not logged in: the server says so, and nothing else runs.
+        let denied = "`codex app-server` account/rateLimits/read: authentication required";
+        let agents = Scripted::new().app_server_says(
+            "codex:work",
+            Ok(vec![
+                Err(denied.to_string()),
+                Ok(json!({"account": null, "requiresOpenaiAuth": true})),
+            ]),
+        );
+        let (entry, ran) = gathered(&work, &agents, true);
+        assert_eq!(ran, [SERVER]);
+        assert_eq!(
+            entry.blocked.as_deref(),
+            Some("not logged in (`codex app-server` account/read)")
+        );
+        // ... as `codex login status` does where the server did not say.
+        let agents = Scripted::new()
+            .app_server_says("codex:work", Err(no_server.to_string()))
+            .on(STATUS, Scripted::exited(1, "", "Not logged in\n"));
+        let (entry, ran) = gathered(&work, &agents, true);
+        assert_eq!(ran, [SERVER, STATUS]);
+        assert_eq!(
+            entry.blocked.as_deref(),
+            Some("not logged in (`codex login status`)")
+        );
+
+        // `account/read` fails and the status cannot be read: noted, not blocking, and the
+        // usage the server did answer is used.
+        let agents = Scripted::new()
+            .app_server_says(
+                "codex:work",
+                Ok(vec![
+                    Ok(limits),
+                    Err("`codex app-server` account/read: no".into()),
+                ]),
+            )
+            .on(STATUS, crate::probe::Outcome::TimedOut);
+        let (entry, ran) = gathered(&work, &agents, true);
+        assert_eq!(ran, [SERVER, STATUS]);
+        assert_eq!(
+            (entry.blocked.as_deref(), source(&entry)),
+            (None, Some(Source::Live))
+        );
+        assert_eq!(
+            entry.notes,
+            [
+                "login unknown: codex:work: `codex login status` timed out after 15s; identity \
+              unknown"
+            ]
+        );
+
+        // Without `--live`, only `codex login status`.
+        let agents = Scripted::new().on(STATUS, Scripted::exited(1, "", "Not logged in\n"));
+        let (entry, ran) = gathered(&work, &agents, false);
+        assert_eq!(ran, [STATUS]);
+        assert_eq!(
+            entry.blocked.as_deref(),
+            Some("not logged in (`codex login status`)")
+        );
+        let agents = Scripted::new().on(STATUS, logged_in);
+        let (entry, ran) = gathered(&work, &agents, false);
+        assert_eq!(ran, [STATUS]);
+        assert_eq!(entry.blocked, None);
+
+        // No codex on PATH: blocked, and nothing runs.
+        for live in [false, true] {
+            let agents = Scripted::new().without(Provider::Codex);
+            let (entry, ran) = gathered(&work, &agents, live);
+            assert_eq!(entry.blocked.as_deref(), Some("`codex` not found on PATH"));
+            assert!(ran.is_empty(), "{ran:?}");
+        }
+    }
+
+    /// R23 (The instant): a codex account's live answer is recorded when its one
+    /// `codex app-server` run answers, before `codex login status` is asked where that run did
+    /// not say whether the account is logged in, and read once everything is gathered.
+    #[test]
+    fn a_live_codex_answer_is_recorded_when_it_arrives() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static TICKS: AtomicI64 = AtomicI64::new(0);
+        fn t0() -> Timestamp {
+            "2026-10-06T00:00:00Z".parse().unwrap()
+        }
+        // The answer, then the end of the gathering, 100 seconds later.
+        fn clock() -> Timestamp {
+            t0() + jiff::SignedDuration::from_secs(100 * TICKS.fetch_add(1, Ordering::SeqCst))
+        }
+        let work = Account {
+            provider: Provider::Codex,
+            name: "work".into(),
+            home: Home::Path("/nonexistent/work".into()),
+        };
+        let limits =
+            json!({"rateLimits": {"primary": {"usedPercent": 4, "windowDurationMins": 300}}});
+        let agents = Scripted::new()
+            .app_server_says(
+                "codex:work",
+                Ok(vec![
+                    Ok(limits),
+                    Err("`codex app-server` account/read: no".into()),
+                ]),
+            )
+            .on(
+                "codex:work login status",
+                Scripted::exited(0, "", "Logged in using ChatGPT\n"),
+            );
+        let env = Env::new();
+        let sources = Sources {
+            env: &env,
+            clock,
+            agents: &agents,
+            live: Some(Duration::from_secs(90)),
+            provider: None,
+        };
+        let (entries, now) = gather(std::slice::from_ref(&work), &Config::default(), &sources);
+        assert_eq!(
+            agents.ran(),
+            [
+                "codex:work app-server account/rateLimits/read account/read",
+                "codex:work login status"
+            ]
+        );
+        assert_eq!(now, t0() + jiff::SignedDuration::from_secs(100));
+        assert_eq!(TICKS.load(Ordering::SeqCst), 2, "one answer, one reading");
+        let usage = entries[0].usage.as_ref().expect("live usage");
+        assert_eq!(usage.source, Source::Live);
+        assert_eq!(usage.fetched_at, Some(t0()));
+        assert_eq!(usage.age_seconds, Some(100));
+    }
+
+    /// R23: a claude account's live query that cannot run (no claude on PATH) is a failed
+    /// query like any other: noted, and the cache decides.
+    #[test]
+    fn a_live_claude_query_without_claude_is_a_failed_query() {
+        let max = Account {
+            provider: Provider::Claude,
+            name: "max".into(),
+            home: Home::Path("/nonexistent/max".into()),
+        };
+        let agents = Scripted::new().without(Provider::Claude);
+        let (entry, ran) = gathered(&max, &agents, true);
+        assert!(ran.is_empty(), "{ran:?}");
+        assert_eq!(
+            entry.notes[0],
+            "live query failed (`claude` not found on PATH); using cached usage"
+        );
+        assert_eq!(entry.usage, None);
     }
 
     /// R3: an invalid `[pick]` fails loading, naming the table.

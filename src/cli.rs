@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
+use crate::account_command::OnPath;
 use crate::identity::{self, Identity};
 use crate::index::{self, Index, RefreshStats};
 use crate::privacy::Aliases;
@@ -263,8 +264,10 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
     let sources = pick::Sources {
         env: &ctx.env,
         clock: ctx.clock,
-        claude: claude.as_deref(),
-        codex: codex.as_deref(),
+        agents: &OnPath {
+            claude: claude.as_deref(),
+            codex: codex.as_deref(),
+        },
         live: o.live,
         provider: only,
     };
@@ -481,12 +484,12 @@ fn list(config: &Path, timeout: Duration, ctx: &Context) -> Result<ExitCode> {
     if codex.is_none() && accounts.iter().any(|a| a.provider == Provider::Codex) {
         eprintln!("remuda: warning: `codex` not found on PATH; codex identities are unknown");
     }
+    let agents = OnPath {
+        claude: claude.as_deref(),
+        codex: codex.as_deref(),
+    };
     let results = probe::parallel(&accounts, |account| {
-        let program = match account.provider {
-            Provider::Claude => claude.as_deref(),
-            Provider::Codex => codex.as_deref(),
-        };
-        identity::identify(account, program, &ctx.env, timeout)
+        identity::identify(account, &agents, &ctx.env, timeout)
     });
     for warning in results.iter().filter_map(|(_, w)| w.as_ref()) {
         eprintln!("remuda: warning: {warning}");
@@ -535,12 +538,12 @@ fn usage(
             false => None,
         };
         let codex = program(ctx, Provider::Codex).ok();
+        let agents = OnPath {
+            claude: claude.as_deref(),
+            codex: codex.as_deref(),
+        };
         probe::parallel(&accounts, |account| {
-            let program = match account.provider {
-                Provider::Claude => claude.as_deref(),
-                Provider::Codex => codex.as_deref(),
-            };
-            usage::live_report(account, program, &ctx.tz, ctx.clock, timeout)
+            usage::live_report(account, &agents, &ctx.tz, ctx.clock, timeout)
         })
     } else {
         accounts
@@ -686,7 +689,10 @@ fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
     let ps = launch::find_on_path("ps", path_var).ok();
     let live = live::collect(
         &accounts,
-        claude.as_deref(),
+        &OnPath {
+            claude: claude.as_deref(),
+            codex: None,
+        },
         ps.as_deref(),
         &ctx.env,
         live::TIMEOUT,

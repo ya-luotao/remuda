@@ -220,6 +220,28 @@ the UI, not reported as an error:
     for `list` or the identities of the accounts view.
   - remuda calls only `initialize`, `account/rateLimits/read`, and `account/read`, never a method
     that changes anything (such as `account/rateLimitResetCredit/consume` or `account/logout`).
+- Every command remuda runs for its output (the identity, usage, and running-session commands
+  above, `claude logs`, `stop`, and `rm`, and likewise `ps` and `curl`) gets a timeout and a
+  process group of its own. At most 1024 of them run at a time: there is one per account, and
+  in R7's fallback one `ps` per file of a `sessions/` directory, and nothing else limits
+  either, so one more waits for another to be over, its timeout counting from its own start.
+  Once the command has exited, remuda takes what was printed by then, as soon as it has all
+  of it and without waiting for a process the command left holding its output open, whether
+  that process is silent or goes on printing, and leaves the process running: what an agent
+  starts on the side (an update, say) is the agent's business. If not all of it could be read
+  by the command's timeout (remuda itself was behind), the command counts as timed out: a part
+  of an answer is never taken for the answer.
+  On a timeout the whole group is terminated. (`codex app-server` serves until it is told to stop:
+  its group is terminated once it has answered as well.) Such a group is not the terminal's
+  foreground group, and two things follow:
+  - Ctrl-C, Ctrl-\, and a hangup do not reach it by themselves: remuda passes the signal on to
+    every group still running, then ends by it as it would have. Commands are started in
+    parallel, and a signal may come while some are being started: remuda then starts nothing
+    more, passes the signal on to each of those as soon as it runs, and ends by the signal
+    when the last of them has been told. A signal remuda was started ignoring stays ignored.
+  - A process that reads the terminal there, or changes its modes, would be stopped (SIGTTIN,
+    SIGTTOU) until its timeout. The command is started ignoring both: the read fails at once
+    (EIO) and the change goes through, as it would in the foreground.
 - Codex's `$CODEX_HOME/<name>.config.toml` is a configuration layer under the same login, **not**
   account isolation; remuda does not treat it as an account.
 
@@ -495,9 +517,11 @@ appeared in no `history.jsonl`.
        with `{"refreshToken": false}`, and answers both (about a second or two). The rate limits
        are the usage; `account/read` also gives the account's email and plan (R10a).
 - Claude's live source produces only human-readable text (`--output-format json` merely places the
-  same text in `result`). remuda parses only the `Current session` / `Current week (…)` lines; if
-  it cannot parse them it displays the text as-is and never crashes. This format is not a public
-  interface and may change between versions.
+  same text in `result`). remuda parses only the lines that start with `Current session` or
+  `Current week`. If there is none, or one of them cannot be parsed, it displays the text as-is
+  and never crashes: an answer read only in part is not used, because the line left out may be
+  the limit that is used up. This format is not a public interface and may change between
+  versions.
 - **Codex, cached** (verified on 0.155.1 against 1456 real rollouts): each model turn appends
   `{"timestamp", "type": "event_msg", "payload": {"type": "token_count", "rate_limits": {…}}}`.
   `rate_limits` (may be null) holds `limit_id`, `limit_name`, and the windows `primary` and
@@ -528,8 +552,15 @@ appeared in no `history.jsonl`.
   unchanged after consecutive runs); the two sources are displayed separately.
 - remuda makes no network requests of its own, except the one request of `remuda pick` (R23), and
   never reads credentials to call the agent's usage endpoint directly.
-- The cache formats are undocumented and parsed on a best-effort basis: unrecognized formats
-  degrade to missing rows, and parsing never crashes.
+- The cache formats are undocumented and parsed on a best-effort basis, and parsing never
+  crashes; a cache that is not recognized is no cached usage. Claude's `limits` list is read
+  whole or not at all: an entry without a `kind` or a numeric `percent` makes the cache unusable
+  (the notice says how many entries were not recognized) instead of leaving the entries around
+  it to stand for the account's usage. The older `five_hour` / `seven_day` fields are read only
+  when there is no `limits` list or it is empty, and one of them that is there without a
+  numeric `utilization` makes the cache unusable too. What an entry may leave out is read
+  leniently: an unknown `kind` is shown under its own name, and a missing severity, model name,
+  or reset time is not shown.
 - `remuda usage [--live]` prints the same information as plain text for direct use from the shell;
   a codex account's live header also shows its email and plan.
 - The live sources provide no severity: 75% is marked as a warning and 90% as critical. Claude's
@@ -1585,7 +1616,10 @@ It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4)
   with its reason: excluded; not of `--provider`; claude with neither `oauthAccount` in its
   `.claude.json` nor a usage cache; codex without `codex` on PATH, or whose `codex login status`
   says it is not logged in (a status that cannot be read is noted, not blocking); or a window
-  that applies, of known usage, with less than `min_headroom` percent left (default 10).
+  that applies, of known usage, with less than `min_headroom` percent left (default 10). With
+  `--live`, a codex account's one `codex app-server` run (R10) answers both: its `account/read`
+  says whether the account is logged in, and `codex login status` runs only when that did not
+  say (the run failed, or `account/read` failed or was not recognized).
 - **Windows.** A usage row (R10) without a parenthesized name, or with `(all models)`, applies to
   every model. `<window> (<name>)` applies to the claude models of that family
   (`claude-<family>-…`; a bare alias is its own family) and to the codex model with that id,

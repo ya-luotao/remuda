@@ -42,6 +42,11 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   `next` summary, for a per-model window too. A live answer left on screen past a reset it
   named reads the same way, and its reset wording is read from when it was said: `7pm` asked
   at six is not tomorrow's by eight (SPEC R10).
+- `remuda pick --live` starts one codex process per codex account instead of two: the
+  `account/read` of the live query's `codex app-server` run says whether the account is logged
+  in, and `codex login status` runs only when it did not say (SPEC R23). A logged-out codex
+  account is therefore asked through `codex app-server` too, as `remuda usage --live` already
+  does. Without `--live` nothing changes.
 
 ### Fixed
 
@@ -79,6 +84,26 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   cached offset: the index and the statistics kept what the old content had given, and took the
   file for unchanged from then on. It is now read whole, as R8 says of an mtime that moved
   backward (SPEC R8, R20).
+- A live usage answer read only in part was taken for the whole of it: when claude worded one
+  line of `claude -p /usage` differently (a weekly limit that is used up, say), the other lines
+  alone were shown, and `remuda pick --live` could recommend the account as live and available.
+  A `Current session` / `Current week` line that cannot be read now makes the answer
+  unrecognized: it is shown as it is, and `pick` falls back to the cache with a note. The cached
+  `limits` list is treated the same: an entry that cannot be read is no longer dropped quietly,
+  the account then has no cached usage, and the notice says how many entries were not
+  recognized (SPEC R10).
+- An agent command that had exited while a process it started still held its output open was
+  reported as timed out, its output thrown away; and after a real timeout only the command
+  itself was killed, not what it had started. Every command remuda runs for its output now has
+  a process group of its own, as `codex app-server` already had: what it printed is taken once
+  it has exited (a process it left running is left alone), and the whole group is terminated
+  on a timeout. Outside the terminal's foreground process group, such a command ignores
+  SIGTTIN and SIGTTOU, so that one which touches the terminal is not stopped until its timeout
+  (SPEC R4).
+- Ctrl-C during `remuda usage --live` or `remuda pick --live` left a `codex app-server` that
+  did not notice its closed stdin, or anything it had started, running. remuda now passes
+  Ctrl-C, Ctrl-\ and a hangup on to the commands it is still running before it ends, the ones
+  it was in the middle of starting included (SPEC R4).
 - A member whose `projects` is a link to the source's (the layout `remuda setup` creates) had
   claude ask for permission on every auto-memory write: claude grants its memory directory by
   the literal path and then finds the resolved one under the source's `.claude/`, outside the

@@ -4,6 +4,7 @@
 //! an [`Env`] snapshot down. `docs/ARCHITECTURE.md` maps the modules to the SPEC entries
 //! they implement.
 
+pub mod account_command;
 pub mod account_config;
 pub mod attribution;
 pub mod checks;
@@ -11,6 +12,7 @@ pub mod cli;
 pub mod home_items;
 pub mod identity;
 pub mod index;
+pub mod interrupt;
 pub mod jev;
 pub mod launch;
 pub mod live;

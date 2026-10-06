@@ -25,6 +25,7 @@ commands, and launches them with the right environment and options.
    │  paths      identity · usage · live  stats · pricing           │
    │  provider   checks · account_config  transcript · probe · text │
    │  privacy    pick · jev · home_items  owned (every write)       │
+   │  interrupt  account_command                                    │
    └──────────────────────┬─────────────────────────────────────────┘
           reads │         │ runs            │ writes (R13)
                 ▼         ▼                 ▼
@@ -73,9 +74,9 @@ Modules are layered: each layer uses the layers below it.
  │  recommendation: pick · jev                                               │
  ├─ reading agents' data ────────────────────────────────────────────────────┤
  │  index · transcript · provider::codex · provider::app_server · probe      │
- │  tracking                                                                 │
+ │  tracking · account_command                                               │
  ├─ foundation ──────────────────────────────────────────────────────────────┤
- │  registry · provider · paths · privacy · text · owned                     │
+ │  registry · provider · paths · privacy · text · owned · interrupt         │
  └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -83,7 +84,8 @@ The exceptions, all for a type or a small helper:
 
 - `launch` holds the home variable of R2 (`env_change`, `apply_env`, `CONFIG_DIR_VAR`) and
   `find_on_path`, used by everything that runs an agent: `probe`, `provider`,
-  `provider::app_server`, `identity`, `usage` and `live`.
+  `provider::app_server` and `account_command`, through which `identity`, `usage`, `live` and
+  `pick` run an agent's commands for an account.
 - `registry` reads and validates the `[prices]` tables with `pricing::Prices::from_document` (R3,
   R20), and `[pick]` with `pick::Config::from_document` (R3, R23).
 - `pricing` prices `stats::Tokens`; `provider::codex` lists rollouts with `index::list_rollouts` and checks rate limits with
@@ -102,15 +104,17 @@ The exceptions, all for a type or a small helper:
 | `provider` | What differs between claude and codex: isolation variable, stores, launch arguments, login | R4 |
 | `provider::codex` | Rollout parsing: head/tail windows, titles from `session_index.jsonl`, preview, cached rate limits | R10, R17 |
 | `provider::app_server` | JSON-RPC client for `codex app-server` (`account/read`, `account/rateLimits/read`) | R4, R10 |
-| `probe` | Run a short agent command with captured output and a timeout (killing the process group); run many in parallel; run `curl` with its configuration on stdin | R4, R10, R23 |
+| `probe` | Run a short command in its own process group with captured output and a timeout, taking its output once it exited and terminating the group when it times out; JSON-RPC over stdio on the same core, its group terminated on every way out; run many in parallel; run `curl` with its configuration on stdin | R4, R10, R23 |
+| `account_command` | Run an agent's command for an account: pick the provider's program, set or remove the home variable, run it, and word the failure (`Runner`, `OnPath`); the shape of a parse that may be partial (`Parsed`) | R2, R4, R10, R10a |
+| `interrupt` | The terminal's signals, owned in one place: sat out while a foreground child has the terminal, passed on to the process groups of running commands and of commands being started, before remuda ends by them; a place for each of at most 1024 commands at a time, which one more waits for | R4, R6 |
 | `launch` | Classify arguments, inject `--session-id`, set or unset the home variable, the launch record, `exec` and foreground runs | R2, R6, R16, R17 |
 | `share` | Shared configuration injected at launch, the fallback for what a home does not link: `plan` (reads only; a `Plan` carries the relation of every shared item) and `apply` (item links, rule copies, settings file: what they are; `owned` writes them) | R18 |
 | `home_items` | The items of a claude home, once: the catalog (each item's name, whether `setup` links it and on what condition, whether the launch's `--add-dir` carries it, when the source's counts as one to share, what breaks when it is another account's) and how a member's home relates to the source's right now (`Source::relate`, `linked_elsewhere`, `membership`) | R11, R12, R18 |
 | `setup` | Create the new home (through `owned`), link a member's to the source's session store and configuration (`share_links`, over the catalog of `home_items`), and register it; the login command | R5, R12, R13, R17, R18 |
-| `identity` | `claude auth status --json`, `.claude.json` fallback, `codex login status`, `account/read` | R10a |
-| `usage` | Cached and live usage for both providers as rows (what the agent said), window labels, the text of `remuda usage` | R10 |
+| `identity` | Parses `claude auth status --json`, `codex login status` and `account/read`; the `.claude.json` fallback | R10a |
+| `usage` | Cached and live usage for both providers as rows (what the agent said; a partly read answer is not used), window labels, the text of `remuda usage` | R10 |
 | `usage::snapshot` | Rows read at an instant: each window's reset (ahead, passed since, unknown), its percentage and severity (unknown once it has reset since), the snapshot's age and staleness. The one place that compares a reset with now; `usage`, `pick`, `jev` and the TUI take it from here | R10, R23 |
-| `live` | Running claude sessions: `agents --json`, `sessions/*.json` fallback checked against `ps`; attach, logs, stop, rm | R7, R16 |
+| `live` | Running claude sessions: parses `agents --json`, `sessions/*.json` fallback checked against `ps`; attach, logs, stop, rm | R7, R16 |
 | `checks` | Warnings for the Accounts view, among them what a member's home links and does not (the relations of `home_items`, put into words) | R11 |
 | `index` | The session index over claude transcripts and codex rollouts: its stores, how they are listed, the head and tail windows of one file, its cache | R8, R17 |
 | `tracking` | Keeping a cache up to date with the files below a set of directories: which are reused, read on or read whole, the worker threads, what vanished, progress, and a directory that cannot be listed. Private; `index` and `stats` each give it an adapter | R8, R20 |
@@ -468,7 +472,11 @@ tests include that same file (`src/lib.rs`), so there is one builder.
 | `tui_cli.rs` | Bare `remuda` needs a terminal (R5) |
 
 Unit tests sit next to the code (`mod tests`); the TUI's are in `src/tui/tests.rs` and drive
-`app::update` and `render` against a test backend, without a terminal.
+`app::update` and `render` against a test backend, without a terminal. The modules that parse
+an agent's answers (`identity`, `usage`, `live`, `pick`) are tested with
+`account_command::Scripted`, a runner that answers from a script without starting a process;
+how a process is run, timed out, cleaned up and interrupted is tested in `probe` and
+`interrupt` with real `sh` scripts.
 
 `examples/corpus_timing.rs` and `examples/codex_timing.rs` time the index on a real claude or
 codex home. They read it only, and put the cache in a temporary directory:
@@ -488,6 +496,8 @@ cargo run --release --example codex_timing -- [<codex home>]
 | Add an item of a home, or change how one is shared or kept per account | SPEC R11 / R18, its entry in `home_items::ITEMS`; then `share::plan` if a launch injects it, `checks::sharing` if the Accounts view warns about it |
 | Write a new file below `$REMUDA_HOME`, or change a mode, a lock, or how a file is replaced | SPEC R3 / R13, `owned` (and its tests, which cover what all writes share); never `std::fs` writes elsewhere |
 | Support another agent CLI | SPEC R4, `provider` (every `match Provider`), `index`, `usage`, `identity` |
+| Run another agent command for an account | `account_command` runs it (`runner.run_ok(account, ARGS, timeout)`); the caller only parses, and tests its parsing with `account_command::Scripted` |
+| Change how commands are run, killed or interrupted | SPEC R4, `probe` (`Bounded`) and `interrupt`; `probe`'s script tests |
 | Read a new field from transcripts | `transcript` (index) or `stats` (counts); bump the cache's `SCHEMA_VERSION` |
 | Change when a file is read again, or what an unreadable directory means | SPEC R8, `tracking` (`decide`, `Listing`); its unit tests drive it with a fake adapter |
 | Keep another set of append-only files up to date | A `tracking::Files` adapter (how to list, how to read one file) and a map for `tracking::refresh` |

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use common::Sandbox;
 use remuda::Env;
+use remuda::account_command::OnPath;
 use remuda::live::{self, LiveSession, Source};
 use remuda::provider::Provider;
 use remuda::registry::{Account, Home};
@@ -23,6 +24,14 @@ fn named(name: &str, home: &Path) -> Account {
         provider: Provider::Claude,
         name: name.into(),
         home: Home::Path(home.display().to_string()),
+    }
+}
+
+/// What runs `claude` for an account: the fake at `claude`, or no claude on PATH.
+fn agents(claude: Option<&Path>) -> OnPath<'_> {
+    OnPath {
+        claude,
+        codex: None,
     }
 }
 
@@ -93,7 +102,7 @@ fn agents_json_is_queried_under_each_accounts_home() {
     let claude = sb.bin().join("claude");
     let got = live::collect(
         &accounts,
-        Some(&claude),
+        &agents(Some(&claude)),
         Some(&ps()),
         &env(&sb),
         live::TIMEOUT,
@@ -152,7 +161,7 @@ fn failing_agents_falls_back_to_verified_session_files() {
     // No fake-agents.json: the fake claude prints nothing, which is not an agents list.
     let got = live::collect(
         &accounts,
-        Some(&claude),
+        &agents(Some(&claude)),
         Some(&ps()),
         &env(&sb),
         live::TIMEOUT,
@@ -187,7 +196,7 @@ fn unparseable_or_hanging_agents_fall_back_too() {
     let start = Instant::now();
     let got = live::collect(
         &accounts,
-        Some(&claude),
+        &agents(Some(&claude)),
         Some(&ps()),
         &env(&sb),
         Duration::from_millis(500),
@@ -226,7 +235,13 @@ fn native_login_falls_back_to_home_dot_claude_sessions() {
         Some(sb.home().join(".claude/sessions"))
     );
     // No claude at all: straight to the fallback.
-    let got = live::collect(&accounts, None, Some(&ps()), &env(&sb), live::TIMEOUT);
+    let got = live::collect(
+        &accounts,
+        &agents(None),
+        Some(&ps()),
+        &env(&sb),
+        live::TIMEOUT,
+    );
     assert_eq!(
         ids(&got),
         [(
@@ -236,7 +251,7 @@ fn native_login_falls_back_to_home_dot_claude_sessions() {
         )]
     );
     // Without ps nothing can be verified, so nothing is claimed.
-    assert!(live::collect(&accounts, None, None, &env(&sb), live::TIMEOUT).is_empty());
+    assert!(live::collect(&accounts, &agents(None), None, &env(&sb), live::TIMEOUT).is_empty());
 }
 
 /// Background entries have a short id and a state instead of a pid (R7, claude 2.1.281);
@@ -261,7 +276,7 @@ fn background_sessions_are_collected_including_stopped_ones() {
     let claude = sb.bin().join("claude");
     let got = live::collect(
         &[named("max", &max)],
-        Some(&claude),
+        &agents(Some(&claude)),
         None,
         &env(&sb),
         live::TIMEOUT,
@@ -300,7 +315,13 @@ fn accounts_that_could_not_be_read_are_reported() {
     let claude = sb.bin().join("claude");
 
     // No ps: blind's sessions cannot be verified.
-    let got = live::collect_report(&accounts, Some(&claude), None, &env(&sb), live::TIMEOUT);
+    let got = live::collect_report(
+        &accounts,
+        &agents(Some(&claude)),
+        None,
+        &env(&sb),
+        live::TIMEOUT,
+    );
     assert_eq!(
         ids(&got.sessions),
         [("claude:ok".into(), Some("s-ok".into()), Source::Agents)]
@@ -312,14 +333,20 @@ fn accounts_that_could_not_be_read_are_reported() {
     assert!(reason.contains("ps"), "{reason}");
     // `collect` is the same without the report.
     assert_eq!(
-        live::collect(&accounts, Some(&claude), None, &env(&sb), live::TIMEOUT),
+        live::collect(
+            &accounts,
+            &agents(Some(&claude)),
+            None,
+            &env(&sb),
+            live::TIMEOUT
+        ),
         got.sessions
     );
 
     // With ps: no `sessions/` directory means no sessions ever ran there.
     let got = live::collect_report(
         &accounts,
-        Some(&claude),
+        &agents(Some(&claude)),
         Some(&ps()),
         &env(&sb),
         live::TIMEOUT,
@@ -332,7 +359,7 @@ fn accounts_that_could_not_be_read_are_reported() {
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
     let got = live::collect_report(
         &accounts,
-        Some(&claude),
+        &agents(Some(&claude)),
         Some(&ps()),
         &env(&sb),
         live::TIMEOUT,
@@ -342,7 +369,7 @@ fn accounts_that_could_not_be_read_are_reported() {
     assert_eq!(unknown, ["claude:blind"]);
 
     // No claude and no ps at all: every account is unknown.
-    let got = live::collect_report(&accounts, None, None, &env(&sb), live::TIMEOUT);
+    let got = live::collect_report(&accounts, &agents(None), None, &env(&sb), live::TIMEOUT);
     assert_eq!(got.unknown.len(), 2);
 }
 
@@ -360,7 +387,7 @@ fn a_running_pids_unreadable_session_file_makes_the_account_unknown() {
     let report = || {
         live::collect_report(
             &accounts,
-            Some(&claude),
+            &agents(Some(&claude)),
             Some(&ps()),
             &env(&sb),
             live::TIMEOUT,
@@ -409,7 +436,7 @@ fn logs_with_a_huge_cursor_parameter_stay_small() {
     fs::write(max.join("fake-logs.txt"), "\u{1b}[9999999999999;1Hx").unwrap();
     let claude = sb.bin().join("claude");
     let logs = live::logs(
-        &claude,
+        &agents(Some(&claude)),
         &named("max", &max),
         "766560c5",
         Duration::from_secs(10),
@@ -434,11 +461,16 @@ fn logs_stop_and_rm_run_under_the_accounts_environment() {
     let claude = sb.bin().join("claude");
     let account = named("max", &max);
 
-    let logs = live::logs(&claude, &account, "766560c5", Duration::from_secs(10));
+    let logs = live::logs(
+        &agents(Some(&claude)),
+        &account,
+        "766560c5",
+        Duration::from_secs(10),
+    );
     assert_eq!(logs, Ok("Building the index\nstep 2".to_string()));
     assert_eq!(
         live::control(
-            &claude,
+            &agents(Some(&claude)),
             &account,
             live::Control::Stop,
             "766560c5",
@@ -448,7 +480,7 @@ fn logs_stop_and_rm_run_under_the_accounts_environment() {
     );
     assert_eq!(
         live::control(
-            &claude,
+            &agents(Some(&claude)),
             &account,
             live::Control::Remove,
             "766560c5",
@@ -486,7 +518,13 @@ fn background_command_failures_say_why() {
     let claude = sb.bin().join("claude");
     let account = named("max", &max);
     // No logs fixture: the fake fails like claude does for an unknown session.
-    let err = live::logs(&claude, &account, "0badf00d", Duration::from_secs(10)).unwrap_err();
+    let err = live::logs(
+        &agents(Some(&claude)),
+        &account,
+        "0badf00d",
+        Duration::from_secs(10),
+    )
+    .unwrap_err();
     assert!(err.contains("exited with status 1"), "{err}");
     assert!(err.contains("no fixture"), "{err}");
     fs::write(
@@ -495,7 +533,7 @@ fn background_command_failures_say_why() {
     )
     .unwrap();
     let err = live::control(
-        &claude,
+        &agents(Some(&claude)),
         &account,
         live::Control::Remove,
         "0badf00d",
@@ -507,7 +545,7 @@ fn background_command_failures_say_why() {
     fs::write(sb.home().join(".fake-stop-error.txt"), "").unwrap();
     let native = Account::default_for(Provider::Claude);
     let err = live::control(
-        &claude,
+        &agents(Some(&claude)),
         &native,
         live::Control::Stop,
         "0badf00d",
