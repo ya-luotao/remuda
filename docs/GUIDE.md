@@ -221,7 +221,10 @@ models = ["gpt-6-astra"]
   family (`claude-fable-5-1` counts against `Week (Fable)`). Without `models`, remuda does not
   know the agent's default model: per-model windows are shown (`also`), never counted. Write
   accounts in `[pick]` as `provider:name`. A window whose reset has passed
-  since the cache was written counts as empty; old data never makes an exhausted window usable.
+  since the cache was written is of unknown usage: remuda names it (`reset since cached`) and
+  neither counts it nor lets it block the pair, and a pair with no known window left ranks after
+  every pair that has one; `--live` asks the agent instead. Old data never makes an exhausted
+  window usable.
   Excluded and logged-out accounts are not feasible. The feasible pairs are ranked by model
   order, headroom (in 10-point bands), freshness, the sooner reset, `prefer`, and registry order.
 - **Jev, when asked.** With `TYPESAFE_API_KEY` set and `notes` written, and something to choose

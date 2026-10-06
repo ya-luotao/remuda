@@ -17,7 +17,7 @@ use crate::index::Entry;
 use crate::pricing::PRICES_AS_OF;
 use crate::stats::{self, Cost, ModelRow, Step, Table, Tokens};
 use crate::transcript::{Role, one_line};
-use crate::usage::{self, Resets, UsageRow};
+use crate::usage::{self, Reset, Source, Window};
 use crate::{text, usage::format_age};
 
 use super::app::{
@@ -516,8 +516,8 @@ fn usage_columns(app: &App) -> Vec<(String, String)> {
         .collect()
 }
 
-fn severity_style(r: &UsageRow) -> Style {
-    match usage::severity(r) {
+fn severity_style(w: &Window) -> Style {
+    match w.severity() {
         "critical" => CRIT,
         "warning" => WARN,
         _ => Style::new(),
@@ -543,14 +543,16 @@ fn source_cell(a: &AccountState, now: Timestamp) -> (String, Style) {
         return ("live…".to_string(), WARN);
     }
     match (&a.live, &a.cached) {
-        (Some(Ok((_, at))), _) => (format!("live {}", format_age(*at, now)), OK),
         (Some(Err(_)), _) => ("live failed".to_string(), CRIT),
         (None, None) => dim("…"),
-        (None, Some(Ok(c))) => match c.fetched_at {
-            Some(at) => dim(format!("cached {}", format_age(at, now))),
-            None => dim("cached"),
-        },
         (None, Some(Err(_))) => dim("no cache"),
+        // What is shown, and how old it is.
+        _ => match a.usage_at(now).map(|u| (u.source, u.age_text())) {
+            Some((Source::Live, Some(age))) => (format!("live {age}"), OK),
+            Some((Source::Cached, Some(age))) => dim(format!("cached {age}")),
+            Some((source, None)) => dim(source.name()),
+            None => dim("…"),
+        },
     }
 }
 
@@ -697,16 +699,20 @@ fn accounts_table(app: &App, f: &mut Frame, table: Rect) -> u16 {
             let a = &app.accounts[i];
             let mut cells = vec![plain(short(&a.account.qualified()))];
             cells.extend(identity_cells(a));
-            let rows = a.rows();
+            let usage = a.usage_at(app.now);
+            let windows = usage.as_ref().map_or(&[][..], |u| &u.windows);
             let loading = a.cached.is_none() && a.live.is_none();
             for (k, (_, label)) in columns.iter().enumerate() {
                 // Right-aligned in its column.
                 let w = widths[4 + k];
-                cells.push(match rows.iter().find(|r| &r.label == label) {
-                    Some(r) => (
-                        format!("{:>w$}", usage::format_percent(r.percent)),
-                        severity_style(r),
+                let window = windows.iter().find(|window| &window.label == label);
+                cells.push(match window.map(|window| (window, window.used())) {
+                    Some((window, Some(used))) => (
+                        format!("{:>w$}", usage::format_percent(used)),
+                        severity_style(window),
                     ),
+                    // Reset since the usage was recorded: what it holds now is unknown (R10).
+                    Some((_, None)) => dim(format!("{:>w$}", RESET)),
                     None if loading => dim(format!("{:>w$}", "…")),
                     None => dim(format!("{:>w$}", "-")),
                 });
@@ -752,23 +758,64 @@ fn legend_text(label: &str) -> String {
     }
 }
 
-/// When a row resets: its own time, or (for live wording remuda cannot read) the cached row
-/// of the same limit if that is still ahead.
-fn reset_of(a: &AccountState, r: &UsageRow, now: Timestamp) -> Option<Timestamp> {
-    if let Some(t) = r.resets.as_ref().and_then(|x| usage::reset_instant(x, now)) {
-        return Some(t);
-    }
-    let cached = a.cached.as_ref()?.as_ref().ok()?;
-    let same = cached.rows.iter().find(|c| c.label == r.label)?;
-    match same.resets {
-        Some(Resets::At(t)) if t > now => Some(t),
-        _ => None,
-    }
-}
+/// In place of a percentage, and of the time to the next reset, for a window that has reset
+/// since its usage was recorded (R10): every usage column is at least this wide.
+const RESET: &str = "reset";
 
 fn timeline_view(app: &App, f: &mut Frame, area: Rect, name_w: usize) {
+    /// The least the `next` summary takes: `S 10h00m W 6d23h` and a little air.
     const SUMMARY: usize = 18;
-    let axis_w = (area.width as usize).saturating_sub(name_w + 2 + SUMMARY);
+    let mut scoped: Vec<(char, String)> = Vec::new();
+    // Per account: the markers to draw, and the summary.
+    let mut tracks: Vec<(Vec<(char, Timestamp)>, String)> = Vec::new();
+    for a in &app.accounts {
+        let mut marks: Vec<(char, Timestamp)> = Vec::new();
+        let mut next: Vec<String> = Vec::new();
+        let mut next_scoped: Vec<String> = Vec::new();
+        // Model-scoped weeks first, so S and W win a shared column.
+        let usage = a.usage_at(app.now);
+        let mut windows: Vec<&Window> = usage.iter().flat_map(|u| &u.windows).collect();
+        windows.sort_by_key(|w| match marker(&w.label) {
+            'S' => 2,
+            'W' => 1,
+            _ => 0,
+        });
+        for w in windows {
+            let m = marker(&w.label);
+            let general = m == 'S' || m == 'W';
+            // A window drawn or summarized under another letter is named in the legend.
+            if !general && w.reset != Reset::Unknown {
+                let entry = (m, legend_text(&w.label));
+                if !scoped.contains(&entry) {
+                    scoped.push(entry);
+                }
+            }
+            match w.reset {
+                Reset::Ahead(t) => {
+                    if general {
+                        next.push(format!("{m} {}", timeline::until(app.now, t)));
+                    }
+                    marks.push((m, t));
+                }
+                // The next reset is unknown: no marker, and the summary says so, for any
+                // window (R10).
+                Reset::Passed(_) if general => next.push(format!("{m} {RESET}")),
+                Reset::Passed(_) => next_scoped.push(format!("{m} {RESET}")),
+                Reset::Unknown => {}
+            }
+        }
+        next.reverse();
+        next.extend(next_scoped);
+        tracks.push((marks, next.join(" ")));
+    }
+    // The axis gives way to a summary that names more than S and W.
+    let summary_w = tracks
+        .iter()
+        .map(|(_, next)| text::width(next) + 1)
+        .max()
+        .unwrap_or(0)
+        .max(SUMMARY);
+    let axis_w = (area.width as usize).saturating_sub(name_w + 2 + summary_w);
     let mut lines = vec![section("Resets · next 7 days", area.width)];
     lines.push(Line::styled(
         format!(
@@ -779,34 +826,8 @@ fn timeline_view(app: &App, f: &mut Frame, area: Rect, name_w: usize) {
         ),
         DIM,
     ));
-    let mut scoped: Vec<(char, String)> = Vec::new();
-    for a in &app.accounts {
-        let mut marks: Vec<(char, Timestamp)> = Vec::new();
-        let mut next: Vec<String> = Vec::new();
-        // Model-scoped weeks first, so S and W win a shared column.
-        let mut rows: Vec<&UsageRow> = a.rows().iter().collect();
-        rows.sort_by_key(|r| match marker(&r.label) {
-            'S' => 2,
-            'W' => 1,
-            _ => 0,
-        });
-        for r in rows {
-            let Some(t) = reset_of(a, r, app.now) else {
-                continue;
-            };
-            let m = marker(&r.label);
-            if m != 'S' && m != 'W' {
-                let entry = (m, legend_text(&r.label));
-                if !scoped.contains(&entry) {
-                    scoped.push(entry);
-                }
-            } else {
-                next.push(format!("{m} {}", timeline::until(app.now, t)));
-            }
-            marks.push((m, t));
-        }
-        next.reverse();
-        let track = timeline::track(app.now, &marks, axis_w);
+    for (a, (marks, next)) in app.accounts.iter().zip(&tracks) {
+        let track = timeline::track(app.now, marks, axis_w);
         let mut spans = vec![Span::raw(format!(
             "{} ",
             text::pad(short(&a.account.qualified()), name_w)
@@ -819,7 +840,7 @@ fn timeline_view(app: &App, f: &mut Frame, area: Rect, name_w: usize) {
             };
             spans.push(Span::styled(c.to_string(), style));
         }
-        spans.push(Span::raw(format!(" {}", next.join(" "))));
+        spans.push(Span::raw(format!(" {next}")));
         lines.push(Line::from(spans));
     }
     let mut legend = String::from("S session · W week (all models)");

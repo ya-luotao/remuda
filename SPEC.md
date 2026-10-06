@@ -460,7 +460,34 @@ appeared in no `history.jsonl`.
   a codex account's live header also shows its email and plan.
 - The live sources provide no severity: 75% is marked as a warning and 90% as critical. Claude's
   live reset times are localized text; the timeline makes a best effort to parse them into instants
-  and otherwise uses the cached reset time of the same limit. Codex reports instants.
+  and otherwise (wording it cannot read, or no reset told) uses the cached reset time of the same
+  limit, if that is still ahead. A reset that was read is never replaced by the cached one,
+  whatever it comes to below. Codex reports instants.
+- **Usage is read at an instant.** A percentage is what an agent said at some time: the cache
+  time, or the time a live query answered (not the time it was started: a query may take as long
+  as its timeout; nor the time the answer is first shown: in the TUI it may wait behind a
+  foreground agent). Every place that shows or uses it (`remuda usage`, the table and the
+  timeline, `remuda pick`) reads it against the current time in the same way; a command that
+  waits for an agent takes the current time after the wait (`remuda usage --live` when each
+  answer arrives, `remuda pick` as R23 says):
+  - Reset wording is read as the next such time after it was said, not after now.
+  - A window whose reset fell after its usage was recorded and is not after now has **reset
+    since**: the percentage recorded is obsolete, and what the window holds now is unknown until
+    there is new data (0% used would only be a lower bound). No percentage and no severity are
+    shown for it. `remuda usage` prints `-` and `reset since cached` with the reset time; the
+    table shows `reset` in place of the percentage; the timeline draws no marker for it (its
+    next reset is unknown) and says `reset` after the window's letter in the `next` summary,
+    for a per-model window too (the legend still names its letter; the axis gives way to a
+    longer summary). A live answer that stays on screen past a reset it named is read the same
+    way. R23 says what `pick` makes of it.
+  - A reset that was already behind when the usage was recorded (live wording read into the
+    past, a cache that records one) says nothing: the percentage stands, and no reset instant
+    is shown or drawn for it, not the cached one of the same limit either. This is decided
+    against the recording, before the current time is looked at: a clock that runs behind the
+    cache does not turn such a reset into one ahead. `remuda usage --live` still prints
+    claude's wording as it is. So the answer of a live query, read when it arrives, always
+    keeps its percentages.
+  - A reset in the past is never shown as a time ahead, nor drawn on the timeline.
 
 ## R10a. Identity
 
@@ -1449,25 +1476,49 @@ It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4)
   with its reason: excluded; not of `--provider`; claude with neither `oauthAccount` in its
   `.claude.json` nor a usage cache; codex without `codex` on PATH, or whose `codex login status`
   says it is not logged in (a status that cannot be read is noted, not blocking); or a window
-  that applies with less than `min_headroom` percent left (default 10).
+  that applies, of known usage, with less than `min_headroom` percent left (default 10).
 - **Windows.** A usage row (R10) without a parenthesized name, or with `(all models)`, applies to
   every model. `<window> (<name>)` applies to the claude models of that family
   (`claude-<family>-…`; a bare alias is its own family) and to the codex model with that id,
   ignoring case; one that matches no configured model is ignored. Without `models`, the agent's
   default model is unknown: the `default` pair shows its account's per-model windows (in the
   output, in `--json` as `default_model_windows`, and in the request, marked as applying only if
-  that model is of their family) but is never made infeasible by them. A window whose reset
-  instant has passed counts as 0% used (reset since cached). Headroom is the least percent left over the
-  windows that apply; without usage data a pair is feasible, of unknown headroom. Cached codex
-  usage has no per-model limits (R10): they are shown as unknown.
+  that model is of their family) but is never made infeasible by them. A window that has reset
+  since its usage was cached (R10) is of unknown usage: after its reset remuda knows nothing
+  about it, and 0% used is only a lower bound. It is named (`reset since cached`), never counted,
+  and never makes a pair infeasible: `min_headroom` is checked against known percentages only,
+  so a window that is known and exhausted still blocks a pair whose other windows have reset.
+  Headroom is the least percent left over the windows that apply and are known. A pair with no
+  such window, because there is no usage data or because each window that applies has reset
+  since, is feasible, of unknown headroom. Live usage is recorded when its query answers: a
+  reset time it names that reads as behind then (R10) leaves its percentage as told. Cached
+  codex usage has no per-model limits (R10): they are shown as unknown.
+- **The instant.** A recommendation reads every account's usage at one instant: the time once
+  all of it is gathered, logins checked and live queries answered or failed. It is not the time
+  remuda started: a live query may take as long as its timeout, and a window that resets while
+  it runs has reset. Feasibility, headroom, staleness, and every time in the output and in the
+  request (the time to a reset, the data's age) count from that instant. A live answer is
+  recorded when it arrives; when another account's slower query outlasts a reset it named, that
+  window has reset since it was asked (`reset since asked`, without the hint to `--live`). The
+  round trip to Jev (at most 10 s) and the launch come after that instant and do not move it.
 - **Staleness.** Cached usage older than `stale_after` minutes (default 120), or of unknown age,
   is stale; it is marked, and breaks ties (below). Staleness never makes a window feasible: a used
-  percentage only grows until its reset. `--live` queries every candidate account first (R10;
-  `--timeout` per query, default 90); a failed query falls back to the cache, with a note.
+  percentage only grows until its reset. Staleness and a reset since are independent: staleness
+  is the age of all of an account's usage, a reset since is one window's. Usage that is not
+  stale can hold a window that has reset since, and the windows of stale usage whose resets are
+  ahead stay known, at the percentage recorded. `--live` queries every candidate account first
+  (R10; `--timeout` per query, default 90); a failed query falls back to the cache, with a note.
+  remuda never queries live on its own, not before `--run` either (a live query lets the agent
+  reach its provider and write in its home): where the recommended pair has a window that has
+  reset since, the output names it and, for cached usage, says that `--live` asks the agent.
 - **Rules.** Feasible pairs rank by: known headroom before unknown; the model's position in
   `models`; headroom in 10-point bands, higher first (90% left and more is one band); fresh before
-  stale; the binding window's reset, sooner first; `prefer` order; registry order. The rules'
-  effort is `default_effort`, or none.
+  stale; the binding window's reset, sooner first; `prefer` order; registry order. Headroom
+  known from stale usage is still known: such a pair ranks before every pair of unknown
+  headroom, so usage whose resets have all passed never outranks usage that says something.
+  Pairs of unknown headroom, without usage data or past every reset, rank among themselves by
+  the same rules (a pair without usage data is not stale). The rules' effort is
+  `default_effort`, or none.
 - **When Jev is asked.** Only with `TYPESAFE_API_KEY` in remuda's environment, without
   `--offline`, with `notes`, and with a choice to make (two feasible pairs, or a provider with two
   or more `efforts` and a feasible pair). Otherwise the rules decide, and the reason is `offline`,
@@ -1479,13 +1530,15 @@ It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4)
   holding a quote, a backslash, or a control character is not sent.
   - Questions: `launch`, a Choice over the feasible pairs (the rules' best 255 when there are
     more), named `<alias> / <model>` (`default` for the agent's default) and described by the
-    binding window and the data's age, asked only when there are two or more; and
+    binding window, the windows that have reset since (of unknown usage), and the data's
+    age, asked only when there are two or more; and
     `effort_<provider>`, a Score over `efforts`, for each provider with at least two and a
     feasible pair. The criteria are a JSON object, so their order carries no meaning.
   - State: plain text with the local weekday and time (no time zone), the rules already applied,
     each account with a feasible pair under its alias (`<provider>:account-<n>`, numbered per
     provider in registry order as in R21; `default` stays `default`), its usage (source, age,
-    staleness, and each window that applies with its percentage and time to reset), the models,
+    staleness, and each window that applies with its percentage and time to reset, or as
+    `usage unknown (reset since cached)`), the models,
     the notes, and an empty task. In the notes, each qualified name is replaced by its alias: a
     provider, `:`, and the longest run of name characters (`[A-Za-z0-9_-]`) after it, wherever
     the character before it is not an ASCII letter or digit (so also right after CJK text, `-`,
@@ -1505,20 +1558,28 @@ It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4)
   (`jev_error`), and the message holds at most 200 characters of the response and never the key.
 - **Output.** The account, model, and effort (and whether the effort is Jev's); what decided and
   why, with Jev's confidence; the rules' choice when Jev's differs; the binding window and its
-  reset; the data's age; the exclusions; the `remuda run <account> <options>` command; and every pair that is not feasible,
+  reset (`unknown` when no window that applies is known); the windows that have reset since,
+  with the hint to `--live` when the usage is cached; the data's age; the exclusions; the
+  `remuda run <account> <options>` command; and every pair that is not feasible,
   with its reason. `--json` prints `account`, `provider`, `model`, `effort`, `decided_by` (`jev`,
   `jev_account`, `rules`), `reason`, `effort_by` (`jev`, `rules`; null without an effort), `jev`
   (`model`, `confidence`, `effort_confidence`, `effort_error`, `error`; null when not asked),
   `command`, and `candidates` (`account`, `model`, `feasible`, `why_not`, `headroom`, `binding`,
-  `resets_at`, `default_model_windows`, `source`, `fetched_at`, `age_seconds`, `stale`,
-  `rules_rank`, `jev_probability`). `--print-request` prints the body a send would use and sends
-  nothing (no key needed). With nothing feasible: the reasons, exit 1.
+  `resets_at`, `reset_passed`, `default_model_windows`, `source`, `fetched_at`, `age_seconds`,
+  `stale`, `rules_rank`, `jev_probability`). `headroom` and `binding` are null when the headroom
+  is unknown; `resets_at` is the binding window's reset, null unless it is ahead: never an
+  instant in the past; `reset_passed` is true when a window that applies has reset since.
+  Each of `default_model_windows` has `label`, `percent`, `resets_at`, and `reset_passed`, with
+  `percent` and `resets_at` null when its reset has passed. `--print-request` prints the body a
+  send would use and sends nothing (no key needed). With nothing feasible: the reasons, exit 1.
 - **`--run`.** Launches the recommendation exactly as `remuda run <account> <options> <args>`
   (R6, R17, R18), `<args>` being those after `--`: claude gets `--model <m> --effort <e>`, codex
   `-m <m> -c model_reasoning_effort=<e>` (verified: codex 0.156.1 accepts both before a
   subcommand), before the user's arguments; the launch log records them among its `args`. An
   option the user's arguments already set (claude `--model`, `--effort`; codex `-m`, `--model`,
-  `-c`/`--config model_reasoning_effort=…`) is not injected, and remuda says so on stderr.
+  `-c`/`--config model_reasoning_effort=…`) is not injected, and remuda says so on stderr. So
+  does it when a window of the launched pair has reset since (with the hint to `--live` when
+  the usage is cached); it launches all the same.
   Arguments that do not start a new session (R6's classification for claude; `resume` or `fork`
   first for codex) are refused before anything is sent. `--json` and `--print-request` do not
   combine with `--run`.

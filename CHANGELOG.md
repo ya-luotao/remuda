@@ -8,6 +8,29 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ## [Unreleased]
 
+### Changed
+
+- A usage window whose reset has passed since its usage was recorded is of unknown usage
+  everywhere, instead of three different things (SPEC R10, R23). `remuda pick` counted it as 0%
+  used, so an account cached four days ago, past every reset, was recommended as "100% left" ahead
+  of one cached nine minutes ago with 71% left. Such a window is now named (`reset since cached`),
+  never counted as headroom and never blocking; a pair with no known window left is feasible, of
+  unknown headroom, and ranks after every pair of known headroom, stale ones included. `pick`
+  still never queries live on its own: its output, and `--run` on stderr, say that `--live` asks
+  the agent. Live usage keeps its percentages whatever its reset times read as. The usage is read
+  once it is all gathered, not when remuda started: a window that resets while a live query runs
+  has reset, and a live answer shows its age (`live 40s ago`). **Changes `pick --json`:**
+  candidates gain `reset_passed`; `resets_at` is null unless the reset is ahead; `headroom` and
+  `binding` are null when no window that applies is known; each of `default_model_windows` gains
+  `reset_passed`, with `percent` and `resets_at` null past its reset. The state sent to Jev says
+  `usage unknown (reset since cached)` instead of `0% used`.
+- `remuda usage` prints `-` and `reset since cached (<time>)` for such a window instead of the
+  percentage and severity recorded before the reset; the Accounts view shows `reset` in its
+  place, draws no marker for it on the timeline (it drew one at `now`) and says `reset` in the
+  `next` summary, for a per-model window too. A live answer left on screen past a reset it
+  named reads the same way, and its reset wording is read from when it was said: `7pm` asked
+  at six is not tomorrow's by eight (SPEC R10).
+
 ### Fixed
 
 - A member whose `projects` is a link to the source's (the layout `remuda setup` creates) had

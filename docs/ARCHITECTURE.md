@@ -100,7 +100,8 @@ The exceptions, all for a type or a small helper:
 | `share` | Shared configuration injected at launch, the fallback for what a home does not link: `plan` (reads only) and `apply` (item links, rule copies, settings file) | R18 |
 | `setup` | Create the new home, link a member's to the source's session store and configuration (`LINKS`, `share_links`), and register it; the login command | R5, R12, R13, R17, R18 |
 | `identity` | `claude auth status --json`, `.claude.json` fallback, `codex login status`, `account/read` | R10a |
-| `usage` | Cached and live usage for both providers, window labels, severity, reset instants | R10 |
+| `usage` | Cached and live usage for both providers as rows (what the agent said), window labels, the text of `remuda usage` | R10 |
+| `usage::snapshot` | Rows read at an instant: each window's reset (ahead, passed since, unknown), its percentage and severity (unknown once it has reset since), the snapshot's age and staleness. The one place that compares a reset with now; `usage`, `pick`, `jev` and the TUI take it from here | R10, R23 |
 | `live` | Running claude sessions: `agents --json`, `sessions/*.json` fallback checked against `ps`; attach, logs, stop, rm | R7, R16 |
 | `checks` | Warnings for the Accounts view, among them what a member's home links and does not | R11 |
 | `index` | The session index over claude transcripts and codex rollouts; incremental cache | R8, R17 |
@@ -109,7 +110,7 @@ The exceptions, all for a type or a small helper:
 | `stats` | Token counting, deduplication across copies, periods, sections, chart buckets, text table | R20 |
 | `pricing` | Built-in prices and `[prices]` overrides; the cost of one request in picodollars | R20 |
 | `account_config` | What an account's sessions load and where each item comes from | R22 |
-| `pick` | `[pick]`; candidates, windows and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options | R3, R23 |
+| `pick` | `[pick]`; candidates, which windows apply to a model, and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options | R3, R23 |
 | `jev` | The request to Jev (aliased state, Choice and Score questions), `curl` transport, response parsing | R23 |
 | `privacy` | Account-name aliases, whole-word aliasing of names in free text, and aliasing of every `provider:name` in the `pick` notes | R21, R23 |
 | `text` | Terminal text measured in display columns | – |
@@ -382,4 +383,5 @@ cargo run --release --example codex_timing -- [<codex home>]
 | Add a TUI action | `tui::app` (`Key` → `Effect`), `tui::workers` (the effect), `tui::render`, `tui::privacy` |
 | Add something shown on screen | `tui::app` state, `tui::render`, and its case in `tui::privacy::redacted`; a path in a notice goes in with `Marked::path` |
 | Add a model price | SPEC R20 table and `pricing` |
+| Change what a usage window means once its reset has passed, or how old usage counts | SPEC R10 / R23, `usage::snapshot` (`Snapshot::at`); every surface reads it from there |
 | Change what `remuda pick` sends to Jev | SPEC R23, `jev::request` and `jev::state_text`; the privacy test in `tests/pick_cli.rs` |
