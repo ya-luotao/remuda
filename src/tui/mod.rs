@@ -405,18 +405,18 @@ fn run_launch(
     request: &LaunchRequest,
     tx: &Sender<Event>,
 ) -> Result<(Result<Exit, String>, Vec<String>)> {
+    // The registry as it is now, before anything else can end the launch: the last word on
+    // whether the account is still listed (R16), and its shared configuration (R18).
+    let reading = deps.listing.read(tx);
+    if let Some(why) = reading.refusal(&request.account) {
+        return Ok((Err(why), Vec::new()));
+    }
     let provider = request.account.provider;
     let Some(program) = deps.program(provider) else {
         let missing = format!("`{}` not found on PATH", provider.program());
         return Ok((Err(missing), Vec::new()));
     };
     let cwd = request.cwd.as_deref().or(deps.cwd.as_deref());
-    // The registry as it is now: the last word on whether the account is still listed (R16),
-    // and its shared configuration (R18).
-    let reading = deps.listing.read(tx);
-    if let Some(why) = reading.refusal(&request.account) {
-        return Ok((Err(why), Vec::new()));
-    }
     let planned = launch::plan(
         &request.account,
         request.args.clone(),

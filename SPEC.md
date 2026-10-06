@@ -678,7 +678,10 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
   accounts, and so at least:
   - before every launch: in the check that precedes a new session, a fork, and a resume, and
     once more when the launch itself starts (an attach has no check before it); for
-    `remuda run` without an account, after the account is chosen (below);
+    `remuda run` without an account, after the account is chosen (below). In the check and
+    in the launch the registry is read before anything else that can end them (a directory
+    that does not exist, an agent executable that was not found), so an account that is gone
+    is what is said, and a change reaches the screen whatever the answer;
   - on every refresh (`r`), also while what the refresh would start is still running;
   - after a setup and after a removal from the TUI, whatever their outcome.
 

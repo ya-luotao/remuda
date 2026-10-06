@@ -233,30 +233,33 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
     }
 }
 
-/// Why `request` cannot be launched now, if it cannot: its directory, then its account, which
-/// the registry as it is now must still list (the TUI is told of a change through `tx`), then
-/// (for a resume in place) the session's state in every account, collected afresh (R16). The
-/// accounts asked are the registry's and every account listed before (one may have been
-/// unregistered meanwhile and still run it, C2). An account that cannot be read may be running
-/// it, and so may one the registry cannot say: both refuse too.
+/// Why `request` cannot be launched now, if it cannot. The registry is read first, whatever
+/// the answer turns out to be (the TUI is told of a change through `tx`): the account must
+/// still be listed; then the directory; then (for a resume in place) the session's state in
+/// every account, collected afresh (R16). The accounts asked are the registry's and every
+/// account listed before (one may have been unregistered meanwhile and still run it, C2). An
+/// account that cannot be read may be running it, and so may one the registry cannot say: both
+/// refuse too.
 fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Option<Marked> {
+    let reading = deps.listing.read(tx);
+    // A registry that cannot be read says nothing of the account: see below.
+    if reading.unreadable.is_none()
+        && let Some(gone) = reading.refusal(&request.account)
+    {
+        return Some(gone.into());
+    }
     if let Some(error) = request.cwd.as_deref().and_then(check_dir) {
         return Some(error);
     }
-    let reading = deps.listing.read(tx);
-    let resumed = request.resumes();
+    let id = request.resumes()?;
     if let Some(e) = &reading.unreadable {
         // Any other launch is refused when it starts, for the same reason.
         let said = format!(
             "cannot confirm that session {} is not running: cannot read the registry: ",
-            app::short_id(&resumed?)
+            app::short_id(&id)
         );
         return Some(Marked::from(said).text(e));
     }
-    if let Some(gone) = reading.refusal(&request.account) {
-        return Some(gone.into());
-    }
-    let id = resumed?;
     let found = live::collect_report(
         &reading.seen,
         deps.claude.as_deref(),

@@ -337,10 +337,12 @@ fn tui_attach_runs_in_remudas_directory_and_injects_nothing() {
 #[test]
 fn tui_launch_without_claude_does_not_suspend() {
     let sb = Sandbox::new();
+    let max = named("max", "/p/max");
+    register(&sb, &[&max]);
     let mut deps = deps(&sb);
     deps.claude = None;
     let request = LaunchRequest {
-        account: named("max", "/p/max"),
+        account: max,
         args: vec![],
         cwd: None,
         what: "new session as max".into(),
@@ -622,6 +624,7 @@ fn tui_codex_fork_is_logged_with_fork_of_and_without_a_session_id() {
 #[test]
 fn tui_codex_launch_without_codex_does_not_suspend() {
     let sb = Sandbox::new();
+    register(&sb, &[&codex_work()]);
     let request = LaunchRequest {
         account: codex_work(),
         args: vec!["-C".into(), "/w".into()],
@@ -1129,6 +1132,14 @@ fn a_resume_is_refused_when_the_registry_cannot_be_read() {
         ),
         "{error}"
     );
+    // A missing directory is still told as such, for a resume and for a new session.
+    let gone = sb.root().join("gone");
+    for args in [&["--resume", U][..], &["-n", "x"]] {
+        assert_eq!(
+            check_launch(&deps, &max, args, &gone),
+            Some(format!("{} does not exist", gone.display()))
+        );
+    }
     assert_eq!(
         check_launch(
             &deps,
@@ -1208,15 +1219,68 @@ fn an_account_removed_elsewhere_starts_no_new_session_and_no_fork() {
         Some("team is no longer registered")
     );
     assert!(sb.invocations().is_empty(), "{:?}", sb.invocations());
-    // A missing directory is still reported first.
+    // The account comes before the directory: with both wrong, the account is what is said.
     let gone = sb.root().join("gone");
     assert_eq!(
-        check_launch(&deps, &team, &["-n", "x"], &gone),
+        check_launch(&deps, &team, &["-n", "x"], &gone).as_deref(),
+        Some("team is no longer registered")
+    );
+    assert_eq!(
+        check_launch(&deps, &max, &["-n", "x"], &gone),
         Some(format!("{} does not exist", gone.display()))
     );
     // The accounts still listed start as before.
     assert_eq!(check_launch(&deps, &max, &["-n", "x"], &dir), None);
     assert_eq!(check_launch(&deps, &max, &fork, &dir), None);
+}
+
+/// R16: the registry is read before anything else can end a launch or its check, so a change
+/// reaches the TUI whatever the answer is: a missing directory in the check, a missing agent
+/// executable in the launch (an attach has no check before it). An account that is gone is
+/// what is said, not the directory or the executable.
+#[test]
+fn the_registry_is_read_before_the_directory_and_the_executable() {
+    let sb = Sandbox::new();
+    let (deps, max, team) = two_accounts(&sb);
+    let listed = vec![Account::default_for(Provider::Claude), max.clone()];
+    let gone = sb.root().join("gone");
+
+    // The check, for a directory that does not exist: the change is told all the same.
+    sb.register(&[("max", home_of(&max))]);
+    let (events, error) = check_launch_events(&deps, &max, &["-n", "x"], &gone);
+    assert_eq!(error, Some(format!("{} does not exist", gone.display())));
+    assert_eq!(events, [Event::Accounts(listed.clone())]);
+
+    // The launch, in a TUI that found no `claude` when it started.
+    sb.register(&[("max", home_of(&max)), ("team", home_of(&team))]);
+    let deps = Deps {
+        claude: None,
+        ..self::deps(&sb)
+    };
+    sb.register(&[("max", home_of(&max))]);
+    let (tx, rx) = mpsc::channel();
+    let mut screen = FakeScreen::default();
+    let attach = request(&team, &["attach", "0badf00d"], None);
+    let event = tui::launch_in_foreground(&mut screen, &deps, attach, &tx).unwrap();
+    assert_eq!(
+        exit_of(&event),
+        &Err("team is no longer registered".to_string()),
+        "not the executable"
+    );
+    assert_eq!(
+        rx.try_iter().collect::<Vec<_>>(),
+        [Event::Accounts(listed)],
+        "told although nothing could have run"
+    );
+    // An account still listed is told of the executable.
+    let attach = request(&max, &["attach", "0badf00d"], None);
+    let event = tui::launch_in_foreground(&mut screen, &deps, attach, &tx).unwrap();
+    assert_eq!(
+        exit_of(&event),
+        &Err("`claude` not found on PATH".to_string())
+    );
+    assert!(screen.calls.is_empty());
+    assert!(sb.invocations().is_empty(), "{:?}", sb.invocations());
 }
 
 /// R16, R2: the same name registered again with another home is another account: a launch
