@@ -611,9 +611,12 @@ impl Redactor<'_> {
     }
 
     fn index(&self, index: &Index) -> Index {
+        // What the cache remembers of each account's store (names and real paths) is the
+        // refresh's and is never drawn: the copy holds none of it.
         let Index {
             schema_version,
             entries,
+            stores: _,
         } = index;
         Index {
             schema_version: *schema_version,
@@ -621,6 +624,7 @@ impl Redactor<'_> {
                 .iter()
                 .map(|(p, e)| (key_path(p), self.entry(e)))
                 .collect(),
+            stores: Default::default(),
         }
     }
 

@@ -388,15 +388,56 @@ remuda help [<command>]                            help for remuda or a command
     first 1 MB is unchanged before and after a file grows). The offset is cached; when a file has
     grown and its mtime is not earlier than the cached one, only the new bytes are parsed. The whole
     file is rescanned when it shrinks, when its size is unchanged but its mtime changed, when its
-    mtime moves backward, or when its inode changed (the file was replaced).
+    mtime moves backward, or when its inode changed (the file was replaced). The file is checked
+    again once it is open, since it may have changed after it was listed: it is read incrementally
+    only if it is then still larger than cached, the same inode, and its mtime not earlier.
   - When the tail window contains no complete record (the file ends with one very long line), the
     window grows by ×4, up to 4 MB.
   - Known limitation: when a large file's only `ai-title` is in the middle and the tail window does
     contain complete records, the title is not found and the first user text is used instead.
   - Only complete lines are parsed: a final line still being written is left for the next scan.
     Lines cut by a window boundary are discarded.
+  - **A directory that is gone and one that cannot be read are different things.** A store, or a
+    directory below it, that no longer exists has no transcripts: their entries drop out of the
+    index. One that exists but cannot be read says nothing about the transcripts below it: it
+    cannot be listed (permission denied, an I/O error: any error other than the directory not
+    existing, also one met partway through the listing), or it can be listed but what it lists
+    cannot be examined (a directory that may be read but not searched gives names and nothing
+    else). The entries that store has below it stay in the index and in its cache as they were
+    last indexed, the directories that can be read are indexed as usual, and the refresh says it
+    is incomplete, naming the directory (once, not again for what is below it) and the error.
+    `remuda sessions` still lists those sessions and warns on stderr; the TUI says so in the
+    status line. Nothing is read again once the directory can be read and its transcripts have
+    not changed. The entries of a store that is no longer listed drop out all the same, also
+    where they lie below a directory another store cannot read. A single transcript that cannot
+    be opened or read is left out, as before; so is one that is a symlink to somewhere out of
+    reach, which is one transcript and not a directory (the entry the index had for it drops
+    out, and nothing is reported), while a project directory that is such a symlink is a
+    directory that cannot be read.
+  - **Nor is a store that cannot be resolved a store that is gone.** A store is known by the
+    realpath of `projects`. When that cannot be found because the home, or a directory on the
+    way to it or to the target of a link, cannot be searched or read (any error other than the
+    directory not existing), the store may be there, and the path the home gives does not say
+    which entries are its. The index therefore remembers, for each store directory as its
+    home gives it (the whole path, `<home>/projects`), the real path it last resolved to. The
+    entries last indexed from that store stay in the index and in its cache as they were, the
+    stores that could be listed are indexed as usual, and the refresh says it is incomplete,
+    naming the directory as the home gives it and the error, as above. Nothing else stays for
+    it: the entries of a store that is gone, or whose account left the registry, drop out as
+    they always did, whatever cannot be resolved beside them; and where another account lists
+    the same store, its entries are that listing's. It is the directory that is remembered,
+    not the account's name: an account registered again under the same name with another home
+    takes over nothing of the old home's store, and one registered again under another name
+    with the same home keeps what that home's store had. When nothing is remembered of the
+    directory (it never resolved, or the cache was written before this was kept, or deleted),
+    there is nothing to tell its entries by: they drop out, and the store is reported all the
+    same. Meanwhile the store is not among the stores listed: a
+    codex rollout kept this way shows no account (R17). A `projects` that does not exist is no
+    store, as before.
 - Cache: `$REMUDA_HOME/state/index.json`, with a schema version; on a version mismatch it is
-  rebuilt. Written atomically; may be deleted at any time (R3).
+  rebuilt. Written atomically; may be deleted at any time (R3). Beside the entries it holds the
+  real path each store directory last resolved to (see above); a cache without that is read as
+  it is, the schema version being that of the entries.
 - The index is built in the background: the UI does not wait for it and shows progress and the rows
   obtained so far while it builds.
 - The list hides "noise" sessions by default: those whose first user text starts with
@@ -1319,12 +1360,25 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   per model over everything. Counts below 1,000 are shown whole, others in K, M, B, or T, with
   one decimal below 100 (`1.2M`, `93.3B`, `118K`).
 - **Only transcripts that exist count**: tokens of transcripts deleted since (claude deletes those
-  older than `cleanupPeriodDays`) are no longer counted.
+  older than `cleanupPeriodDays`) are no longer counted. A transcript below a directory that
+  exists but cannot be read (R8) is not known to be deleted: its counts stay in the cache and in
+  the report as they were last read, and the report says that it is incomplete, naming the
+  directory and how many transcripts below it are counted that way. A directory that no longer
+  exists has no transcripts. The same goes for a store, or a codex home's `archived_sessions`,
+  whose path cannot be resolved (R8): the cache remembers the real path each of them last
+  resolved to, by the directory as its home gives it and not by the account's name, the
+  transcripts last read from that directory stay counted as last read, and the
+  report names the directory as the home gives it. Nothing else stays for it: what was counted
+  from a directory that is gone (a home's `sessions`, say, while its `archived_sessions` cannot
+  be resolved) or whose account left the registry is no longer counted. A codex rollout kept
+  this way is counted as unattributed while that lasts: the accounts of its home are not known.
 - **Cache**: `$REMUDA_HOME/state/stats.json`, with a schema version, rebuilt on a mismatch,
   written atomically, deletable at any time (R3). For each transcript it holds what was counted
   from it (a 64-bit FNV-1a hash of each request's key, its timestamp, model, counts with the
   cache write by lifetime, and whether it used fast mode or US-only inference), how far the
-  transcript was read, and, for codex, the last total and model. Transcripts are read like the
+  transcript was read, and, for codex, the last total and model. Beside the transcripts it
+  holds the real path each store and `archived_sessions` last resolved to (R8), which a cache
+  written before that was kept lacks and is read without. Transcripts are read like the
   index (R8): an unchanged file is not read again, a grown one only from its last complete line,
   any other one whole; only complete lines are parsed. Records of one message read in two
   refreshes merge by their key. The first computation reads every transcript whole (measured:
@@ -1334,11 +1388,14 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   (default `all`) with a COST column, then a line saying the cost is ≈ API list price and the
   prices' date, and a line naming the models not priced, if any. With an account, it prints only
   the sections that include that account, and no overall section. Reading progress goes to
-  stderr, as for `sessions`.
+  stderr, as for `sessions`. A directory that could not be read is named in an `Incomplete:` line
+  on stdout, after the table and the lines that follow it, so that a report that is piped does
+  not pass for a complete one.
 - **TUI**: view `4`, Stats. The statistics are computed in the background the first time the
   view opens, and again on each `r` after that, with reading progress shown; `r` also reads the
   prices in `config.toml` again (when they cannot be read, the built-in prices are used and the
-  status line says so). `t` in the view cycles the period (all, today, 7 days, 30 days).
+  status line says so). A directory that could not be read is named in the status line too
+  (`incomplete: …`). `t` in the view cycles the period (all, today, 7 days, 30 days).
   The title says the cost is ≈ API list price, and the status line gives the prices' date unless it shows an error. Above
   the table, a chart shows the period over time: a bar per hour (today), per day (7 and 30 days),
   or, for all, per day from the first request with a timestamp (at most 3,660 days back), else

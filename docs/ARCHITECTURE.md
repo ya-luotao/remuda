@@ -73,6 +73,7 @@ Modules are layered: each layer uses the layers below it.
  │  recommendation: pick · jev                                               │
  ├─ reading agents' data ────────────────────────────────────────────────────┤
  │  index · transcript · provider::codex · provider::app_server · probe      │
+ │  tracking                                                                 │
  ├─ foundation ──────────────────────────────────────────────────────────────┤
  │  registry · provider · paths · privacy · text · owned                     │
  └───────────────────────────────────────────────────────────────────────────┘
@@ -110,10 +111,11 @@ The exceptions, all for a type or a small helper:
 | `usage` | Cached and live usage for both providers, window labels, severity, reset instants | R10 |
 | `live` | Running claude sessions: `agents --json`, `sessions/*.json` fallback checked against `ps`; attach, logs, stop, rm | R7, R16 |
 | `checks` | Warnings for the Accounts view, among them what a member's home links and does not (the relations of `home_items`, put into words) | R11 |
-| `index` | The session index over claude transcripts and codex rollouts; incremental cache | R8, R17 |
+| `index` | The session index over claude transcripts and codex rollouts: its stores, how they are listed, the head and tail windows of one file, its cache | R8, R17 |
+| `tracking` | Keeping a cache up to date with the files below a set of directories: which are reused, read on or read whole, the worker threads, what vanished, progress, and a directory that cannot be listed. Private; `index` and `stats` each give it an adapter | R8, R20 |
 | `transcript` | Reading claude transcripts without loading them whole: windows, complete lines, preview | R8 |
 | `attribution` | Which accounts a session belongs to: launch log, live sessions, `history.jsonl` | R9 |
-| `stats` | Token counting, deduplication across copies, periods, sections, chart buckets, text table | R20 |
+| `stats` | Token counting, deduplication across copies, periods, sections, chart buckets, text table; its sources, how they are listed, its cache | R20 |
 | `pricing` | Built-in prices and `[prices]` overrides; the cost of one request in picodollars | R20 |
 | `account_config` | What an account's sessions load and where each item comes from, on top of `share::plan` | R22 |
 | `pick` | `[pick]`; candidates, windows and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options | R3, R23 |
@@ -213,6 +215,47 @@ Both refreshes follow the append-only rule of R8: an unchanged file is skipped, 
 read from the last complete line, and a file that shrank, was replaced or moved back in time is
 read again whole. Only complete lines are parsed. The first index scan reads only a head and a
 tail window per file; the statistics read every file whole the first time.
+
+That rule is written once, in `tracking`. `index::refresh` and `stats::refresh` each hand
+`tracking::refresh` their cache's map and an adapter, a `tracking::Files`:
+
+```text
+  tracking::refresh(cache, directories, adapter, progress) -> RefreshStats
+    │  per listed file: reused · incremental · cold (size, mtime, inode)
+    │  opens it and stats it again: a decision is only downgraded
+    │  8 worker threads · what vanished drops out · progress
+    │  a directory that cannot be read: what the cache has of that store below
+    │  it stays, and it is reported (RefreshStats::unreadable)
+    │  a store that cannot be resolved: what the cache has of the real path it
+    │  last resolved to stays, and it is reported likewise
+    │
+    ├─ Files::list   index: projects/*/*.jsonl (top level), sessions/**/rollout-*.jsonl
+    │                stats: also below <project>/<session>/, and archived_sessions
+    └─ Files::read   index: head and tail windows of the open file → Entry
+                     stats: every complete line, in chunks → FileStats
+```
+
+The two adapters list differently on purpose (R8 takes the top level of a project, R20 also the
+subagent transcripts below it) and read differently; everything else is `tracking`'s. An adapter
+reads no directory and examines no entry itself: it lists through `tracking::Listing`, which is
+where a directory that does not exist (it has no files: what the cache had there drops out) is
+told from one that exists but cannot be read, because it cannot be listed or because what it
+lists cannot be examined (nothing is known: what the cache has of that store below it stays,
+and `remuda sessions`, `remuda stats` and the TUI say the result is incomplete).
+
+A store whose real path cannot be found (its home cannot be searched, say) fails before there
+is anything to list. `index::stores` and `stats::sources` leave it out, as they always did, so
+that `checks`, `attribution` and the TUI see the same lists; `index::resolve` and
+`stats::resolve` return those lists together with what each home gives as its directory
+(`index::Given`, one for each directory a home gives that is or may be there, with its real
+path or the error; for the statistics also a codex home's `archived_sessions`), told from
+missing ones by `tracking::real_dir`. `remuda sessions`, `remuda stats` and the TUI workers pass
+both to `index::refresh_with` / `stats::refresh_with`. A directory that cannot be resolved has
+no real path for its cached files to be below, so each cache remembers the real path every
+directory last resolved to, by the whole path its home gives it (`Index::stores`,
+`Cache::sources`, kept up by `tracking::remember`), and `tracking` keeps the files of that
+real path alone: a store that is gone or that left the registry drops out as usual, whatever
+cannot be resolved beside it, and an account's name carries nothing from one home to another.
 
 Deduplication is the heart of the statistics: a claude message counts once by `message.id`
 across records, forks and shared stores; a codex request counts once by its
@@ -445,6 +488,8 @@ cargo run --release --example codex_timing -- [<codex home>]
 | Write a new file below `$REMUDA_HOME`, or change a mode, a lock, or how a file is replaced | SPEC R3 / R13, `owned` (and its tests, which cover what all writes share); never `std::fs` writes elsewhere |
 | Support another agent CLI | SPEC R4, `provider` (every `match Provider`), `index`, `usage`, `identity` |
 | Read a new field from transcripts | `transcript` (index) or `stats` (counts); bump the cache's `SCHEMA_VERSION` |
+| Change when a file is read again, or what an unreadable directory means | SPEC R8, `tracking` (`decide`, `Listing`); its unit tests drive it with a fake adapter |
+| Keep another set of append-only files up to date | A `tracking::Files` adapter (how to list, how to read one file) and a map for `tracking::refresh` |
 | Add a TUI action | `tui::app` (`Key` → `Effect`), `tui::workers` (the effect), `tui::render`, `tui::privacy` |
 | Add something shown on screen | `tui::app` state, `tui::render`, and its case in `tui::privacy::redacted`; a path in a notice goes in with `Marked::path` |
 | Add a model price | SPEC R20 table and `pricing` |

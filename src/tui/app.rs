@@ -105,7 +105,8 @@ pub enum Event {
         total: usize,
         entries: Vec<Entry>,
     },
-    /// The complete index after a refresh (vanished transcripts are gone from it).
+    /// The complete index after a refresh (vanished transcripts are gone from it). `error`:
+    /// the directories that could not be read (R8), a cache that could not be written.
     IndexDone {
         entries: Vec<Entry>,
         error: Option<String>,
@@ -636,7 +637,8 @@ pub struct ConfigPane {
 pub struct StatsState {
     /// The last report; kept while the next one is computed.
     pub report: Option<stats::Report>,
-    /// Why the last computation could not write the cache.
+    /// What the last computation could not do: read a directory (the report is incomplete,
+    /// R20), write the cache, read the prices.
     pub error: Option<String>,
     pub in_flight: bool,
     /// The view has been opened: `r` computes again.
@@ -692,6 +694,7 @@ pub struct App {
     /// The cache has been loaded (or found missing): an empty list now means no sessions.
     pub index_loaded: bool,
     pub index_refreshed: Option<Timestamp>,
+    /// What the last refresh could not do: read a directory (R8), write the cache.
     pub index_error: Option<String>,
     pub(super) by_session: HashMap<String, PathBuf>,
 
