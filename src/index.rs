@@ -9,12 +9,12 @@ use anyhow::Result;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::Env;
 use crate::provider::{Provider, codex};
-use crate::registry::{self, Account};
+use crate::registry::Account;
 use crate::tracking::{self, Files, Listed, Listing, Stat};
 pub use crate::tracking::{RefreshStats, Unreadable};
 use crate::transcript::{self, Head, Tail, WINDOW, complete_lines, read_at};
+use crate::{Env, owned};
 
 /// Bump whenever [`Entry`] or the scanning rules change: a mismatching cache is rebuilt.
 ///
@@ -147,7 +147,7 @@ impl Index {
     /// Writes the cache atomically, as a file of `$REMUDA_HOME/state`: readable by the user
     /// alone, in a directory made or tightened to be (R3).
     pub fn save(&self, path: &Path) -> Result<()> {
-        registry::write_private(path, &serde_json::to_vec(self)?)
+        owned::save_cache(path, &serde_json::to_vec(self)?)
     }
 
     /// Entries newest first: by `ts_last` (else mtime), then path.

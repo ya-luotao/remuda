@@ -12,15 +12,15 @@ use jiff::{Timestamp, ToSpan};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
-use crate::Env;
 use crate::attribution::Attribution;
 use crate::index::{self, Given, RefreshStats};
 use crate::pricing::{PRICES_AS_OF, Prices, Rate};
 use crate::provider::Provider;
-use crate::registry::{self, Account};
+use crate::registry::Account;
 use crate::text::{self, human_count, human_usd};
 use crate::tracking::{self, Files, Listed, Listing, Stat};
 use crate::transcript::{complete_lines, contains, read_at};
+use crate::{Env, owned};
 
 /// Bump whenever [`Row`], [`FileStats`] or the counting rules change: a mismatching cache is
 /// rebuilt (2: cache write by lifetime, fast / US flags).
@@ -224,7 +224,7 @@ impl Cache {
     /// Writes the cache atomically, as a file of `$REMUDA_HOME/state`: readable by the user
     /// alone, in a directory made or tightened to be (R3).
     pub fn save(&self, path: &Path) -> Result<()> {
-        registry::write_private(path, &serde_json::to_vec(self)?)
+        owned::save_cache(path, &serde_json::to_vec(self)?)
     }
 
     /// After [`refresh`] reported `refreshed`: writes the cache unless the refresh changed

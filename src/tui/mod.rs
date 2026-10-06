@@ -37,7 +37,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::provider::Provider;
 use crate::registry::{Account, Registry};
-use crate::{Env, launch, paths, setup};
+use crate::{Env, launch, owned, paths, setup};
 
 use app::{App, Effect, Event, Exit, Key, LaunchRequest, Mode};
 
@@ -442,7 +442,7 @@ fn run_launch(
     };
     let mut warnings = launch::env_warnings(&deps.env);
     warnings.extend(plan.notices.iter().cloned());
-    let log = deps.state_dir.join("launches.jsonl");
+    let log = owned::launch_log(&deps.state_dir);
     if let Err(e) = screen.suspend() {
         let _ = screen.resume();
         return Ok((Err(format!("cannot hand the terminal over: {e}")), warnings));

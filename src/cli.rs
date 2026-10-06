@@ -16,7 +16,7 @@ use crate::privacy::Aliases;
 use crate::provider::Provider;
 use crate::registry::{self, Account, Registry};
 use crate::stats::{self, Period};
-use crate::{Env, paths};
+use crate::{Env, owned, paths};
 use crate::{attribution, jev, launch, live, pick, probe, setup, text, transcript, tui, usage};
 
 #[derive(Debug, Parser)]
@@ -449,7 +449,7 @@ fn exec_plan(
     for notice in &plan.notices {
         eprintln!("remuda: {notice}");
     }
-    let log = state_dir(config).join("launches.jsonl");
+    let log = owned::launch_log(&owned::state_dir(config));
     if let Err(e) = launch::append_log(&log, &plan.record) {
         eprintln!(
             "remuda: warning: cannot write launch log {}: {e:#}",
@@ -458,11 +458,6 @@ fn exec_plan(
     }
     let err = launch::exec(program, plan);
     Err(anyhow::Error::new(err).context(format!("cannot run {}", program.display())))
-}
-
-/// `$REMUDA_HOME/state`, the sibling of `config.toml` (R3).
-fn state_dir(config: &Path) -> PathBuf {
-    config.with_file_name("state")
 }
 
 /// `remuda list`: identities are queried in parallel; failures degrade to the cached
@@ -659,7 +654,7 @@ fn unreadable_lines(refreshed: &RefreshStats, file: &str, shown: &str) -> Vec<St
 /// attribution, then the newest `limit` sessions (R5, R8, R9).
 fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
     let accounts = Registry::load(config)?.all(&ctx.env);
-    let state = state_dir(config);
+    let state = owned::state_dir(config);
     let cache = state.join("index.json");
     let mut index = Index::load(&cache);
     let (stores, given) = index::resolve(&accounts, &ctx.env);
@@ -689,7 +684,7 @@ fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
         &ctx.env,
         live::TIMEOUT,
     );
-    let owners = attribution::collect(&accounts, &ctx.env, &state.join("launches.jsonl"), &live);
+    let owners = attribution::collect(&accounts, &ctx.env, &owned::launch_log(&state), &live);
 
     let mut rows = vec![
         ["TIME", "ACCOUNTS", "TITLE", "CWD"]
@@ -744,7 +739,7 @@ fn stats(
         Some(reference) => Some(registry.resolve(&reference)?.qualified()),
         None => None,
     };
-    let state = state_dir(config);
+    let state = owned::state_dir(config);
     let path = state.join("stats.json");
     let mut cache = stats::Cache::load(&path);
     let (sources, given) = stats::resolve(&accounts, &ctx.env);
@@ -760,7 +755,7 @@ fn stats(
             path.display()
         );
     }
-    let attribution = attribution::collect(&accounts, &ctx.env, &state.join("launches.jsonl"), &[]);
+    let attribution = attribution::collect(&accounts, &ctx.env, &owned::launch_log(&state), &[]);
     let report = stats::report(
         &cache,
         &sources,
@@ -881,7 +876,7 @@ fn open_tui(config: &Path, ctx: &Context, mode: tui::app::Mode) -> Result<Option
         tz: ctx.tz.clone(),
         clock: ctx.clock,
         config: config.to_path_buf(),
-        state_dir: state_dir(config),
+        state_dir: owned::state_dir(config),
         cwd: ctx.cwd.clone(),
         mode,
         private: false,

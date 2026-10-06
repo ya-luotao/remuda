@@ -110,6 +110,36 @@ switching to a different, logged-out account.
 - Writes are atomic (temporary file + rename) and preserve the user's comments and unknown keys
   (the comments of an account that `remove` deletes go with it, R14a). If `config.toml` is a
   symlink, writes go through the symlink.
+- `add`, `setup`, and `remove` read, check, and write `config.toml` under an exclusive lock on
+  the directory that holds the file being replaced (no lock file is created): `$REMUDA_HOME`
+  itself or, for a `config.toml` that is a symlink, the directory of the file it points at.
+  Every path to one registry so takes the same lock, two `$REMUDA_HOME`s that share one
+  through such a link included, and those that run at the same time each see the others'
+  changes: every account is kept, and a name asked for twice is given once, the other being
+  told it is taken (R14). `setup` takes the lock twice: for its
+  checks, before it creates the home, and again to register; it is not held in between, so
+  of two `setup`s of one name at once the second fails when it creates the home, which
+  exists by then (R13). On a file system without locks the three refuse and change nothing,
+  since a registry written without the lock could silently lose an account; `config.toml`
+  can still be edited by hand. The same holds where that directory cannot be opened for
+  reading (the user took their own read permission away): it cannot be locked. (Where `$REMUDA_HOME` does not exist yet there is nothing to
+  lock for the checks: a `setup` there learns it only when it registers, and the home it
+  created stays, R2.)
+- A write that is killed between creating its temporary file and the rename leaves that file
+  behind: `.remuda-<pid>-<32 hex digits>.tmp`, in the directory of the file being written
+  (for a `config.toml` or a cache that is a symlink: where it points). Those whose process no
+  longer exists are removed by a later write, and each write cleans one directory: a change
+  to the registry and a cache being saved, the directory their file is replaced in (their
+  own or, for a symlink, where it points); a line appended to the launch log, `state/`, the
+  directory the log is named in, and not where a log that is a symlink points; a new
+  settings file, `state/settings`; a launch that needs the shared instructions of R18,
+  `shared/claude/.claude`. So what a cache that is a symlink left where it points is removed
+  by the next cache saved there, not by a launch. One whose process may still be running is
+  being written and stays, whatever its age. A directory that cannot be listed (below)
+  keeps them until it can. This is the one name for everything
+  remuda writes and renames into place: the registry, the caches, the settings files, the
+  item links, and the rule copies of R18. A process ID that has since been given to another
+  process keeps its leftover until that one exits.
 - Loading validates strictly: an invalid name, a duplicate name, a claimed `default`, a named
   account whose `home` is not an absolute path, `share` on a codex account, a `[share.claude] from`
   that names no claude account, a `[prices."<model>"]` that is not a table, has a key other than
@@ -129,7 +159,10 @@ switching to a different, logged-out account.
   among them (R6), and the caches hold titles and directories. `state/` is created with mode
   0700 and its files with mode 0600. A `state/` or a launch log from before that the group or
   others could access is tightened by the next write there, and a cache is always replaced by a
-  file of mode 0600; nothing is ever loosened. Two modes are left as the user has them: that of
+  file of mode 0600; nothing is ever loosened. `state/settings` (R18) is created and
+  tightened like `state/`. A `state/` the user can search and write but not read (mode 0300,
+  say) is written in by name all the same, and keeps its mode: remuda opens it for that
+  alone, and only what needs to list it, the cleanup of leftovers above, waits. Two modes are left as the user has them: that of
   the directory a `state` symlink points at, and that of the file a symlink in `state/` points
   at; both are written through. The regular files remuda owns by name in a directory reached
   through a `state` symlink (the caches, the launch log) are its own all the same: created
@@ -586,18 +619,24 @@ The complete set of remuda's write operations:
 
 - `$REMUDA_HOME/config.toml`, `$REMUDA_HOME/state/**`, `$REMUDA_HOME/shared/**` (R18).
   Where the user put a symlink: a `config.toml`, a `state`, or a file in `state/` that is a
-  symlink is written through (R3); where it points, remuda touches only its own files (the
+  symlink (a cache, the launch log) is written through (R3); where it points, remuda touches
+  only its own files (the
   registry, the caches, the launch log, the settings files of R18). Modes there (R3): the
   directory a `state` symlink points at keeps its mode, and so does the file that a
   `config.toml` or a file in `state/` that is itself a symlink points at; a regular file
   remuda owns by name in a directory reached through a `state` symlink is still created with
   mode 0600, and the launch log there tightened to it. A launch log that is a symlink to a
   file others can access, or that is not a regular file, is not appended to (R3).
-  Below `shared`, remuda also replaces and removes links and rule copies, so it writes there
-  only below real directories: a `shared` or `shared/claude` that is a symlink, or that exists
-  and is not a directory, is refused before anything is created, replaced, or removed, and the
-  launch goes on without shared instructions (R18). What remains is the instant between that
-  check and the write (R18).
+  Below `shared` and in `state/settings`, remuda also replaces and removes what it keeps
+  there (links, rule copies, settings files), so it writes there only below real directories:
+  a `shared`, `shared/claude`, or `state/settings` that is a symlink, or that exists and is
+  not a directory, is refused before anything is created, replaced, or removed, and the
+  launch goes on without shared instructions, or without shared settings (R18). These
+  directories are reached as `setup` reaches a new home (below): `$REMUDA_HOME` is opened as
+  given (and `state` as R3 says), each level below is opened relative to the directory above
+  without following a symlink, and every file or link is created, replaced, or removed by
+  its name through the descriptor of the directory it is in. A symlink put at one of these
+  paths after remuda opened the directory redirects nothing (R18).
 - `$REMUDA_HOME/homes/<provider>/<name>/` created by `setup`: the directory itself and, for a
   claude account that is a member of `[share.claude]`, the symlinks of R18 in it, made once,
   while the directory is still empty, before the account is registered and logged in (login is
@@ -887,7 +926,8 @@ not see the sessions in the source's store (R11, R16).
   source does not have (missing, or a dangling link) gets no entry. remuda brings the directory to
   that state before a launch that needs it, and writes nothing when it already is: a missing link
   is created, one with another target is replaced atomically (a temporary link in the same
-  directory, renamed into place), and one for an item the source no longer has is removed. An
+  directory, renamed into place; one that a killed remuda left behind is removed by the next
+  launch, R3), and one for an item the source no longer has is removed. An
   entry named like an item that is not a symlink, or a `.claude` that is neither a directory nor
   a symlink, is never replaced: nothing is changed, and the launch goes on without shared
   instructions and says so. `shared` and `shared/claude` are directories of remuda's own, made
@@ -908,13 +948,19 @@ not see the sessions in the source's store (R11, R16).
   and the rename leaves no `.claude` (and an inert temporary directory, which is not touched)
   until the next member launch creates it. A remuda from before this layout, still running,
   refuses the directory ("is not a symlink") and launches without shared instructions, saying
-  so, until it is restarted. Residual: a `shared`, `shared/claude`, or `.claude` that is a
-  symlink when remuda looks is refused (or, for `.claude`, migrated), but the checks and the
-  writes are by path, so a process of the same user that replaced one of them with a
-  symlink in the instant between remuda's check and its write could redirect that write; remuda
-  never creates such a symlink, and such a process can already write there itself. The same
-  holds for the rule copies and their directories, where the redirected operation could also
-  replace or remove a `*.md` file.
+  so, until it is restarted. Residual: none by path below `$REMUDA_HOME`. A `shared`,
+  `shared/claude`, or `.claude` that is a symlink is refused (or, for `.claude`, migrated),
+  and so is `rules` or a directory of the copies that is one; each is opened relative to the
+  directory above without following a symlink, and the links and the copies are created,
+  replaced, and removed through the descriptor of the directory they are in (R13). A process
+  of the same user that puts a symlink at one of these paths, or moves the directory away,
+  after remuda opened it redirects no write: the write lands in the directory remuda opened,
+  and the next launch treats the symlink as it does any it finds there (refused; migrated
+  for `.claude`). What remains is `$REMUDA_HOME`
+  itself, opened as the path the user gave; the source's items, whose existence is read by
+  path a moment before each link is made; and the reading that decides what to copy or
+  remove under `rules`, which is by path: a path replaced at that moment can make remuda copy
+  a rule again or give up with an error, not write or remove anything elsewhere.
   Basis (verified on 2.1.282): with the environment variable set, `--add-dir=<dir>` loads
   `<dir>/.claude/CLAUDE.md` and the skills, commands, and agents under `<dir>/.claude/` with their
   plain names, through per-item symlinks exactly as through a whole-home `.claude` symlink: a
@@ -942,11 +988,13 @@ not see the sessions in the source's store (R11, R16).
   brings it to that state together with the item links, before a launch that needs it, and
   writes nothing when it already is:
   - a copy that is missing or whose content differs is written read-only (mode 0400) under a
-    temporary name in its directory (`.<32 hex digits>.tmp`, not a rule's name) and renamed
-    into place; directories are made one level at a time, never through a link;
+    temporary name in its directory (R3: `.remuda-<pid>-<32 hex digits>.tmp`, not a rule's
+    name) and renamed into place; directories are made one level at a time, never through a
+    link;
   - a regular `*.md` file there that the source no longer has is removed, and so is a temporary
-    file a write cut short left behind, and then the directories that leaves empty, `rules`
-    included. A file reached under another spelling of a rule's name (a file system that
+    file a write cut short left behind (every one there is, under the lock below, whichever
+    process made it; `.<32 hex digits>.tmp`, the name earlier versions used, counts as one),
+    and then the directories that leaves empty, `rules` included. A file reached under another spelling of a rule's name (a file system that
     ignores case) is that rule's copy and stays;
   - a rule that became a directory of rules, or the reverse, replaces the copy of the other
     kind: the removals come first, and a directory in a copy's place goes when they leave it
@@ -1044,7 +1092,11 @@ not see the sessions in the source's store (R11, R16).
   when the content is unchanged; files not used for 30 days are removed when a new one is written,
   under an exclusive lock on `state/settings/.lock` (a regular file) that reuse also takes, so a
   file is never removed between being chosen and being passed; on a filesystem that does not
-  support locking, remuda proceeds without the lock). claude reads the file once at startup and keeps its
+  support locking, remuda proceeds without the lock). `state/settings` is a directory of
+  remuda's own, the user's alone (R3): remuda removes files there, so one that is a symlink,
+  or that exists and is not a directory, is refused as a `shared` that is one is (R13):
+  nothing is written or removed where it points, and the launch goes on without shared
+  settings and says so. claude reads the file once at startup and keeps its
   content (2.1.281 bundle).
   This keeps settings values out of the process list and away from per-argument size limits.
   `autoMemoryDirectory` is added to the same JSON when auto-memory is injected. If the user's

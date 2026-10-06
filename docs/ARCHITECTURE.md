@@ -24,7 +24,7 @@ commands, and launches them with the right environment and options.
    │  registry   launch · share           index · attribution       │
    │  paths      identity · usage · live  stats · pricing           │
    │  provider   checks · account_config  transcript · probe · text │
-   │  privacy    pick · jev                                         │
+   │  privacy    pick · jev · home_items  owned (every write)       │
    └──────────────────────┬─────────────────────────────────────────┘
           reads │         │ runs            │ writes (R13)
                 ▼         ▼                 ▼
@@ -46,11 +46,13 @@ Three rules shape the whole design and are worth knowing before reading any modu
 - **Home strings are sacred** (R2). A home is stored and passed to the agent byte-for-byte.
   Canonical paths (realpath) are used only to compare directories: shared stores, duplicate
   registrations, components already shared with the source. They are never passed to an agent.
-- **Writes are confined** (R13). Everything remuda writes is under `$REMUDA_HOME`. The one
-  write inside a home is the set of symlinks `setup` makes in the directory it has just created,
-  before the login (R12, R18); nothing is written into a home after that, or into a home
-  registered with `add`. `setup` reaches that directory without following a symlink below
-  `$REMUDA_HOME`, and writes into it through its descriptor.
+- **Writes are confined** (R13). Everything remuda writes is under `$REMUDA_HOME`, and all of
+  it is written by one module, `owned`. The one write inside a home is the set of symlinks
+  `setup` makes in the directory it has just created, before the login (R12, R18); nothing is
+  written into a home after that, or into a home registered with `add`. `owned` reaches every
+  directory it creates, replaces, or removes in without following a symlink below
+  `$REMUDA_HOME`, and writes into it through its descriptor; the symlinks it writes through
+  are the ones R3 names (`config.toml`, `state`, a file in `state/`).
 - **The library never reads the process environment.** `main.rs` captures the command line, the
   environment, the current directory, the clock, the time zone and whether the standard streams
   are terminals into a `cli::Context` once, and everything below receives an `Env` snapshot.
@@ -65,7 +67,7 @@ Modules are layered: each layer uses the layers below it.
  │  main ──► cli                        tui ─ app · workers · render ·       │
  │                                            privacy · timeline · search    │
  ├─ features ────────────────────────────────────────────────────────────────┤
- │  launch · share · setup               accounts: identity · usage · live · │
+ │  launch · share · setup · home_items  accounts: identity · usage · live · │
  │                                                 checks · account_config   │
  │  sessions: attribution                tokens:   stats · pricing           │
  │  recommendation: pick · jev                                               │
@@ -73,7 +75,7 @@ Modules are layered: each layer uses the layers below it.
  │  index · transcript · provider::codex · provider::app_server · probe      │
  │  tracking                                                                 │
  ├─ foundation ──────────────────────────────────────────────────────────────┤
- │  registry · provider · paths · privacy · text                             │
+ │  registry · provider · paths · privacy · text · owned                     │
  └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -86,31 +88,36 @@ The exceptions, all for a type or a small helper:
   R20), and `[pick]` with `pick::Config::from_document` (R3, R23).
 - `pricing` prices `stats::Tokens`; `provider::codex` lists rollouts with `index::list_rollouts` and checks rate limits with
   `usage::codex_rows`.
+- `home_items` and `share` use each other: `share::plan` starts from the relations
+  `home_items` gives it, and `home_items` reads the source's `settings.json` and counts its
+  rule files with `share`'s readers (`read_settings`, `withheld`, `rule_files`).
 
 | Module | Responsibility | SPEC |
 | --- | --- | --- |
 | `main.rs` | Parse arguments, capture the process context, call `cli::run` | – |
 | `cli` | Every subcommand; the `run` fast path and `exec`; plain-text output | R5, R6, R14, R14a, R20, R23 |
-| `registry` | `config.toml`: load and validate strictly, resolve `name` / `provider:name`, add, remove, atomic comment-preserving writes; `[share.claude]` and `[prices]` | R1, R3, R14, R14a |
+| `registry` | `config.toml`: load and validate strictly, resolve `name` / `provider:name`, add, remove, comment-preserving edits (written by `owned`, under its lock); `[share.claude]` and `[prices]` | R1, R3, R14, R14a |
+| `owned` | Every write below `$REMUDA_HOME`: the way down without following a symlink (`Dir`), private modes and tightening, temporary file + rename and the cleanup of leftovers, exclusive locks (`Locks`), the registry's locked update, the caches, the launch log's rules; where things are (`state_dir`, `launch_log`, …) | R3, R13, R18 |
 | `paths` | `$REMUDA_HOME`, `~` expansion, home string checks, the native login's directory | R2, R3 |
 | `provider` | What differs between claude and codex: isolation variable, stores, launch arguments, login | R4 |
 | `provider::codex` | Rollout parsing: head/tail windows, titles from `session_index.jsonl`, preview, cached rate limits | R10, R17 |
 | `provider::app_server` | JSON-RPC client for `codex app-server` (`account/read`, `account/rateLimits/read`) | R4, R10 |
 | `probe` | Run a short agent command with captured output and a timeout (killing the process group); run many in parallel; run `curl` with its configuration on stdin | R4, R10, R23 |
-| `launch` | Classify arguments, inject `--session-id`, set or unset the home variable, the launch log, `exec` and foreground runs | R2, R6, R16, R17 |
-| `share` | Shared configuration injected at launch, the fallback for what a home does not link: `plan` (reads only) and `apply` (item links, rule copies, settings file) | R18 |
-| `setup` | Create the new home, link a member's to the source's session store and configuration (`LINKS`, `share_links`), and register it; the login command | R5, R12, R13, R17, R18 |
+| `launch` | Classify arguments, inject `--session-id`, set or unset the home variable, the launch record, `exec` and foreground runs | R2, R6, R16, R17 |
+| `share` | Shared configuration injected at launch, the fallback for what a home does not link: `plan` (reads only; a `Plan` carries the relation of every shared item) and `apply` (item links, rule copies, settings file: what they are; `owned` writes them) | R18 |
+| `home_items` | The items of a claude home, once: the catalog (each item's name, whether `setup` links it and on what condition, whether the launch's `--add-dir` carries it, when the source's counts as one to share, what breaks when it is another account's) and how a member's home relates to the source's right now (`Source::relate`, `linked_elsewhere`, `membership`) | R11, R12, R18 |
+| `setup` | Create the new home (through `owned`), link a member's to the source's session store and configuration (`share_links`, over the catalog of `home_items`), and register it; the login command | R5, R12, R13, R17, R18 |
 | `identity` | `claude auth status --json`, `.claude.json` fallback, `codex login status`, `account/read` | R10a |
 | `usage` | Cached and live usage for both providers, window labels, severity, reset instants | R10 |
 | `live` | Running claude sessions: `agents --json`, `sessions/*.json` fallback checked against `ps`; attach, logs, stop, rm | R7, R16 |
-| `checks` | Warnings for the Accounts view, among them what a member's home links and does not | R11 |
+| `checks` | Warnings for the Accounts view, among them what a member's home links and does not (the relations of `home_items`, put into words) | R11 |
 | `index` | The session index over claude transcripts and codex rollouts: its stores, how they are listed, the head and tail windows of one file, its cache | R8, R17 |
 | `tracking` | Keeping a cache up to date with the files below a set of directories: which are reused, read on or read whole, the worker threads, what vanished, progress, and a directory that cannot be listed. Private; `index` and `stats` each give it an adapter | R8, R20 |
 | `transcript` | Reading claude transcripts without loading them whole: windows, complete lines, preview | R8 |
 | `attribution` | Which accounts a session belongs to: launch log, live sessions, `history.jsonl` | R9 |
 | `stats` | Token counting, deduplication across copies, periods, sections, chart buckets, text table; its sources, how they are listed, its cache | R20 |
 | `pricing` | Built-in prices and `[prices]` overrides; the cost of one request in picodollars | R20 |
-| `account_config` | What an account's sessions load and where each item comes from | R22 |
+| `account_config` | What an account's sessions load and where each item comes from, on top of `share::plan` | R22 |
 | `pick` | `[pick]`; candidates, windows and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options | R3, R23 |
 | `jev` | The request to Jev (aliased state, Choice and Score questions), `curl` transport, response parsing | R23 |
 | `privacy` | Account-name aliases, whole-word aliasing of names in free text, and aliasing of every `provider:name` in the `pick` notes | R21, R23 |
@@ -151,7 +158,7 @@ differ between them (R6, R16, R18).
         │
         ▼
  append_log(state/launches.jsonl)      the session ID is on disk before the agent starts;
-        │                              state/ is 0700 and the log 0600 (R3)
+        │                              state/ is 0700 and the log 0600 (R3, owned::append_log)
         │
         ▼
  exec(claude, [shared options…] + [user args with --session-id <uuid>])
@@ -316,9 +323,10 @@ Accounts share one session store and their configuration through symlinks in eac
         │                 (a symlinked homes or homes/claude is refused), and the new home
         │                 stays open
         ├─ share_links    through that descriptor, only if the directory is empty: for each
-        │                 item of LINKS the source has, work/<item> -> <source home>/<item>
-        │                 (as registered); settings.json only if it has no
-        │                 authentication at that moment (checked once);
+        │                 item the catalog says setup links (home_items) that the source
+        │                 has, work/<item> -> <source home>/<item> (as registered);
+        │                 settings.json only if it has no authentication at that moment
+        │                 (checked once);
         │                 never .claude.json, history.jsonl, sessions, remote-settings.json,
         │                 policy-limits.json; nothing replaced, nothing removed
         └─ register       config.toml
@@ -329,6 +337,35 @@ Accounts share one session store and their configuration through symlinks in eac
 
 A home registered with `add` is never linked by remuda; `checks::sharing` reports what it does
 not link (R11).
+
+What a home holds, and what a member's home has of the source's, is answered in one place,
+`home_items`, and read everywhere else:
+
+```text
+ home_items
+   the catalog      in R18's order: 13 items a member shares with the source (session
+                    store, then configuration), 5 that stay per account
+   Source           the source's home: its settings.json read once, its authentication
+                    settings (withheld), what setup links (setup_links)
+   Source::relate   member's home × source ─► for each shared item, one of:
+                    linked (same realpath) │ unlinked (the source has it and the home
+                    does not reach it) │ the source has none
+   linked_elsewhere a per-account item that is a link to another account's
+   membership       Alone │ Source │ OptedOut │ SourceMissing │ Member
+        │
+        ├─► share::plan       what is linked is not injected; Plan.items keeps the table
+        │        └─► account_config::read   origins in the Configuration pane (R22)
+        ├─► checks::sharing   what is not linked, in words (R11)
+        └─► setup             share_links and its notes (R18)
+```
+
+None of these spells an item's name or decides by itself whether a home has the source's, so
+they cannot disagree about what is linked. Paths are always the home as registered with the
+item's name appended (R2); realpaths are compared inside `home_items` and never leave it.
+The catalog does not say how a launch injects the settings, the plugins or the memory
+locations: `share::plan` decides that, item by item, from the relations. Of injection the
+catalog knows only which items the one `--add-dir` carries, as links or as copies, because
+`share` builds its directory from that list.
 
 Injection is the fallback for what a member's home does not link. `share::plan` decides, for
 one account, one directory and one argument list, what the source's configuration adds;
@@ -355,8 +392,10 @@ pane cannot disagree with a launch.
 ```
 
 Each row is skipped when the member's home already resolves to the source's item by realpath
-(the links above, R12), so nothing loads twice; a fully linked home gets nothing injected.
-Sessions have no row: they are shared only through the `projects` link.
+(linked, in the relations above: R12), so nothing loads twice; a fully linked home gets
+nothing injected. Sessions have no row: they are shared only through the `projects` link, and
+so are `file-history`, `hooks`, `output-styles` and `keybindings.json`, which no launch option
+carries.
 
 ## Files remuda owns
 
@@ -381,13 +420,38 @@ Sessions have no row: they are shared only through the `projects` link.
 `launches.jsonl` is the only file in `state/` whose loss costs information: attribution of
 sessions started through remuda falls back to `history.jsonl`.
 
+The modules in the right column decide what a file holds; `owned` is the one that writes it.
+What every write there has in common lives in that module and is tested there once:
+
+```text
+ owned::Dir            an open directory of remuda's own: each level opened from the one
+                       above with O_NOFOLLOW, every operation an *at call on one entry name
+   state / settings    private (0700, tightened, never loosened); `state` may be a symlink
+   shared / homes      real directories or refused (Blocked: Symlink, NotADirectory)
+   write, replace_link `.remuda-<pid>-<32 hex>.tmp` in the same directory, then rename
+   sweep               removes the temporary files of processes that are gone
+   (a directory that can be searched and written but not read is opened for that alone:
+    written in by name, not listed, so not swept and not locked)
+   lock, lock_file     flock through the `Locks` seam; Lockless::Refuse (the registry)
+                       or Lockless::Proceed (settings, shared instructions)
+ owned::update_registry  lock the directory of the file that is replaced ($REMUDA_HOME, or
+                         where a symlinked config points), run the edit, write it there
+ owned::save_cache       0600 whatever was there; through a symlinked cache file
+ owned::append_log       regular file only, the user's alone, opened without blocking
+```
+
+The symlinks remuda writes through are the three R3 names; everything else is opened without
+following one. Reads do not go through `owned`, so a command that only reads creates nothing.
+
 ## Tests
 
 Integration tests live in `tests/`, one file per area, each naming the SPEC entries it covers in
 its first line. `tests/common/` builds the sealed sandbox (R15): a fresh `HOME` and
 `REMUDA_HOME`, a cleared environment, and fake `claude` and `codex` scripts first on `PATH` that
 record their arguments and environment and answer from fixtures. `tests/common/transcripts.rs`
-and `tests/common/rollouts.rs` build synthetic records with the real shapes.
+and `tests/common/rollouts.rs` build synthetic records with the real shapes, and
+`tests/common/homes.rs` builds claude homes (a source's items, a member's links); the unit
+tests include that same file (`src/lib.rs`), so there is one builder.
 
 | Test file | Covers |
 | --- | --- |
@@ -419,7 +483,9 @@ cargo run --release --example codex_timing -- [<codex home>]
 | --- | --- |
 | Add or change a subcommand | SPEC R5, `cli`, a `tests/*_cli.rs` file |
 | Change what a launch passes to the agent | SPEC R6 / R18, `launch::prepare_with` or `share::plan` |
-| Change what `setup` links in a new home | SPEC R12 / R13 / R18, `setup::LINKS` and `setup::share_links`, `tests/setup_cli.rs`; it is the write boundary |
+| Change what `setup` links in a new home | SPEC R12 / R13 / R18, the catalog in `home_items` (`ITEMS`, read through `Source::setup_links`) and `setup::share_links`, `tests/setup_cli.rs`; it is the write boundary |
+| Add an item of a home, or change how one is shared or kept per account | SPEC R11 / R18, its entry in `home_items::ITEMS`; then `share::plan` if a launch injects it, `checks::sharing` if the Accounts view warns about it |
+| Write a new file below `$REMUDA_HOME`, or change a mode, a lock, or how a file is replaced | SPEC R3 / R13, `owned` (and its tests, which cover what all writes share); never `std::fs` writes elsewhere |
 | Support another agent CLI | SPEC R4, `provider` (every `match Provider`), `index`, `usage`, `identity` |
 | Read a new field from transcripts | `transcript` (index) or `stats` (counts); bump the cache's `SCHEMA_VERSION` |
 | Change when a file is read again, or what an unreadable directory means | SPEC R8, `tracking` (`decide`, `Listing`); its unit tests drive it with a fake adapter |
