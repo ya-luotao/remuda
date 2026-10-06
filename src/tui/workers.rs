@@ -318,11 +318,11 @@ fn refresh_index(deps: &Deps, tx: &Sender<Event>) {
     let _ = tx.send(Event::IndexLoaded(
         index.entries.values().cloned().collect(),
     ));
-    let stores = index::stores(&deps.accounts, &deps.env);
+    let (stores, given) = index::resolve(&deps.accounts, &deps.env);
     let _ = tx.send(Event::Stores(stores.clone()));
     let mut batch = Vec::new();
     let mut last = Instant::now();
-    let refreshed = index::refresh(&mut index, &stores, |p| {
+    let refreshed = index::refresh_with(&mut index, &stores, &given, |p| {
         if let Some(entry) = p.entry {
             batch.push(entry.clone());
         }
@@ -364,9 +364,9 @@ fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
     };
     let path = deps.state_dir.join("stats.json");
     let mut cache = stats::Cache::load(&path);
-    let sources = stats::sources(&deps.accounts, &deps.env);
+    let (sources, given) = stats::resolve(&deps.accounts, &deps.env);
     let mut last = Instant::now();
-    let refreshed = stats::refresh(&mut cache, &sources, |done, total| {
+    let refreshed = stats::refresh_with(&mut cache, &sources, &given, |done, total| {
         if done == 0 || done == total || last.elapsed() >= PROGRESS_EVERY {
             last = Instant::now();
             let _ = tx.send(Event::StatsProgress { done, total });
@@ -587,6 +587,55 @@ mod tests {
         assert!(matches!(
             stats.last(),
             Some(Event::Stats { error: None, .. })
+        ));
+    }
+
+    /// R8, R20 (review #10): a home that cannot be searched: its store cannot be resolved,
+    /// which is told with the result, and what was cached of it stays.
+    #[test]
+    fn a_store_that_cannot_be_resolved_is_told_and_keeps_what_was_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let indexed = |e: &Event| matches!(e, Event::IndexDone { .. });
+        let counted = |e: &Event| matches!(e, Event::Stats { .. });
+        collect(Effect::RefreshIndex, &deps, indexed);
+        collect(Effect::Stats, &deps, counted);
+
+        let home = dir.path().join("max");
+        let chmod = |mode| fs::set_permissions(&home, fs::Permissions::from_mode(mode)).unwrap();
+        chmod(0o000);
+        let index = collect(Effect::RefreshIndex, &deps, indexed);
+        let stats = collect(Effect::Stats, &deps, counted);
+        chmod(0o755);
+        let said = |error: &Option<String>| {
+            let error = error.as_deref().expect("an incomplete refresh says so");
+            let store = home.join("projects");
+            assert!(
+                error.starts_with(&format!("incomplete: cannot read {}: ", store.display())),
+                "{error}"
+            );
+        };
+        assert!(
+            index.contains(&Event::Stores(vec![])),
+            "no store is listed: {index:?}"
+        );
+        let Some(Event::IndexDone { entries, error }) = index.last() else {
+            panic!("{index:?}")
+        };
+        assert_eq!(entries.len(), 2);
+        said(error);
+        let Some(Event::Stats { report, error }) = stats.last() else {
+            panic!("{stats:?}")
+        };
+        assert_eq!(report.files, 2);
+        said(error);
+
+        // Resolved again: nothing more to say.
+        let index = collect(Effect::RefreshIndex, &deps, indexed);
+        assert!(matches!(
+            index.last(),
+            Some(Event::IndexDone { entries, error: None }) if entries.len() == 2
         ));
     }
 

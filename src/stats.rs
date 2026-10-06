@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Env;
 use crate::attribution::Attribution;
-use crate::index::{self, RefreshStats};
+use crate::index::{self, Given, RefreshStats};
 use crate::pricing::{PRICES_AS_OF, Prices, Rate};
 use crate::provider::Provider;
 use crate::registry::{self, Account};
@@ -184,6 +184,13 @@ pub struct Cache {
     pub schema_version: u32,
     /// Keyed by transcript path.
     pub files: BTreeMap<PathBuf, FileStats>,
+    /// The real path of each source when it was last read, by the directory as its home gives
+    /// it ([`Given::path`]): which files are a source's while it cannot be resolved (R8, R20).
+    /// By the whole path, like [`index::Index::stores`]. Absent from a cache written before it
+    /// was kept, which is read as remembering nothing; neither [`Row`], [`FileStats`] nor the
+    /// counting rules changed, so the schema version did not.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sources: BTreeMap<PathBuf, PathBuf>,
 }
 
 impl Default for Cache {
@@ -191,6 +198,7 @@ impl Default for Cache {
         Cache {
             schema_version: SCHEMA_VERSION,
             files: BTreeMap::new(),
+            sources: BTreeMap::new(),
         }
     }
 }
@@ -220,11 +228,13 @@ impl Cache {
     }
 
     /// After [`refresh`] reported `refreshed`: writes the cache unless the refresh changed
-    /// nothing (it read nothing into the cache and dropped nothing from it) and the file exists
-    /// (it is tens of MB on a large corpus). Returns whether it was written.
+    /// nothing (it read nothing into the cache, dropped nothing from it, and what it remembers
+    /// of the sources is as it was) and the file exists (it is tens of MB on a large corpus).
+    /// Returns whether it was written.
     pub fn save_if_changed(&self, path: &Path, refreshed: &RefreshStats) -> Result<bool> {
-        let changed =
-            refreshed.reused + refreshed.kept() != refreshed.files || refreshed.removed > 0;
+        let changed = refreshed.reused + refreshed.kept() != refreshed.files
+            || refreshed.removed > 0
+            || refreshed.remembered;
         if !changed && path.exists() {
             return Ok(false);
         }
@@ -264,9 +274,19 @@ pub struct Source {
 
 /// The sources of `accounts`: the session stores of the index (R8, R17), then each codex
 /// home's `archived_sessions`, grouped by realpath like the stores. Missing directories are
-/// skipped.
+/// skipped. A directory that may be there and cannot be resolved is left out too: [`resolve`]
+/// tells of those.
 pub fn sources(accounts: &[Account], env: &Env) -> Vec<Source> {
-    let mut out: Vec<Source> = index::stores(accounts, env)
+    resolve(accounts, env).0
+}
+
+/// The sources of `accounts` ([`sources`]), and each directory a home gives as a source with
+/// what resolving it found: those of [`index::resolve`], then the `archived_sessions`. For
+/// [`refresh_with`], which remembers those that resolved and keeps what the cache has of those
+/// that could not be (R8, R20). A directory that does not exist is in neither.
+pub fn resolve(accounts: &[Account], env: &Env) -> (Vec<Source>, Vec<Given>) {
+    let (stores, mut given) = index::resolve(accounts, env);
+    let mut out: Vec<Source> = stores
         .into_iter()
         .map(|store| Source {
             kind: match store.provider {
@@ -281,12 +301,19 @@ pub fn sources(accounts: &[Account], env: &Env) -> Vec<Source> {
         let Some(home) = account.home_dir(env) else {
             continue;
         };
-        let Ok(real) = fs::canonicalize(home.join("archived_sessions")) else {
-            continue;
+        let path = home.join("archived_sessions");
+        let real = match tracking::real_dir(&path) {
+            Ok(None) => continue,
+            Ok(Some(real)) => Ok(real),
+            Err(error) => Err(error),
         };
-        if !real.is_dir() {
-            continue;
-        }
+        given.push(Given {
+            provider: Provider::Codex,
+            path,
+            account: account.qualified(),
+            real: real.clone(),
+        });
+        let Ok(real) = real else { continue };
         match out
             .iter_mut()
             .find(|s| s.kind == SourceKind::CodexArchived && s.path == real)
@@ -299,7 +326,7 @@ pub fn sources(accounts: &[Account], env: &Env) -> Vec<Source> {
             }),
         }
     }
-    out
+    (out, given)
 }
 
 /// `<store>/*/*.jsonl` (the session id is the stem), and every `*.jsonl` at any depth below a
@@ -340,18 +367,33 @@ fn jsonl_stem(name: &str) -> Option<&str> {
     name.strip_suffix(".jsonl").filter(|s| !s.is_empty())
 }
 
+/// A directory the statistics track.
+enum Dir<'a> {
+    Source(&'a Source),
+    /// One that may be a source and whose real path could not be found.
+    Unresolved {
+        given: &'a Given,
+        error: &'a str,
+        /// The real path it had when it was last read, if the cache remembers one.
+        last: Option<&'a Path>,
+    },
+}
+
 /// How the statistics list a source and read one of its files ([`tracking::Files`]).
 struct Requests;
 
-impl Files<Source> for Requests {
+impl Files<Dir<'_>> for Requests {
     type Tracked = FileStats;
 
-    fn list(&self, source: &Source, listing: &mut Listing) {
-        match source.kind {
-            SourceKind::Claude => list_claude(&source.path, listing),
-            SourceKind::CodexSessions | SourceKind::CodexArchived => {
-                index::list_rollouts(&source.path, listing)
-            }
+    fn list(&self, dir: &Dir<'_>, listing: &mut Listing) {
+        match dir {
+            Dir::Source(source) => match source.kind {
+                SourceKind::Claude => list_claude(&source.path, listing),
+                SourceKind::CodexSessions | SourceKind::CodexArchived => {
+                    index::list_rollouts(&source.path, listing)
+                }
+            },
+            Dir::Unresolved { given, error, .. } => listing.unresolved(&given.path, error),
         }
     }
 
@@ -363,18 +405,27 @@ impl Files<Source> for Requests {
         }
     }
 
-    fn listed_under(file: &FileStats, source: &Source) -> bool {
-        file.source == source.path && file.provider == source.kind.provider()
+    /// Of a directory that could not be resolved: of the source it was when last read.
+    fn listed_under(file: &FileStats, dir: &Dir<'_>) -> bool {
+        let (source, provider) = match dir {
+            Dir::Source(source) => (Some(source.path.as_path()), source.kind.provider()),
+            Dir::Unresolved { given, last, .. } => (*last, given.provider),
+        };
+        source == Some(file.source.as_path()) && file.provider == provider
     }
 
     fn read(
         &self,
-        source: &Source,
+        dir: &Dir<'_>,
         listed: &Listed,
         file: &File,
         stat: Stat,
         cached: Option<&FileStats>,
     ) -> Option<(FileStats, u64)> {
+        // Nothing is listed for a directory that could not be resolved.
+        let Dir::Source(source) = dir else {
+            return None;
+        };
         count(source, listed, file, stat, cached, CHUNK)
     }
 }
@@ -389,11 +440,47 @@ impl Files<Source> for Requests {
 pub fn refresh(
     cache: &mut Cache,
     sources: &[Source],
+    progress: impl FnMut(usize, usize),
+) -> RefreshStats {
+    track(cache, sources, None, progress)
+}
+
+/// [`refresh`], given also what each home gives as a source ([`resolve`]). The cache remembers
+/// the real path of each directory that resolved ([`Cache::sources`]). For one that could not
+/// be resolved, the cached files of the source it was when it was last read stay as they
+/// were, unless another account lists that source, and the directory is reported in
+/// [`RefreshStats::unreadable`]; the files of any other source that is not listed drop out as
+/// usual (R8, R20). [`refresh`] itself leaves what is remembered alone.
+pub fn refresh_with(
+    cache: &mut Cache,
+    sources: &[Source],
+    given: &[Given],
+    progress: impl FnMut(usize, usize),
+) -> RefreshStats {
+    track(cache, sources, Some(given), progress)
+}
+
+fn track(
+    cache: &mut Cache,
+    sources: &[Source],
+    given: Option<&[Given]>,
     mut progress: impl FnMut(usize, usize),
 ) -> RefreshStats {
-    tracking::refresh(&mut cache.files, sources, &Requests, |p| {
+    // As it was before this refresh: where each directory that cannot be resolved now was.
+    let remembered = cache.sources.clone();
+    let unresolved = given.unwrap_or_default().iter().filter_map(|given| {
+        let (path, error) = given.unresolved()?;
+        let last = remembered.get(path).map(PathBuf::as_path);
+        Some(Dir::Unresolved { given, error, last })
+    });
+    let dirs: Vec<Dir<'_>> = sources.iter().map(Dir::Source).chain(unresolved).collect();
+    let mut stats = tracking::refresh(&mut cache.files, &dirs, &Requests, |p| {
         progress(p.done, p.total)
-    })
+    });
+    if let Some(given) = given {
+        stats.remembered = tracking::remember(&mut cache.sources, given);
+    }
+    stats
 }
 
 /// Counts one file, open as `file`: on from `cached` (from its offset), or whole, reading

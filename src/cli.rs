@@ -634,8 +634,8 @@ const UNREADABLE_NAMED: usize = 5;
 fn unreadable_lines(refreshed: &RefreshStats, file: &str, shown: &str) -> Vec<String> {
     let kept = |n: usize, below: &str| match n {
         0 => String::new(),
-        1 => format!("; 1 {file} below {below} is {shown}"),
-        n => format!("; {n} {file}s below {below} are {shown}"),
+        1 => format!("; 1 {file} {below} is {shown}"),
+        n => format!("; {n} {file}s {below} are {shown}"),
     };
     let (named, rest) = match refreshed.unreadable.len() {
         n if n <= UNREADABLE_NAMED + 1 => (&refreshed.unreadable[..], &[][..]),
@@ -643,13 +643,13 @@ fn unreadable_lines(refreshed: &RefreshStats, file: &str, shown: &str) -> Vec<St
     };
     let mut lines: Vec<String> = named
         .iter()
-        .map(|u| format!("{u}{}", kept(u.kept, "it")))
+        .map(|u| format!("{u}{}", kept(u.kept, "below it")))
         .collect();
     if !rest.is_empty() {
         lines.push(format!(
             "cannot read {} more directories{}",
             rest.len(),
-            kept(rest.iter().map(|u| u.kept).sum(), "them")
+            kept(rest.iter().map(|u| u.kept).sum(), "below them")
         ));
     }
     lines
@@ -662,10 +662,10 @@ fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
     let state = state_dir(config);
     let cache = state.join("index.json");
     let mut index = Index::load(&cache);
-    let stores = index::stores(&accounts, &ctx.env);
+    let (stores, given) = index::resolve(&accounts, &ctx.env);
     let mut progress = IndexingProgress::new(ctx.stderr_is_tty, "indexing transcripts", "indexed");
     let mut stderr = std::io::stderr();
-    let refreshed = index::refresh(&mut index, &stores, |p| {
+    let refreshed = index::refresh_with(&mut index, &stores, &given, |p| {
         progress.report(p.done, p.total, &mut stderr)
     });
     progress.finish(index.entries.len(), &mut stderr);
@@ -747,10 +747,10 @@ fn stats(
     let state = state_dir(config);
     let path = state.join("stats.json");
     let mut cache = stats::Cache::load(&path);
-    let sources = stats::sources(&accounts, &ctx.env);
+    let (sources, given) = stats::resolve(&accounts, &ctx.env);
     let mut progress = IndexingProgress::new(ctx.stderr_is_tty, "reading transcripts", "read");
     let mut stderr = std::io::stderr();
-    let refreshed = stats::refresh(&mut cache, &sources, |done, total| {
+    let refreshed = stats::refresh_with(&mut cache, &sources, &given, |done, total| {
         progress.report(done, total, &mut stderr)
     });
     progress.finish(cache.files.len(), &mut stderr);
@@ -965,18 +965,32 @@ mod tests {
     /// past a handful, the rest are counted.
     #[test]
     fn unreadable_directories_are_named_up_to_a_handful() {
+        let unreadable = |i: usize, kept: usize, unresolved: bool| index::Unreadable {
+            path: format!("/s/p{i}").into(),
+            error: "denied".into(),
+            kept,
+            unresolved,
+        };
         let refreshed = |kept: &[usize]| RefreshStats {
             unreadable: kept
                 .iter()
                 .enumerate()
-                .map(|(i, &kept)| index::Unreadable {
-                    path: format!("/s/p{i}").into(),
-                    error: "denied".into(),
-                    kept,
-                })
+                .map(|(i, &kept)| unreadable(i, kept, false))
                 .collect(),
             ..RefreshStats::default()
         };
+        // A store that could not be resolved is named the same way.
+        let unresolved = RefreshStats {
+            unreadable: vec![unreadable(0, 2, true), unreadable(1, 0, true)],
+            ..RefreshStats::default()
+        };
+        assert_eq!(
+            unreadable_lines(&unresolved, "session", "listed"),
+            [
+                "cannot read /s/p0: denied; 2 sessions below it are listed",
+                "cannot read /s/p1: denied",
+            ]
+        );
         let lines = |kept: &[usize]| unreadable_lines(&refreshed(kept), "session", "listed");
         assert!(lines(&[]).is_empty());
         assert_eq!(

@@ -381,8 +381,30 @@ remuda help [<command>]                            help for remuda or a command
     reach, which is one transcript and not a directory (the entry the index had for it drops
     out, and nothing is reported), while a project directory that is such a symlink is a
     directory that cannot be read.
+  - **Nor is a store that cannot be resolved a store that is gone.** A store is known by the
+    realpath of `projects`. When that cannot be found because the home, or a directory on the
+    way to it or to the target of a link, cannot be searched or read (any error other than the
+    directory not existing), the store may be there, and the path the home gives does not say
+    which entries are its. The index therefore remembers, for each store directory as its
+    home gives it (the whole path, `<home>/projects`), the real path it last resolved to. The
+    entries last indexed from that store stay in the index and in its cache as they were, the
+    stores that could be listed are indexed as usual, and the refresh says it is incomplete,
+    naming the directory as the home gives it and the error, as above. Nothing else stays for
+    it: the entries of a store that is gone, or whose account left the registry, drop out as
+    they always did, whatever cannot be resolved beside them; and where another account lists
+    the same store, its entries are that listing's. It is the directory that is remembered,
+    not the account's name: an account registered again under the same name with another home
+    takes over nothing of the old home's store, and one registered again under another name
+    with the same home keeps what that home's store had. When nothing is remembered of the
+    directory (it never resolved, or the cache was written before this was kept, or deleted),
+    there is nothing to tell its entries by: they drop out, and the store is reported all the
+    same. Meanwhile the store is not among the stores listed: a
+    codex rollout kept this way shows no account (R17). A `projects` that does not exist is no
+    store, as before.
 - Cache: `$REMUDA_HOME/state/index.json`, with a schema version; on a version mismatch it is
-  rebuilt. Written atomically; may be deleted at any time (R3).
+  rebuilt. Written atomically; may be deleted at any time (R3). Beside the entries it holds the
+  real path each store directory last resolved to (see above); a cache without that is read as
+  it is, the schema version being that of the entries.
 - The index is built in the background: the UI does not wait for it and shows progress and the rows
   obtained so far while it builds.
 - The list hides "noise" sessions by default: those whose first user text starts with
@@ -1290,12 +1312,21 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   exists but cannot be read (R8) is not known to be deleted: its counts stay in the cache and in
   the report as they were last read, and the report says that it is incomplete, naming the
   directory and how many transcripts below it are counted that way. A directory that no longer
-  exists has no transcripts.
+  exists has no transcripts. The same goes for a store, or a codex home's `archived_sessions`,
+  whose path cannot be resolved (R8): the cache remembers the real path each of them last
+  resolved to, by the directory as its home gives it and not by the account's name, the
+  transcripts last read from that directory stay counted as last read, and the
+  report names the directory as the home gives it. Nothing else stays for it: what was counted
+  from a directory that is gone (a home's `sessions`, say, while its `archived_sessions` cannot
+  be resolved) or whose account left the registry is no longer counted. A codex rollout kept
+  this way is counted as unattributed while that lasts: the accounts of its home are not known.
 - **Cache**: `$REMUDA_HOME/state/stats.json`, with a schema version, rebuilt on a mismatch,
   written atomically, deletable at any time (R3). For each transcript it holds what was counted
   from it (a 64-bit FNV-1a hash of each request's key, its timestamp, model, counts with the
   cache write by lifetime, and whether it used fast mode or US-only inference), how far the
-  transcript was read, and, for codex, the last total and model. Transcripts are read like the
+  transcript was read, and, for codex, the last total and model. Beside the transcripts it
+  holds the real path each store and `archived_sessions` last resolved to (R8), which a cache
+  written before that was kept lacks and is read without. Transcripts are read like the
   index (R8): an unchanged file is not read again, a grown one only from its last complete line,
   any other one whole; only complete lines are parsed. Records of one message read in two
   refreshes merge by their key. The first computation reads every transcript whole (measured:

@@ -377,6 +377,145 @@ fn a_project_that_cannot_be_searched_is_warned_about_and_its_sessions_stay_liste
     assert_eq!((rows.len(), stderr.as_str()), (2, ""));
 }
 
+/// R8 (review #10): a home that cannot be searched does not make its store an absent one. The
+/// store cannot be resolved, so its sessions stay listed and in the cache that is saved, with
+/// a warning naming it as the home gives it.
+#[test]
+fn a_store_that_cannot_be_resolved_is_warned_about_and_its_sessions_stay_listed() {
+    let Setup {
+        sb,
+        team,
+        native_projects,
+        ..
+    } = setup();
+    transcript(&native_projects, S_A, &user("native one", "/w", &ts(3)));
+    transcript(&team.join("projects"), S_B, &user("team one", "/w", &ts(2)));
+    transcript(&team.join("projects"), S_C, &user("team two", "/w", &ts(1)));
+    let titles = |rows: &[BTreeMap<String, String>]| -> Vec<String> {
+        rows.iter().map(|r| r["TITLE"].clone()).collect()
+    };
+    let (rows, stderr) = sessions(&sb, &[]);
+    assert_eq!(titles(&rows), ["native one", "team one", "team two"]);
+    assert_eq!(stderr, "");
+    let cache = sb.remuda_home().join("state/index.json");
+    let saved = |cache: &Path| -> usize {
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(cache).unwrap()).unwrap();
+        v["entries"].as_object().unwrap().len()
+    };
+
+    fs::set_permissions(&team, fs::Permissions::from_mode(0o000)).unwrap();
+    let (rows, stderr) = sessions(&sb, &[]);
+    fs::set_permissions(&team, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(titles(&rows), ["native one", "team one", "team two"]);
+    let warning: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("cannot read"))
+        .collect();
+    let [warning] = warning.as_slice() else {
+        panic!("one warning: {stderr}")
+    };
+    assert!(
+        warning.starts_with(&format!(
+            "remuda: warning: cannot read {}: ",
+            team.join("projects").display()
+        )),
+        "{warning}"
+    );
+    assert!(
+        warning.ends_with("; 2 sessions below it are listed as last indexed"),
+        "{warning}"
+    );
+    assert_eq!(saved(&cache), 3, "the cache keeps them");
+
+    let (rows, stderr) = sessions(&sb, &[]);
+    assert_eq!((rows.len(), stderr.as_str()), (3, ""));
+}
+
+/// R8 (review #10): while one store cannot be resolved, a store that is gone is still gone.
+/// Its sessions leave the list and the cache; only those of the store that cannot be resolved
+/// stay, with the warning.
+#[test]
+fn a_store_that_is_gone_drops_out_while_another_cannot_be_resolved() {
+    let Setup {
+        sb,
+        team,
+        native_projects,
+        ..
+    } = setup();
+    transcript(&native_projects, S_A, &user("native one", "/w", &ts(3)));
+    transcript(&team.join("projects"), S_B, &user("team one", "/w", &ts(2)));
+    let (rows, stderr) = sessions(&sb, &[]);
+    assert_eq!((rows.len(), stderr.as_str()), (2, ""));
+
+    fs::remove_dir_all(&native_projects).unwrap();
+    fs::set_permissions(&team, fs::Permissions::from_mode(0o000)).unwrap();
+    let (rows, stderr) = sessions(&sb, &[]);
+    fs::set_permissions(&team, fs::Permissions::from_mode(0o755)).unwrap();
+    let titles: Vec<&str> = rows.iter().map(|r| r["TITLE"].as_str()).collect();
+    assert_eq!(titles, ["team one"]);
+    assert!(
+        stderr.contains("; 1 session below it is listed as last indexed"),
+        "{stderr}"
+    );
+    let cache = sb.remuda_home().join("state/index.json");
+    let v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&cache).unwrap()).unwrap();
+    let saved: Vec<&String> = v["entries"].as_object().unwrap().keys().collect();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    assert!(saved[0].contains(S_B), "{saved:?}");
+}
+
+/// R8 (review #10): an account removed and registered again under the same name with another
+/// home, whose store cannot be resolved before it was indexed, does not keep the sessions of
+/// the old home: they leave the list and the saved cache, on this run and the next, and the
+/// new store is named in the warning with nothing kept below it.
+#[test]
+fn an_account_registered_again_with_another_home_does_not_keep_the_old_sessions() {
+    let sb = common::Sandbox::new();
+    let (old, new) = (sb.make_claude_home("p/old"), sb.make_claude_home("p/new"));
+    transcript(&old.join("projects"), S_A, &user("old home", "/w", &ts(2)));
+    transcript(&new.join("projects"), S_B, &user("new home", "/w", &ts(1)));
+    sb.register(&[("work", &old)]);
+    let (rows, stderr) = sessions(&sb, &[]);
+    assert_eq!((rows.len(), stderr.as_str()), (1, ""));
+    assert_eq!(rows[0]["TITLE"], "old home");
+    let cache = sb.remuda_home().join("state/index.json");
+    let saved = |cache: &Path| -> usize {
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(cache).unwrap()).unwrap();
+        v["entries"].as_object().unwrap().len()
+    };
+
+    sb.register(&[("work", &new)]);
+    fs::set_permissions(&new, fs::Permissions::from_mode(0o000)).unwrap();
+    let runs = [sessions(&sb, &[]), sessions(&sb, &[])];
+    let left = saved(&cache);
+    fs::set_permissions(&new, fs::Permissions::from_mode(0o755)).unwrap();
+    for (rows, stderr) in &runs {
+        assert!(rows.is_empty(), "{rows:?}");
+        let warnings: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("cannot read"))
+            .collect();
+        let [warning] = warnings.as_slice() else {
+            panic!("one warning: {stderr}")
+        };
+        assert!(
+            warning.starts_with(&format!(
+                "remuda: warning: cannot read {}: ",
+                new.join("projects").display()
+            )),
+            "{warning}"
+        );
+        assert!(!warning.contains("below it"), "nothing is kept: {warning}");
+    }
+    assert_eq!(left, 0, "the saved cache does not keep the old home's");
+
+    let (rows, stderr) = sessions(&sb, &[]);
+    assert_eq!((rows.len(), stderr.as_str()), (1, ""));
+    assert_eq!(rows[0]["TITLE"], "new home");
+}
+
 #[test]
 fn index_cache_is_written_and_reused() {
     let Setup {

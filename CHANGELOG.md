@@ -19,8 +19,14 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   below it stays as it was last read, the directories that can be read are read as usual, and
   the result says it is incomplete, naming the directory and the error: a warning on stderr
   from `remuda sessions`, an `Incomplete:` line after the table from `remuda stats`,
-  `incomplete: …` in the status line of History and Stats. A directory that no longer exists
-  still means its transcripts are gone (SPEC R8, R20).
+  `incomplete: …` in the status line of History and Stats. The same goes for a store that
+  cannot be resolved, because the account's home, or a directory on the way to it or to the
+  target of a `projects` link, cannot be searched (a codex home's `archived_sessions`
+  included): it used to drop out of the list of stores, and everything indexed and counted
+  from it with it. The caches now remember the real path each store directory last resolved
+  to, and keep what they hold of that store while it cannot be resolved (the first run after
+  the upgrade writes `stats.json` once more to record it; the schema versions are unchanged).
+  A directory that no longer exists still means its transcripts are gone (SPEC R8, R20).
 - A transcript rewritten in place after it was listed and before it was read, larger and with an
   mtime earlier than the cached one (a sync restoring an older copy, say), was read on from the
   cached offset: the index and the statistics kept what the old content had given, and took the

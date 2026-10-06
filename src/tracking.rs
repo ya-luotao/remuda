@@ -50,14 +50,44 @@ pub(crate) struct Listed {
 }
 
 /// A directory that exists but could not be listed, or not to its end, or whose entries could
-/// not be examined (R8).
+/// not be examined; or one to track whose real path could not be found (R8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unreadable {
+    /// The directory; as it was given, not a real path, when `unresolved`.
     pub path: PathBuf,
     /// The system's error, as text.
     pub error: String,
-    /// Cached files below it, kept as they were last read.
+    /// Cached files below it, kept as they were last read. When `unresolved`: the cached
+    /// files last read below the real path it had when it last resolved.
     pub kept: usize,
+    /// The directory was one to track and its real path could not be found.
+    pub unresolved: bool,
+}
+
+/// Whether `error` says that what was asked for is not there, rather than out of reach (R8).
+fn gone(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+/// The real path of the directory at `path` (a store, a source): `Ok(None)` when there is
+/// none (it does not exist, or is no directory); `Err` with the system's error as text when
+/// that cannot be told, because the way to it cannot be searched or read: it may be there
+/// (R8). An adapter then gives the directory to [`refresh`] all the same, and says so when
+/// listing it ([`Listing::unresolved`]).
+///
+/// A cache remembers the real path of each directory it tracks, by the path it is given as
+/// ([`Remembered`]), which is what tells which cached files were such a directory's.
+pub(crate) fn real_dir(path: &Path) -> Result<Option<PathBuf>, String> {
+    let found = fs::canonicalize(path).and_then(|real| Ok((fs::metadata(&real)?.is_dir(), real)));
+    match found {
+        Ok((true, real)) => Ok(Some(real)),
+        Ok((false, _)) => Ok(None),
+        Err(e) if gone(&e) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 impl fmt::Display for Unreadable {
@@ -91,6 +121,39 @@ impl Found {
     }
 }
 
+/// What a cache remembers of the directories it tracks: the real path each was last found at,
+/// by the path it is given as, which is the directory's whether or not it resolves. It tells
+/// which cached files were read below a directory that cannot be resolved now, whatever else
+/// of the same provider the cache holds (R8).
+pub(crate) type Remembered = BTreeMap<PathBuf, PathBuf>;
+
+/// A directory as it is given to be tracked, and where resolving it found it.
+pub(crate) trait Resolved {
+    /// The path it is given as.
+    fn given(&self) -> &Path;
+    /// Its real path; `None` when it could not be resolved ([`real_dir`] failed).
+    fn real(&self) -> Option<&Path>;
+}
+
+/// Brings `remembered` up to date with `dirs`, the directories given to this refresh: one
+/// that resolved is at its real path, one that could not be resolved stays where it was last
+/// found, and any other is forgotten: it does not exist, or is no longer tracked. Returns
+/// whether that changed anything.
+pub(crate) fn remember<R: Resolved>(remembered: &mut Remembered, dirs: &[R]) -> bool {
+    let now: Remembered = dirs
+        .iter()
+        .filter_map(|dir| {
+            let real = dir
+                .real()
+                .or_else(|| Some(remembered.get(dir.given())?.as_path()))?;
+            Some((dir.given().to_path_buf(), real.to_path_buf()))
+        })
+        .collect();
+    let changed = now != *remembered;
+    *remembered = now;
+    changed
+}
+
 /// What listing a directory found. An adapter lists through it alone (it reads no directory
 /// and examines no entry itself), so that what a failure means is decided here (R8): a
 /// directory or an entry that does not exist is not there; a directory that exists but cannot
@@ -101,6 +164,8 @@ impl Found {
 pub(crate) struct Listing {
     files: Vec<Listed>,
     unreadable: Vec<Unreadable>,
+    /// The directory being listed is one whose real path could not be found.
+    unresolved: bool,
 }
 
 impl Listing {
@@ -173,6 +238,21 @@ impl Listing {
         self.files.push(listed);
     }
 
+    /// The directory being listed is `path` as it was given, and its real path could not be
+    /// found for `error` ([`real_dir`]): nothing of it can be listed, and the cached files do
+    /// not lie below `path`. [`refresh`] then keeps the cached files of no directory that
+    /// could be listed which [`Files::listed_under`] says are its: those read below the real
+    /// path it had when it last resolved ([`Remembered`]).
+    pub(crate) fn unresolved(&mut self, path: &Path, error: &str) {
+        self.unresolved = true;
+        self.unreadable.push(Unreadable {
+            path: path.to_path_buf(),
+            error: error.to_string(),
+            kept: 0,
+            unresolved: true,
+        });
+    }
+
     /// The files listed, for a caller that keeps no cache.
     pub(crate) fn into_files(self) -> Vec<Listed> {
         self.files
@@ -205,11 +285,7 @@ impl Listing {
     /// which is recorded once, and not below a directory already recorded (what cannot be
     /// searched fails again for each directory below it).
     fn failed(&mut self, path: &Path, error: &io::Error) {
-        let gone = matches!(
-            error.kind(),
-            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-        );
-        if gone || self.unreadable.iter().any(|u| path.starts_with(&u.path)) {
+        if gone(error) || self.unreadable.iter().any(|u| path.starts_with(&u.path)) {
             return;
         }
         self.unreadable.retain(|u| !u.path.starts_with(path));
@@ -217,6 +293,7 @@ impl Listing {
             path: path.to_path_buf(),
             error: error.to_string(),
             kept: 0,
+            unresolved: false,
         });
     }
 }
@@ -236,7 +313,10 @@ pub(crate) trait Files<D>: Sync {
 
     /// Whether `item` was read as a file of `dir`. One read as another directory's, or another
     /// provider's, is read whole again; and only the items of `dir` are kept when a directory
-    /// listed for it cannot be read.
+    /// listed for it cannot be read. For a `dir` whose real path could not be found
+    /// ([`Listing::unresolved`]): whether `item` was read as a file of it when it last
+    /// resolved, by the real path remembered for it ([`Remembered`]); of none when nothing
+    /// is remembered.
     fn listed_under(item: &Self::Tracked, dir: &D) -> bool;
 
     /// Reads `listed`, open as `file` and `stat` as it is now: on from `cached` when given
@@ -265,7 +345,8 @@ pub(crate) struct Progress<'a, T> {
 }
 
 /// What a refresh did. It left the cache as it was exactly when `reused + kept() == files`
-/// (nothing was read into it) and `removed == 0` (nothing was dropped from it).
+/// (nothing was read into it), `removed == 0` (nothing was dropped from it) and `remembered`
+/// is false.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefreshStats {
     /// Files in the cache after the refresh.
@@ -279,6 +360,9 @@ pub struct RefreshStats {
     pub cold: usize,
     /// Cached files dropped: no longer listed, or listed as changed and no longer readable.
     pub removed: usize,
+    /// What the cache remembers of its directories ([`Remembered`]) changed. Set by the
+    /// cache's own refresh, which keeps that beside the files.
+    pub remembered: bool,
     pub bytes_read: u64,
     /// The directories that exist but could not be listed, in listing order: the refresh is
     /// incomplete, and the cached files below them were kept as they were (R8). Empty after a
@@ -351,7 +435,10 @@ struct Job<T> {
 /// files that vanished and files of directories no longer given drop out. Where a directory
 /// listed for one of `dirs` exists but could not be read, the cached files of that one below
 /// it are kept as they are, and the directory is reported ([`RefreshStats::unreadable`]).
-/// `progress` is called on this thread. Never fails: a file that cannot be read is dropped.
+/// Where one of `dirs` is a directory whose real path could not be found, the cached files
+/// that were its when it last resolved, and are of none of the directories listed now, are
+/// kept, and it is reported likewise. `progress` is called on this thread. Never fails: a
+/// file that cannot be read is dropped.
 pub(crate) fn refresh<D: Sync, F: Files<D>>(
     cache: &mut BTreeMap<PathBuf, F::Tracked>,
     dirs: &[D],
@@ -363,9 +450,12 @@ pub(crate) fn refresh<D: Sync, F: Files<D>>(
     let mut jobs: Vec<Job<F::Tracked>> = Vec::new();
     // Each with the index of the directory it was met listing.
     let mut unreadable: Vec<(usize, Unreadable)> = Vec::new();
+    // Whether each directory was given by its real path: what it lists is told by path.
+    let mut resolved: Vec<bool> = Vec::with_capacity(dirs.len());
     for (dir_index, dir) in dirs.iter().enumerate() {
         let mut listing = Listing::default();
         files.list(dir, &mut listing);
+        resolved.push(!listing.unresolved);
         unreadable.extend(listing.unreadable.drain(..).map(|u| (dir_index, u)));
         for listed in listing.files {
             if !seen.insert(listed.path.clone()) {
@@ -400,15 +490,29 @@ pub(crate) fn refresh<D: Sync, F: Files<D>>(
     // that one. A failure says nothing for the files of a directory no longer given, and none
     // for a file at the very path that failed: what the cache holds there was a file, not a
     // directory with files below it.
+    //
+    // Nor is anything known about the files of a directory whose real path could not be found,
+    // and their paths are not below the path it was given as: its files are those the adapter
+    // says were its when it last resolved. One of them that is also a file of a directory
+    // given by its real path now (the two share a real path) is not kept for that: there it
+    // was listed for, and it vanished.
     cache.retain(|path, item| {
         if seen.contains(path) {
             return true;
         }
-        match unreadable.iter_mut().find(|(dir, u)| {
-            path != &u.path && path.starts_with(&u.path) && F::listed_under(item, &dirs[*dir])
-        }) {
-            Some((_, unreadable)) => {
-                unreadable.kept += 1;
+        let of = |dir: usize| F::listed_under(item, &dirs[dir]);
+        let below = unreadable.iter().position(|(dir, u)| {
+            !u.unresolved && path != &u.path && path.starts_with(&u.path) && of(*dir)
+        });
+        let kept = below.or_else(|| {
+            let last_of = |(dir, u): &(usize, Unreadable)| u.unresolved && of(*dir);
+            let unresolved = unreadable.iter().position(last_of)?;
+            let listed = (0..dirs.len()).any(|dir| resolved[dir] && of(dir));
+            (!listed).then_some(unresolved)
+        });
+        match kept {
+            Some(i) => {
+                unreadable[i].1.kept += 1;
                 true
             }
             None => {
@@ -532,6 +636,10 @@ mod tests {
         failing: Vec<(PathBuf, io::ErrorKind)>,
         /// Also every file found below `path`, listed for real.
         walk: bool,
+        /// `path` is not a real path: the directory could not be resolved, for this error.
+        unresolved: Option<&'static str>,
+        /// The real path it had when it last resolved, if that is remembered.
+        last: Option<PathBuf>,
     }
 
     impl Dir {
@@ -570,6 +678,17 @@ mod tests {
             self.provider = provider;
             self
         }
+
+        /// A directory given as `path` whose real path could not be found; it was `last`
+        /// when it last resolved, if that is remembered.
+        fn unresolved(path: &Path, last: Option<&Path>) -> Dir {
+            Dir {
+                path: path.to_path_buf(),
+                unresolved: Some("out of reach"),
+                last: last.map(Path::to_path_buf),
+                ..Dir::default()
+            }
+        }
     }
 
     /// Every file at any depth below `dir`.
@@ -590,6 +709,9 @@ mod tests {
         type Tracked = Item;
 
         fn list(&self, dir: &Dir, listing: &mut Listing) {
+            if let Some(error) = dir.unresolved {
+                listing.unresolved(&dir.path, error);
+            }
             for (path, kind) in &dir.failing {
                 listing.failed(path, &io::Error::from(*kind));
             }
@@ -613,7 +735,11 @@ mod tests {
         }
 
         fn listed_under(item: &Item, dir: &Dir) -> bool {
-            item.dir == dir.path && item.provider == dir.provider
+            let real = match dir.unresolved {
+                Some(_) => dir.last.as_ref(),
+                None => Some(&dir.path),
+            };
+            item.provider == dir.provider && real == Some(&item.dir)
         }
 
         fn read(
@@ -1077,6 +1203,7 @@ mod tests {
                 path: a.clone(),
                 error: io::Error::from(denied).to_string(),
                 kept: 2,
+                unresolved: false,
             }]
         );
         assert_eq!((&cache[&f], &cache[&deep]), (&before[&f], &before[&deep]));
@@ -1114,6 +1241,180 @@ mod tests {
             let s = run(&mut cache, &[Dir::of(&a, &[]).failing(&a, gone)]);
             assert_eq!((counts(&s), s.files, s.kept()), ((0, 0, 0, 1), 0, 0));
             assert!(s.unreadable.is_empty() && cache.is_empty());
+        }
+    }
+
+    /// R8: a directory to track whose real path could not be found lists nothing, and the
+    /// cached files are not below the path it is given as. Those read below the real path it
+    /// last resolved to are kept, and no others: not the files of another directory of the
+    /// same provider that is no longer given, nor of one that is listed, nor of another
+    /// provider.
+    #[test]
+    fn an_unresolved_directory_keeps_the_files_of_its_last_real_path_alone() {
+        let (tmp, a) = sandbox();
+        let root = tmp.path().canonicalize().unwrap();
+        let (b, c, d) = (root.join("b"), root.join("c"), root.join("d"));
+        for dir in [&b, &c, &d] {
+            fs::create_dir(dir).unwrap();
+        }
+        let (f, g, h) = (a.join("f"), a.join("g"), b.join("h"));
+        let (gone, other) = (c.join("gone"), d.join("other"));
+        for file in [&f, &g, &h, &gone, &other] {
+            write(file, "x\n");
+        }
+        let all = [
+            Dir::of(&a, &[&f, &g]),
+            Dir::of(&b, &[&h]),
+            Dir::of(&c, &[&gone]),
+            Dir::of(&d, &[&other]).provider("other"),
+        ];
+        let mut cache = Cache::new();
+        run(&mut cache, &all);
+        let cached = cache.clone();
+
+        // `b` is given as a path that cannot be resolved, and was at `b`. `c`, of the same
+        // provider, and `d` are no longer given; in `a`, which is listed, `g` vanished.
+        fs::remove_file(&g).unwrap();
+        let given = root.join("home/b as given");
+        let dirs = [Dir::of(&a, &[&f, &g]), Dir::unresolved(&given, Some(&b))];
+        let s = run(&mut cache, &dirs);
+        assert_eq!((counts(&s), s.files, s.kept()), ((1, 0, 0, 3), 2, 1));
+        assert_eq!(
+            s.unreadable,
+            [Unreadable {
+                path: given.clone(),
+                error: "out of reach".into(),
+                kept: 1,
+                unresolved: true,
+            }]
+        );
+        assert_eq!(cache.keys().collect::<Vec<_>>(), [&f, &h]);
+        assert_eq!(cache[&h], cached[&h]);
+        assert_eq!(
+            s.incomplete().as_deref(),
+            Some(format!("incomplete: cannot read {}: out of reach", given.display()).as_str())
+        );
+
+        // Resolved again: nothing was lost, nothing is read.
+        let s = run(&mut cache, &[Dir::of(&a, &[&f]), Dir::of(&b, &[&h])]);
+        assert_eq!((counts(&s), s.bytes_read), ((2, 0, 0, 0), 0));
+        assert!(s.unreadable.is_empty());
+
+        // It was at `a`, which another directory given lists: `g`, which vanished there, is
+        // not kept for it.
+        let mut cache = cached.clone();
+        let dirs = [Dir::of(&a, &[&f, &g]), Dir::unresolved(&given, Some(&a))];
+        let s = run(&mut cache, &dirs);
+        assert_eq!((counts(&s), s.files, s.kept()), ((1, 0, 0, 4), 1, 0));
+        assert_eq!(cache.keys().collect::<Vec<_>>(), [&f]);
+
+        // Nothing is remembered of it: nothing is its to keep, and it is reported all the
+        // same.
+        let mut cache = cached.clone();
+        let s = run(&mut cache, &[Dir::unresolved(&given, None)]);
+        assert_eq!((counts(&s), s.files, s.kept()), ((0, 0, 0, 5), 0, 0));
+        assert_eq!(s.unreadable.len(), 1);
+        assert!(s.unreadable[0].unresolved);
+
+        // Several that cannot be resolved: each keeps its own.
+        let mut cache = cached.clone();
+        let dirs = [
+            Dir::unresolved(&given, Some(&c)),
+            Dir::unresolved(&root.join("another"), Some(&b)),
+        ];
+        let s = run(&mut cache, &dirs);
+        assert_eq!((counts(&s), s.files), ((0, 0, 0, 3), 2));
+        let kept: Vec<usize> = s.unreadable.iter().map(|u| u.kept).collect();
+        assert_eq!(kept, [1, 1]);
+        assert_eq!(cache.keys().collect::<Vec<_>>(), [&h, &gone]);
+    }
+
+    /// R8: what a cache remembers of its directories, by the path each is given as: where one
+    /// that resolved is, where one that cannot be resolved was, and nothing of any other.
+    #[test]
+    fn a_cache_remembers_where_its_directories_were_last_found() {
+        /// Given as `.0`, found at `.1` or not resolved.
+        struct At(&'static str, Option<&'static str>);
+        impl Resolved for At {
+            fn given(&self) -> &Path {
+                Path::new(self.0)
+            }
+            fn real(&self) -> Option<&Path> {
+                self.1.map(Path::new)
+            }
+        }
+        let at = |pairs: &[(&str, &str)]| -> Remembered {
+            let pair = |(given, real): &(&str, &str)| (PathBuf::from(given), PathBuf::from(real));
+            pairs.iter().map(pair).collect()
+        };
+        let mut remembered = Remembered::new();
+        // `c` never resolved: nothing is known of it.
+        let dirs = [
+            At("/h/a/projects", Some("/r/a")),
+            At("/h/b/projects", Some("/r/b")),
+            At("/h/c/projects", None),
+        ];
+        assert!(remember(&mut remembered, &dirs));
+        let both = at(&[("/h/a/projects", "/r/a"), ("/h/b/projects", "/r/b")]);
+        assert_eq!(remembered, both);
+        assert!(!remember(&mut remembered, &dirs), "the same again");
+
+        // `b` cannot be resolved: it stays where it was. `a` moved; `d` is new.
+        let dirs = [
+            At("/h/a/projects", Some("/r/a2")),
+            At("/h/b/projects", None),
+            At("/h/d/projects", Some("/r/d")),
+        ];
+        assert!(remember(&mut remembered, &dirs));
+        assert_eq!(
+            remembered,
+            at(&[
+                ("/h/a/projects", "/r/a2"),
+                ("/h/b/projects", "/r/b"),
+                ("/h/d/projects", "/r/d")
+            ])
+        );
+        assert!(!remember(&mut remembered, &dirs));
+
+        // Another directory, in another home, that cannot be resolved is not `b`, whoever
+        // gives it: nothing is known of it, and `b`, no longer given, is forgotten.
+        let dirs = [
+            At("/h/a/projects", Some("/r/a2")),
+            At("/elsewhere/b/projects", None),
+        ];
+        assert!(remember(&mut remembered, &dirs));
+        assert_eq!(remembered, at(&[("/h/a/projects", "/r/a2")]));
+        // Not given at all: gone, or no longer tracked.
+        assert!(remember(&mut remembered, &[] as &[At]));
+        assert!(remembered.is_empty());
+    }
+
+    /// R8: the real path of a directory to track: none when it is not there or no directory,
+    /// an error when the way to it cannot be searched.
+    #[test]
+    fn a_directory_that_cannot_be_resolved_is_told_from_one_that_is_missing() {
+        let (tmp, a) = sandbox();
+        let root = tmp.path().canonicalize().unwrap();
+        let inside = a.join("store");
+        fs::create_dir(&inside).unwrap();
+        write(&a.join("file"), "x\n");
+        std::os::unix::fs::symlink(&inside, root.join("link")).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling")).unwrap();
+        // As given, through a symlinked directory: resolved to the real path.
+        assert_eq!(real_dir(&tmp.path().join("link")), Ok(Some(inside.clone())));
+        assert_eq!(real_dir(&inside), Ok(Some(inside.clone())));
+        assert_eq!(real_dir(&a.join("missing")), Ok(None));
+        assert_eq!(real_dir(&a.join("file")), Ok(None), "no directory");
+        assert_eq!(real_dir(&a.join("file/below")), Ok(None));
+        assert_eq!(real_dir(&root.join("dangling")), Ok(None));
+
+        chmod(&a, 0o000);
+        let (direct, linked) = (real_dir(&inside), real_dir(&root.join("link")));
+        let missing = real_dir(&a.join("missing"));
+        chmod(&a, 0o755);
+        for found in [direct, linked, missing] {
+            let error = found.expect_err("it may be there: `a` cannot be searched");
+            assert!(!error.is_empty());
         }
     }
 
@@ -1390,6 +1691,7 @@ mod tests {
             path: path.into(),
             error: "Permission denied (os error 13)".into(),
             kept,
+            unresolved: false,
         };
         let mut s = RefreshStats::default();
         assert_eq!((s.incomplete(), s.kept()), (None, 0));

@@ -219,6 +219,8 @@ That rule is written once, in `tracking`. `index::refresh` and `stats::refresh` 
     │  8 worker threads · what vanished drops out · progress
     │  a directory that cannot be read: what the cache has of that store below
     │  it stays, and it is reported (RefreshStats::unreadable)
+    │  a store that cannot be resolved: what the cache has of the real path it
+    │  last resolved to stays, and it is reported likewise
     │
     ├─ Files::list   index: projects/*/*.jsonl (top level), sessions/**/rollout-*.jsonl
     │                stats: also below <project>/<session>/, and archived_sessions
@@ -233,6 +235,20 @@ where a directory that does not exist (it has no files: what the cache had there
 told from one that exists but cannot be read, because it cannot be listed or because what it
 lists cannot be examined (nothing is known: what the cache has of that store below it stays,
 and `remuda sessions`, `remuda stats` and the TUI say the result is incomplete).
+
+A store whose real path cannot be found (its home cannot be searched, say) fails before there
+is anything to list. `index::stores` and `stats::sources` leave it out, as they always did, so
+that `checks`, `attribution` and the TUI see the same lists; `index::resolve` and
+`stats::resolve` return those lists together with what each home gives as its directory
+(`index::Given`, one for each directory a home gives that is or may be there, with its real
+path or the error; for the statistics also a codex home's `archived_sessions`), told from
+missing ones by `tracking::real_dir`. `remuda sessions`, `remuda stats` and the TUI workers pass
+both to `index::refresh_with` / `stats::refresh_with`. A directory that cannot be resolved has
+no real path for its cached files to be below, so each cache remembers the real path every
+directory last resolved to, by the whole path its home gives it (`Index::stores`,
+`Cache::sources`, kept up by `tracking::remember`), and `tracking` keeps the files of that
+real path alone: a store that is gone or that left the registry drops out as usual, whatever
+cannot be resolved beside it, and an account's name carries nothing from one home to another.
 
 Deduplication is the heart of the statistics: a claude message counts once by `message.id`
 across records, forks and shared stores; a codex request counts once by its
