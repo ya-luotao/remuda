@@ -521,6 +521,7 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
         &mut app,
         Event::LiveUsage {
             account: account("max"),
+            answered_at: ts(NOW),
             result: Ok(LiveUsage::Rows(vec![row("Session", 55.0, None, None)]).into()),
         },
     );
@@ -533,6 +534,7 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
         &mut app,
         Event::LiveUsage {
             account: account("max"),
+            answered_at: ts(NOW),
             result: Ok(LiveUsage::Rows(vec![row("Session", 56.0, None, None)]).into()),
         },
     );
@@ -541,6 +543,7 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
         &mut app,
         Event::LiveUsage {
             account: account("team"),
+            answered_at: ts(NOW),
             result: Err("timed out after 90s".into()),
         },
     );
@@ -548,6 +551,7 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
         &mut app,
         Event::LiveUsage {
             account: account("default"),
+            answered_at: ts(NOW),
             result: Ok(LiveUsage::Unrecognized("??".into()).into()),
         },
     );
@@ -575,6 +579,7 @@ fn late_results_follow_their_account_when_rows_move() {
         &mut app,
         Event::LiveUsage {
             account: account("team"),
+            answered_at: ts(NOW),
             result: Ok(LiveUsage::Rows(vec![row("Session", 42.0, None, None)]).into()),
         },
     );
@@ -587,6 +592,7 @@ fn late_results_follow_their_account_when_rows_move() {
         &mut app,
         Event::LiveUsage {
             account: account("max"),
+            answered_at: ts(NOW),
             result: Ok(LiveUsage::Rows(vec![row("Session", 99.0, None, None)]).into()),
         },
     );
@@ -2533,6 +2539,7 @@ fn populated_accounts() -> App {
         &mut app,
         Event::LiveUsage {
             account: account("max"),
+            answered_at: ts(NOW),
             result: Ok(LiveUsage::Rows(vec![
                 UsageRow {
                     label: "Session".into(),
@@ -2658,6 +2665,263 @@ fn accounts_view_populated() {
     assert!(all.contains("! team: not logged in"), "{all}");
 }
 
+/// R10: a window that has reset since its usage was recorded shows `reset` where its
+/// percentage would be, has no marker on the timeline, and `reset` in the summary. The same
+/// for a live answer that has been on screen past its reset.
+#[test]
+fn accounts_view_windows_past_their_reset() {
+    let mut app = populated_accounts();
+    // Cached at 09:00; the session reset at 11:00, an hour before now.
+    update(
+        &mut app,
+        Event::CachedUsage {
+            account: account("default"),
+            result: Ok(CachedUsage {
+                fetched_at: Some(ts("2026-09-24T09:00:00Z")),
+                rows: vec![
+                    row(
+                        "Session",
+                        95.0,
+                        Some("critical"),
+                        Some("2026-09-24T11:00:00Z"),
+                    ),
+                    row(
+                        "Week (all models)",
+                        77.0,
+                        Some("warning"),
+                        Some("2026-09-27T12:00:00Z"),
+                    ),
+                    row(
+                        "Week (Fable)",
+                        100.0,
+                        Some("critical"),
+                        Some("2026-09-24T11:30:00Z"),
+                    ),
+                ],
+            }),
+        },
+    );
+    let lines = screen(&app);
+    let (_, default) = line_with(&lines, "me@example.com");
+    assert!(!default.contains("95%"), "{default}");
+    let cells: Vec<&str> = default.split_whitespace().collect();
+    let email = cells.iter().position(|c| *c == "me@example.com").unwrap();
+    assert_eq!(
+        cells[email + 3..],
+        ["reset", "77%", "reset", "cached", "3h", "ago"],
+        "{default}"
+    );
+    let (axis_y, axis) = line_with(&lines, "now");
+    let axis_col = axis.find("now").unwrap();
+    let track = lines
+        .iter()
+        .skip(axis_y + 1)
+        .find(|l| l.starts_with("default"))
+        .unwrap();
+    let marks: String = track
+        .chars()
+        .skip(axis_col)
+        .filter(|c| c.is_ascii_alphabetic())
+        .collect();
+    // No `S` and no `f` at the start of the axis: only the week is ahead.
+    assert!(marks.starts_with('W'), "{track}");
+    // The summary names every window past its reset, the per-model one too, and the legend
+    // still says what its letter is.
+    assert!(track.ends_with("S reset W 3d00h f reset"), "{track}");
+    assert!(lines.join("\n").contains("f week (Fable)"), "{lines:#?}");
+
+    // max's live answer said `Sep 24 at 1pm`; two hours later it is still on screen.
+    let later = ts("2026-09-24T14:00:00Z");
+    update(&mut app, Event::Tick(later));
+    let lines = screen(&app);
+    let (_, max) = line_with(&lines, "max@example.com");
+    assert!(max.contains("reset") && max.contains("91%"), "{max}");
+    assert!(!max.contains("12%"), "{max}");
+    assert!(max.contains("live 2h ago"), "{max}");
+    let max_track = lines
+        .iter()
+        .skip(axis_y + 1)
+        .find(|l| l.starts_with("max"))
+        .unwrap();
+    assert!(max_track.ends_with("S reset W 5d21h"), "{max_track}");
+}
+
+/// R10: an account whose only window is a per-model one past its reset still says so: `reset`
+/// in the summary under the window's letter, and the legend names the letter.
+#[test]
+fn accounts_view_a_per_model_window_past_its_reset_alone() {
+    let mut app = app();
+    app.start();
+    update(
+        &mut app,
+        Event::CachedUsage {
+            account: account("max"),
+            result: Ok(CachedUsage {
+                fetched_at: Some(ts("2026-09-24T09:00:00Z")),
+                rows: vec![row(
+                    "Week (Fable)",
+                    95.0,
+                    Some("critical"),
+                    Some("2026-09-24T11:00:00Z"),
+                )],
+            }),
+        },
+    );
+    let lines = screen(&app);
+    let (axis_y, axis) = line_with(&lines, "now");
+    let axis_col = axis.find("now").unwrap();
+    let track = lines
+        .iter()
+        .skip(axis_y + 1)
+        .find(|l| l.starts_with("max"))
+        .unwrap();
+    assert!(track.ends_with(" f reset"), "{track}");
+    let drawn: String = track
+        .chars()
+        .skip(axis_col)
+        .take_while(|c| *c == '·' || *c == '|')
+        .collect();
+    assert!(
+        drawn.chars().count() > 20,
+        "no marker on the track: {track}"
+    );
+    let legend = &lines[axis_y + 1 + app.accounts.len()];
+    assert!(
+        legend.contains("S session · W week (all models) · f week (Fable)"),
+        "{legend}"
+    );
+}
+
+/// R10: live wording that was read, and names a reset already behind the answer, shows no
+/// reset: the cached reset of the same limit, still ahead, is not drawn in its place.
+#[test]
+fn accounts_view_a_live_reset_behind_its_answer_is_not_replaced() {
+    let mut app = app();
+    app.start();
+    update(
+        &mut app,
+        Event::CachedUsage {
+            account: account("max"),
+            result: Ok(CachedUsage {
+                fetched_at: Some(ts("2026-09-24T09:00:00Z")),
+                rows: vec![
+                    row("Session", 20.0, None, Some("2026-09-24T14:00:00Z")),
+                    row(
+                        "Week (all models)",
+                        50.0,
+                        None,
+                        Some("2026-09-27T12:00:00Z"),
+                    ),
+                ],
+            }),
+        },
+    );
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: account("max"),
+            answered_at: ts(NOW),
+            result: Ok(LiveUsage::Rows(vec![
+                UsageRow {
+                    label: "Session".into(),
+                    percent: 60.0,
+                    severity: None,
+                    resets: Some(Resets::Text("Sep 24 at 11am (UTC)".into())),
+                },
+                UsageRow {
+                    label: "Week (all models)".into(),
+                    percent: 55.0,
+                    severity: None,
+                    resets: Some(Resets::Text("whenever".into())),
+                },
+            ])
+            .into()),
+        },
+    );
+    let usage = app.accounts[1].usage_at(app.now).unwrap();
+    assert_eq!(app.accounts[1].account.name, "max");
+    assert_eq!(usage.windows[0].used(), Some(60.0));
+    assert_eq!(usage.windows[0].resets_at(), None);
+    // Wording remuda cannot read: the cached reset.
+    assert_eq!(
+        usage.windows[1].resets_at(),
+        Some(ts("2026-09-27T12:00:00Z"))
+    );
+    let lines = screen(&app);
+    let (_, max) = line_with(&lines, "60%");
+    assert!(max.contains("55%"), "{max}");
+    let (axis_y, _) = line_with(&lines, "now");
+    let track = lines
+        .iter()
+        .skip(axis_y + 1)
+        .find(|l| l.starts_with("max"))
+        .unwrap();
+    assert!(track.ends_with(" W 3d00h"), "no S: {track}");
+}
+
+/// R10: a live answer is recorded when its query answered, not when the loop got to its event.
+/// A foreground agent holds the loop: the answer waits in the queue and is read before the
+/// next tick. A reset behind the answer leaves its percentage; one between the answer and now
+/// has passed.
+#[test]
+fn accounts_view_a_queued_live_answer_keeps_its_answer_time() {
+    let mut app = app();
+    app.start();
+    // The last tick was at 12:00:00; the query answered at 12:00:40, behind a foreground agent.
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: account("max"),
+            answered_at: ts("2026-09-24T12:00:40Z"),
+            result: Ok(LiveUsage::Rows(vec![
+                UsageRow {
+                    label: "Session".into(),
+                    percent: 60.0,
+                    severity: None,
+                    resets: Some(Resets::Text("Sep 24 at 12pm (UTC)".into())),
+                },
+                UsageRow {
+                    label: "Week (all models)".into(),
+                    percent: 40.0,
+                    severity: None,
+                    resets: Some(Resets::Text("Sep 24 at 12:01pm (UTC)".into())),
+                },
+            ])
+            .into()),
+        },
+    );
+    // Before the next tick the clock on screen is behind the answer: nothing has passed yet.
+    let early = app.accounts[1].usage_at(app.now).unwrap();
+    assert_eq!(early.fetched_at, Some(ts("2026-09-24T12:00:40Z")));
+    assert_eq!(early.age_seconds, Some(0));
+    assert_eq!(early.windows[0].used(), Some(60.0));
+    assert_eq!(early.windows[0].resets_at(), None);
+    assert_eq!(
+        early.windows[1].resets_at(),
+        Some(ts("2026-09-24T12:01:00Z"))
+    );
+    // The agent exits at 12:05 and the loop ticks again.
+    update(&mut app, Event::Tick(ts("2026-09-24T12:05:00Z")));
+    let usage = app.accounts[1].usage_at(app.now).unwrap();
+    let used: Vec<(&str, Option<f64>)> = usage
+        .windows
+        .iter()
+        .map(|w| (w.label.as_str(), w.used()))
+        .collect();
+    assert_eq!(
+        used,
+        [("Session", Some(60.0)), ("Week (all models)", None)],
+        "the session reset before the answer, the week after it"
+    );
+    let lines = screen(&app);
+    let (_, max) = line_with(&lines, "live 4m ago");
+    let cells: Vec<&str> = max.split_whitespace().collect();
+    assert!(
+        cells.windows(2).any(|pair| pair == ["60%", "reset"]),
+        "{max}"
+    );
+}
+
 #[test]
 fn accounts_view_errors_and_pending_live_usage() {
     let mut app = populated_accounts();
@@ -2668,6 +2932,7 @@ fn accounts_view_errors_and_pending_live_usage() {
         &mut app,
         Event::LiveUsage {
             account: account("team"),
+            answered_at: ts(NOW),
             result: Err("`claude -p /usage --no-session-persistence` timed out after 90s".into()),
         },
     );
@@ -3166,6 +3431,7 @@ fn codex_accounts_show_identity_and_usage() {
         &mut app,
         Event::LiveUsage {
             account: codex_account("work"),
+            answered_at: ts(NOW),
             result: Ok(LiveResult {
                 usage: LiveUsage::Rows(vec![
                     row(
@@ -3202,6 +3468,7 @@ fn codex_accounts_show_identity_and_usage() {
         &mut app,
         Event::LiveUsage {
             account: codex_account("default"),
+            answered_at: ts(NOW),
             result: Ok(LiveUsage::Rows(vec![row("Session", 1.0, None, None)]).into()),
         },
     );
@@ -4625,6 +4892,7 @@ fn secret_app() -> App {
         &mut app,
         Event::LiveUsage {
             account: zq_account(CODEX, "zqbeta"),
+            answered_at: ts(NOW),
             result: Err(format!(
                 "cannot reach {ZQ_HOME}/.zqhomes/zqbeta: zqbeta timed out"
             )),
@@ -4669,7 +4937,7 @@ fn secret_app() -> App {
                 },
             ],
             error: Some(format!(
-                "zqalpha: cannot write {ZQ_HOME}/.remuda/state/index.json"
+                "index cache: zqalpha: cannot write {ZQ_HOME}/.remuda/state/index.json"
             )),
         },
     );
@@ -5147,6 +5415,45 @@ fn secret_states() -> Vec<SecretState> {
             "index error",
             |app| drop(keys(app, &[Key::Char('1')])),
             "index cache: zqalpha",
+        ),
+        // A directory the refresh could not read (R8, R20), one the app does not know.
+        state(
+            "index incomplete",
+            |app| {
+                keys(app, &[Key::Char('1')]);
+                let entries = app.index.entries.values().cloned().collect();
+                update(
+                    app,
+                    Event::IndexDone {
+                        entries,
+                        error: Some(
+                            "incomplete: cannot read /zqvol/zq disk/zqstore: Permission \
+                             denied (os error 13)"
+                                .into(),
+                        ),
+                    },
+                );
+            },
+            "cannot read /zqvol",
+        ),
+        state(
+            "statistics incomplete",
+            |app| {
+                keys(app, &[Key::Char('4')]);
+                let report = app.stats.report.clone().expect("a report");
+                update(
+                    app,
+                    Event::Stats {
+                        report,
+                        error: Some(
+                            "incomplete: cannot read /zqvol/zq disk/zqstore: Permission \
+                             denied (os error 13)"
+                                .into(),
+                        ),
+                    },
+                );
+            },
+            "cannot read /zqvol",
         ),
         state(
             "directory with brackets refused in the form",

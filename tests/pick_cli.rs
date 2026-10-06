@@ -495,8 +495,8 @@ fn print_request_shows_the_body_without_sending() {
     );
 }
 
-/// Staleness is shown; a stale exhausted window stays exhausted until its reset, and a reset
-/// that has passed frees it.
+/// Staleness is shown; a stale exhausted window stays exhausted until its reset. A window whose
+/// reset has passed is of unknown usage: named, never counted, and the output offers `--live`.
 #[test]
 fn stale_usage_and_passed_resets() {
     let sb = Sandbox::new();
@@ -540,6 +540,11 @@ fn stale_usage_and_passed_resets() {
         "{}",
         out.stdout
     );
+    assert!(field(&out, "limit").starts_with("Week (all models) 50% left, resets in "));
+    assert_eq!(
+        field(&out, "unknown"),
+        "Session: reset since cached (--live asks the agent)"
+    );
     let body = pick(&sb, false, &["--print-request"]).stdout;
     let v: Value = serde_json::from_str(body.trim_end()).unwrap();
     let state = v["state"].as_str().unwrap();
@@ -548,9 +553,10 @@ fn stale_usage_and_passed_resets() {
         "{state}"
     );
     assert!(
-        state.contains("Session: 0% used (reset since cached)"),
+        state.contains("  Session: usage unknown (reset since cached)\n"),
         "{state}"
     );
+    assert!(!state.contains(": 0% used"), "{state}");
 
     let v: Value = serde_json::from_str(&pick(&sb, false, &["--json"]).stdout).unwrap();
     let old = &v["candidates"][1];
@@ -559,6 +565,252 @@ fn stale_usage_and_passed_resets() {
         (Some("claude:old"), Some(true))
     );
     assert_eq!(old["headroom"], 50.0);
+    assert_eq!(old["binding"], "Week (all models)");
+    assert_eq!(old["reset_passed"], true);
+    assert_eq!(v["candidates"][2]["reset_passed"], false);
+}
+
+/// The review of 2026-10-02, on real data: usage cached four days ago, every reset passed since,
+/// was recommended as "100% left" ahead of usage cached nine minutes ago with 71% left. It is of
+/// unknown headroom: feasible, after every pair of known headroom. `--json` says `reset_passed`
+/// and never names a reset in the past; nothing is queried live unless `--live` asks.
+#[test]
+fn usage_past_every_reset_ranks_after_known_headroom() {
+    let sb = Sandbox::new();
+    let alt = sb.make_claude_home("h/team-alt");
+    let max = sb.make_claude_home("h/max");
+    sb.write_claude_json(
+        Some(&alt),
+        &claude_json(
+            "alt@example.com",
+            4 * DAY,
+            &[
+                limit("session", 100.0, -4 * DAY + 3 * 3600),
+                limit("weekly_all", 100.0, -DAY),
+            ],
+        ),
+    );
+    sb.write_claude_json(
+        Some(&max),
+        &claude_json(
+            "max@example.com",
+            540,
+            &[limit("weekly_all", 29.0, 3 * DAY)],
+        ),
+    );
+    // team-alt first: registry order would favor it.
+    let accounts = [
+        ("claude", "team-alt", alt.as_path()),
+        ("claude", "max", &max),
+    ];
+    configure(&sb, &accounts, "");
+    let out = pick(&sb, false, &[]);
+    assert_eq!(field(&out, "account"), "claude:max");
+    assert!(field(&out, "limit").starts_with("Week (all models) 71% left, resets in "));
+    assert!(!out.stdout.contains("--live"), "{}", out.stdout);
+
+    let v: Value = serde_json::from_str(&pick(&sb, false, &["--json"]).stdout).unwrap();
+    assert_eq!(v["account"], "claude:max");
+    let of = |account: &str| {
+        v["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["account"] == account)
+            .unwrap_or_else(|| panic!("no {account}: {v:#}"))
+    };
+    let alt_pair = of("claude:team-alt");
+    assert_eq!(alt_pair["feasible"], true);
+    assert_eq!(alt_pair["reset_passed"], true);
+    assert_eq!(alt_pair["rules_rank"], 2);
+    assert_eq!(alt_pair["stale"], true);
+    for null in ["headroom", "binding", "resets_at", "why_not"] {
+        assert_eq!(alt_pair[null], Value::Null, "{null}: {alt_pair:#}");
+    }
+    let max_pair = of("claude:max");
+    assert_eq!(max_pair["reset_passed"], false);
+    assert_eq!(max_pair["rules_rank"], 1);
+    assert_eq!(max_pair["headroom"], 71.0);
+    let resets_at: jiff::Timestamp = max_pair["resets_at"].as_str().unwrap().parse().unwrap();
+    assert!(resets_at.as_second() > now(), "{max_pair:#}");
+
+    // Alone, it is recommended, as what it is; `--run` launches it and says so, without a live
+    // query of its own.
+    configure(&sb, &accounts, "[pick]\nexclude = [\"claude:max\"]\n");
+    let out = pick(&sb, false, &[]);
+    assert_eq!(field(&out, "account"), "claude:team-alt");
+    assert_eq!(field(&out, "limit"), "unknown");
+    assert_eq!(
+        field(&out, "unknown"),
+        "Session, Week (all models): reset since cached (--live asks the agent)"
+    );
+    assert_eq!(
+        field(&out, "usage"),
+        "cached 4d ago (stale: may be higher now)"
+    );
+    let state = pick(&sb, false, &["--print-request"]).stdout;
+    assert!(
+        state.contains("Week (all models): usage unknown (reset since cached)"),
+        "{state}"
+    );
+    let out = pick(&sb, false, &["--run", "--", "-p", "hello"]);
+    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains(
+            "remuda: pick: usage unknown: Session, Week (all models): reset since cached \
+             (--live asks the agent)"
+        ),
+        "{}",
+        out.stderr
+    );
+    let inv = sb.only_invocation();
+    assert_eq!(inv.config_dir.as_deref(), alt.to_str());
+    assert_eq!(
+        inv.args[..2],
+        ["-p", "hello"],
+        "the launch, not `-p /usage`"
+    );
+}
+
+/// A live query takes time, and a reset does not wait for it: the usage is read once it is all
+/// gathered, not when remuda started. Here the query fails after three seconds and the cache
+/// decides; its exhausted session reset in the meantime, so it no longer blocks the pair.
+#[test]
+fn usage_is_read_once_gathered_not_when_pick_started() {
+    let sb = Sandbox::new();
+    let slow = sb.make_claude_home("h/slow");
+    sb.write_claude_json(
+        Some(&slow),
+        &claude_json("s@example.com", 3600, &[limit("session", 100.0, 2)]),
+    );
+    // Every claude run for this home sleeps, then prints nothing: the live output is not
+    // recognized, and the cache is used.
+    sb.set_hang(Some(&slow), 3);
+    configure(&sb, &[("claude", "slow", &slow)], "");
+    let out = pick(&sb, false, &["--live", "--json"]);
+    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
+    let v: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(v["account"], "claude:slow");
+    let pair = &v["candidates"][1];
+    assert_eq!(pair["account"], "claude:slow");
+    assert_eq!(pair["source"], "cached");
+    assert_eq!(pair["feasible"], true, "{pair:#}");
+    assert_eq!(pair["reset_passed"], true);
+    assert_eq!(pair["headroom"], Value::Null);
+    assert_eq!(pair["resets_at"], Value::Null);
+}
+
+/// A live answer is recorded when it arrives and read when every account is in ([`gather`]'s
+/// two instants, here 100 seconds apart). A reset it names behind its arrival is no reset
+/// ahead; one that falls before everything is gathered has passed since it was asked.
+#[test]
+fn a_live_answer_is_recorded_when_it_arrives() {
+    use remuda::pick::{self, Config, Sources};
+    use remuda::provider::Provider;
+    use remuda::registry::{Account, Home};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    static TICKS: AtomicI64 = AtomicI64::new(0);
+    fn t0() -> jiff::Timestamp {
+        "2026-09-27T10:00:00Z".parse().unwrap()
+    }
+    fn clock() -> jiff::Timestamp {
+        t0() + jiff::SignedDuration::from_secs(100 * TICKS.fetch_add(1, Ordering::SeqCst))
+    }
+
+    let sb = Sandbox::new();
+    let home = sb.make_claude_home("h/max");
+    sb.set_live_usage(
+        Some(&home),
+        "Current session: 60% used \u{b7} resets Sep 27 at 9:59am (UTC)\n\
+         Current week (all models): 40% used \u{b7} resets Sep 27 at 10:01am (UTC)\n\
+         Current week (Fable): 5% used \u{b7} resets Sep 27 at 10:30am (UTC)\n",
+    );
+    let account = Account {
+        provider: Provider::Claude,
+        name: "max".into(),
+        home: Home::Path(home.to_str().unwrap().into()),
+    };
+    let claude = sb.bin().join("claude");
+    let env = remuda::Env::new();
+    let config = Config::default();
+    let sources = Sources {
+        env: &env,
+        clock,
+        agents: &remuda::account_command::OnPath {
+            claude: Some(&claude),
+            codex: None,
+        },
+        live: Some(std::time::Duration::from_secs(30)),
+        provider: None,
+    };
+    let (entries, now) = pick::gather(&[account], &config, &sources);
+    let answered = t0();
+    assert_eq!(now, answered + jiff::SignedDuration::from_secs(100));
+    let usage = entries[0].usage.as_ref().expect("live usage");
+    assert_eq!(usage.source.name(), "live");
+    assert_eq!(usage.fetched_at, Some(answered));
+    assert_eq!(usage.age_seconds, Some(100));
+    let read: Vec<(&str, Option<f64>, Option<jiff::Timestamp>, bool)> = usage
+        .windows
+        .iter()
+        .map(|w| (w.label.as_str(), w.used(), w.resets_at(), w.reset_passed()))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            // Behind when it was answered: the percentage stands, without a reset.
+            ("Session", Some(60.0), None, false),
+            // It reset while the rest was gathered.
+            ("Week (all models)", None, None, true),
+            (
+                "Week (Fable)",
+                Some(5.0),
+                Some("2026-09-27T10:30:00Z".parse().unwrap()),
+                false
+            ),
+        ]
+    );
+    let candidates = pick::candidates(&entries, &config, now);
+    assert!(candidates[0].feasible());
+    assert_eq!(candidates[0].headroom, Some(40.0));
+    // Nothing to ask live: it was.
+    assert_eq!(
+        pick::live_hint(&entries[0], &candidates[0]).as_deref(),
+        Some("Week (all models): reset since asked")
+    );
+    let v = pick::to_json(&entries, &candidates, None, &config);
+    assert_eq!(v["candidates"][0]["resets_at"], Value::Null);
+    assert_eq!(v["candidates"][0]["reset_passed"], true);
+    assert_eq!(v["candidates"][0]["age_seconds"], 100);
+
+    // The answer's age, counted from the same instant, is in the text and in what Jev reads:
+    // a live answer that waited for the others is not "just now".
+    let asked = pick::Asked::Skipped(pick::Reason::Offline);
+    let decision = pick::decide(&candidates, &entries, &config, asked).unwrap();
+    let text = pick::format_text(&entries, &candidates, &decision, &config, now);
+    assert!(text.contains("usage       live 1m ago\n"), "{text}");
+    let mut aliases = remuda::privacy::Aliases::default();
+    aliases.note("claude:max");
+    let tz = jiff::tz::TimeZone::UTC;
+    let request = remuda::jev::request(&entries, &candidates, &config, &aliases, now, &tz);
+    let state = request.body["state"].as_str().unwrap();
+    assert!(state.contains("  usage: live, 1m ago\n"), "{state}");
+    assert!(
+        state.contains("  Week (all models): usage unknown (reset since asked)\n"),
+        "{state}"
+    );
+    // One option: `launch` is not asked. With a second model it is, and each description
+    // carries the age.
+    let mut config = config;
+    config.claude.models = vec!["claude-opus-5-5".into(), "claude-sonnet-5".into()];
+    let candidates = pick::candidates(&entries, &config, now);
+    let request = remuda::jev::request(&entries, &candidates, &config, &aliases, now, &tz);
+    assert_eq!(
+        request.body["questions"]["launch"]["criteria"]["claude:account-1 / claude-opus-5-5"],
+        "tightest: Session 40% left; usage unknown: Week (all models): reset since asked; data \
+         live, 1m old"
+    );
 }
 
 /// Exclusions, `min_headroom`, and per-model windows; cached codex usage has no per-model
@@ -734,7 +986,12 @@ fn live_asks_codex_once() {
     let out = pick(&sb, false, &["--live"]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert_eq!(field(&out, "account"), "codex:work");
-    assert_eq!(field(&out, "usage"), "live");
+    // Live, with the answer's age (R23).
+    let usage = field(&out, "usage");
+    assert!(
+        usage.starts_with("live ") && usage.ends_with(" ago"),
+        "{usage:?}"
+    );
     assert_eq!(
         why_not(&out, "codex:out"),
         "not logged in (`codex app-server` account/read)"
@@ -931,6 +1188,7 @@ fn json_report() {
             "headroom",
             "jev_probability",
             "model",
+            "reset_passed",
             "resets_at",
             "rules_rank",
             "source",
@@ -943,6 +1201,7 @@ fn json_report() {
     assert_eq!(c["headroom"], 60.0);
     assert_eq!(c["binding"], "Week (all models)");
     assert_eq!(c["source"], "cached");
+    assert_eq!(c["reset_passed"], false);
     assert_eq!(c["rules_rank"], 1);
     assert_eq!(c["jev_probability"], 0.85);
     let age = c["age_seconds"].as_i64().unwrap();

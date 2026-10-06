@@ -8,6 +8,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use common::Sandbox;
+use common::homes::ClaudeHome;
 use predicates::prelude::*;
 use serde_json::Value;
 
@@ -51,32 +52,22 @@ fn names(dir: &Path) -> Vec<String> {
 /// what is never linked. `commands`, `rules`, `agent-memory` and `output-styles` are missing,
 /// and `agents` is a dangling link.
 fn source_home(dir: &Path) {
-    for sub in [
-        "projects",
-        "file-history",
-        "skills/review",
-        "hooks",
-        "plugins",
-        "sessions",
-        "todos",
-    ] {
-        fs::create_dir_all(dir.join(sub)).unwrap();
-    }
-    for (file, content) in [
-        (
-            "settings.json",
-            r#"{"model": "opus", "cleanupPeriodDays": 365}"#,
-        ),
-        ("CLAUDE.md", "be brief\n"),
-        ("keybindings.json", "{}"),
-        (".claude.json", "{}"),
-        ("history.jsonl", ""),
-        ("remote-settings.json", "{}"),
-        ("policy-limits.json", "{}"),
-    ] {
-        fs::write(dir.join(file), content).unwrap();
-    }
-    symlink(dir.join("nowhere"), dir.join("agents")).unwrap();
+    ClaudeHome::at(dir)
+        .dir("projects")
+        .dir("file-history")
+        .skill("review")
+        .dir("hooks")
+        .dir("plugins")
+        .dir("sessions")
+        .dir("todos")
+        .settings(r#"{"model": "opus", "cleanupPeriodDays": 365}"#)
+        .claude_md("be brief\n")
+        .file("keybindings.json", "{}")
+        .file(".claude.json", "{}")
+        .file("history.jsonl", "")
+        .file("remote-settings.json", "{}")
+        .file("policy-limits.json", "{}")
+        .dangling("agents");
 }
 
 /// What a home linked to [`source_home`] holds, sorted.

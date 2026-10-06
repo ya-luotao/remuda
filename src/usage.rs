@@ -17,6 +17,10 @@ use crate::provider::{Provider, codex};
 use crate::registry::Account;
 use crate::{Env, text};
 
+pub mod snapshot;
+
+pub use snapshot::{Reading, Reset, Snapshot, Source, Window};
+
 /// When a limit resets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resets {
@@ -271,7 +275,11 @@ pub fn format_time(ts: Timestamp, tz: &TimeZone) -> String {
 
 /// `45s ago`, `3m ago`, `2h ago`, `3d ago` (floored; a future time counts as `0s ago`).
 pub fn format_age(then: Timestamp, now: Timestamp) -> String {
-    let secs = (now.as_second() - then.as_second()).max(0);
+    format_ago((now.as_second() - then.as_second()).max(0))
+}
+
+/// [`format_age`] of an age in seconds.
+pub fn format_ago(secs: i64) -> String {
     match secs {
         s if s < 60 => format!("{s}s ago"),
         s if s < 3600 => format!("{}m ago", s / 60),
@@ -285,33 +293,33 @@ pub const WARN_AT: f64 = 75.0;
 /// ... and from this one critical (R10).
 pub const CRIT_AT: f64 = 90.0;
 
-/// The reported severity, else one derived from the percentage (live rows carry none).
-pub fn severity(r: &UsageRow) -> &str {
-    match r.severity.as_deref() {
-        Some(s) => s,
-        None if r.percent >= CRIT_AT => "critical",
-        None if r.percent >= WARN_AT => "warning",
-        None => "normal",
-    }
-}
-
-/// Indented, aligned rows: label, percent, `!`/`!!` for warning/critical ([`severity`]),
-/// reset time.
-pub fn format_rows(rows: &[UsageRow], tz: &TimeZone) -> String {
-    let cells: Vec<(&str, String, &str, String)> = rows
+/// Indented, aligned rows of `reading`'s windows: label, percent, `!`/`!!` for warning/critical
+/// ([`Window::severity`]), reset time. A window whose reset has passed since the usage was
+/// recorded has `-` for its percent and says so (R10).
+pub fn format_rows(reading: &Reading, tz: &TimeZone) -> String {
+    let cells: Vec<(&str, String, &str, String)> = reading
+        .windows
         .iter()
-        .map(|r| {
-            let mark = match severity(r) {
+        .map(|w| {
+            let mark = match w.severity() {
                 "warning" => "!",
                 "critical" => "!!",
                 _ => "",
             };
-            let resets = match &r.resets {
-                Some(Resets::At(ts)) => format!("resets {}", format_time(*ts, tz)),
-                Some(Resets::Text(text)) => format!("resets {text}"),
-                None => String::new(),
+            let (percent, resets) = match (w.used(), w.reset, &w.wording) {
+                (None, Reset::Passed(at), _) => (
+                    "-".to_string(),
+                    format!("{} ({})", w.reset_since(), format_time(at, tz)),
+                ),
+                (None, _, _) => ("-".to_string(), String::new()),
+                (Some(used), _, Some(text)) => (format_percent(used), format!("resets {text}")),
+                (Some(used), Reset::Ahead(at), None) => (
+                    format_percent(used),
+                    format!("resets {}", format_time(at, tz)),
+                ),
+                (Some(used), _, None) => (format_percent(used), String::new()),
             };
-            (r.label.as_str(), format_percent(r.percent), mark, resets)
+            (w.label.as_str(), percent, mark, resets)
         })
         .collect();
     let label_w = cells.iter().map(|c| text::width(c.0)).max().unwrap_or(0);
@@ -378,11 +386,12 @@ pub fn cached_report(account: &Account, env: &Env, tz: &TimeZone, now: Timestamp
     match cached_usage(account, env) {
         Err(notice) => format!("{name}  no cached usage ({notice})\n"),
         Ok(cached) => {
-            let when = match cached.fetched_at {
-                Some(at) => format!("cached {} ({})", format_age(at, now), format_time(at, tz)),
-                None => "cached (time unknown)".to_string(),
+            let reading = Snapshot::cached(&cached).at(now);
+            let when = match (reading.age_text(), reading.fetched_at) {
+                (Some(age), Some(at)) => format!("cached {age} ({})", format_time(at, tz)),
+                _ => "cached (time unknown)".to_string(),
             };
-            format!("{name}  {when}\n{}", format_rows(&cached.rows, tz))
+            format!("{name}  {when}\n{}", format_rows(&reading, tz))
         }
     }
 }
@@ -500,11 +509,13 @@ pub fn live_codex(
 
 /// `remuda usage --live` block for one account; `false` when the query failed (R10), which an
 /// agent that is not on PATH is too. The header names the identity the query told (codex: email
-/// and plan).
+/// and plan). The rows are read when they are answered, by `clock`: the query may take as long
+/// as `timeout`.
 pub fn live_report(
     account: &Account,
     agents: &dyn Runner,
     tz: &TimeZone,
+    clock: fn() -> Timestamp,
     timeout: Duration,
 ) -> (String, bool) {
     let name = account.qualified();
@@ -523,10 +534,14 @@ pub fn live_report(
                         true,
                     )
                 }
-                LiveUsage::Rows(rows) => (
-                    format!("{name}  live{who}\n{}", format_rows(&rows, tz)),
-                    true,
-                ),
+                LiveUsage::Rows(rows) => {
+                    let now = clock();
+                    let reading = Snapshot::live(&rows, now).at(now);
+                    (
+                        format!("{name}  live{who}\n{}", format_rows(&reading, tz)),
+                        true,
+                    )
+                }
             }
         }
     }
@@ -539,75 +554,6 @@ fn who_and_plan(identity: &Identity) -> String {
             plan: Some(plan), ..
         } => format!("  {} ({plan})", identity.who()),
         _ => format!("  {}", identity.who()),
-    }
-}
-
-/// When a limit resets, as an instant: [`Resets::At`] as is; claude's wording
-/// (`Sep 24 at 3:19am (Asia/Shanghai)`, `3am (UTC)`) parsed best-effort, as the next such
-/// time around `now`. `None` when the wording is not recognized.
-pub fn reset_instant(resets: &Resets, now: Timestamp) -> Option<Timestamp> {
-    match resets {
-        Resets::At(ts) => Some(*ts),
-        Resets::Text(text) => parse_reset_text(text, now),
-    }
-}
-
-fn parse_reset_text(text: &str, now: Timestamp) -> Option<Timestamp> {
-    let (rest, zone) = text.trim().strip_suffix(')')?.rsplit_once(" (")?;
-    let zone = TimeZone::get(zone).ok()?;
-    let (date, time) = match rest.split_once(" at ") {
-        Some((date, time)) => (Some(date.trim()), time.trim()),
-        None => (None, rest.trim()),
-    };
-    let time = time.to_ascii_lowercase();
-    let (clock, pm) = match (time.strip_suffix("am"), time.strip_suffix("pm")) {
-        (Some(c), _) => (c, false),
-        (_, Some(c)) => (c, true),
-        _ => return None,
-    };
-    let (hour, minute) = match clock.split_once(':') {
-        Some((h, m)) => (h.parse::<i8>().ok()?, m.parse::<i8>().ok()?),
-        None => (clock.parse::<i8>().ok()?, 0),
-    };
-    if !(1..=12).contains(&hour) {
-        return None;
-    }
-    let hour = hour % 12 + if pm { 12 } else { 0 };
-    let today = now.to_zoned(zone.clone()).date();
-    let at = |d: jiff::civil::Date| -> Option<Timestamp> {
-        Some(
-            d.at(hour, minute, 0, 0)
-                .to_zoned(zone.clone())
-                .ok()?
-                .timestamp(),
-        )
-    };
-    match date {
-        None => {
-            let t = at(today)?;
-            if t >= now {
-                Some(t)
-            } else {
-                at(today.tomorrow().ok()?)
-            }
-        }
-        Some(date) => {
-            let (month, day) = date.split_once(' ')?;
-            const MONTHS: [&str; 12] = [
-                "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
-            ];
-            let month = month.get(..3)?.to_ascii_lowercase();
-            let month = MONTHS.iter().position(|m| *m == month)? as i8 + 1;
-            let day: i8 = day.trim().parse().ok()?;
-            // The nearest year that does not put the reset more than a day in the past.
-            let year = today.year();
-            let this = at(jiff::civil::Date::new(year, month, day).ok()?)?;
-            if this.as_second() >= now.as_second() - 86_400 {
-                Some(this)
-            } else {
-                at(jiff::civil::Date::new(year + 1, month, day).ok()?)
-            }
-        }
     }
 }
 
@@ -1077,7 +1023,7 @@ mod tests {
             Err("`claude` not found on PATH".to_string())
         );
         assert_eq!(
-            live_report(&max, &agents, &TimeZone::UTC, T),
+            live_report(&max, &agents, &TimeZone::UTC, Timestamp::now, T),
             (
                 "claude:max  error: `claude` not found on PATH\n".to_string(),
                 false
@@ -1101,7 +1047,7 @@ mod tests {
             live_usage(&max, &agents, T),
             Ok(LiveUsage::Unrecognized(drifted.clone()).into())
         );
-        let (report, ok) = live_report(&max, &agents, &TimeZone::UTC, T);
+        let (report, ok) = live_report(&max, &agents, &TimeZone::UTC, Timestamp::now, T);
         assert!(ok);
         assert!(
             report.starts_with("claude:max  live (output not recognized; shown as is)\n"),
@@ -1185,56 +1131,12 @@ mod tests {
         );
         let agents = Scripted::new().without(Provider::Codex);
         assert_eq!(
-            live_report(&work, &agents, &TimeZone::UTC, T),
+            live_report(&work, &agents, &TimeZone::UTC, Timestamp::now, T),
             (
                 "codex:work  error: `codex` not found on PATH\n".to_string(),
                 false
             )
         );
-    }
-
-    #[test]
-    fn reset_text_becomes_an_instant() {
-        let now = ts("2026-09-23T18:00:00Z"); // Sep 24 02:00 in Shanghai
-        let parse = |t: &str| reset_instant(&Resets::Text(t.into()), now);
-        assert_eq!(
-            parse("Sep 24 at 3:19am (Asia/Shanghai)"),
-            Some(ts("2026-09-23T19:19:00Z"))
-        );
-        assert_eq!(
-            parse("Sep 29 at 11:59am (Asia/Shanghai)"),
-            Some(ts("2026-09-29T03:59:00Z"))
-        );
-        assert_eq!(
-            parse("Sep 29 at 12pm (UTC)"),
-            Some(ts("2026-09-29T12:00:00Z"))
-        );
-        assert_eq!(
-            parse("Sep 29 at 12:30am (UTC)"),
-            Some(ts("2026-09-29T00:30:00Z"))
-        );
-        // No date: the next such time.
-        assert_eq!(parse("7pm (UTC)"), Some(ts("2026-09-23T19:00:00Z")));
-        assert_eq!(parse("5pm (UTC)"), Some(ts("2026-09-24T17:00:00Z")));
-        // Around New Year: January is next year.
-        let dec = ts("2026-12-30T00:00:00Z");
-        assert_eq!(
-            reset_instant(&Resets::Text("Jan 2 at 1am (UTC)".into()), dec),
-            Some(ts("2027-01-02T01:00:00Z"))
-        );
-        for junk in [
-            "",
-            "soon",
-            "Sep 24 at 3:19am",
-            "Sep 24 at 3:19am (Not/AZone)",
-            "Sep 24 at 13am (UTC)",
-            "Foo 24 at 3am (UTC)",
-            "Sep 24 at 3:xxam (UTC)",
-        ] {
-            assert_eq!(parse(junk), None, "{junk:?}");
-        }
-        let at = ts("2026-09-25T05:00:00Z");
-        assert_eq!(reset_instant(&Resets::At(at), now), Some(at));
     }
 
     #[test]
@@ -1259,16 +1161,25 @@ mod tests {
         }
     }
 
+    /// A live answer's rows as text, read when they were answered.
+    fn live_text(rows: &[UsageRow]) -> String {
+        let now = ts("2026-09-23T12:00:00Z");
+        format_rows(&Snapshot::live(rows, now).at(now), &TimeZone::UTC)
+    }
+
+    fn normalized(out: &str) -> Vec<String> {
+        out.lines()
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect()
+    }
+
     #[test]
     fn formats_rows_with_markers() {
-        let rows = parse_cached(CACHE).unwrap().rows;
-        let out = format_rows(&rows, &TimeZone::UTC);
-        let normalized: Vec<String> = out
-            .lines()
-            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect();
+        let cached = parse_cached(CACHE).unwrap();
+        let fetched = cached.fetched_at.unwrap();
+        let out = format_rows(&Snapshot::cached(&cached).at(fetched), &TimeZone::UTC);
         assert_eq!(
-            normalized,
+            normalized(&out),
             [
                 "Session 34% resets Sep 23 15:39",
                 "Week (all models) 77% ! resets Sep 25 04:59",
@@ -1279,66 +1190,87 @@ mod tests {
         // Percent columns line up.
         let pct_end: Vec<usize> = out.lines().map(|l| l.find('%').unwrap()).collect();
         assert!(pct_end.windows(2).all(|w| w[0] == w[1]), "{out}");
-        let live = format_rows(&parse_live(LIVE).items, &TimeZone::UTC);
+        let live = live_text(&parse_live(LIVE).items);
         assert!(live.contains("9%"), "{live}");
         assert!(
             live.contains("resets Sep 24 at 3:19am (Asia/Shanghai)"),
             "{live}"
         );
         // Labels align by display width (a double-width model name).
-        let wide = format_rows(
-            &[
-                row("Week (模型)", 5.0, None, None),
-                row("Session", 7.0, None, None),
-            ],
-            &TimeZone::UTC,
-        );
+        let wide = live_text(&[
+            row("Week (模型)", 5.0, None, None),
+            row("Session", 7.0, None, None),
+        ]);
         let pct_col: Vec<usize> = wide
             .lines()
             .map(|l| text::width(&l[..l.find('%').unwrap()]))
             .collect();
         assert_eq!(pct_col[0], pct_col[1], "{wide}");
-        let fractional = format_rows(&[row("X", 12.5, None, None)], &TimeZone::UTC);
+        let fractional = live_text(&[row("X", 12.5, None, None)]);
         assert_eq!(fractional.trim(), "X  12.5%");
     }
 
+    /// R10: a window whose reset has passed since the cache was written has no percentage (and
+    /// no marker): it says when it reset. The others read as recorded.
     #[test]
-    fn live_rows_are_marked_at_75_and_90_percent() {
-        assert_eq!((WARN_AT, CRIT_AT), (75.0, 90.0));
-        let live = |percent| row("Session", percent, None, None);
-        for (percent, want) in [
-            (0.0, "normal"),
-            (74.9, "normal"),
-            (75.0, "warning"),
-            (89.9, "warning"),
-            (90.0, "critical"),
-            (100.0, "critical"),
-        ] {
-            assert_eq!(severity(&live(percent)), want, "{percent}%");
-        }
-        // A reported severity (cached rows) wins over the percentage.
+    fn a_passed_reset_is_said_instead_of_the_old_percentage() {
+        let cached = parse_cached(CACHE).unwrap();
+        // After the session's reset (Sep 23 15:39), before the week's.
+        let reading = Snapshot::cached(&cached).at(ts("2026-09-24T00:00:00Z"));
+        let out = format_rows(&reading, &TimeZone::UTC);
         assert_eq!(
-            severity(&row("Session", 95.0, Some("normal"), None)),
-            "normal"
+            normalized(&out),
+            [
+                "Session - reset since cached (Sep 23 15:39)",
+                "Week (all models) 77% ! resets Sep 25 04:59",
+                "Week (Fable) 100% !! resets Sep 25 04:59",
+            ]
+        );
+        // The `-` ends where the percentages do.
+        let ends: Vec<usize> = out
+            .lines()
+            .map(|l| {
+                l.find(" - ")
+                    .map_or_else(|| l.find('%').unwrap(), |i| i + 1)
+            })
+            .collect();
+        assert!(ends.windows(2).all(|w| w[0] == w[1]), "{out}");
+        // Every reset passed: the exhausted per-model week is not marked critical any more.
+        let later = Snapshot::cached(&cached).at(ts("2026-10-01T00:00:00Z"));
+        assert_eq!(
+            normalized(&format_rows(&later, &TimeZone::UTC)),
+            [
+                "Session - reset since cached (Sep 23 15:39)",
+                "Week (all models) - reset since cached (Sep 25 04:59)",
+                "Week (Fable) - reset since cached (Sep 25 04:59)",
+            ]
+        );
+        // A live answer naming a reset already behind keeps its percentage, and its wording.
+        let now = ts("2026-09-24T00:00:00Z");
+        let rows = [row("Session", 95.0, None, text("Sep 23 at 11pm (UTC)"))];
+        let live = format_rows(&Snapshot::live(&rows, now).at(now), &TimeZone::UTC);
+        assert_eq!(
+            normalized(&live),
+            ["Session 95% !! resets Sep 23 at 11pm (UTC)"]
+        );
+        // The same answer, asked before that reset and read after it.
+        let asked = ts("2026-09-23T20:00:00Z");
+        let aged = format_rows(&Snapshot::live(&rows, asked).at(now), &TimeZone::UTC);
+        assert_eq!(
+            normalized(&aged),
+            ["Session - reset since asked (Sep 23 23:00)"]
         );
     }
 
     #[test]
     fn live_rows_get_the_same_markers_in_text() {
-        let out = format_rows(
-            &[
-                row("Session", 74.0, None, None),
-                row("Week (all models)", 75.0, None, None),
-                row("Week (Fable)", 90.0, None, None),
-            ],
-            &TimeZone::UTC,
-        );
-        let normalized: Vec<String> = out
-            .lines()
-            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect();
+        let out = live_text(&[
+            row("Session", 74.0, None, None),
+            row("Week (all models)", 75.0, None, None),
+            row("Week (Fable)", 90.0, None, None),
+        ]);
         assert_eq!(
-            normalized,
+            normalized(&out),
             [
                 "Session 74%",
                 "Week (all models) 75% !",

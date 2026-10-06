@@ -5,8 +5,9 @@ mod common;
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use common::rollouts as cx;
 use common::transcripts as cl;
@@ -1075,6 +1076,620 @@ fn vanished_files_stop_counting() {
     let table = f.report().table(Period::All).clone();
     assert_eq!(of(&table.overall, "claude-test"), toks(7, 0, 0, 7, 0));
     assert_eq!(f.report().files, 1);
+}
+
+fn chmod(path: &Path, mode: u32) {
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// R20, R8 (review #10): a store that exists but cannot be listed is not a store whose
+/// transcripts were deleted. Their counts stay in the cache and in the report as last read,
+/// the refresh names the store, the cache is not rewritten, and nothing is read again once the
+/// store can be listed.
+#[test]
+fn a_store_that_cannot_be_read_keeps_its_counts_and_is_reported() {
+    let mut f = Fixture::new();
+    f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+    f.write(
+        &format!("{S_A}/subagents/agent-1.jsonl"),
+        &cl::assistant_usage(
+            S_A,
+            "msg_sub",
+            "claude-test",
+            cl::usage(7, 7, 0, 0),
+            &cl::ts(5),
+        ),
+    );
+    let counted = toks(10, 300, 100, 47, 0);
+    assert_eq!(of(&f.all().overall, "claude-test"), counted);
+    let saved = f.root.join("remuda/state/stats.json");
+    f.cache.save(&saved).unwrap();
+    let before = f.cache.clone();
+    let store = f.projects();
+
+    chmod(&store, 0o000);
+    let s = f.refresh();
+    chmod(&store, 0o755);
+    assert_eq!(f.cache, before, "nothing is known about the store");
+    assert_eq!(
+        (s.files, s.removed, s.reused, s.cold, s.kept()),
+        (2, 0, 0, 0, 2)
+    );
+    assert_eq!(s.unreadable.len(), 1, "{:?}", s.unreadable);
+    assert_eq!(
+        (s.unreadable[0].path.as_path(), s.unreadable[0].kept),
+        (store.as_path(), 2)
+    );
+    assert!(s.incomplete().is_some_and(|said| {
+        said.starts_with(&format!("incomplete: cannot read {}: ", store.display()))
+    }));
+    let report = f.report();
+    assert_eq!(
+        of(&report.table(Period::All).overall, "claude-test"),
+        counted
+    );
+    assert_eq!(report.files, 2);
+    assert!(
+        !f.cache.save_if_changed(&saved, &s).unwrap(),
+        "what was kept is no change"
+    );
+
+    let s = f.refresh();
+    assert_eq!(
+        (s.reused, s.cold, s.incremental, s.bytes_read),
+        (2, 0, 0, 0),
+        "readable again: nothing is read again"
+    );
+    assert!(s.unreadable.is_empty());
+    assert_eq!(f.cache, before);
+}
+
+/// R20, R8 (review #10): only what is below the directory that cannot be listed is kept: a
+/// transcript deleted beside it stops counting, and so do those of a directory that is gone.
+#[test]
+fn a_session_directory_that_cannot_be_read_keeps_its_counts_alone() {
+    let mut f = Fixture::new();
+    let top = f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+    let sub = f.write(
+        &format!("{S_A}/subagents/agent-1.jsonl"),
+        &cl::assistant_usage(
+            S_A,
+            "msg_sub",
+            "claude-test",
+            cl::usage(7, 7, 0, 0),
+            &cl::ts(5),
+        ),
+    );
+    f.all();
+    let locked = f.projects().join("-w-proj").join(S_A);
+
+    chmod(&locked, 0o000);
+    fs::remove_file(&top).unwrap();
+    let s = f.refresh();
+    chmod(&locked, 0o755);
+    assert_eq!((s.files, s.removed, s.kept()), (1, 1, 1));
+    assert_eq!(s.unreadable.len(), 1, "{:?}", s.unreadable);
+    assert_eq!(s.unreadable[0].path, locked);
+    assert!(f.cache.files.contains_key(&sub) && !f.cache.files.contains_key(&top));
+    let table = f.report().table(Period::All).clone();
+    assert_eq!(of(&table.overall, "claude-test"), toks(7, 0, 0, 7, 0));
+
+    // The directory is gone: its transcripts no longer count.
+    fs::remove_dir_all(&locked).unwrap();
+    let s = f.refresh();
+    assert_eq!((s.files, s.removed), (0, 1));
+    assert!(s.unreadable.is_empty());
+    assert_eq!(f.report().files, 0);
+}
+
+/// R20, R8 (review #10): directories that can be listed but not searched, a claude project and
+/// a codex day directory, give names and nothing else. Their transcripts are not taken for
+/// deleted: the counts stay, each directory is reported, and nothing is read again once they
+/// can be searched.
+#[test]
+fn directories_that_cannot_be_searched_keep_their_counts_and_are_reported() {
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let top = f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+    f.write(
+        &format!("{S_A}/subagents/agent-1.jsonl"),
+        &cl::assistant_usage(
+            S_A,
+            "msg_sub",
+            "claude-test",
+            cl::usage(7, 7, 0, 0),
+            &cl::ts(5),
+        ),
+    );
+    let rollout = cx::write_rollout(&work, R1, &r1_records(cx::ts));
+    f.all();
+    let before = f.cache.clone();
+    let (project, day) = (top.parent().unwrap(), rollout.parent().unwrap());
+
+    chmod(project, 0o444);
+    chmod(day, 0o444);
+    let s = f.refresh();
+    chmod(project, 0o755);
+    chmod(day, 0o755);
+    assert_eq!(f.cache, before);
+    assert_eq!((s.files, s.removed, s.cold, s.kept()), (3, 0, 0, 3));
+    // The project once: not again for the session directory below it, which fails too.
+    let unreadable: Vec<(&Path, usize)> = s
+        .unreadable
+        .iter()
+        .map(|u| (u.path.as_path(), u.kept))
+        .collect();
+    assert_eq!(unreadable, [(project, 2), (day, 1)]);
+
+    let s = f.refresh();
+    assert_eq!(
+        (s.reused, s.cold, s.incremental, s.bytes_read),
+        (3, 0, 0, 0)
+    );
+    assert!(s.unreadable.is_empty());
+}
+
+/// R20, R8: a file rewritten in place between the listing and the read (the same inode,
+/// larger) with an mtime earlier than the cached one is read whole: its counts are replaced,
+/// not added to.
+#[test]
+fn a_file_rewritten_with_an_earlier_mtime_before_it_is_opened_is_read_whole() {
+    let set_mtime = |path: &Path, to| {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(to).unwrap();
+    };
+    let mut f = Fixture::new();
+    let path = f.write(&format!("{S_A}.jsonl"), &msg_a2());
+    assert_eq!(of(&f.all().overall, "claude-test"), toks(1, 200, 0, 5, 0));
+    let before = fs::metadata(&path).unwrap().modified().unwrap();
+    append(&path, "\n");
+    set_mtime(&path, before + Duration::from_secs(60));
+
+    let sources = f.sources();
+    // The first report comes after the listing and before anything is read.
+    let s = stats::refresh(&mut f.cache, &sources, |done, _| {
+        if done == 0 {
+            fs::write(&path, msg_a1_records().concat()).unwrap();
+            set_mtime(&path, before - Duration::from_secs(60));
+        }
+    });
+    assert_eq!((s.incremental, s.cold), (1, 0), "listed as grown");
+    let table = f.report().table(Period::All).clone();
+    assert_eq!(of(&table.overall, "claude-test"), toks(3, 300, 100, 40, 0));
+    let s = f.refresh();
+    assert_eq!((s.reused, s.bytes_read), (1, 0), "cached as it was opened");
+}
+
+/// R20: a transcript the cache holds that is listed as changed and can no longer be read is
+/// dropped, and that is a change to save: the saved cache does not keep it, whether or not the
+/// refresh also kept what is below a directory it could not read (R8).
+#[test]
+fn a_cached_file_that_can_no_longer_be_read_leaves_the_saved_cache() {
+    for with_an_unreadable_directory in [false, true] {
+        let mut f = Fixture::new();
+        f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+        f.write(
+            &format!("{S_A}/subagents/agent-1.jsonl"),
+            &cl::assistant_usage(
+                S_A,
+                "msg_sub",
+                "claude-test",
+                cl::usage(7, 7, 0, 0),
+                &cl::ts(5),
+            ),
+        );
+        let b = f.write(
+            &format!("{S_B}.jsonl"),
+            &cl::assistant_usage(
+                S_B,
+                "msg_b1",
+                "claude-test",
+                cl::usage(7, 7, 0, 0),
+                &cl::ts(5),
+            ),
+        );
+        f.all();
+        let saved = f.root.join("remuda/state/stats.json");
+        f.cache.save(&saved).unwrap();
+        assert_eq!(Cache::load(&saved).files.len(), 3);
+
+        // Grown, then no longer readable: listed, and not opened.
+        append(
+            &b,
+            &cl::assistant_usage(
+                S_B,
+                "msg_b2",
+                "claude-test",
+                cl::usage(1, 1, 0, 0),
+                &cl::ts(6),
+            ),
+        );
+        let session = f.projects().join("-w-proj").join(S_A);
+        chmod(&b, 0o000);
+        if with_an_unreadable_directory {
+            chmod(&session, 0o000);
+        }
+        let s = f.refresh();
+        chmod(&b, 0o644);
+        chmod(&session, 0o755);
+        let kept = usize::from(with_an_unreadable_directory);
+        assert_eq!(
+            (s.files, s.incremental, s.removed, s.kept(), s.bytes_read),
+            (2, 1, 1, kept, 0),
+            "{s:?}"
+        );
+        assert_eq!(s.reused, 2 - kept);
+        assert!(!f.cache.files.contains_key(&b));
+        assert!(
+            f.cache.save_if_changed(&saved, &s).unwrap(),
+            "dropping a cached file is a change"
+        );
+        assert_eq!(Cache::load(&saved), f.cache);
+    }
+}
+
+/// R20, R8: a transcript that is a symlink to somewhere out of reach is a single transcript
+/// that cannot be read. It stops counting, like one that cannot be opened; it is no directory
+/// whose counts stay, and the refresh is not incomplete for it.
+#[test]
+fn a_symlinked_transcript_out_of_reach_stops_counting() {
+    let mut f = Fixture::new();
+    f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+    let away = f.root.join("away");
+    let target = write_file(
+        &away.join("b.jsonl"),
+        &cl::assistant_usage(
+            S_B,
+            "msg_b1",
+            "claude-test",
+            cl::usage(7, 7, 0, 0),
+            &cl::ts(5),
+        ),
+    );
+    let linked = f.projects().join(format!("-w-proj/{S_B}.jsonl"));
+    symlink(&target, &linked).unwrap();
+    let both = toks(10, 300, 100, 47, 0);
+    assert_eq!(of(&f.all().overall, "claude-test"), both);
+    assert!(f.cache.files.contains_key(&linked));
+
+    chmod(&away, 0o000);
+    let s = f.refresh();
+    chmod(&away, 0o755);
+    assert_eq!(
+        (s.files, s.removed, s.reused, s.kept()),
+        (1, 1, 1, 0),
+        "{:?}",
+        s.unreadable
+    );
+    assert!(s.unreadable.is_empty(), "{:?}", s.unreadable);
+    assert_eq!(s.incomplete(), None);
+    assert!(!f.cache.files.contains_key(&linked));
+    let table = f.report().table(Period::All).clone();
+    assert_eq!(of(&table.overall, "claude-test"), toks(3, 300, 100, 40, 0));
+
+    // In reach again: it counts again.
+    assert_eq!(of(&f.all().overall, "claude-test"), both);
+}
+
+/// R20, R8 (review #10): a codex home that cannot be searched: neither its `sessions` nor its
+/// `archived_sessions` can be resolved, which is not the same as their being gone. Their
+/// rollouts stay in the cache and in the counts as last read, both directories are reported
+/// as the home gives them, and nothing is read again once they resolve. A home that is gone
+/// has no sources.
+#[test]
+fn sources_that_cannot_be_resolved_keep_their_counts_and_are_reported() {
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+    cx::write_rollout(&work, R1, &r1_records(cx::ts));
+    cx::write_archived_rollout(
+        &work,
+        R2,
+        &[
+            cx::meta(R2, "/w/proj", json!("cli"), 0, &cx::ts(0)),
+            cx::model_turn("gpt-test-a", &cx::ts(1)),
+            cx::tokens([7, 0, 3, 0], [7, 0, 3, 0], &cx::ts(2)),
+        ]
+        .concat(),
+    );
+    let refresh = |f: &mut Fixture| {
+        let (sources, given) = stats::resolve(&f.accounts, &f.env);
+        let s = stats::refresh_with(&mut f.cache, &sources, &given, |_, _| {});
+        let unresolved: Vec<_> = given.into_iter().filter(|g| g.real.is_err()).collect();
+        (sources, unresolved, s)
+    };
+    let (sources, unresolved, s) = refresh(&mut f);
+    assert_eq!((sources.len(), unresolved.len(), s.files), (3, 0, 3));
+    let before = f.cache.clone();
+    let overall = f.report().table(Period::All).overall.clone();
+    let saved = f.root.join("remuda/state/stats.json");
+    f.cache.save(&saved).unwrap();
+
+    chmod(&work, 0o000);
+    let (sources, unresolved, s) = refresh(&mut f);
+    let listed = f.sources();
+    let report = f.report();
+    chmod(&work, 0o755);
+    assert_eq!(
+        sources, listed,
+        "the list of sources is the same either way"
+    );
+    assert_eq!(sources.len(), 1);
+    let given: Vec<(Provider, &Path, &str)> = unresolved
+        .iter()
+        .map(|u| (u.provider, u.path.as_path(), u.account.as_str()))
+        .collect();
+    assert_eq!(
+        given,
+        [
+            (
+                Provider::Codex,
+                work.join("sessions").as_path(),
+                "codex:work"
+            ),
+            (
+                Provider::Codex,
+                work.join("archived_sessions").as_path(),
+                "codex:work"
+            ),
+        ]
+    );
+    assert_eq!(f.cache, before);
+    assert_eq!(
+        (s.files, s.removed, s.reused, s.cold, s.kept()),
+        (3, 0, 1, 0, 2)
+    );
+    // Each with the rollouts last read below it.
+    let kept: Vec<(&Path, usize, bool)> = s
+        .unreadable
+        .iter()
+        .map(|u| (u.path.as_path(), u.kept, u.unresolved))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            (work.join("sessions").as_path(), 1, true),
+            (work.join("archived_sessions").as_path(), 1, true),
+        ]
+    );
+    assert_eq!(report.table(Period::All).overall, overall);
+    assert_eq!(report.files, 3);
+    // Whose home the rollouts are in is not known meanwhile: counted, as unattributed.
+    let table = report.table(Period::All);
+    assert!(section(table, &["codex:work"]).models.is_empty());
+    assert!(!of(&section(table, &[]).models, "gpt-test-a").is_zero());
+    assert!(
+        !f.cache.save_if_changed(&saved, &s).unwrap(),
+        "what was kept is no change"
+    );
+
+    let (_, unresolved, s) = refresh(&mut f);
+    assert!(unresolved.is_empty() && s.unreadable.is_empty());
+    assert_eq!(
+        (s.reused, s.cold, s.incremental, s.bytes_read),
+        (3, 0, 0, 0),
+        "resolved again: nothing is read again"
+    );
+
+    // Only `archived_sessions` cannot be resolved (a link through a directory that cannot be
+    // searched): the rollouts of `sessions`, which is listed, are told from the archived one.
+    let away = f.root.join("away");
+    fs::create_dir_all(&away).unwrap();
+    fs::rename(work.join("archived_sessions"), away.join("archived")).unwrap();
+    symlink(away.join("archived"), work.join("archived_sessions")).unwrap();
+    let (sources, _, s) = refresh(&mut f);
+    assert_eq!((sources.len(), s.files, s.removed, s.cold), (3, 3, 1, 1));
+    chmod(&away, 0o000);
+    fs::remove_dir_all(work.join("sessions/2026")).unwrap();
+    let (sources, unresolved, s) = refresh(&mut f);
+    chmod(&away, 0o755);
+    assert_eq!((sources.len(), unresolved.len()), (2, 1));
+    assert_eq!((s.files, s.removed, s.reused, s.kept()), (2, 1, 1, 1));
+    assert_eq!(s.unreadable[0].path, work.join("archived_sessions"));
+
+    // The home is gone: so are its sources and what was counted from them.
+    fs::remove_dir_all(&work).unwrap();
+    let (sources, unresolved, s) = refresh(&mut f);
+    assert_eq!((sources.len(), unresolved.len()), (1, 0));
+    assert_eq!((s.files, s.removed), (1, 1));
+    assert!(s.unreadable.is_empty());
+}
+
+/// R20, R8 (review #10): a source that cannot be resolved keeps what was counted from the
+/// source it last resolved to, and from that alone. Here a codex home's `archived_sessions`
+/// cannot be resolved while its `sessions` is gone: the rollouts of `sessions` stop counting,
+/// the archived one stays, and the cache that is saved says the same. Likewise for a claude
+/// store whose account left the registry.
+#[test]
+fn a_source_that_cannot_be_resolved_does_not_keep_the_counts_of_another() {
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let other = f.claude("other");
+    f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+    write_file(
+        &other.join(format!("projects/-w/{S_B}.jsonl")),
+        &cl::assistant_usage(
+            S_B,
+            "msg_b1",
+            "claude-test",
+            cl::usage(7, 7, 0, 0),
+            &cl::ts(5),
+        ),
+    );
+    cx::write_rollout(&work, R1, &r1_records(cx::ts));
+    let away = f.root.join("away");
+    let archived = cx::write_archived_rollout(
+        &away,
+        R2,
+        &[
+            cx::meta(R2, "/w/proj", json!("cli"), 0, &cx::ts(0)),
+            cx::model_turn("gpt-test-a", &cx::ts(1)),
+            cx::tokens([7, 0, 3, 0], [7, 0, 3, 0], &cx::ts(2)),
+        ]
+        .concat(),
+    );
+    symlink(
+        away.join("archived_sessions"),
+        work.join("archived_sessions"),
+    )
+    .unwrap();
+    let refresh = |f: &mut Fixture| {
+        let (sources, given) = stats::resolve(&f.accounts, &f.env);
+        stats::refresh_with(&mut f.cache, &sources, &given, |_, _| {})
+    };
+    let s = refresh(&mut f);
+    assert_eq!((s.files, s.cold), (4, 4));
+    assert!(s.remembered, "where each source is was not known before");
+    assert_eq!(f.cache.sources.len(), 4, "{:?}", f.cache.sources);
+    let saved = f.root.join("remuda/state/stats.json");
+    f.cache.save(&saved).unwrap();
+    let s = refresh(&mut f);
+    assert!(!s.remembered && !f.cache.save_if_changed(&saved, &s).unwrap());
+
+    // `sessions` is gone, `archived_sessions` cannot be resolved, and `other` left the
+    // registry with its store still there.
+    fs::remove_dir_all(work.join("sessions")).unwrap();
+    f.accounts.retain(|a| a.name != "other");
+    chmod(&away, 0o000);
+    let s = refresh(&mut f);
+    chmod(&away, 0o755);
+    assert_eq!(
+        (s.files, s.removed, s.reused, s.kept()),
+        (2, 2, 1, 1),
+        "{:?}",
+        s.unreadable
+    );
+    let left: Vec<&PathBuf> = f.cache.files.keys().collect();
+    assert_eq!(
+        left,
+        [
+            &archived,
+            &f.projects().join(format!("-w-proj/{S_A}.jsonl"))
+        ]
+    );
+    assert_eq!(s.unreadable.len(), 1);
+    assert_eq!(
+        (s.unreadable[0].path.as_path(), s.unreadable[0].kept),
+        (work.join("archived_sessions").as_path(), 1)
+    );
+    assert!(s.remembered, "two sources are no longer tracked");
+    assert!(f.cache.save_if_changed(&saved, &s).unwrap());
+    assert_eq!(Cache::load(&saved), f.cache);
+
+    let s = refresh(&mut f);
+    assert_eq!((s.files, s.reused, s.removed, s.bytes_read), (2, 2, 0, 0));
+    assert!(!s.remembered);
+}
+
+/// R20, R8: the cache remembers where each source was last found, without another schema: a
+/// cache written before that was kept is read as it was, and remembers nothing.
+#[test]
+fn the_cache_remembers_its_sources_and_reads_one_written_before() {
+    let mut f = Fixture::new();
+    f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+    let (sources, given) = stats::resolve(&f.accounts, &f.env);
+    let s = stats::refresh_with(&mut f.cache, &sources, &given, |_, _| {});
+    assert!(s.remembered);
+    // By the directory as the home gives it: `$HOME/.claude/projects`, here its real path too.
+    let remembered: Vec<(&Path, &Path)> = f
+        .cache
+        .sources
+        .iter()
+        .map(|(given, real)| (given.as_path(), real.as_path()))
+        .collect();
+    assert_eq!(
+        remembered,
+        [(f.projects().as_path(), f.projects().as_path())]
+    );
+    let saved = f.root.join("remuda/state/stats.json");
+    f.cache.save(&saved).unwrap();
+    assert_eq!(Cache::load(&saved), f.cache);
+
+    let mut v: Value = serde_json::from_slice(&fs::read(&saved).unwrap()).unwrap();
+    assert_eq!(v["schema_version"], SCHEMA_VERSION);
+    assert_eq!(v["sources"].as_object().map(|m| m.len()), Some(1));
+    v.as_object_mut().unwrap().remove("sources");
+    fs::write(&saved, v.to_string()).unwrap();
+    let mut before = Cache::load(&saved);
+    assert_eq!(before.files, f.cache.files);
+    assert!(before.sources.is_empty());
+    // Refreshed, it remembers, and that alone is a change to save.
+    let s = stats::refresh_with(&mut before, &sources, &given, |_, _| {});
+    assert_eq!((s.reused, s.files, s.bytes_read), (1, 1, 0));
+    assert!(s.remembered && before.save_if_changed(&saved, &s).unwrap());
+    assert_eq!(Cache::load(&saved), f.cache);
+}
+
+/// R20, R8 (review #10): what the cache remembers of a source goes by the directory its home
+/// gives, not by the account's name. A codex account registered again under the same name
+/// with another home that cannot be searched does not take over what was counted from the old
+/// home, neither from its `sessions` nor from its `archived_sessions`; registered again under
+/// another name with the same home, it keeps it. Either way the cache saved and read back
+/// says the same on the next refresh.
+#[test]
+fn what_is_kept_for_a_source_goes_by_its_home_not_by_the_accounts_name() {
+    let f = Fixture::new();
+    let (old, new) = (f.root.join("c/old"), f.root.join("c/new"));
+    cx::write_rollout(&old, R1, &r1_records(cx::ts));
+    cx::write_archived_rollout(
+        &old,
+        R2,
+        &[
+            cx::meta(R2, "/w/proj", json!("cli"), 0, &cx::ts(0)),
+            cx::model_turn("gpt-test-a", &cx::ts(1)),
+            cx::tokens([7, 0, 3, 0], [7, 0, 3, 0], &cx::ts(2)),
+        ]
+        .concat(),
+    );
+    cx::write_rollout(&new, R3, &r1_records(cx::ts));
+    let codex = |name: &str, home: &Path| Account {
+        provider: Provider::Codex,
+        name: name.into(),
+        home: Home::Path(home.display().to_string()),
+    };
+    let saved = f.root.join("remuda/state/stats.json");
+    // One process each: the cache is loaded, refreshed for `accounts`, and saved if changed.
+    let run = |accounts: &[Account]| {
+        let mut cache = Cache::load(&saved);
+        let (sources, given) = stats::resolve(accounts, &f.env);
+        let s = stats::refresh_with(&mut cache, &sources, &given, |_, _| {});
+        cache.save_if_changed(&saved, &s).unwrap();
+        assert_eq!(
+            Cache::load(&saved),
+            cache,
+            "what is saved is what was refreshed"
+        );
+        (s.files, s.removed, s.kept(), s.unreadable.len())
+    };
+    assert_eq!(run(&[codex("work", &old)]), (2, 0, 0, 0));
+    let before = Cache::load(&saved);
+    assert_eq!(before.sources.len(), 2, "{:?}", before.sources);
+
+    // The same home under another name, out of reach before the next refresh: the same two
+    // sources, kept.
+    chmod(&old, 0o000);
+    let renamed = [
+        run(&[codex("renamed", &old)]),
+        run(&[codex("renamed", &old)]),
+    ];
+    chmod(&old, 0o755);
+    assert_eq!(renamed, [(2, 0, 2, 2); 2]);
+    assert_eq!(Cache::load(&saved), before);
+
+    // The same name with another home, out of reach before it was ever read: nothing of the
+    // old home is its to keep. Both directories of the new home are reported: whether it has
+    // an `archived_sessions` cannot be told either.
+    chmod(&new, 0o000);
+    let moved = [run(&[codex("work", &new)]), run(&[codex("work", &new)])];
+    chmod(&new, 0o755);
+    assert_eq!(moved, [(0, 2, 0, 2), (0, 0, 0, 2)]);
+    let after = Cache::load(&saved);
+    assert!(
+        after.files.is_empty() && after.sources.is_empty(),
+        "{:?}",
+        after.sources
+    );
+    assert_eq!(run(&[codex("work", &new)]), (1, 0, 0, 0));
 }
 
 /// The row of `model` in the cache entry of `path`, as the cache stores it.

@@ -1,7 +1,8 @@
 //! `remuda pick` (SPEC R23): which account and model to launch now, and at what effort. Rules
 //! decide what is feasible (headroom on every window that applies, exclusions, logins) and rank
 //! it; with a key and notes, Jev chooses among the feasible options ([`crate::jev`]), and its
-//! answer is taken only when it is confident enough.
+//! answer is taken only when it is confident enough. What a usage window holds now is
+//! [`crate::usage::snapshot`]'s to say.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -16,7 +17,7 @@ use crate::identity::{self, Identity};
 use crate::launch::{self, Intent};
 use crate::provider::Provider;
 use crate::registry::{Account, Registry};
-use crate::usage::{self, LiveUsage, UsageRow};
+use crate::usage::{self, CachedUsage, LiveUsage, Reading, Snapshot, Source, UsageRow, Window};
 use crate::{Env, probe};
 
 /// Percent left required on every window that applies, unless `[pick] min_headroom` says (R23).
@@ -247,53 +248,6 @@ fn duplicate(items: &[String]) -> Option<&String> {
         .map(|(_, item)| item)
 }
 
-/// One usage window, as the rules see it (R23).
-#[derive(Debug, Clone, PartialEq)]
-pub struct Window {
-    /// As R10 labels it: `Session`, `Week (all models)`, `Week (Fable)`.
-    pub label: String,
-    /// The name in the label's trailing parentheses; `None` for a general window.
-    pub model: Option<String>,
-    /// Percent used; 0 when the reset has passed since it was recorded.
-    pub percent: f64,
-    pub resets_at: Option<Timestamp>,
-    /// The reset instant is not after now: the recorded percent is obsolete.
-    pub reset_passed: bool,
-}
-
-impl Window {
-    pub fn left(&self) -> f64 {
-        (100.0 - self.percent).max(0.0)
-    }
-}
-
-/// `rows` as windows at `now`: each row's reset as an instant (R10's best effort for claude's
-/// wording), and a window whose reset has passed counts as 0% used.
-pub fn windows(rows: &[UsageRow], now: Timestamp) -> Vec<Window> {
-    rows.iter()
-        .map(|row| {
-            let resets_at = row
-                .resets
-                .as_ref()
-                .and_then(|r| usage::reset_instant(r, now));
-            let reset_passed = resets_at.is_some_and(|at| at <= now);
-            Window {
-                label: row.label.clone(),
-                model: window_model(&row.label),
-                percent: if reset_passed { 0.0 } else { row.percent },
-                resets_at,
-                reset_passed,
-            }
-        })
-        .collect()
-}
-
-/// `Week (Fable)` → `Fable`; `Week (all models)`, `Session`, `5h window` → `None`.
-fn window_model(label: &str) -> Option<String> {
-    let inner = label.strip_suffix(')')?.rsplit_once(" (")?.1;
-    (inner != "all models").then(|| inner.to_string())
-}
-
 /// A claude model's family: `claude-fable-5-1` → `fable`; a bare alias is its own family.
 pub fn family(model: &str) -> &str {
     let rest = model.strip_prefix("claude-").unwrap_or(model);
@@ -309,36 +263,14 @@ pub fn limits_model(provider: Provider, model: &str, name: &str) -> bool {
     }
 }
 
-/// Where an account's usage came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    Cached,
-    Live,
-}
-
-impl Source {
-    pub fn name(self) -> &'static str {
-        match self {
-            Source::Cached => "cached",
-            Source::Live => "live",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Usage {
-    pub source: Source,
-    pub fetched_at: Option<Timestamp>,
-    pub windows: Vec<Window>,
-}
-
 /// One account, as gathered: why it cannot be recommended at all, or its usage.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub account: Account,
     /// Why no model of this account is feasible (excluded, logged out, ...).
     pub blocked: Option<String>,
-    pub usage: Option<Usage>,
+    /// Its usage, read at the instant of the recommendation ([`gather`]).
+    pub usage: Option<Reading>,
     /// For the user only, never sent: they may name paths (a failed live query, no cache).
     pub notes: Vec<String>,
 }
@@ -353,27 +285,11 @@ impl Entry {
                 .is_none_or(|u| u.source == Source::Cached)
     }
 
-    /// Older than `stale_after` minutes, or of unknown age; live usage never is.
-    pub fn stale(&self, config: &Config, now: Timestamp) -> bool {
-        match &self.usage {
-            None => false,
-            Some(Usage {
-                source: Source::Live,
-                ..
-            }) => false,
-            Some(Usage {
-                fetched_at: None, ..
-            }) => true,
-            Some(Usage {
-                fetched_at: Some(at),
-                ..
-            }) => now.as_second() - at.as_second() > i64::from(config.stale_after) * 60,
-        }
-    }
-
-    pub fn age_seconds(&self, now: Timestamp) -> Option<i64> {
-        let at = self.usage.as_ref()?.fetched_at?;
-        Some((now.as_second() - at.as_second()).max(0))
+    /// Its usage is older than `stale_after` minutes, or of unknown age; live usage never is.
+    pub fn stale(&self, config: &Config) -> bool {
+        self.usage
+            .as_ref()
+            .is_some_and(|usage| usage.stale(config.stale_after))
     }
 }
 
@@ -387,10 +303,14 @@ pub struct Candidate {
     /// Position of `model` in its provider's `models`.
     pub model_rank: usize,
     pub why_not: Option<String>,
-    /// Least percent left over the windows that apply; `None` without usage data.
+    /// Least percent left over the windows that apply and are known; `None` when none is:
+    /// without usage data, or when each has reset since its usage was recorded.
     pub headroom: Option<f64>,
     /// The window that gives `headroom`.
     pub binding: Option<Window>,
+    /// The windows that apply and have reset since their usage was recorded: of unknown
+    /// usage, shown, never counted.
+    pub reset_passed: Vec<Window>,
     /// For a pair without a model: the per-model windows, which apply only if the agent's
     /// default model is of their family. Shown, never counted: remuda does not know that model.
     pub default_model_windows: Vec<Window>,
@@ -417,6 +337,7 @@ pub fn candidates(entries: &[Entry], config: &Config, now: Timestamp) -> Vec<Can
                 why_not: Some(blocked.clone()),
                 headroom: None,
                 binding: None,
+                reset_passed: Vec::new(),
                 default_model_windows: Vec::new(),
                 rules_rank: None,
             });
@@ -438,17 +359,23 @@ pub fn candidates(entries: &[Entry], config: &Config, now: Timestamp) -> Vec<Can
                     (Some(_), None) => false,
                 })
                 .collect();
-            // The least left; of equals, the one that resets last binds longest.
-            let binding = windows
-                .iter()
-                .min_by(|a, b| {
-                    a.left().total_cmp(&b.left()).then_with(|| {
-                        let at = |w: &Window| w.resets_at.map_or(i64::MAX, |t| t.as_second());
+            // Of the known ones, the least left; of equals, the one that resets last binds
+            // longest. A window that has reset since is unknown: it binds nothing.
+            let binding = windows.iter().filter_map(|w| Some((*w, w.left()?))).min_by(
+                |(a, a_left), (b, b_left)| {
+                    a_left.total_cmp(b_left).then_with(|| {
+                        let at = |w: &Window| w.resets_at().map_or(i64::MAX, |t| t.as_second());
                         at(b).cmp(&at(a))
                     })
-                })
-                .map(|w| (*w).clone());
-            let headroom = binding.as_ref().map(Window::left);
+                },
+            );
+            let headroom = binding.map(|(_, left)| left);
+            let binding = binding.map(|(w, _)| w.clone());
+            let reset_passed: Vec<Window> = windows
+                .iter()
+                .filter(|w| w.reset_passed())
+                .map(|w| (*w).clone())
+                .collect();
             let default_model_windows: Vec<Window> = match model {
                 Some(_) => Vec::new(),
                 None => entry
@@ -459,18 +386,20 @@ pub fn candidates(entries: &[Entry], config: &Config, now: Timestamp) -> Vec<Can
                     .cloned()
                     .collect(),
             };
-            let why_not = match &binding {
-                Some(w) if w.left() < f64::from(config.min_headroom) => Some(format!(
-                    "{}: {} used, below the {}% left required{}",
-                    w.label,
-                    usage::format_percent(w.percent),
-                    config.min_headroom,
-                    w.resets_at
-                        .map(|at| format!(", resets in {}", format_in(at, now)))
-                        .unwrap_or_default()
-                )),
-                _ => None,
-            };
+            // Only a known percentage can fall short: a window of unknown usage blocks nothing.
+            let why_not = binding
+                .as_ref()
+                .and_then(|w| Some((w, w.used()?, w.left()?)))
+                .filter(|(_, _, left)| *left < f64::from(config.min_headroom))
+                .map(|(w, used, _)| {
+                    format!(
+                        "{}: {} used, below the {}% left required{}",
+                        w.label,
+                        usage::format_percent(used),
+                        config.min_headroom,
+                        resets_text(w, now)
+                    )
+                });
             out.push(Candidate {
                 entry: i,
                 model: model.cloned(),
@@ -478,25 +407,22 @@ pub fn candidates(entries: &[Entry], config: &Config, now: Timestamp) -> Vec<Can
                 why_not,
                 headroom,
                 binding,
+                reset_passed,
                 default_model_windows,
                 rules_rank: None,
             });
         }
     }
-    rank_rules(&mut out, entries, config, now);
+    rank_rules(&mut out, entries, config);
     out
 }
 
-/// Numbers the feasible candidates by the rules (R23): known headroom before unknown; then the
-/// model's position in `models`; the 10-point headroom band, higher first (90% left and more is
-/// one band); fresh before stale; the binding window's reset, sooner first; `prefer` order;
+/// Numbers the feasible candidates by the rules (R23): known headroom before unknown (stale
+/// data is still known; no usage data, or every window reset since, is not); then the model's
+/// position in `models`; the 10-point headroom band, higher first (90% left and more is one
+/// band); fresh before stale; the binding window's reset, sooner first; `prefer` order;
 /// registry order.
-pub fn rank_rules(
-    candidates: &mut [Candidate],
-    entries: &[Entry],
-    config: &Config,
-    now: Timestamp,
-) {
+pub fn rank_rules(candidates: &mut [Candidate], entries: &[Entry], config: &Config) {
     let mut order: Vec<usize> = (0..candidates.len())
         .filter(|&i| candidates[i].feasible())
         .collect();
@@ -512,10 +438,10 @@ pub fn rank_rules(
             c.headroom.is_none(),
             c.model_rank,
             std::cmp::Reverse(c.headroom.map_or(0, band)),
-            entry.stale(config, now),
+            entry.stale(config),
             c.binding
                 .as_ref()
-                .and_then(|w| w.resets_at)
+                .and_then(Window::resets_at)
                 .map_or(i64::MAX, |t| t.as_second()),
             prefer,
             c.entry,
@@ -879,7 +805,9 @@ pub fn run_args(
 /// How the usage is gathered (R23).
 pub struct Sources<'a> {
     pub env: &'a Env,
-    pub now: Timestamp,
+    /// Asked when a live query answers, and once more when everything is gathered: a query may
+    /// take as long as its timeout, and a reset does not wait for it.
+    pub clock: fn() -> Timestamp,
     /// Runs the agents' commands: `codex login status`, the live queries.
     pub agents: &'a dyn Runner,
     /// Query usage live (R10) instead of reading the cache; a failed query falls back to it.
@@ -892,11 +820,51 @@ pub struct Sources<'a> {
 /// codex not logged in (`codex login status`; with a live query, the `account/read` of its one
 /// `codex app-server` run, and `codex login status` only when that told nothing), claude with
 /// neither `oauthAccount` in `.claude.json` nor a usage cache. Accounts are queried in parallel.
-pub fn gather(accounts: &[Account], config: &Config, sources: &Sources) -> Vec<Entry> {
-    probe::parallel(accounts, |account| gather_one(account, config, sources))
+///
+/// Also the instant of the recommendation: the time once every account has answered or failed.
+/// Each account's usage is read at that one instant, whenever its agent said it, and whatever
+/// is said of the recommendation (time to a reset, age) counts from it.
+pub fn gather(accounts: &[Account], config: &Config, sources: &Sources) -> (Vec<Entry>, Timestamp) {
+    let gathered = probe::parallel(accounts, |account| {
+        let mut said = None;
+        let entry = gather_one(account, config, sources, &mut said);
+        (entry, said)
+    });
+    let now = (sources.clock)();
+    let entries = gathered
+        .into_iter()
+        .map(|(entry, said)| Entry {
+            usage: said.map(|said| said.at(now)),
+            ..entry
+        })
+        .collect();
+    (entries, now)
 }
 
-fn gather_one(account: &Account, config: &Config, sources: &Sources) -> Entry {
+/// What an account's agent said about its usage, not yet read at an instant.
+enum Said {
+    Cached(CachedUsage),
+    /// A live answer, and when it arrived.
+    Live(Vec<UsageRow>, Timestamp),
+}
+
+impl Said {
+    fn at(&self, now: Timestamp) -> Reading {
+        match self {
+            Said::Cached(cached) => Snapshot::cached(cached).at(now),
+            Said::Live(rows, answered_at) => Snapshot::live(rows, *answered_at).at(now),
+        }
+    }
+}
+
+/// `account`'s entry, without its usage: what its agent said goes to `said`, for [`gather`] to
+/// read once every account is in.
+fn gather_one(
+    account: &Account,
+    config: &Config,
+    sources: &Sources,
+    said: &mut Option<Said>,
+) -> Entry {
     let mut entry = Entry {
         account: account.clone(),
         blocked: None,
@@ -914,7 +882,8 @@ fn gather_one(account: &Account, config: &Config, sources: &Sources) -> Entry {
         entry.blocked = Some(format!("not a {only} account (--provider {only})"));
         return entry;
     }
-    // What the live query answered, when one is asked.
+    // What the live query answered, when one is asked, and when the answer arrived: it is
+    // recorded then, not after whatever this account is asked next.
     let mut live = None;
     if provider == Provider::Codex {
         if !sources.agents.has(Provider::Codex) {
@@ -923,12 +892,13 @@ fn gather_one(account: &Account, config: &Config, sources: &Sources) -> Entry {
         }
         // The live query's one `codex app-server` run says whether the account is logged in
         // as well (`account/read`): `codex login status` is asked only when it did not.
-        let asked = sources
-            .live
-            .map(|timeout| usage::live_codex(account, sources.agents, timeout));
+        let asked = sources.live.map(|timeout| {
+            let asked = usage::live_codex(account, sources.agents, timeout);
+            (asked, (sources.clock)())
+        });
         let told = asked
             .as_ref()
-            .and_then(|asked| asked.as_ref().ok())
+            .and_then(|(asked, _)| asked.as_ref().ok())
             .and_then(|live| live.login.clone());
         let (login, source) = match told {
             Some(identity) => ((identity, None), "`codex app-server` account/read"),
@@ -948,39 +918,30 @@ fn gather_one(account: &Account, config: &Config, sources: &Sources) -> Entry {
             )),
             (Identity::LoggedIn { .. }, _) => {}
         }
-        live = asked.map(|asked| asked.and_then(|live| live.usage));
+        live = asked.map(|(asked, at)| (asked.and_then(|live| live.usage), at));
     } else if let Some(timeout) = sources.live {
-        live = Some(usage::live_usage(account, sources.agents, timeout).map(|live| live.usage));
+        let asked = usage::live_usage(account, sources.agents, timeout).map(|live| live.usage);
+        live = Some((asked, (sources.clock)()));
     }
     match live {
         None => {}
-        Some(Ok(LiveUsage::Rows(rows))) => {
-            entry.usage = Some(Usage {
-                source: Source::Live,
-                fetched_at: Some(sources.now),
-                windows: windows(&rows, sources.now),
-            });
+        Some((Ok(LiveUsage::Rows(rows)), answered_at)) => {
+            *said = Some(Said::Live(rows, answered_at));
         }
-        Some(Ok(LiveUsage::Unrecognized(_))) => entry
+        Some((Ok(LiveUsage::Unrecognized(_)), _)) => entry
             .notes
             .push("live output not recognized; using cached usage".to_string()),
-        Some(Err(e)) => entry
+        Some((Err(e), _)) => entry
             .notes
             .push(format!("live query failed ({e}); using cached usage")),
     }
-    if entry.usage.is_none() {
+    if said.is_none() {
         match usage::cached_usage(account, sources.env) {
-            Ok(cached) => {
-                entry.usage = Some(Usage {
-                    source: Source::Cached,
-                    fetched_at: cached.fetched_at,
-                    windows: windows(&cached.rows, sources.now),
-                });
-            }
+            Ok(cached) => *said = Some(Said::Cached(cached)),
             Err(notice) => entry.notes.push(format!("no usage data ({notice})")),
         }
     }
-    if provider == Provider::Claude && entry.usage.is_none() {
+    if provider == Provider::Claude && said.is_none() {
         let logged_in = account
             .claude_json(sources.env)
             .and_then(|path| std::fs::read_to_string(path).ok())
@@ -1019,49 +980,77 @@ pub fn pair_label(entry: &Entry, candidate: &Candidate) -> String {
     )
 }
 
-/// `usage: cached 25m ago`, `live`, `cached (time unknown)`, `none`.
-fn data_text(entry: &Entry, config: &Config, now: Timestamp) -> String {
-    let stale = if entry.stale(config, now) {
+/// `usage: cached 25m ago`, `live 3s ago`, `cached (time unknown)`, `none`. A live answer has
+/// an age too: it is read once every account's has arrived.
+fn data_text(entry: &Entry, config: &Config) -> String {
+    let stale = if entry.stale(config) {
         " (stale: may be higher now)"
     } else {
         ""
     };
     match &entry.usage {
         None => "none".to_string(),
-        Some(u) => match (u.source, u.fetched_at) {
-            (Source::Live, _) => "live".to_string(),
-            (Source::Cached, Some(at)) => format!("cached {}{stale}", usage::format_age(at, now)),
+        Some(u) => match (u.source, u.age_text()) {
+            (Source::Live, Some(age)) => format!("live {age}"),
+            (Source::Live, None) => "live".to_string(),
+            (Source::Cached, Some(age)) => format!("cached {age}{stale}"),
             (Source::Cached, None) => format!("cached (time unknown){stale}"),
         },
     }
 }
 
-/// The binding window as `Week (all models) 23% left, resets in 2d3h`.
-pub fn binding_text(w: &Window, now: Timestamp) -> String {
-    let when = if w.reset_passed {
-        " (reset since cached)".to_string()
-    } else {
-        w.resets_at
-            .map(|at| format!(", resets in {}", format_in(at, now)))
-            .unwrap_or_default()
-    };
-    format!("{} {} left{when}", w.label, usage::format_percent(w.left()))
+/// `, resets in 2d3h`; empty without a reset ahead.
+fn resets_text(w: &Window, now: Timestamp) -> String {
+    w.resets_at()
+        .map(|at| format!(", resets in {}", format_in(at, now)))
+        .unwrap_or_default()
 }
 
-/// A window as used: `Week (Fable) 100% used, resets in 3d`.
+/// The binding window as `Week (all models) 23% left, resets in 2d3h`; one of unknown usage
+/// (never a binding window) as in [`used_text`].
+pub fn binding_text(w: &Window, now: Timestamp) -> String {
+    match w.left() {
+        Some(left) => format!(
+            "{} {} left{}",
+            w.label,
+            usage::format_percent(left),
+            resets_text(w, now)
+        ),
+        None => used_text(w, now),
+    }
+}
+
+/// A window as used: `Week (Fable) 100% used, resets in 3d`; `Week (Fable) usage unknown (reset
+/// since cached)` when its reset has passed.
 pub fn used_text(w: &Window, now: Timestamp) -> String {
-    let when = if w.reset_passed {
-        " (reset since cached)".to_string()
-    } else {
-        w.resets_at
-            .map(|at| format!(", resets in {}", format_in(at, now)))
-            .unwrap_or_default()
-    };
-    format!(
-        "{} {} used{when}",
-        w.label,
-        usage::format_percent(w.percent)
-    )
+    match w.used() {
+        Some(used) => format!(
+            "{} {} used{}",
+            w.label,
+            usage::format_percent(used),
+            resets_text(w, now)
+        ),
+        None => format!("{} usage unknown ({})", w.label, w.reset_since()),
+    }
+}
+
+/// The windows of unknown usage as `Session, Week (all models): reset since cached`; `None`
+/// when the pair has none. (`reset since asked` for a live answer that another account's
+/// slower one outlasted.)
+pub fn reset_passed_text(c: &Candidate) -> Option<String> {
+    let since = c.reset_passed.first()?.reset_since();
+    let labels: Vec<&str> = c.reset_passed.iter().map(|w| w.label.as_str()).collect();
+    Some(format!("{}: {since}", labels.join(", ")))
+}
+
+/// What to say where a pair has windows of unknown usage (R23): remuda never queries live on
+/// its own, so for cached usage it names the option that does.
+pub fn live_hint(entry: &Entry, c: &Candidate) -> Option<String> {
+    let text = reset_passed_text(c)?;
+    Some(match entry.usage.as_ref().map(|usage| usage.source) {
+        Some(Source::Live) => text,
+        _ => format!("{text} (--live asks the agent)"),
+    })
 }
 
 /// The effort of the text report, with where it came from when Jev answered.
@@ -1118,10 +1107,15 @@ pub fn format_text(
     }
     rows.push((
         "limit",
-        c.binding
-            .as_ref()
-            .map_or("no usage data".to_string(), |w| binding_text(w, now)),
+        match (&c.binding, c.reset_passed.is_empty()) {
+            (Some(w), _) => binding_text(w, now),
+            (None, false) => "unknown".to_string(),
+            (None, true) => "no usage data".to_string(),
+        },
     ));
+    if let Some(hint) = live_hint(entry, c) {
+        rows.push(("unknown", hint));
+    }
     for w in &c.default_model_windows {
         rows.push((
             "also",
@@ -1131,7 +1125,7 @@ pub fn format_text(
             ),
         ));
     }
-    rows.push(("usage", data_text(entry, config, now)));
+    rows.push(("usage", data_text(entry, config)));
     if entry.usage.is_some() && entry.per_model_unknown() {
         rows.push((
             "",
@@ -1241,7 +1235,6 @@ pub fn to_json(
     candidates: &[Candidate],
     decision: Option<&Decision>,
     config: &Config,
-    now: Timestamp,
 ) -> Value {
     let ts = |t: Option<Timestamp>| t.map(|t| t.to_string());
     let list: Vec<Value> = candidates
@@ -1257,15 +1250,17 @@ pub fn to_json(
                 "why_not": c.why_not,
                 "headroom": c.headroom,
                 "binding": c.binding.as_ref().map(|w| w.label.clone()),
-                "resets_at": ts(c.binding.as_ref().and_then(|w| w.resets_at)),
+                "resets_at": ts(c.binding.as_ref().and_then(Window::resets_at)),
+                "reset_passed": !c.reset_passed.is_empty(),
                 "source": usage.map(|u| u.source.name()),
                 "fetched_at": ts(usage.and_then(|u| u.fetched_at)),
-                "age_seconds": entry.age_seconds(now),
-                "stale": usage.map(|_| entry.stale(config, now)),
+                "age_seconds": usage.and_then(|u| u.age_seconds),
+                "stale": usage.map(|u| u.stale(config.stale_after)),
                 "default_model_windows": c.default_model_windows.iter().map(|w| json!({
                     "label": w.label,
-                    "percent": w.percent,
-                    "resets_at": ts(w.resets_at),
+                    "percent": w.used(),
+                    "resets_at": ts(w.resets_at()),
+                    "reset_passed": w.reset_passed(),
                 })).collect::<Vec<_>>(),
                 "rules_rank": c.rules_rank,
                 "jev_probability": decision
@@ -1308,7 +1303,7 @@ mod tests {
     use super::*;
     use crate::account_command::Scripted;
     use crate::registry::Home;
-    use crate::usage::Resets;
+    use crate::usage::{CachedUsage, Resets, UsageRow};
 
     fn parse(text: &str) -> Result<Config> {
         Registry::from_document(&text.parse::<DocumentMut>().unwrap()).map(|r| r.pick)
@@ -1345,12 +1340,12 @@ mod tests {
         let env = Env::new();
         let sources = Sources {
             env: &env,
-            now: "2026-10-06T00:00:00Z".parse().unwrap(),
+            clock: || "2026-10-06T00:00:00Z".parse().unwrap(),
             agents,
             live: live.then_some(Duration::from_secs(90)),
             provider: None,
         };
-        let mut entries = gather(std::slice::from_ref(account), &Config::default(), &sources);
+        let (mut entries, _) = gather(std::slice::from_ref(account), &Config::default(), &sources);
         (entries.remove(0), agents.ran())
     }
 
@@ -1466,6 +1461,63 @@ mod tests {
             assert_eq!(entry.blocked.as_deref(), Some("`codex` not found on PATH"));
             assert!(ran.is_empty(), "{ran:?}");
         }
+    }
+
+    /// R23 (The instant): a codex account's live answer is recorded when its one
+    /// `codex app-server` run answers, before `codex login status` is asked where that run did
+    /// not say whether the account is logged in, and read once everything is gathered.
+    #[test]
+    fn a_live_codex_answer_is_recorded_when_it_arrives() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static TICKS: AtomicI64 = AtomicI64::new(0);
+        fn t0() -> Timestamp {
+            "2026-10-06T00:00:00Z".parse().unwrap()
+        }
+        // The answer, then the end of the gathering, 100 seconds later.
+        fn clock() -> Timestamp {
+            t0() + jiff::SignedDuration::from_secs(100 * TICKS.fetch_add(1, Ordering::SeqCst))
+        }
+        let work = Account {
+            provider: Provider::Codex,
+            name: "work".into(),
+            home: Home::Path("/nonexistent/work".into()),
+        };
+        let limits =
+            json!({"rateLimits": {"primary": {"usedPercent": 4, "windowDurationMins": 300}}});
+        let agents = Scripted::new()
+            .app_server_says(
+                "codex:work",
+                Ok(vec![
+                    Ok(limits),
+                    Err("`codex app-server` account/read: no".into()),
+                ]),
+            )
+            .on(
+                "codex:work login status",
+                Scripted::exited(0, "", "Logged in using ChatGPT\n"),
+            );
+        let env = Env::new();
+        let sources = Sources {
+            env: &env,
+            clock,
+            agents: &agents,
+            live: Some(Duration::from_secs(90)),
+            provider: None,
+        };
+        let (entries, now) = gather(std::slice::from_ref(&work), &Config::default(), &sources);
+        assert_eq!(
+            agents.ran(),
+            [
+                "codex:work app-server account/rateLimits/read account/read",
+                "codex:work login status"
+            ]
+        );
+        assert_eq!(now, t0() + jiff::SignedDuration::from_secs(100));
+        assert_eq!(TICKS.load(Ordering::SeqCst), 2, "one answer, one reading");
+        let usage = entries[0].usage.as_ref().expect("live usage");
+        assert_eq!(usage.source, Source::Live);
+        assert_eq!(usage.fetched_at, Some(t0()));
+        assert_eq!(usage.age_seconds, Some(100));
     }
 
     /// R23: a claude account's live query that cannot run (no claude on PATH) is a failed
@@ -1593,16 +1645,17 @@ mod tests {
         }
     }
 
+    /// An account whose usage was cached `age_min` minutes before [`NOW`].
     fn entry(provider: Provider, name: &str, age_min: i64, rows: &[UsageRow]) -> Entry {
         let now = ts(NOW);
+        let cached = CachedUsage {
+            fetched_at: Some(now - jiff::SignedDuration::from_mins(age_min)),
+            rows: rows.to_vec(),
+        };
         Entry {
             account: account(provider, name),
             blocked: None,
-            usage: Some(Usage {
-                source: Source::Cached,
-                fetched_at: Some(now - jiff::SignedDuration::from_mins(age_min)),
-                windows: windows(rows, now),
-            }),
+            usage: Some(Snapshot::cached(&cached).at(now)),
             notes: Vec::new(),
         }
     }
@@ -1634,9 +1687,6 @@ mod tests {
             "gpt-5.3-codex-spark",
             "GPT-5.3-Codex-Spark"
         ));
-        assert_eq!(window_model("Week (Fable)").as_deref(), Some("Fable"));
-        assert_eq!(window_model("Week (all models)"), None);
-        assert_eq!(window_model("Session"), None);
 
         let rows = [
             row("Session", 20.0, Some("2026-09-27T12:00:00Z")),
@@ -1661,23 +1711,221 @@ mod tests {
         );
     }
 
-    /// R23: a window whose reset has passed counts as 0% used; a stale exhausted window with a
-    /// reset still ahead stays exhausted.
+    /// R23: a window whose reset has passed is of unknown usage: never counted, never blocking.
+    /// A stale exhausted window with a reset still ahead stays exhausted.
     #[test]
-    fn a_passed_reset_frees_a_window_and_staleness_does_not() {
+    fn a_passed_reset_is_unknown_and_staleness_frees_nothing() {
         let now = ts(NOW);
         let rows = [
             row("Session", 100.0, Some("2026-09-27T09:00:00Z")),
             row("Week (all models)", 100.0, Some("2026-09-28T09:00:00Z")),
         ];
-        let w = windows(&rows, now);
-        assert!(w[0].reset_passed && w[0].percent == 0.0);
-        assert!(!w[1].reset_passed && w[1].percent == 100.0);
         let entries = [entry(Provider::Claude, "max", 600, &rows)];
         let config = Config::default();
-        assert!(entries[0].stale(&config, now));
+        assert!(entries[0].stale(&config));
         let c = candidates(&entries, &config, now);
+        assert!(!c[0].feasible(), "the week is known, and exhausted");
+        assert_eq!(
+            c[0].why_not.as_deref(),
+            Some("Week (all models): 100% used, below the 10% left required, resets in 23h")
+        );
+        assert_eq!(c[0].headroom, Some(0.0));
+        let unknown: Vec<&str> = c[0].reset_passed.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(unknown, ["Session"]);
+
+        // The week has room: the pair is feasible, by the week alone. The session, exhausted
+        // when it was cached, neither blocks nor counts as 100% left.
+        let rows = [
+            row("Session", 100.0, Some("2026-09-27T09:00:00Z")),
+            row("Week (all models)", 50.0, Some("2026-09-28T09:00:00Z")),
+        ];
+        let entries = [entry(Provider::Claude, "max", 600, &rows)];
+        let c = candidates(&entries, &config, now);
+        assert!(c[0].feasible());
+        assert_eq!(c[0].headroom, Some(50.0));
+        assert_eq!(
+            c[0].binding.as_ref().map(|w| w.label.as_str()),
+            Some("Week (all models)")
+        );
+        assert_eq!(
+            live_hint(&entries[0], &c[0]).as_deref(),
+            Some("Session: reset since cached (--live asks the agent)")
+        );
+    }
+
+    /// R23: when every window that applies has reset since, the headroom is unknown: the pair
+    /// is feasible whatever `min_headroom` asks, with no binding window and no reset time.
+    #[test]
+    fn unknown_headroom_is_feasible_whatever_min_headroom() {
+        let now = ts(NOW);
+        let rows = [
+            row("Session", 100.0, Some("2026-09-27T09:00:00Z")),
+            row("Week (all models)", 100.0, Some("2026-09-26T09:00:00Z")),
+            // Applies to no configured model: not this pair's.
+            row("Week (Fable)", 100.0, Some("2026-09-26T09:00:00Z")),
+        ];
+        let entries = [entry(Provider::Claude, "old", 4 * 24 * 60, &rows)];
+        let mut config = with_models(&["claude-opus-5-5"], &[]);
+        config.min_headroom = 100;
+        let c = candidates(&entries, &config, now);
+        assert!(c[0].feasible(), "{:?}", c[0].why_not);
+        assert_eq!((c[0].headroom, &c[0].binding), (None, &None));
+        assert_eq!(
+            reset_passed_text(&c[0]).as_deref(),
+            Some("Session, Week (all models): reset since cached")
+        );
+        assert_eq!(c[0].rules_rank, Some(1));
+
+        let decision = decide(&c, &entries, &config, Asked::Skipped(Reason::NoKey)).unwrap();
+        let text = format_text(&entries, &c, &decision, &config, now);
+        for line in [
+            "limit       unknown\n",
+            "unknown     Session, Week (all models): reset since cached (--live asks the agent)\n",
+            "usage       cached 4d ago (stale: may be higher now)\n",
+        ] {
+            assert!(text.contains(line), "{line:?} in:\n{text}");
+        }
+        let v = to_json(&entries, &c, Some(&decision), &config);
+        let pair = &v["candidates"][0];
+        assert_eq!(pair["feasible"], true);
+        assert_eq!(pair["reset_passed"], true);
+        for null in ["headroom", "binding", "resets_at", "why_not"] {
+            assert_eq!(pair[null], Value::Null, "{null}: {pair:#}");
+        }
+        assert_eq!(pair["stale"], true);
+        assert_eq!(pair["age_seconds"], 4 * 86_400);
+    }
+
+    /// R23, a real run (review of 2026-10-02): four-day-old data whose resets have all passed
+    /// must not outrank nine-minute-old data with 71% left. Old data that is still known
+    /// (stale, no reset passed) ranks before it too; a pair without usage data is as unknown.
+    #[test]
+    fn stale_data_past_its_resets_ranks_after_known_headroom() {
+        let now = ts(NOW);
+        let entries = [
+            entry(
+                Provider::Claude,
+                "team-alt",
+                4 * 24 * 60,
+                &[
+                    row("Session", 12.0, Some("2026-09-23T14:00:00Z")),
+                    row("Week (all models)", 100.0, Some("2026-09-25T09:00:00Z")),
+                ],
+            ),
+            entry(
+                Provider::Claude,
+                "max",
+                9,
+                &[row("Week (all models)", 29.0, Some("2026-09-30T09:00:00Z"))],
+            ),
+            entry(
+                Provider::Claude,
+                "stale",
+                4 * 24 * 60,
+                &[row("Week (all models)", 85.0, Some("2026-09-28T09:00:00Z"))],
+            ),
+            Entry {
+                usage: None,
+                ..entry(Provider::Claude, "new", 0, &[])
+            },
+        ];
+        let config = Config::default();
+        let c = candidates(&entries, &config, now);
+        assert!(c.iter().all(Candidate::feasible));
+        assert_eq!(
+            order(&entries, &c),
+            [
+                "claude:max / default",
+                "claude:stale / default",
+                // Unknown headroom, both, by the rest of the rules: no data is not stale.
+                "claude:new / default",
+                "claude:team-alt / default",
+            ]
+        );
+        assert_eq!(c[0].headroom, None);
+        assert_eq!(c[1].headroom, Some(71.0));
+        assert_eq!(c[2].headroom, Some(15.0));
+        // The report never names an instant in the past.
+        let v = to_json(&entries, &c, None, &config);
+        let passed: Vec<(&Value, &Value, &Value)> = v["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (&c["account"], &c["reset_passed"], &c["resets_at"]))
+            .collect();
+        assert_eq!(
+            passed,
+            [
+                (&json!("claude:team-alt"), &json!(true), &Value::Null),
+                (
+                    &json!("claude:max"),
+                    &json!(false),
+                    &json!("2026-09-30T09:00:00Z")
+                ),
+                (
+                    &json!("claude:stale"),
+                    &json!(false),
+                    &json!("2026-09-28T09:00:00Z")
+                ),
+                (&json!("claude:new"), &json!(false), &Value::Null),
+            ]
+        );
+    }
+
+    /// R23: live usage is recorded now: a reset that reads as behind does not empty its window.
+    #[test]
+    fn live_usage_keeps_its_percentage_past_a_reset() {
+        let now = ts(NOW);
+        let rows = [UsageRow {
+            resets: Some(Resets::Text("Sep 27 at 9am (UTC)".into())),
+            ..row("Week (all models)", 95.0, None)
+        }];
+        let entries = [Entry {
+            usage: Some(Snapshot::live(&rows, now).at(now)),
+            ..entry(Provider::Claude, "max", 0, &[])
+        }];
+        let c = candidates(&entries, &Config::default(), now);
         assert!(!c[0].feasible());
+        assert_eq!(
+            c[0].why_not.as_deref(),
+            Some("Week (all models): 95% used, below the 10% left required")
+        );
+        assert!(c[0].reset_passed.is_empty());
+        let v = to_json(&entries, &c, None, &Config::default());
+        assert_eq!(v["candidates"][0]["reset_passed"], false);
+        assert_eq!(v["candidates"][0]["resets_at"], Value::Null);
+        assert_eq!(v["candidates"][0]["headroom"], 5.0);
+    }
+
+    /// R23: a per-model window shown for the `default` pair reads the same way.
+    #[test]
+    fn a_default_model_window_past_its_reset_is_unknown() {
+        let now = ts(NOW);
+        let rows = [
+            row("Week (all models)", 50.0, Some("2026-09-30T10:00:00Z")),
+            row("Week (Fable)", 100.0, Some("2026-09-27T09:00:00Z")),
+            row("Week (Sonnet)", 40.0, Some("2026-09-30T10:00:00Z")),
+        ];
+        let entries = [entry(Provider::Claude, "max", 600, &rows)];
+        let c = candidates(&entries, &Config::default(), now);
+        assert!(
+            c[0].reset_passed.is_empty(),
+            "it does not apply to the pair"
+        );
+        assert_eq!(
+            used_text(&c[0].default_model_windows[0], now),
+            "Week (Fable) usage unknown (reset since cached)"
+        );
+        let v = to_json(&entries, &c, None, &Config::default());
+        assert_eq!(
+            v["candidates"][0]["default_model_windows"],
+            json!([
+                {"label": "Week (Fable)", "percent": null, "resets_at": null,
+                 "reset_passed": true},
+                {"label": "Week (Sonnet)", "percent": 40.0,
+                 "resets_at": "2026-09-30T10:00:00Z", "reset_passed": false},
+            ])
+        );
     }
 
     /// R23: rules rank by model order, then 10-point bands, then fresh before stale, then the

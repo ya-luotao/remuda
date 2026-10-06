@@ -7,6 +7,7 @@
 // Each test file compiles its own copy of this module; not every file uses every helper.
 #![allow(dead_code)]
 
+pub mod homes;
 pub mod rollouts;
 pub mod transcripts;
 
