@@ -4,7 +4,8 @@
 //!
 //! [`app`] holds the state and the pure `update`; [`render`] draws it; this module owns the
 //! terminal and the event loop (including foreground launches, which suspend the TUI),
-//! [`workers`] run the slow parts in the background, and [`accounts`] says which accounts
+//! [`workers`] run the slow parts in the background, [`work`] keeps count of them (what is
+//! out, what runs again, which answer is still wanted), and [`accounts`] says which accounts
 //! there are.
 
 pub mod accounts;
@@ -13,6 +14,7 @@ pub mod privacy;
 pub mod render;
 pub mod search;
 pub mod timeline;
+pub mod work;
 pub mod workers;
 
 #[cfg(test)]
@@ -37,9 +39,10 @@ use jiff::tz::TimeZone;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+use crate::account_command::OnPath;
 use crate::provider::Provider;
 use crate::registry::Account;
-use crate::{Env, launch, paths, setup};
+use crate::{Env, launch, owned, paths, setup};
 
 use accounts::Listing;
 use app::{App, Effect, Event, Exit, Key, LaunchRequest, Mode};
@@ -71,6 +74,14 @@ impl Deps {
         match provider {
             Provider::Claude => self.claude.as_deref(),
             Provider::Codex => self.codex.as_deref(),
+        }
+    }
+
+    /// What runs the agents' commands for an account: the executables found on `PATH`.
+    pub fn agents(&self) -> OnPath<'_> {
+        OnPath {
+            claude: self.claude.as_deref(),
+            codex: self.codex.as_deref(),
         }
     }
 }
@@ -433,7 +444,7 @@ fn run_launch(
     };
     let mut warnings = launch::env_warnings(&deps.env);
     warnings.extend(plan.notices.iter().cloned());
-    let log = deps.state_dir.join("launches.jsonl");
+    let log = owned::launch_log(&deps.state_dir);
     if let Err(e) = screen.suspend() {
         let _ = screen.resume();
         return Ok((Err(format!("cannot hand the terminal over: {e}")), warnings));

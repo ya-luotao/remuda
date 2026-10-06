@@ -31,17 +31,18 @@ fn cache_json(age_secs: u128, utilization: &str) -> String {
     )
 }
 
+/// The resets are in 2099: ahead whenever this runs.
 const LIMITS: &str = r#"{
-  "five_hour": {"utilization": 34, "resets_at": "2026-09-23T15:40:00.292773+00:00"},
-  "seven_day": {"utilization": 76, "resets_at": "2026-09-25T05:00:00.632368+00:00"},
+  "five_hour": {"utilization": 34, "resets_at": "2099-09-23T15:40:00.292773+00:00"},
+  "seven_day": {"utilization": 76, "resets_at": "2099-09-25T05:00:00.632368+00:00"},
   "seven_day_opus": null, "extra_usage": {"is_enabled": false},
   "limits": [
     {"kind": "session", "group": "session", "percent": 34, "severity": "normal",
-     "resets_at": "2026-09-23T15:39:59.632347+00:00", "scope": null, "is_active": false},
+     "resets_at": "2099-09-23T15:39:59.632347+00:00", "scope": null, "is_active": false},
     {"kind": "weekly_all", "group": "weekly", "percent": 77, "severity": "warning",
-     "resets_at": "2026-09-25T04:59:59.632368+00:00", "scope": null, "is_active": false},
+     "resets_at": "2099-09-25T04:59:59.632368+00:00", "scope": null, "is_active": false},
     {"kind": "weekly_scoped", "group": "weekly", "percent": 100, "severity": "critical",
-     "resets_at": "2026-09-25T04:59:59.632532+00:00",
+     "resets_at": "2099-09-25T04:59:59.632532+00:00",
      "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}, "is_active": true}]}"#;
 
 struct Setup {
@@ -114,6 +115,40 @@ fn cached_usage_for_every_account_without_running_claude() {
     assert!(
         sb.invocations().is_empty(),
         "cached usage must not run claude"
+    );
+}
+
+/// R10: a window whose reset has passed since the cache was written shows no percentage (and no
+/// severity): what it holds now is unknown. One whose reset is ahead reads as recorded.
+#[test]
+fn cached_usage_past_a_reset_says_so() {
+    let Setup { sb, max, .. } = setup();
+    let at = |offset_secs: i64| {
+        jiff::Timestamp::from_second((now_ms() / 1000) as i64 + offset_secs).unwrap()
+    };
+    // Cached two hours ago: the session, then critical, reset an hour ago.
+    let (session, week) = (at(-3600), at(2 * 86_400));
+    let limits = format!(
+        r#"{{"limits": [
+            {{"kind": "session", "percent": 97, "severity": "critical", "resets_at": "{session}"}},
+            {{"kind": "weekly_all", "percent": 77, "severity": "warning", "resets_at": "{week}"}}]}}"#
+    );
+    sb.write_claude_json(Some(&max), &cache_json(7200, &limits));
+    let out = stdout_of(sb.remuda().args(["usage", "max"]).assert().success());
+    let b = blocks(&out);
+    assert!(b[0].0.starts_with("claude:max cached 2h ago ("), "{out}");
+    let utc = |t: jiff::Timestamp| {
+        t.to_zoned(jiff::tz::TimeZone::UTC)
+            .strftime("%b %-d %H:%M")
+            .to_string()
+    };
+    assert_eq!(
+        b[0].1,
+        [
+            format!("Session - reset since cached ({})", utc(session)),
+            format!("Week (all models) 77% ! resets {}", utc(week)),
+        ],
+        "{out}"
     );
 }
 
@@ -230,6 +265,53 @@ fn live_usage_prints_unparseable_output_raw() {
     assert!(out.contains("\n      Session: plenty\n"), "{out}");
 }
 
+/// R10 (review #14): the week is used up and its line no longer reads `<N>% used`. The answer
+/// is shown as it is, whole: the lines that still read would show the account as available.
+#[test]
+fn live_usage_read_in_part_is_shown_as_is() {
+    let Setup { sb, max, .. } = setup();
+    let drifted = LIVE_SAMPLE.replace(
+        "Current week (all models): 74% used",
+        "Current week (all models): limit reached",
+    );
+    sb.set_live_usage(Some(&max), &drifted);
+    let out = stdout_of(
+        sb.remuda()
+            .args(["usage", "max", "--live"])
+            .assert()
+            .success(),
+    );
+    assert!(
+        out.starts_with("claude:max  live (output not recognized; shown as is)\n"),
+        "{out}"
+    );
+    for line in [
+        "\n    Current session: 9% used \u{b7} resets Sep 24 at 3:19am (Asia/Shanghai)\n",
+        "\n    Current week (all models): limit reached \u{b7} resets Sep 29 at 11:59am \
+         (Asia/Shanghai)\n",
+    ] {
+        assert!(out.contains(line), "{line:?} in:\n{out}");
+    }
+    // Not the aligned rows of an answer that was read.
+    assert!(!out.contains("  Session  "), "{out}");
+}
+
+/// A cached `limits` entry that cannot be read spoils the cache (R10, review #14): the limits
+/// that can be read are not shown as the account's usage.
+#[test]
+fn cached_usage_with_an_unreadable_limit_is_no_usage() {
+    let Setup { sb, max, .. } = setup();
+    let limits = r#"{"five_hour": {"utilization": 34}, "limits": [
+        {"kind": "session", "percent": 34},
+        {"kind": "weekly_all", "percent": "all of it"}]}"#;
+    sb.write_claude_json(Some(&max), &cache_json(60, limits));
+    let out = stdout_of(sb.remuda().args(["usage", "max"]).assert().success());
+    assert_eq!(
+        out,
+        "claude:max  no cached usage (1 of 2 usage limits in the cache not recognized)\n"
+    );
+}
+
 #[test]
 fn live_usage_failure_is_reported_and_others_still_print() {
     let Setup { sb, max, .. } = setup();
@@ -281,4 +363,312 @@ fn live_usage_needs_claude_on_path() {
         .assert()
         .code(1)
         .stderr(predicate::str::starts_with("remuda: ").and(predicate::str::contains("claude")));
+}
+
+// --- with a terminal ---------------------------------------------------------------------
+
+/// A pseudo-terminal, `(master, slave)`, that stops a background process which writes to it
+/// (`TOSTOP`), as it stops one that reads it. The tests have no controlling terminal of their
+/// own to rely on (CI has none), so one is made.
+fn pty() -> (libc::c_int, libc::c_int) {
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty(3) writes the two descriptors (the name, modes and size are not asked);
+    // tcgetattr(3) and tcsetattr(3) read and write the zeroed `modes` of this function.
+    unsafe {
+        let made = libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(made, 0, "openpty: {}", std::io::Error::last_os_error());
+        let mut modes: libc::termios = std::mem::zeroed();
+        assert_eq!(libc::tcgetattr(slave, &mut modes), 0);
+        modes.c_lflag |= libc::TOSTOP;
+        assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &modes), 0);
+    }
+    (master, slave)
+}
+
+/// R4: a command remuda runs for its output is outside the terminal's foreground process
+/// group, where a process that reads the terminal, or writes to one that asks for it, is
+/// stopped until someone continues it: the query would hang until its timeout. remuda has the
+/// command ignore those two signals, so the write goes through, the read fails at once, and
+/// the query answers.
+///
+/// remuda runs here as the leader of a session of its own whose controlling terminal is a
+/// pseudo-terminal, as under a real terminal: the fake claude's `/dev/tty` is that terminal.
+/// The fake touches it with the shell's own `echo` and `read`: a shell may give the processes
+/// it starts the default actions back (macOS's `/bin/sh` does), an agent does not.
+#[test]
+fn a_query_that_touches_the_terminal_is_not_stopped() {
+    use std::os::unix::process::CommandExt;
+    let Setup { sb, .. } = setup();
+    common::write_executable(
+        &sb.bin().join("claude"),
+        "#!/bin/sh\n\
+         echo hello > /dev/tty; echo \"write $?\" > \"$HOME/tty.write\"\n\
+         read line < /dev/tty; echo \"read $?\" > \"$HOME/tty.read\"\n\
+         echo 'Current session: 7% used'\n",
+    );
+    let (master, slave) = pty();
+    let mut cmd = sb.remuda_process();
+    cmd.args(["usage", "max", "--live", "--timeout", "5"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // SAFETY: the closure only calls setsid(2) and ioctl(2), both async-signal-safe: a new
+    // session, with the pseudo-terminal as its controlling terminal.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setsid() == -1 || libc::ioctl(slave, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let start = Instant::now();
+    let remuda = cmd.spawn().unwrap();
+    // SAFETY: the descriptor `pty` opened, closed once: remuda's session has the terminal now.
+    unsafe { libc::close(slave) };
+    // What is written to the terminal must be read: a session cannot end while its terminal
+    // has output nobody took. Reading ends when the last process of the session is gone.
+    let terminal = std::thread::spawn(move || {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        // SAFETY: the descriptor `pty` opened; this file is its only owner.
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let mut shown = Vec::new();
+        let _ = master.read_to_end(&mut shown);
+        String::from_utf8_lossy(&shown).into_owned()
+    });
+    let out = remuda.wait_with_output().unwrap();
+    let took = start.elapsed();
+    let shown = terminal.join().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    let b = blocks(&stdout);
+    assert_eq!(b[0].0, "claude:max live", "{stdout}");
+    assert_eq!(b[0].1, ["Session 7%"], "{stdout}");
+    assert!(took < Duration::from_secs(4), "took {took:?}: stopped");
+    // It did reach the terminal: the write went through, and the read failed (EIO).
+    let said = |name: &str| std::fs::read_to_string(sb.home().join(name)).unwrap();
+    assert_eq!(said("tty.write"), "write 0\n");
+    assert!(shown.contains("hello"), "{shown:?}");
+    assert_ne!(said("tty.read"), "read 0\n");
+}
+
+// --- interrupted -------------------------------------------------------------------------
+
+/// A fake agent that hangs with a process of its own, both in the agent's process group: the
+/// agent waits for `<agent> inner`, which sleeps. Each writes its pid into `$HOME`.
+const HANGING_AGENT: &str = "#!/bin/sh\n\
+    if [ \"$1\" = inner ]; then echo $$ > \"$HOME/inner.pid\"; exec sleep 60; fi\n\
+    echo $$ > \"$HOME/agent.pid\"\n\
+    \"$0\" inner\n";
+
+/// The pid a hanging agent wrote to `path`, once it is there.
+fn pid_once_written(path: &std::path::Path) -> libc::pid_t {
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        match std::fs::read_to_string(path).map(|text| text.trim().parse()) {
+            Ok(Ok(pid)) => return pid,
+            _ if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+            other => panic!("no pid in {}: {other:?}", path.display()),
+        }
+    }
+}
+
+/// Whether process `pid` is gone, waiting up to 10 s for it to be.
+fn gone(pid: libc::pid_t) -> bool {
+    let until = Instant::now() + Duration::from_secs(10);
+    // SAFETY: kill(2) with signal 0 only checks that the process exists.
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+/// `remuda <args>` with the hanging agent as `program`, interrupted once the agent runs:
+/// remuda's own exit signal, and whether the agent and its process are gone. Only remuda is
+/// signalled, as by a terminal whose foreground process group the agent has left.
+fn interrupted(sb: &Sandbox, program: &str, args: &[&str]) -> (Option<i32>, bool, bool) {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    common::write_executable(&sb.bin().join(program), HANGING_AGENT);
+    let mut cmd = sb.remuda_process();
+    cmd.args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: the closure only calls `signal`, which is async-signal-safe. Whatever started
+    // the tests may have left SIGINT ignored, which remuda would then leave alone too.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let mut remuda = cmd.spawn().unwrap();
+    let agent = pid_once_written(&sb.home().join("agent.pid"));
+    let inner = pid_once_written(&sb.home().join("inner.pid"));
+    // SAFETY: kill(2) takes no pointers.
+    assert_eq!(
+        unsafe { libc::kill(remuda.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match remuda.try_wait().unwrap() {
+            Some(status) => break status,
+            None if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+            None => {
+                let _ = remuda.kill();
+                panic!("remuda outlived the interrupt");
+            }
+        }
+    };
+    let gone = (gone(agent), gone(inner));
+    for pid in [agent, inner] {
+        // SAFETY: as above; nothing is left running when the assertion fails.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    (status.signal(), gone.0, gone.1)
+}
+
+/// R4: an agent command runs outside the terminal's foreground process group, so Ctrl-C does
+/// not reach it by itself: remuda passes the signal on to the command's group, and then ends
+/// by it as before.
+#[test]
+fn an_interrupt_reaches_a_running_claude_query() {
+    let Setup { sb, .. } = setup();
+    let got = interrupted(
+        &sb,
+        "claude",
+        &["usage", "max", "--live", "--timeout", "60"],
+    );
+    assert_eq!(got, (Some(libc::SIGINT), true, true));
+}
+
+/// R4: the same for `codex app-server`, which never was in the foreground process group.
+#[test]
+fn an_interrupt_reaches_a_running_codex_query() {
+    let sb = Sandbox::new();
+    let got = interrupted(
+        &sb,
+        "codex",
+        &["usage", "codex:default", "--live", "--timeout", "60"],
+    );
+    assert_eq!(got, (Some(libc::SIGINT), true, true));
+}
+
+/// One `remuda usage --live` over 60 claude and 60 codex accounts (and the two `default`
+/// ones), each query a fake agent that hangs, interrupted `after` remuda was started: whether
+/// any process remuda had started outlived it.
+///
+/// remuda is given the writing end of a pipe, which every process it starts inherits: the
+/// reading end sees the end of the pipe when the last of them is gone, and not before. That
+/// counts a query from its `fork` on, before it could say anything itself.
+fn outlived_by_a_query(after: Duration) -> bool {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    /// Per provider: enough that starting them all takes a while.
+    const ACCOUNTS: usize = 60;
+    let sb = Sandbox::new();
+    let mut config = String::new();
+    for i in 0..ACCOUNTS {
+        for (provider, home) in [
+            ("claude", sb.make_claude_home(&format!("h/a{i}"))),
+            ("codex", sb.make_codex_home(&format!("c/a{i}"))),
+        ] {
+            config.push_str(&format!(
+                "[[account]]\nprovider = \"{provider}\"\nname = \"a{i}\"\nhome = \"{}\"\n\n",
+                home.display()
+            ));
+        }
+    }
+    sb.write_config(&config);
+    let pids = sb.home().join("pids");
+    std::fs::create_dir(&pids).unwrap();
+    for program in ["claude", "codex"] {
+        // One process, the shell become `sleep`: a shell that is forking as the signal comes
+        // loses its child to it, here as under a terminal, and that is not remuda's doing.
+        // The pid is for cleaning up after a failure only.
+        let agent = "#!/bin/sh\necho $$ > \"$HOME/pids/$$\"\nexec sleep 20\n";
+        common::write_executable(&sb.bin().join(program), agent);
+    }
+    let (mut alive, held) = std::io::pipe().unwrap();
+    let held_fd = held.as_raw_fd();
+    let mut cmd = sb.remuda_process();
+    cmd.args(["usage", "--live", "--timeout", "60"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: the closure only calls `signal` and `fcntl`, both async-signal-safe: SIGINT has
+    // its default action (see `interrupted`), and the pipe's writing end, closed on exec in
+    // every other process the tests start, stays open in remuda and what it starts.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            if libc::fcntl(held_fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut remuda = cmd.spawn().unwrap();
+    drop(held);
+    std::thread::sleep(after);
+    // SAFETY: kill(2) takes no pointers.
+    assert_eq!(
+        unsafe { libc::kill(remuda.id() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match remuda.try_wait().unwrap() {
+            Some(status) => break status,
+            None if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
+            None => {
+                let _ = remuda.kill();
+                panic!("remuda outlived the interrupt");
+            }
+        }
+    };
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+    // remuda is gone and starts nothing more. What it told goes within moments; what it did
+    // not tell sleeps on.
+    let (tx, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = alive.read(&mut [0]);
+        let _ = tx.send(());
+    });
+    let outlived = ended.recv_timeout(Duration::from_secs(5)).is_err();
+    if outlived {
+        for entry in std::fs::read_dir(&pids).unwrap() {
+            let pid = entry.unwrap().file_name().to_str().unwrap().parse::<i32>();
+            // SAFETY: as above; nothing is left running when the assertion fails.
+            unsafe { libc::kill(pid.unwrap(), libc::SIGKILL) };
+        }
+    }
+    outlived
+}
+
+/// R4 (review round 1): Ctrl-C while queries are being started, in parallel, reaches every
+/// one of them: the ones already running, and the ones remuda had started and not yet come
+/// to watch. Nothing new is started, and remuda ends by the signal once the last start is
+/// over. The interrupt comes at a range of moments after remuda's own start, so that some
+/// fall among the starts whatever the machine's speed; one that comes before or after them
+/// proves nothing and costs little.
+#[test]
+fn an_interrupt_while_queries_are_starting_reaches_them_all() {
+    for after in (0..120).step_by(8).map(Duration::from_millis) {
+        assert!(
+            !outlived_by_a_query(after),
+            "interrupted after {after:?}: a query outlived remuda"
+        );
+    }
 }

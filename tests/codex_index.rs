@@ -4,6 +4,7 @@ mod common;
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use common::rollouts::*;
@@ -394,6 +395,39 @@ fn appended_records_are_read_incrementally() {
 }
 
 /// Only `sessions/**/rollout-*.jsonl`; the 2025 format degrades to what it has.
+/// R8, R17 (review #10): a day directory that can be listed but not searched gives its
+/// rollouts' names and nothing else. They stay in the index, the directory is reported, and
+/// nothing is read again once it can be searched.
+#[test]
+fn a_day_directory_that_cannot_be_searched_keeps_its_rollouts() {
+    let h = CodexHome::new();
+    let path = h.write(
+        ID,
+        &[
+            meta(ID, "/w/proj", cli(), 0, &ts(0)),
+            user(&["hello"], &ts(1)),
+        ]
+        .concat(),
+    );
+    let mut index = Index::default();
+    h.refresh(&mut index);
+    let before = index.clone();
+    let day = path.parent().unwrap();
+    let chmod = |mode| fs::set_permissions(day, fs::Permissions::from_mode(mode)).unwrap();
+
+    chmod(0o444);
+    let s = h.refresh(&mut index);
+    chmod(0o755);
+    assert_eq!(index, before);
+    assert_eq!((s.files, s.removed, s.cold, s.kept()), (1, 0, 0, 1));
+    assert_eq!(s.unreadable.len(), 1, "{:?}", s.unreadable);
+    assert_eq!(s.unreadable[0].path, day);
+
+    let s = h.refresh(&mut index);
+    assert_eq!((s.reused, s.cold, s.bytes_read), (1, 0, 0));
+    assert!(s.unreadable.is_empty());
+}
+
 #[test]
 fn what_counts_as_a_rollout() {
     let h = CodexHome::new();

@@ -375,7 +375,8 @@ fn rollout_limits(limit_id: serde_json::Value, windows: &[(f64, i64, i64)]) -> s
 }
 
 /// R10: cached codex usage is the newest general rate limits recorded in the home's rollouts
-/// (`sessions/**` and `archived_sessions/`); codex is not run.
+/// (`sessions/**` and `archived_sessions/`); codex is not run. A window that has reset since its
+/// record says so instead of its percentage.
 #[test]
 fn usage_reads_codex_rate_limits_from_rollouts() {
     use common::rollouts::{token_count, ts, write_archived_rollout, write_rollout};
@@ -390,8 +391,9 @@ fn usage_reads_codex_rate_limits_from_rollouts() {
         ],
     );
     // A Pro plan: one weekly window. Older records and a per-model one after it do not count.
-    let pro = rollout_limits(json!("codex"), &[(99.0, 10080, 1790414559)]);
-    let older = rollout_limits(json!("codex"), &[(50.0, 10080, 1790414559)]);
+    // Its reset is in 2099: ahead whenever this runs.
+    let pro = rollout_limits(json!("codex"), &[(99.0, 10080, 4094097759)]);
+    let older = rollout_limits(json!("codex"), &[(50.0, 10080, 4094097759)]);
     let spark = json!({"limit_id": "codex_bengalfox", "limit_name": "GPT-5.3-Codex-Spark",
                        "primary": {"used_percent": 5.0, "window_minutes": 300, "resets_at": 1}});
     write_rollout(
@@ -406,10 +408,11 @@ fn usage_reads_codex_rate_limits_from_rollouts() {
         .concat(),
     );
     // codex:default (`~/.codex`) has only an archived rollout, from 2025: a null `limit_id`,
-    // windows of 299 and 10079 minutes.
+    // windows of 299 and 10079 minutes. Its session reset on 2026-09-22, two days after the
+    // record: since then nothing is known about it.
     let plus = rollout_limits(
         serde_json::Value::Null,
-        &[(10.0, 299, 1790100000), (20.0, 10079, 1790500000)],
+        &[(10.0, 299, 1790100000), (20.0, 10079, 4094183200)],
     );
     write_archived_rollout(
         &sb.home().join(".codex"),
@@ -430,7 +433,7 @@ fn usage_reads_codex_rate_limits_from_rollouts() {
     assert_eq!(
         rows,
         &[
-            "Session 10% resets Sep 22 18:00",
+            "Session - reset since cached (Sep 22 18:00)",
             "Week (all models) 20% resets Sep 27 09:06"
         ]
     );
@@ -446,19 +449,20 @@ fn usage_reads_codex_rate_limits_from_rollouts() {
     assert!(sb.codex_invocations().is_empty());
 }
 
-/// An `account/rateLimits/read` result: Pro's weekly general limit, and a per-model limit.
+/// An `account/rateLimits/read` result: Pro's weekly general limit, and a per-model limit. The
+/// resets are in 2099: a live answer shows only a reset that is ahead (R10).
 const RATE_LIMITS: &str = r#"{
   "rateLimits": {"limitId": "codex", "limitName": null,
-    "primary": {"usedPercent": 99, "windowDurationMins": 10080, "resetsAt": 1790414559},
+    "primary": {"usedPercent": 99, "windowDurationMins": 10080, "resetsAt": 4094097759},
     "secondary": null, "credits": {"hasCredits": false, "unlimited": false, "balance": "0"},
     "planType": "pro"},
   "rateLimitsByLimitId": {
     "codex": {"limitId": "codex", "limitName": null,
-      "primary": {"usedPercent": 99, "windowDurationMins": 10080, "resetsAt": 1790414559},
+      "primary": {"usedPercent": 99, "windowDurationMins": 10080, "resetsAt": 4094097759},
       "secondary": null, "planType": "pro"},
     "codex_bengalfox": {"limitId": "codex_bengalfox", "limitName": "GPT-5.3-Codex-Spark",
-      "primary": {"usedPercent": 5, "windowDurationMins": 300, "resetsAt": 1790300000},
-      "secondary": {"usedPercent": 7, "windowDurationMins": 10080, "resetsAt": 1790700000},
+      "primary": {"usedPercent": 5, "windowDurationMins": 300, "resetsAt": 4093983200},
+      "secondary": {"usedPercent": 7, "windowDurationMins": 10080, "resetsAt": 4094383200},
       "planType": "pro"}},
   "rateLimitResetCredits": null
 }"#;

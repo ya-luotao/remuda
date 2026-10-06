@@ -11,6 +11,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 
 use common::Sandbox;
+use common::homes::ClaudeHome;
 use remuda::launch::{self, EnvChange};
 use remuda::provider::Provider;
 use remuda::registry::{Account, Home};
@@ -428,9 +429,9 @@ fn tui_launches_name_authentication_read_through_a_link() {
 #[test]
 fn tui_launches_get_shared_configuration() {
     let sb = Sandbox::new();
-    let source = sb.home().join(".claude");
-    fs::create_dir_all(&source).unwrap();
-    fs::write(source.join("CLAUDE.md"), "be brief").unwrap();
+    let source = ClaudeHome::at(sb.home().join(".claude"))
+        .claude_md("be brief")
+        .into_path();
     let max = sb.make_claude_home("max");
     sb.write_config(&format!(
         "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{}\"\n\
@@ -1485,8 +1486,11 @@ fn a_registry_change_reaches_the_app_and_the_account_gone_does_not_launch() {
     tui.keys(&[Key::Down, Key::Down, Key::Char('n')]);
     sb.register(&[("max", home_of(&max))]);
     tui.keys(&[Key::Enter]);
-    assert!(tui.app.pending.is_some(), "the launch waits for its check");
-    tui.run_until(|app| app.pending.is_none());
+    assert!(
+        tui.app.work.launch.is_running(),
+        "the launch waits for its check"
+    );
+    tui.run_until(|app| !app.work.launch.is_running());
 
     assert_eq!(
         tui.told,
@@ -1551,7 +1555,7 @@ fn a_form_open_while_its_account_moves_to_another_home_starts_nothing() {
     assert_eq!(tui.app.accounts[2].account, moved, "the row is the new one");
 
     assert_eq!(tui.apply(Event::Key(Key::Enter)), [], "nothing is started");
-    assert_eq!(tui.app.pending, None);
+    assert_eq!(tui.app.work.launch.running(), None);
     let Some(Overlay::Form(form)) = &tui.app.overlay else {
         panic!("{:?}", tui.app.overlay)
     };
@@ -1579,13 +1583,18 @@ fn a_form_open_while_its_account_moves_to_another_home_starts_nothing() {
 #[test]
 fn a_refresh_reads_the_registry_while_earlier_answers_are_still_queued() {
     let sb = Sandbox::new();
-    let (deps, max, _) = two_accounts(&sb);
+    let (deps, max, team) = two_accounts(&sb);
     let mut tui = Headless::start(&sb, deps);
     tui.app.mode = Mode::PickForRun;
     let started = tui.app.start();
+    let everyone = vec![Account::default_for(Provider::Claude), max.clone(), team];
     assert_eq!(
         started,
-        [Effect::Identities, Effect::CachedUsage, Effect::Checks]
+        [
+            Effect::Identities(everyone.clone()),
+            Effect::CachedUsage(everyone),
+            Effect::Checks
+        ]
     );
     tui.dispatch(started);
     // Every answer of the old list is in the queue, none applied: three identities, three

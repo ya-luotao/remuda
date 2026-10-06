@@ -26,8 +26,8 @@ use crate::transcript::Message;
 use crate::usage::{CachedUsage, Resets, UsageRow};
 
 use super::app::{
-    AccountState, App, ConfigPane, Confirm, Field, Form, FormKind, History, LaunchRequest, Logs,
-    Marked, Mask, Notice, Overlay, Pick, Preview, ResumeCodex, StatsState,
+    AccountState, App, Background, ConfigPane, Confirm, Field, Form, FormKind, History,
+    LaunchRequest, Logs, Marked, Mask, Notice, Overlay, Pick, Preview, ResumeCodex, StatsState,
 };
 
 /// What masked text shows.
@@ -401,26 +401,21 @@ pub fn redacted(app: &App) -> App {
         accounts,
         accounts_list,
         checks,
-        checks_in_flight,
         config,
         index,
         indexing,
-        index_in_flight,
         index_loaded,
         index_refreshed,
         index_error,
         by_session,
         attribution_base,
         attribution,
-        attribution_in_flight,
         live,
         live_rows,
         live_show_inactive,
         live_list,
         logs,
         live_loaded,
-        live_in_flight,
-        live_stale,
         live_updated,
         history,
         preview,
@@ -428,14 +423,9 @@ pub fn redacted(app: &App) -> App {
         notice,
         overlay,
         stores,
-        pending,
-        launch_checks,
+        work,
         cancelled,
         form_check,
-        index_again,
-        attribution_again,
-        live_again,
-        checks_again,
         private,
         aliases: _,
     } = app;
@@ -454,11 +444,9 @@ pub fn redacted(app: &App) -> App {
         checks: checks
             .as_ref()
             .map(|checks| checks.iter().map(|c| r.check(c)).collect()),
-        checks_in_flight: *checks_in_flight,
         config: r.config_pane(config),
         index: r.index(index),
         indexing: *indexing,
-        index_in_flight: *index_in_flight,
         index_loaded: *index_loaded,
         index_refreshed: *index_refreshed,
         index_error: r.scrub_opt(index_error),
@@ -468,15 +456,12 @@ pub fn redacted(app: &App) -> App {
             .collect::<HashMap<_, _>>(),
         attribution_base: attribution_base.redacted(|q| r.alias(q)),
         attribution: attribution.redacted(|q| r.alias(q)),
-        attribution_in_flight: *attribution_in_flight,
         live: live.iter().map(|s| r.live_session(s)).collect(),
         live_rows: live_rows.clone(),
         live_show_inactive: *live_show_inactive,
         live_list: *live_list,
         logs: logs.as_ref().map(|l| r.logs(l)),
         live_loaded: *live_loaded,
-        live_in_flight: *live_in_flight,
-        live_stale: *live_stale,
         live_updated: *live_updated,
         history: r.history(history),
         preview: r.preview(preview),
@@ -486,16 +471,9 @@ pub fn redacted(app: &App) -> App {
         stores: stores
             .as_ref()
             .map(|stores| stores.iter().map(|s| r.store(s)).collect()),
-        pending: pending
-            .as_ref()
-            .map(|(check, request)| (*check, r.request(request))),
-        launch_checks: *launch_checks,
+        work: r.background(work),
         cancelled: r.scrub_opt(cancelled),
         form_check: *form_check,
-        index_again: *index_again,
-        attribution_again: *attribution_again,
-        live_again: *live_again,
-        checks_again: *checks_again,
         private: *private,
         // Its keys are the names private mode hides; nothing drawn needs them.
         aliases: Aliases::default(),
@@ -585,22 +563,43 @@ impl Redactor<'_> {
         let AccountState {
             account,
             identity,
-            identity_pending,
             cached,
-            cached_pending,
             live,
-            live_pending,
+            work,
         } = a;
         AccountState {
             account: self.account(account),
             identity: identity.as_ref().map(identity_redacted),
-            identity_pending: *identity_pending,
             cached: cached.as_ref().map(|c| self.scrub_result(c, cached_usage)),
-            cached_pending: *cached_pending,
             live: live.as_ref().map(|l| {
                 self.scrub_result(l, |(rows, at)| (rows.iter().map(usage_row).collect(), *at))
             }),
-            live_pending: *live_pending,
+            // What is out, not what it found.
+            work: work.clone(),
+        }
+    }
+
+    /// What is out: the launch being checked is shown in the status line, so it is masked like
+    /// any other, and so is the account whose logs are read; a short id is shown as it is, like
+    /// [`Logs::short_id`].
+    fn background(&self, work: &Background) -> Background {
+        let Background {
+            index,
+            live,
+            attribution,
+            checks,
+            stats,
+            launch,
+            logs,
+        } = work;
+        Background {
+            index: index.clone(),
+            live: live.clone(),
+            attribution: attribution.clone(),
+            checks: checks.clone(),
+            stats: stats.clone(),
+            launch: launch.map(|request| self.request(request)),
+            logs: logs.map(|(account, short_id)| (self.account(account), short_id.clone())),
         }
     }
 
@@ -613,9 +612,12 @@ impl Redactor<'_> {
     }
 
     fn index(&self, index: &Index) -> Index {
+        // What the cache remembers of each account's store (names and real paths) is the
+        // refresh's and is never drawn: the copy holds none of it.
         let Index {
             schema_version,
             entries,
+            stores: _,
         } = index;
         Index {
             schema_version: *schema_version,
@@ -623,6 +625,7 @@ impl Redactor<'_> {
                 .iter()
                 .map(|(p, e)| (key_path(p), self.entry(e)))
                 .collect(),
+            stores: Default::default(),
         }
     }
 
@@ -737,7 +740,7 @@ impl Redactor<'_> {
         let Preview {
             target,
             settled,
-            loading,
+            work,
             loaded,
             expanded,
             scroll,
@@ -745,7 +748,7 @@ impl Redactor<'_> {
         Preview {
             target: target.as_deref().map(key_path),
             settled: *settled,
-            loading: loading.as_deref().map(key_path),
+            work: work.map(|p| key_path(p)),
             loaded: loaded.as_ref().map(|(p, result)| {
                 let messages = |m: &Vec<Message>| m.iter().map(message).collect();
                 (key_path(p), self.scrub_result(result, messages))
@@ -759,7 +762,6 @@ impl Redactor<'_> {
         let StatsState {
             report,
             error,
-            in_flight,
             requested,
             progress,
             computed,
@@ -769,7 +771,6 @@ impl Redactor<'_> {
         StatsState {
             report: report.as_ref().map(|r| self.report(r)),
             error: self.scrub_opt(error),
-            in_flight: *in_flight,
             requested: *requested,
             progress: *progress,
             computed: *computed,
@@ -903,21 +904,19 @@ impl Redactor<'_> {
             open,
             expanded,
             scroll,
-            request,
             account,
             loaded,
-            loading,
+            work,
         } = pane;
         ConfigPane {
             open: *open,
             expanded: *expanded,
             scroll: *scroll,
-            request: *request,
             account: account.as_ref().map(|a| self.account(a)),
             loaded: loaded
                 .as_ref()
                 .map(|l| self.scrub_result(l, |v| self.config_view(v))),
-            loading: *loading,
+            work: work.map(|a| self.account(a)),
         }
     }
 
