@@ -3,6 +3,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -14,7 +15,7 @@ use crate::identity::{self, Identity};
 use crate::index::{self, Index};
 use crate::privacy::Aliases;
 use crate::provider::Provider;
-use crate::registry::{self, Account, Registry};
+use crate::registry::{self, Account, Home, Registry};
 use crate::stats::{self, Period};
 use crate::{Env, paths};
 use crate::{attribution, jev, launch, live, pick, probe, setup, text, transcript, tui, usage};
@@ -401,14 +402,37 @@ fn run_account(
                 );
             }
             match open_tui(config, ctx, tui::app::Mode::PickForRun)? {
-                // The registry as it is now: the picker may have been open a while.
-                Some(account) => (account, Registry::load(config)?),
+                Some(account) => {
+                    let registry = registry_for_picked(config, &account)?;
+                    (account, registry)
+                }
                 // Cancelled: nothing was launched.
                 None => return Ok(ExitCode::FAILURE),
             }
         }
     };
     exec_as(config, &registry, &account, args, ctx)
+}
+
+/// The registry as it is now, for launching the account chosen in the picker (R16): the picker
+/// may have been open a while, and another `remuda` may have taken the account out meanwhile.
+/// Then it is not launched; nor is one of its name registered again with another home, which
+/// is another account (R2). A provider's `default` is implicit (R1): no registry holds it, so
+/// none can lose it. The account is not named: private mode may have been on in the picker
+/// (R21), and it is the one just chosen.
+fn registry_for_picked(config: &Path, account: &Account) -> Result<Registry> {
+    let registry = Registry::load(config)?;
+    if account.home == Home::Default || registry.accounts.contains(account) {
+        return Ok(registry);
+    }
+    let again = registry
+        .accounts
+        .iter()
+        .any(|a| a.provider == account.provider && a.name == account.name);
+    if again {
+        bail!("the account chosen is now registered with another home; nothing was launched");
+    }
+    bail!("the account chosen is no longer registered; nothing was launched");
 }
 
 /// Execs the account's agent exactly like `remuda run <account> [args...]` (R6, R17), with the
@@ -832,18 +856,16 @@ fn tui(config: &Path, ctx: &Context) -> Result<ExitCode> {
 }
 
 fn open_tui(config: &Path, ctx: &Context, mode: tui::app::Mode) -> Result<Option<Account>> {
-    let accounts = Registry::load(config)?.all(&ctx.env);
+    let listing = tui::accounts::Listing::open(config.to_path_buf(), ctx.env.clone())?;
     let path_var = ctx.env.get("PATH").map(String::as_str);
     tui::run(tui::Deps {
-        seen: accounts.clone(),
-        accounts,
+        listing: Arc::new(listing),
         env: ctx.env.clone(),
         claude: claude_program(ctx).ok(),
         codex: program(ctx, Provider::Codex).ok(),
         ps: launch::find_on_path("ps", path_var).ok(),
         tz: ctx.tz.clone(),
         clock: ctx.clock,
-        config: config.to_path_buf(),
         state_dir: state_dir(config),
         cwd: ctx.cwd.clone(),
         mode,
@@ -915,6 +937,76 @@ fn parse_timeout(s: &str) -> std::result::Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R16: the account chosen in the picker of `remuda run` is launched only if the registry
+    /// as it is after the TUI still has it; the registry returned is that one (R18).
+    #[test]
+    fn a_picked_account_must_still_be_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let named = |provider, name: &str, home: &str| Account {
+            provider,
+            name: name.into(),
+            home: Home::Path(home.into()),
+        };
+        let (max, team) = (
+            named(Provider::Claude, "max", "/p/max"),
+            named(Provider::Claude, "team", "/p/team"),
+        );
+        let work = named(Provider::Codex, "work", "/c/work");
+        let entry = |a: &Account| {
+            format!(
+                "[[account]]\nprovider = \"{}\"\nname = \"{}\"\nhome = \"{}\"\n",
+                a.provider, a.name, a.home
+            )
+        };
+        let refused = |account: &Account| {
+            let error = registry_for_picked(&config, account).unwrap_err();
+            format!("{error:#}")
+        };
+        const GONE: &str = "the account chosen is no longer registered; nothing was launched";
+
+        // As when the picker opened: every account goes, with the registry's sharing.
+        let all = entry(&max) + &entry(&team) + &entry(&work);
+        std::fs::write(&config, all + "[share.claude]\nfrom = \"max\"\n").unwrap();
+        for account in [&max, &team, &work] {
+            let registry = registry_for_picked(&config, account).unwrap();
+            assert_eq!(registry.sharing.source, Some(max.clone()));
+        }
+
+        // `remuda remove team` and `remuda remove codex:work` in another terminal meanwhile.
+        std::fs::write(&config, entry(&max)).unwrap();
+        assert!(registry_for_picked(&config, &max).is_ok());
+        assert_eq!(refused(&team), GONE);
+        assert_eq!(refused(&work), GONE);
+        // The same name for the other provider is not that account.
+        assert_eq!(refused(&named(Provider::Codex, "max", "/p/max")), GONE);
+
+        // Registered again with another home, be it one `/` more: another account (R2).
+        std::fs::write(&config, entry(&named(Provider::Claude, "max", "/p/max/"))).unwrap();
+        assert_eq!(
+            refused(&max),
+            "the account chosen is now registered with another home; nothing was launched"
+        );
+
+        // A provider's `default` is implicit: no registry holds it, none loses it, whether or
+        // not codex's is listed.
+        for registry in ["", &entry(&max)] {
+            std::fs::write(&config, registry).unwrap();
+            for provider in Provider::ALL {
+                assert!(registry_for_picked(&config, &Account::default_for(provider)).is_ok());
+            }
+        }
+        std::fs::remove_file(&config).unwrap();
+        assert!(registry_for_picked(&config, &Account::default_for(Provider::Claude)).is_ok());
+        assert_eq!(refused(&max), GONE);
+
+        // A registry that cannot be read launches nothing, `default` included.
+        std::fs::write(&config, "[[account]]\nprovider = 7\n").unwrap();
+        for account in [&max, &Account::default_for(Provider::Claude)] {
+            assert!(refused(account).contains("config.toml"));
+        }
+    }
 
     fn table(rows: &[&[&str]]) -> String {
         let rows: Vec<Vec<String>> = rows

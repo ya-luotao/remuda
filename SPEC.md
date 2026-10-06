@@ -672,6 +672,27 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
 - **Remove account** (`D` in Accounts): equivalent to `remuda remove` (R14a) after confirmation
   (`y` confirms; `Ctrl-P` toggles private mode, R21; any other key cancels); the prompt names the
   home that is kept. Refused on a `default` row. The account list is read again afterwards.
+- **The account list follows the registry** (R3), which another `remuda` may change while the
+  TUI runs. The TUI reads `config.toml` again whenever it starts work that goes over the
+  accounts, and so at least:
+  - before every launch: in the check that precedes a new session, a fork, and a resume, and
+    once more when the launch itself starts (an attach has no check before it); for
+    `remuda run` without an account, after the account is chosen (below);
+  - on every refresh (`r`), also while what the refresh would start is still running;
+  - after a setup and after a removal from the TUI, whatever their outcome.
+
+  A list that changed replaces the one on screen, and everything shown per account is read
+  again; the same list again changes nothing. Nothing is launched as an account the registry no
+  longer lists: the launch is refused with "<account> is no longer registered" (a new
+  session's form shows it; otherwise a notice), and the terminal is not handed over. An
+  account of the same name with another home is another account (R2): "<account> is now
+  registered with another home". A new-session form and a codex resume prompt hold the
+  account they were opened for, home and all: when the list changes under them, they are
+  refused the same way rather than started in the other home. While `config.toml` cannot be
+  read, the accounts stay as last read, every launch is refused with the reason, shared
+  configuration counts as unknown (R18, R22) and prices as the built-in ones (R20). An account
+  that left the registry while the TUI runs is still asked for its running sessions before a
+  resume in place.
 - **Background sessions** (in Live): `Enter` attaches (`claude attach <id>`, likewise suspending the
   TUI); `l` shows `claude logs <id>` in the preview pane; `x` stops and `D` removes a stopped
   session, both after confirmation (`y` confirms; `Ctrl-P` toggles private mode, R21; any other key
@@ -684,7 +705,10 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
   over the terminal and on final exit.
 - **`remuda run` without an account** (in which case no other arguments are allowed either): opens
   the TUI account picker; once an account is chosen, the TUI exits and execs claude as
-  `remuda run <account>` would.
+  `remuda run <account>` would. The registry is read once more between the two: an account
+  that another `remuda` removed while the picker was open, or registered again with another
+  home (R2), is not launched, and remuda exits with an error that says so. A provider's
+  `default` is implicit (R1) and cannot have been removed.
 - **Configuration** (`p` or Space in Accounts): the selected account's configuration (R22).
 - **Preview** (`p` or Space in History / Live): expands or collapses the preview (R8); `Enter`
   resumes or attaches, as above.
@@ -706,10 +730,13 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
 - When the `sessions` directories of several codex accounts resolve to the same realpath, a rollout
   does not uniquely determine its account: resume and fork must show a picker containing only those
   accounts (resume still requires confirmation) and must not default to the first one.
-- The account picker and the new-session form remember the account itself (`provider:name`), not a
-  list index; if the account list changes while they are open, the account is re-resolved by name,
-  and the action is refused if it cannot be resolved. The picker lists only accounts of the same
-  provider as the session.
+- Neither the account picker nor the new-session form remembers a list index. The picker
+  remembers its accounts by name (`provider:name`); if the account list changes while it is
+  open, the chosen account is re-resolved by name, and the action is refused if it cannot be
+  resolved. The picker lists only accounts of the same provider as the session. The
+  new-session form holds the account it was opened for, home and all, and is not re-resolved
+  by name: if the list changes while it is open, it is refused unless that very account is
+  still listed (R16).
 - Session index: `<home>/sessions/**/rollout-*.jsonl` (excluding `archived_sessions`). Only the
   **first** `session_meta` is honored (a forked rollout also contains a second one from the parent
   session, which must be ignored); it supplies `id`, `cwd`, `originator`, and `source`. The title is

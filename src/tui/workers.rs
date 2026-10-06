@@ -1,6 +1,7 @@
 //! Background work for [`Effect`]s: each runs on its own thread and reports back as
 //! [`Event`]s on the event loop's channel. A send error means the TUI has quit; the result
-//! is dropped.
+//! is dropped. Work that goes over the accounts reads them when it starts
+//! ([`super::accounts::Listing::read`]).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -9,9 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::index::{self, Index};
-use crate::pricing::Prices;
 use crate::provider::{Provider, codex};
-use crate::registry::{self, Account, Registry};
+use crate::registry;
 use crate::{account_config, attribution, checks, identity, live, stats, transcript, usage};
 
 use super::Deps;
@@ -36,26 +36,33 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
     let tx = tx.clone();
     match effect {
         Effect::Quit | Effect::Pick(_) | Effect::Launch(_) | Effect::Setup { .. } => {}
+        Effect::ReadAccounts => {
+            thread::spawn(move || {
+                deps.listing.read(&tx);
+            });
+        }
         Effect::RefreshIndex => {
             thread::spawn(move || refresh_index(&deps, &tx));
         }
         Effect::Identities => {
-            for account in &deps.accounts {
-                let (deps, tx, account) = (Arc::clone(&deps), tx.clone(), account.clone());
-                thread::spawn(move || {
-                    let (identity, _warning) = identity::identify(
-                        &account,
-                        deps.program(account.provider),
-                        &deps.env,
-                        IDENTITY_TIMEOUT,
-                    );
-                    let _ = tx.send(Event::Identity { account, identity });
-                });
-            }
+            thread::spawn(move || {
+                for account in deps.listing.read(&tx).accounts {
+                    let (deps, tx) = (Arc::clone(&deps), tx.clone());
+                    thread::spawn(move || {
+                        let (identity, _warning) = identity::identify(
+                            &account,
+                            deps.program(account.provider),
+                            &deps.env,
+                            IDENTITY_TIMEOUT,
+                        );
+                        let _ = tx.send(Event::Identity { account, identity });
+                    });
+                }
+            });
         }
         Effect::CachedUsage => {
             thread::spawn(move || {
-                for account in &deps.accounts {
+                for account in &deps.listing.read(&tx).accounts {
                     let result = usage::cached_usage(account, &deps.env);
                     let _ = tx.send(Event::CachedUsage {
                         account: account.clone(),
@@ -82,7 +89,7 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
         Effect::Live => {
             thread::spawn(move || {
                 let sessions = live::collect(
-                    &deps.accounts,
+                    &deps.listing.read(&tx).accounts,
                     deps.claude.as_deref(),
                     deps.ps.as_deref(),
                     &deps.env,
@@ -94,7 +101,8 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
         Effect::Attribution => {
             thread::spawn(move || {
                 let log = deps.state_dir.join("launches.jsonl");
-                let base = attribution::collect(&deps.accounts, &deps.env, &log, &[]);
+                let accounts = deps.listing.read(&tx).accounts;
+                let base = attribution::collect(&accounts, &deps.env, &log, &[]);
                 let _ = tx.send(Event::Attribution(base));
             });
         }
@@ -103,16 +111,15 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
         }
         Effect::Checks => {
             thread::spawn(move || {
-                let stores = index::stores(&deps.accounts, &deps.env);
-                let mut found = checks::run(&deps.accounts, &deps.env, &stores);
+                let reading = deps.listing.read(&tx);
+                let stores = index::stores(&reading.accounts, &deps.env);
+                let mut found = checks::run(&reading.accounts, &deps.env, &stores);
                 // A registry that cannot be read shares nothing (the launch says why).
-                if let Ok(registry) = Registry::load(&deps.config) {
-                    found.extend(checks::sharing(
-                        &deps.accounts,
-                        &deps.env,
-                        &registry.sharing,
-                    ));
-                }
+                found.extend(checks::sharing(
+                    &reading.accounts,
+                    &deps.env,
+                    &reading.sharing,
+                ));
                 let _ = tx.send(Event::Checks(found));
             });
         }
@@ -167,14 +174,9 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
         // so the rows are rebuilt by the time it is told.
         Effect::RemoveAccount(account) => {
             thread::spawn(move || {
-                let result =
-                    registry::unregister(&deps.config, &account).map_err(|e| format!("{e:#}"));
-                if let Ok(registry) = Registry::load(&deps.config) {
-                    let accounts = registry.all(&deps.env);
-                    if accounts != deps.accounts {
-                        let _ = tx.send(Event::Accounts(accounts));
-                    }
-                }
+                let result = registry::unregister(deps.listing.config(), &account)
+                    .map_err(|e| format!("{e:#}"));
+                deps.listing.read(&tx);
                 let _ = tx.send(Event::AccountRemoved { account, result });
             });
         }
@@ -197,24 +199,20 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                 let result = if account.provider != Provider::Claude {
                     Err("configuration listing is Claude-only".to_string())
                 } else {
-                    let read = |sharing: &registry::Sharing| {
-                        account_config::read(&account, sharing, cwd.as_deref(), &deps.env)
-                    };
-                    Ok(Box::new(match Registry::load(&deps.config) {
-                        Ok(registry) => read(&registry.sharing),
-                        // The account's own configuration still shows.
-                        Err(e) => {
-                            let mut view = read(&registry::Sharing::default());
-                            view.problems.insert(
-                                0,
-                                format!(
-                                    "cannot read {}: {e:#}; shared configuration unknown",
-                                    deps.config.display()
-                                ),
-                            );
-                            view
-                        }
-                    }))
+                    let reading = deps.listing.read(&tx);
+                    let mut view =
+                        account_config::read(&account, &reading.sharing, cwd.as_deref(), &deps.env);
+                    // The account's own configuration still shows.
+                    if let Some(e) = &reading.unreadable {
+                        view.problems.insert(
+                            0,
+                            format!(
+                                "cannot read {}: {e}; shared configuration unknown",
+                                deps.listing.config().display()
+                            ),
+                        );
+                    }
+                    Ok(Box::new(view))
                 };
                 let _ = tx.send(Event::Config {
                     request,
@@ -226,33 +224,32 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
     }
 }
 
-/// Why `request` cannot be launched now, if it cannot: its directory, then (for a resume in
-/// place) the session's state in every account, collected afresh (R16). The accounts are the
-/// registry's as it is now (one may have been added since the TUI started; the TUI is told
-/// through `tx`) and every account seen before (one may have been unregistered meanwhile and
-/// still run it, C2). An account that cannot be read may be running it, and so may one the
-/// registry cannot say: both refuse too.
+/// Why `request` cannot be launched now, if it cannot: its directory, then its account, which
+/// the registry as it is now must still list (the TUI is told of a change through `tx`), then
+/// (for a resume in place) the session's state in every account, collected afresh (R16). The
+/// accounts asked are the registry's and every account listed before (one may have been
+/// unregistered meanwhile and still run it, C2). An account that cannot be read may be running
+/// it, and so may one the registry cannot say: both refuse too.
 fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Option<Marked> {
     if let Some(error) = request.cwd.as_deref().and_then(check_dir) {
         return Some(error);
     }
-    let id = request.resumes()?;
-    let accounts = match Registry::load(&deps.config) {
-        Ok(registry) => registry.all(&deps.env),
-        Err(e) => {
-            let said = format!(
-                "cannot confirm that session {} is not running: cannot read the registry: ",
-                app::short_id(&id)
-            );
-            return Some(Marked::from(said).text(format!("{e:#}")));
-        }
-    };
-    if accounts != deps.accounts {
-        let _ = tx.send(Event::Accounts(accounts.clone()));
+    let reading = deps.listing.read(tx);
+    let resumed = request.resumes();
+    if let Some(e) = &reading.unreadable {
+        // Any other launch is refused when it starts, for the same reason.
+        let said = format!(
+            "cannot confirm that session {} is not running: cannot read the registry: ",
+            app::short_id(&resumed?)
+        );
+        return Some(Marked::from(said).text(e));
     }
-    let accounts = union(&[&accounts, &deps.accounts, &deps.seen]);
+    if let Some(gone) = reading.refusal(&request.account) {
+        return Some(gone.into());
+    }
+    let id = resumed?;
     let found = live::collect_report(
-        &accounts,
+        &reading.seen,
         deps.claude.as_deref(),
         deps.ps.as_deref(),
         &deps.env,
@@ -283,17 +280,6 @@ fn check_launch(deps: &Deps, request: &LaunchRequest, tx: &Sender<Event>) -> Opt
     Some(said)
 }
 
-/// Every account of `lists`, once, in first-seen order.
-pub(super) fn union(lists: &[&[Account]]) -> Vec<Account> {
-    let mut all: Vec<Account> = Vec::new();
-    for account in lists.iter().copied().flatten() {
-        if !all.contains(account) {
-            all.push(account.clone());
-        }
-    }
-    all
-}
-
 /// Why `dir` cannot be a launch directory, if it cannot; the directory is marked as the path
 /// it is, so private mode masks it whole whatever its name holds (R21).
 fn check_dir(dir: &Path) -> Option<Marked> {
@@ -318,7 +304,7 @@ fn refresh_index(deps: &Deps, tx: &Sender<Event>) {
     let _ = tx.send(Event::IndexLoaded(
         index.entries.values().cloned().collect(),
     ));
-    let stores = index::stores(&deps.accounts, &deps.env);
+    let stores = index::stores(&deps.listing.read(tx).accounts, &deps.env);
     let _ = tx.send(Event::Stores(stores.clone()));
     let mut batch = Vec::new();
     let mut last = Instant::now();
@@ -344,22 +330,21 @@ fn refresh_index(deps: &Deps, tx: &Sender<Event>) {
 
 /// Token statistics (R20): the cache brought up to date with progress (the first and last
 /// report, and at most every [`PROGRESS_EVERY`] in between), saved if that changed it, then
-/// the report with attribution from the launch log and `history.jsonl`, priced with the
-/// prices of `config.toml` as it is now (the built-in ones when it cannot be read, which is
-/// told). Leaving the TUI does not wait for it: the thread ends with the process, the cache
-/// unsaved.
+/// the report with attribution from the launch log and `history.jsonl`, for the accounts and
+/// with the prices of `config.toml` as it is now (the built-in ones when it cannot be read,
+/// which is told). Leaving the TUI does not wait for it: the thread ends with the process, the
+/// cache unsaved.
 fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
     let mut errors: Vec<String> = Vec::new();
-    let (prices, prices_error) = match Registry::load(&deps.config) {
-        Ok(registry) => (registry.prices, None),
-        Err(e) => (
-            Prices::default(),
-            Some(format!("prices: {e:#} (built-in prices used)")),
-        ),
-    };
+    let reading = deps.listing.read(tx);
+    let prices_error = reading
+        .unreadable
+        .as_ref()
+        .map(|e| format!("prices: {e} (built-in prices used)"));
+    let (accounts, prices) = (&reading.accounts, &reading.prices);
     let path = deps.state_dir.join("stats.json");
     let mut cache = stats::Cache::load(&path);
-    let sources = stats::sources(&deps.accounts, &deps.env);
+    let sources = stats::sources(accounts, &deps.env);
     let mut last = Instant::now();
     let refreshed = stats::refresh(&mut cache, &sources, |done, total| {
         if done == 0 || done == total || last.elapsed() >= PROGRESS_EVERY {
@@ -372,13 +357,13 @@ fn compute_stats(deps: &Deps, tx: &Sender<Event>) {
     }
     errors.extend(prices_error);
     let log = deps.state_dir.join("launches.jsonl");
-    let attribution = attribution::collect(&deps.accounts, &deps.env, &log, &[]);
+    let attribution = attribution::collect(accounts, &deps.env, &log, &[]);
     let report = stats::report(
         &cache,
         &sources,
         &attribution,
-        &deps.accounts,
-        &prices,
+        accounts,
+        prices,
         (deps.clock)(),
         &deps.tz,
     );
@@ -395,6 +380,7 @@ mod tests {
 
     use super::*;
     use crate::registry::{Account, CLAUDE, Home};
+    use crate::tui::accounts::Listing;
 
     fn user(text: &str, minute: u32) -> String {
         format!(
@@ -403,30 +389,46 @@ mod tests {
         )
     }
 
+    /// `[[account]]` for [`max`], as `config.toml` has it.
+    fn registered(root: &std::path::Path) -> String {
+        let home = root.join("max");
+        format!(
+            "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{}\"\n",
+            home.display()
+        )
+    }
+
+    /// The account the registry of [`deps`] lists after the implicit default.
+    fn max(deps: &Deps) -> Account {
+        let (tx, _rx) = mpsc::channel();
+        let accounts = deps.listing.read(&tx).accounts;
+        assert_eq!(accounts[0], Account::default_for(CLAUDE));
+        assert_eq!(accounts[1].name, "max");
+        accounts[1].clone()
+    }
+
+    /// `max` is registered (two transcripts in its home); the native login has no home.
     fn deps(root: &std::path::Path) -> Arc<Deps> {
         let home = root.join("max");
         let project = home.join("projects/-w");
         fs::create_dir_all(&project).unwrap();
         fs::write(project.join("s1.jsonl"), user("first", 1)).unwrap();
         fs::write(project.join("s2.jsonl"), user("second", 2)).unwrap();
+        let env: crate::Env = [(
+            "HOME".to_string(),
+            root.join("nohome").display().to_string(),
+        )]
+        .into();
+        let config = root.join("config.toml");
+        fs::write(&config, registered(root)).unwrap();
         Arc::new(Deps {
-            accounts: vec![Account {
-                provider: CLAUDE,
-                name: "max".into(),
-                home: Home::Path(home.display().to_string()),
-            }],
-            env: [(
-                "HOME".to_string(),
-                root.join("nohome").display().to_string(),
-            )]
-            .into(),
+            listing: Arc::new(Listing::open(config, env.clone()).unwrap()),
+            env,
             claude: None,
             codex: None,
             ps: None,
-            seen: vec![],
             tz: TimeZone::UTC,
             clock: jiff::Timestamp::now,
-            config: root.join("config.toml"),
             state_dir: root.join("state"),
             cwd: None,
             mode: crate::tui::app::Mode::Browse,
@@ -511,7 +513,9 @@ mod tests {
         assert_eq!(error, &None);
         assert_eq!(report.files, 2);
         let all = report.table(stats::Period::All);
-        assert_eq!(all.sections[0].accounts, ["claude:max"]);
+        // A section for each account of the registry, the implicit default first.
+        let accounts: Vec<_> = all.sections.iter().map(|s| s.accounts.join("+")).collect();
+        assert_eq!(accounts, ["claude:default", "claude:max", ""]);
         let unattributed = all.sections.last().unwrap();
         assert!(unattributed.accounts.is_empty());
         assert_eq!(unattributed.models[0].model, "claude-test");
@@ -549,16 +553,17 @@ mod tests {
         };
 
         fs::write(
-            &deps.config,
-            "[prices.\"claude-test\"]\ninput = 1\noutput = 1\ncache_read = 1\n\
-             cache_write_5m = 1\ncache_write_1h = 1\n",
+            deps.listing.config(),
+            registered(dir.path())
+                + "[prices.\"claude-test\"]\ninput = 1\noutput = 1\ncache_read = 1\n\
+                   cache_write_5m = 1\ncache_write_1h = 1\n",
         )
         .unwrap();
         let (priced, error) = cost(&collect(Effect::Stats, &deps, done));
         assert_eq!(error, None);
         assert_eq!((priced.pico_usd, priced.unpriced_tokens), (443_000_000, 0));
 
-        fs::write(&deps.config, "prices = 1\n").unwrap();
+        fs::write(deps.listing.config(), "prices = 1\n").unwrap();
         let (unpriced, error) = cost(&collect(Effect::Stats, &deps, done));
         let error = error.unwrap();
         assert!(
@@ -597,7 +602,7 @@ mod tests {
         fs::write(&file, "").unwrap();
         let check = |cwd: Option<std::path::PathBuf>| {
             let request = LaunchRequest {
-                account: deps.accounts[0].clone(),
+                account: max(&deps),
                 args: vec![],
                 cwd,
                 what: "x".into(),
@@ -648,19 +653,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let deps = deps(dir.path());
         // The registry has max, and the TUI started with it (and the default account).
-        let max = deps.accounts[0].clone();
-        let Home::Path(home) = &max.home else {
-            unreachable!()
-        };
-        fs::write(
-            &deps.config,
-            format!("[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{home}\"\n"),
-        )
-        .unwrap();
-        let deps = Arc::new(Deps {
-            accounts: vec![Account::default_for(CLAUDE), max.clone()],
-            ..Deps::clone(&deps)
-        });
+        let max = max(&deps);
         let id = "0badf00d-0000-4000-8000-000000000000";
         let check = |args: &[&str]| {
             let request = LaunchRequest {
@@ -723,7 +716,7 @@ mod tests {
         };
         assert_eq!(p, &path);
         assert_eq!(messages[0].text, "first");
-        let max = deps.accounts[0].clone();
+        let max = max(&deps);
         let events = collect(Effect::LiveUsage(vec![max.clone()]), &deps, |_| true);
         assert_eq!(
             events,
@@ -740,7 +733,7 @@ mod tests {
     fn configuration_is_read_in_the_background() {
         let dir = tempfile::tempdir().unwrap();
         let deps = deps(dir.path());
-        let max = deps.accounts[0].clone();
+        let max = max(&deps);
         let events = collect(
             Effect::Config {
                 request: 3,
@@ -765,7 +758,7 @@ mod tests {
         assert_eq!(view.problems, Vec::<String>::new());
 
         // A registry that cannot be read: the account's own configuration, and why.
-        fs::write(&deps.config, "not toml [").unwrap();
+        fs::write(deps.listing.config(), "not toml [").unwrap();
         let events = collect(
             Effect::Config {
                 request: 4,
@@ -845,7 +838,6 @@ mod tests {
              \"email\":\"c@example.com\",\"planType\":\"plus\"}}}'; cat >/dev/null",
         );
         let deps = Arc::new(Deps {
-            accounts: vec![work.clone()],
             codex: Some(codex),
             ..Deps::clone(&deps(dir.path()))
         });
@@ -874,21 +866,37 @@ mod tests {
         );
     }
 
+    /// R16: reading the registry again is work of its own, so a refresh can ask for it while
+    /// everything else is still running; a list that changed is the answer.
+    #[test]
+    fn read_accounts_tells_a_changed_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let max = max(&deps);
+        fs::write(deps.listing.config(), "").unwrap();
+        let events = collect(Effect::ReadAccounts, &deps, |_| true);
+        assert_eq!(
+            events,
+            [Event::Accounts(vec![Account::default_for(CLAUDE)])]
+        );
+        fs::write(deps.listing.config(), registered(dir.path())).unwrap();
+        let events = collect(Effect::ReadAccounts, &deps, |_| true);
+        assert_eq!(
+            events,
+            [Event::Accounts(vec![Account::default_for(CLAUDE), max])]
+        );
+    }
+
     /// R14a, R16: the account leaves config.toml (its home stays), and the registry read
     /// again arrives before the result.
     #[test]
     fn remove_account_rewrites_the_registry() {
         let dir = tempfile::tempdir().unwrap();
         let deps = deps(dir.path());
-        let max = deps.accounts[0].clone();
+        let max = max(&deps);
         let Home::Path(home) = max.home.clone() else {
             unreachable!()
         };
-        fs::write(
-            &deps.config,
-            format!("[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{home}\"\n"),
-        )
-        .unwrap();
         let events = collect(Effect::RemoveAccount(max.clone()), &deps, |e| {
             matches!(e, Event::AccountRemoved { .. })
         });
@@ -902,7 +910,8 @@ mod tests {
                 }
             ]
         );
-        assert!(!fs::read_to_string(&deps.config).unwrap().contains("max"));
+        let left = fs::read_to_string(deps.listing.config()).unwrap();
+        assert!(!left.contains("max"), "{left}");
         assert!(Path::new(&home).join("projects/-w/s1.jsonl").exists());
     }
 }

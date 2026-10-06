@@ -63,7 +63,8 @@ Modules are layered: each layer uses the layers below it.
 ```text
  ┌─ entry ───────────────────────────────────────────────────────────────────┐
  │  main ──► cli                        tui ─ app · workers · render ·       │
- │                                            privacy · timeline · search    │
+ │                                            privacy · timeline · search ·  │
+ │                                            accounts                       │
  ├─ features ────────────────────────────────────────────────────────────────┤
  │  launch · share · setup               accounts: identity · usage · live · │
  │                                                 checks · account_config   │
@@ -116,6 +117,7 @@ The exceptions, all for a type or a small helper:
 | `tui` | Terminal ownership, the event loop, foreground launches | R16 |
 | `tui::app` | All TUI state and the pure `update(app, event) -> effects` | R8, R16, R17, R20–R22 |
 | `tui::workers` | Runs each background effect on a thread and sends back events | R7–R11, R20, R22 |
+| `tui::accounts` | The account listing: reads the registry again for whatever goes over the accounts, tells a change once, refuses a launch as an account no longer listed | R3, R16 |
 | `tui::render` | Draws the state; views, overlays, key reference | – |
 | `tui::privacy` | Private mode: the redacted copy of the state that is drawn; aliases from `privacy` | R21 |
 | `tui::timeline` | The shared seven-day reset timeline | R10 |
@@ -234,7 +236,7 @@ an `Event`.
                  │           tui::workers::spawn
                  │   RefreshIndex · Identities · CachedUsage · LiveUsage · Live
                  │   Attribution · Checks · Stats · Preview · Config · CheckLaunch
-                 │   Logs · Control · RemoveAccount · RolloutWritten
+                 │   Logs · Control · RemoveAccount · RolloutWritten · ReadAccounts
                  │                    │
                  └──── mpsc::Sender<Event> ◄──── a thread per effect (per account for
                                                  identities and live usage)
@@ -247,6 +249,14 @@ an `Event`.
   Configuration pane, pre-launch checks), so an answer to an outdated request is ignored.
 - A launch that resumes a session in place is preceded by `CheckLaunch`, which queries every
   account's running sessions again right before starting (R16).
+- Neither the app nor `Deps` is where the accounts come from: `tui::accounts::Listing` is, and
+  `Listing::read` is the only way to them. A worker that goes over the accounts reads the
+  registry when it starts; so do the check before a launch and the launch itself, and `r`
+  asks for a read of its own (`ReadAccounts`), which nothing still running holds back. A read
+  that finds another list than the last one sends one `Event::Accounts` before it returns, so
+  the app rebuilds its rows ahead of any result for the new list, and results for an account
+  that is gone find no row. What a `config.toml` that cannot be read means (the last accounts,
+  nothing shared, built-in prices, no launch) is decided there once, in `Reading`.
 - In private mode, `render` does not draw `App` itself but `privacy::redacted(app)`, a copy in
   which names are aliased and personal fields masked. `privacy::Snapshot` keeps that copy until
   the app changes, since making it for every frame is too slow for a large index. Every
@@ -380,6 +390,7 @@ cargo run --release --example codex_timing -- [<codex home>]
 | Support another agent CLI | SPEC R4, `provider` (every `match Provider`), `index`, `usage`, `identity` |
 | Read a new field from transcripts | `transcript` (index) or `stats` (counts); bump the cache's `SCHEMA_VERSION` |
 | Add a TUI action | `tui::app` (`Key` → `Effect`), `tui::workers` (the effect), `tui::render`, `tui::privacy` |
+| Use the accounts, shared configuration or prices in the TUI | `deps.listing.read(&tx)` in the worker (`tui::accounts`); never `Registry::load` |
 | Add something shown on screen | `tui::app` state, `tui::render`, and its case in `tui::privacy::redacted`; a path in a notice goes in with `Marked::path` |
 | Add a model price | SPEC R20 table and `pricing` |
 | Change what `remuda pick` sends to Jev | SPEC R23, `jev::request` and `jev::state_text`; the privacy test in `tests/pick_cli.rs` |
