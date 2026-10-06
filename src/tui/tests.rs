@@ -39,9 +39,14 @@ fn account(name: &str) -> Account {
     }
 }
 
+/// The accounts of [`app`].
+fn everyone() -> Vec<Account> {
+    vec![account("default"), account("max"), account("team")]
+}
+
 fn app() -> App {
     let mut app = App::new(
-        vec![account("default"), account("max"), account("team")],
+        everyone(),
         TimeZone::UTC,
         Some("/Users/you".into()),
         ts(NOW),
@@ -154,8 +159,8 @@ fn start_requests_everything_in_the_background() {
         app.start(),
         [
             Effect::RefreshIndex,
-            Effect::Identities,
-            Effect::CachedUsage,
+            Effect::Identities(everyone()),
+            Effect::CachedUsage(everyone()),
             Effect::Live,
             Effect::Attribution,
             Effect::Checks
@@ -178,8 +183,8 @@ fn start_requests_everything_in_the_background() {
         keys(&mut app, &[Key::Char('r')]),
         [
             Effect::RefreshIndex,
-            Effect::Identities,
-            Effect::CachedUsage,
+            Effect::Identities(everyone()),
+            Effect::CachedUsage(everyone()),
             Effect::Live,
             Effect::Attribution,
             Effect::Checks
@@ -208,6 +213,9 @@ fn finish_accounts(app: &mut App) {
     }
 }
 
+/// `r` asks every slot for its work: what is out is not started again (however often it is
+/// asked), and each kind of work, and each account, can be asked again once its own round has
+/// reported. The rules themselves are the slot's (`work::tests`).
 #[test]
 fn refresh_starts_each_kind_of_work_once_until_it_finishes() {
     let mut app = app();
@@ -215,7 +223,8 @@ fn refresh_starts_each_kind_of_work_once_until_it_finishes() {
     let r = [Key::Char('r'); 5];
     assert_eq!(keys(&mut app, &r), []);
 
-    // Identities finish one account at a time: still running until the last one.
+    // Each account is asked on its own: those that have answered are asked again while the
+    // last one is still out, and that one is not asked twice.
     for name in ["default", "max"] {
         update(
             &mut app,
@@ -225,7 +234,10 @@ fn refresh_starts_each_kind_of_work_once_until_it_finishes() {
             },
         );
     }
-    assert_eq!(keys(&mut app, &r), []);
+    assert_eq!(
+        keys(&mut app, &r),
+        [Effect::Identities(vec![account("default"), account("max")])]
+    );
     update(
         &mut app,
         Event::Identity {
@@ -233,7 +245,10 @@ fn refresh_starts_each_kind_of_work_once_until_it_finishes() {
             identity: Identity::NotLoggedIn,
         },
     );
-    assert_eq!(keys(&mut app, &r), [Effect::Identities]);
+    assert_eq!(
+        keys(&mut app, &r),
+        [Effect::Identities(vec![account("team")])]
+    );
 
     for name in ["default", "max", "team"] {
         update(
@@ -244,12 +259,20 @@ fn refresh_starts_each_kind_of_work_once_until_it_finishes() {
             },
         );
     }
-    assert_eq!(keys(&mut app, &r), [Effect::CachedUsage]);
+    assert_eq!(keys(&mut app, &r), [Effect::CachedUsage(everyone())]);
 
     update(&mut app, Event::Attribution(Attribution::default()));
     assert_eq!(keys(&mut app, &r), [Effect::Attribution]);
     update(&mut app, Event::Checks(vec![]));
     assert_eq!(keys(&mut app, &r), [Effect::Checks]);
+    let done = Event::IndexDone {
+        entries: vec![],
+        error: None,
+    };
+    update(&mut app, done);
+    assert_eq!(keys(&mut app, &r), [Effect::RefreshIndex]);
+    update(&mut app, Event::Live(vec![]));
+    assert_eq!(keys(&mut app, &r), [Effect::Live]);
 }
 
 #[test]
@@ -279,7 +302,7 @@ fn index_rows_arrive_before_the_refresh_ends() {
     );
     assert_eq!(history_ids(&app), ["c", "b"]);
     assert_eq!(app.indexing, None);
-    assert!(!app.index_in_flight);
+    assert!(!app.work.index.is_running());
     assert_eq!(app.index_refreshed, Some(ts(NOW)));
     assert_eq!(app.index_error.as_deref(), Some("disk full"));
 }
@@ -516,7 +539,7 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
             account("team")
         ])]
     );
-    assert!(app.accounts.iter().all(|a| a.live_pending));
+    assert!(app.accounts.iter().all(|a| a.work.live.is_running()));
     update(
         &mut app,
         Event::LiveUsage {
@@ -559,7 +582,7 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
         app.accounts[0].live,
         Some(Err("output not recognized".into()))
     );
-    assert!(!app.accounts[2].live_pending);
+    assert!(!app.accounts[2].work.live.is_running());
     assert!(app.accounts[2].rows().is_empty());
 }
 
@@ -584,8 +607,8 @@ fn late_results_follow_their_account_when_rows_move() {
         },
     );
     assert_eq!(app.accounts[1].rows()[0].percent, 42.0);
-    assert!(!app.accounts[1].live_pending);
-    assert!(app.accounts[0].live.is_none() && app.accounts[0].live_pending);
+    assert!(!app.accounts[1].work.live.is_running());
+    assert!(app.accounts[0].live.is_none() && app.accounts[0].work.live.is_running());
 
     let before = app.accounts.clone();
     update(
@@ -749,14 +772,14 @@ fn idle_app() -> App {
 /// [`Effect::CheckLaunch`] of `request` under the number of the last check issued.
 fn check_of(app: &App, request: LaunchRequest) -> Effect {
     Effect::CheckLaunch {
-        check: app.launch_checks,
+        check: app.work.launch.round(),
         request,
     }
 }
 
 /// The worker's answer to the last check issued.
 fn answer(app: &mut App, request: LaunchRequest, error: Option<String>) -> Vec<Effect> {
-    let check = app.launch_checks;
+    let check = app.work.launch.round();
     update(
         app,
         Event::LaunchChecked {
@@ -1129,16 +1152,27 @@ fn a_running_background_session_is_attached_instead() {
         &mut app,
         Event::Live(vec![background("claude:max", "766560c5", A, "blocked")]),
     );
+    let attach = request(
+        "max",
+        &["attach", "766560c5"],
+        None,
+        "attach 766560c5 as max",
+    );
     assert_eq!(
         keys(&mut app, &[Key::Enter]),
-        [Effect::Launch(request(
-            "max",
-            &["attach", "766560c5"],
-            None,
-            "attach 766560c5 as max"
-        ))]
+        [Effect::Launch(attach.clone())]
     );
-    // Once it has stopped, it is an ordinary transcript to resume.
+    // Once it has stopped (by the collection the end of the attach starts), it is an ordinary
+    // transcript to resume.
+    let fx = update(
+        &mut app,
+        Event::Launched {
+            request: attach,
+            result: Ok(Exit::Code(0)),
+            warnings: vec![],
+        },
+    );
+    assert!(fx.contains(&Effect::Live), "{fx:?}");
     update(
         &mut app,
         Event::Live(vec![background("claude:max", "766560c5", A, "stopped")]),
@@ -1211,7 +1245,7 @@ fn resume_waits_for_live_sessions_collected_after_a_launch() {
     let mut app = history_with(&["max"]);
     // A collection already running when the launch ends predates it ...
     tick(&mut app, 6);
-    assert!(app.live_in_flight);
+    assert!(app.work.live.is_running());
     update(
         &mut app,
         Event::Launched {
@@ -1267,7 +1301,7 @@ fn a_session_seen_running_before_the_check_answers_is_not_launched() {
     update(&mut app, Event::Live(vec![live("claude:max", 7, Some(A))]));
     let fx = answer(&mut app, resume_a("max"), None);
     assert_eq!(fx, []);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     assert!(
         notice(&app)
             .unwrap()
@@ -1444,12 +1478,12 @@ fn check_answer_queued_during_an_attach_is_applied_after_it() {
         matches!(fx.as_slice(), [Effect::Launch(r)] if r.args[0] == "attach"),
         "{fx:?}"
     );
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     // What the live list says predates the child too.
-    assert!(app.live_stale);
+    assert!(app.work.live.stale());
     // Queue order after the attach: LaunchChecked (sent during it), then Launched.
     assert_eq!(answer(&mut app, resume_a("max"), None), []);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     let attach = request(
         "max",
         &["attach", "0badf00d"],
@@ -1484,7 +1518,7 @@ fn check_answer_queued_during_a_setup_is_applied_after_it() {
     );
     let mut fx = keys(&mut app, &[Key::Char('1'), Key::Char('s')]);
     // Opening the form already cancelled the pending resume (C1).
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     assert_eq!(
         notice(&app),
         Some(("resume aaaaaaaa as max cancelled", Level::Info))
@@ -1495,10 +1529,10 @@ fn check_answer_queued_during_a_setup_is_applied_after_it() {
         fx.iter().any(|e| matches!(e, Effect::Setup { .. })),
         "{fx:?}"
     );
-    assert_eq!(app.pending, None);
-    assert!(app.live_stale);
+    assert_eq!(app.work.launch.running(), None);
+    assert!(app.work.live.stale());
     assert_eq!(answer(&mut app, resume_a("max"), None), []);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     // The live list is collected again once the login ended (it may have run anything).
     let fx = update(
         &mut app,
@@ -1531,7 +1565,7 @@ fn a_live_collection_from_before_a_foreground_child_is_not_current() {
     assert!(matches!(fx.as_slice(), [Effect::Launch(_)]), "{fx:?}");
     // It lands after the child ran (queued ahead of `Launched`): collected again, still stale.
     assert_eq!(update(&mut app, Event::Live(vec![])), [Effect::Live]);
-    assert!(app.live_stale);
+    assert!(app.work.live.stale());
     keys(&mut app, &[Key::Char('3')]);
     assert_eq!(keys(&mut app, &[Key::Enter]), []);
     assert_eq!(
@@ -1549,14 +1583,14 @@ fn a_live_collection_from_before_a_foreground_child_is_not_current() {
 fn a_running_check_shows_in_the_status_line_and_esc_cancels_it() {
     let mut app = history_with(&["max"]);
     keys(&mut app, &[Key::Enter]);
-    let first = app.launch_checks;
+    let first = app.work.launch.round();
     let all = text(&app);
     assert!(
         all.contains("checking that aaaaaaaa is not running… (esc: cancel)"),
         "{all}"
     );
     assert_eq!(keys(&mut app, &[Key::Esc]), []);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     assert_eq!(
         notice(&app),
         Some(("resume aaaaaaaa as max cancelled", Level::Info))
@@ -1569,14 +1603,14 @@ fn a_running_check_shows_in_the_status_line_and_esc_cancels_it() {
         keys(&mut app, &[Key::Enter]),
         [check_of(&app, resume_a("max"))]
     );
-    assert_ne!(app.launch_checks, first);
+    assert_ne!(app.work.launch.round(), first);
     let old = Event::LaunchChecked {
         check: first,
         request: resume_a("max"),
         error: None,
     };
     assert_eq!(update(&mut app, old), []);
-    assert!(app.pending.is_some());
+    assert!(app.work.launch.is_running());
     assert_eq!(
         answer(&mut app, resume_a("max"), None),
         [Effect::Launch(resume_a("max"))]
@@ -1592,7 +1626,7 @@ fn a_running_check_shows_in_the_status_line_and_esc_cancels_it() {
     );
     // Esc still does what it did otherwise when nothing is pending.
     keys(&mut app, &[Key::Esc]);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     keys(&mut app, &[Key::Char('/'), Key::Char('a'), Key::Enter]);
     assert_eq!(app.history.query, "a");
     keys(&mut app, &[Key::Esc]);
@@ -1606,9 +1640,9 @@ fn opening_an_overlay_cancels_a_pending_launch() {
     // A resume waiting for its check, then the new-session form.
     let mut app = history_with(&["max"]);
     keys(&mut app, &[Key::Enter]);
-    assert!(app.pending.is_some());
+    assert!(app.work.launch.is_running());
     keys(&mut app, &[Key::Char('1'), Key::Char('n')]);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     assert_eq!(
         notice(&app),
         Some(("resume aaaaaaaa as max cancelled", Level::Info))
@@ -1637,7 +1671,7 @@ fn opening_an_overlay_cancels_a_pending_launch() {
         "{:?}",
         app.overlay
     );
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     assert_eq!(answer(&mut app, resume_a("max"), None), []);
     assert!(
         matches!(app.overlay, Some(Overlay::Pick(_))),
@@ -2058,7 +2092,7 @@ fn a_finished_setup_reloads_accounts_and_identities() {
     let mut app = idle_app();
     let mut accounts: Vec<Account> = app.accounts.iter().map(|a| a.account.clone()).collect();
     accounts.push(account("work"));
-    let fx = update(&mut app, Event::Accounts(accounts));
+    let fx = update(&mut app, Event::Accounts(accounts.clone()));
     let names: Vec<&str> = app
         .accounts
         .iter()
@@ -2069,8 +2103,8 @@ fn a_finished_setup_reloads_accounts_and_identities() {
     assert_eq!(app.accounts[1].identity, Some(Identity::NotLoggedIn));
     assert_eq!(app.accounts[3].identity, None);
     for effect in [
-        Effect::Identities,
-        Effect::CachedUsage,
+        Effect::Identities(accounts.clone()),
+        Effect::CachedUsage(accounts.clone()),
         Effect::Checks,
         Effect::RefreshIndex,
     ] {
@@ -2204,6 +2238,7 @@ fn logs_show_in_the_preview_until_the_selection_moves() {
     update(
         &mut app,
         Event::Logs {
+            account: account("team"),
             short_id: "bbbbbbbb".into(),
             // Plain text already: `live::logs` interprets the terminal bytes (tests/live.rs).
             result: Ok("Building the index\nstep 2 of 3".into()),
@@ -2220,6 +2255,7 @@ fn logs_show_in_the_preview_until_the_selection_moves() {
     update(
         &mut app,
         Event::Logs {
+            account: account("team"),
             short_id: "bbbbbbbb".into(),
             result: Err("exited with status 1: Couldn't read logs for bbbbbbbb".into()),
         },
@@ -2231,6 +2267,7 @@ fn logs_show_in_the_preview_until_the_selection_moves() {
     update(
         &mut app,
         Event::Logs {
+            account: account("team"),
             short_id: "bbbbbbbb".into(),
             result: Ok("late".into()),
         },
@@ -2371,13 +2408,21 @@ fn pick_mode_loads_only_what_choosing_an_account_needs() {
     let mut app = pick_app();
     assert_eq!(
         app.start(),
-        [Effect::Identities, Effect::CachedUsage, Effect::Checks]
+        [
+            Effect::Identities(everyone()),
+            Effect::CachedUsage(everyone()),
+            Effect::Checks
+        ]
     );
     finish_accounts(&mut app);
     update(&mut app, Event::Checks(vec![]));
     assert_eq!(
         keys(&mut app, &[Key::Char('r')]),
-        [Effect::Identities, Effect::CachedUsage, Effect::Checks]
+        [
+            Effect::Identities(everyone()),
+            Effect::CachedUsage(everyone()),
+            Effect::Checks
+        ]
     );
     // Live usage helps to choose.
     assert_eq!(
@@ -2535,6 +2580,8 @@ fn populated_accounts() -> App {
             result: Err("no /h/team/.claude.json".into()),
         },
     );
+    // max alone is asked for its live usage.
+    app.accounts[1].work.live.start(());
     update(
         &mut app,
         Event::LiveUsage {
@@ -2671,7 +2718,9 @@ fn accounts_view_populated() {
 #[test]
 fn accounts_view_windows_past_their_reset() {
     let mut app = populated_accounts();
-    // Cached at 09:00; the session reset at 11:00, an hour before now.
+    // The cache is read again. Cached at 09:00; the session reset at 11:00, an hour before
+    // now.
+    app.accounts[0].work.cached.start(());
     update(
         &mut app,
         Event::CachedUsage {
@@ -2816,6 +2865,8 @@ fn accounts_view_a_live_reset_behind_its_answer_is_not_replaced() {
             }),
         },
     );
+    // max is asked for its live usage.
+    app.accounts[1].work.live.start(());
     update(
         &mut app,
         Event::LiveUsage {
@@ -2867,7 +2918,9 @@ fn accounts_view_a_live_reset_behind_its_answer_is_not_replaced() {
 fn accounts_view_a_queued_live_answer_keeps_its_answer_time() {
     let mut app = app();
     app.start();
-    // The last tick was at 12:00:00; the query answered at 12:00:40, behind a foreground agent.
+    // max is asked for its live usage. The last tick was at 12:00:00; the query answered at
+    // 12:00:40, behind a foreground agent.
+    app.accounts[1].work.live.start(());
     update(
         &mut app,
         Event::LiveUsage {
@@ -2976,7 +3029,7 @@ fn history_view_loading_and_empty() {
     keys(&mut app, &[Key::Char('3')]);
     assert!(text(&app).contains("loading sessions…"));
     update(&mut app, Event::IndexLoaded(vec![]));
-    app.index_in_flight = true;
+    app.work.index.start(());
     assert!(text(&app).contains("indexing…"));
     update(
         &mut app,
@@ -3169,6 +3222,8 @@ fn tiny_terminal_does_not_panic() {
 #[test]
 fn accounts_table_stays_compact_on_a_wide_terminal() {
     let mut app = populated_accounts();
+    // The cache is read again.
+    app.accounts[0].work.cached.start(());
     update(
         &mut app,
         Event::CachedUsage {
@@ -3381,7 +3436,8 @@ fn codex_accounts_show_identity_and_usage() {
     let mut app = codex_app();
     // Wide enough for the timeline's legend.
     update(&mut app, Event::Resize(160, 30));
-    keys(&mut app, &[Key::Char('1')]);
+    // `r`: identities and cached usage are asked again.
+    keys(&mut app, &[Key::Char('1'), Key::Char('r')]);
     let method = Identity::LoggedIn {
         email: None,
         org: None,
@@ -3488,6 +3544,7 @@ fn codex_accounts_show_identity_and_usage() {
     assert_eq!(all.matches(&format!("g week ({spark})")).count(), 1);
 
     // A later identity refresh (`codex login status`) shows the login method again.
+    keys(&mut app, &[Key::Char('r')]);
     update(
         &mut app,
         Event::Identity {
@@ -3640,7 +3697,7 @@ fn a_codex_session_resumes_only_as_the_account_of_its_home() {
     update(&mut app, Event::Accounts(accounts));
     keys(&mut app, &[Key::Char('f')]);
     assert_eq!(app.overlay, None);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     assert_eq!(
         notice(&app),
         Some((
@@ -3792,9 +3849,7 @@ fn a_foreground_child_closes_a_codex_confirmation() {
         None,
         "attach 0badf00d as max",
     );
-    let check = app.launch_checks + 1;
-    app.launch_checks = check;
-    app.pending = Some((check, attach.clone()));
+    app.work.launch.start(attach.clone());
     answer(&mut app, attach, None);
     assert_eq!(app.overlay, None);
 }
@@ -3832,7 +3887,7 @@ fn form_index_shift() {
     accounts.retain(|a| a.name != "work");
     update(&mut app, Event::Accounts(accounts));
     assert_eq!(keys(&mut app, &[Key::Enter]), []);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     assert_eq!(
         form(&app).error.as_deref(),
         Some("codex:work is no longer registered")
@@ -3856,7 +3911,7 @@ fn pick_resolves_accounts_by_name() {
     let (_, max) = line_with(&lines, "│› max");
     assert!(max.contains("no longer registered"), "{max}");
     assert_eq!(keys(&mut app, &[Key::Enter]), []);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     assert_eq!(
         notice(&app),
         Some(("max is no longer registered", Level::Error))
@@ -3971,7 +4026,7 @@ fn a_shared_codex_store_asks_which_account() {
     claude.options = vec!["claude:max".into()];
     app.overlay = Some(Overlay::Pick(claude));
     assert_eq!(keys(&mut app, &[Key::Enter]), []);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     assert_eq!(
         notice(&app),
         Some((
@@ -3998,7 +4053,7 @@ fn pick_offers_only_the_sessions_provider() {
     pick.options = vec!["codex:work".into()];
     app.overlay = Some(Overlay::Pick(pick));
     assert_eq!(keys(&mut app, &[Key::Enter]), []);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     assert_eq!(
         notice(&app),
         Some((
@@ -4020,7 +4075,7 @@ fn codex_prompt_account_gone_before_yes() {
         .collect();
     update(&mut app, Event::Accounts(accounts));
     assert_eq!(keys(&mut app, &[Key::Char('y')]), []);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     assert_eq!(
         notice(&app),
         Some(("codex:work is no longer registered", Level::Error))
@@ -4226,7 +4281,7 @@ fn stats_view_computes_on_first_visit_then_on_r() {
     assert!(!app.start().contains(&Effect::Stats));
     assert!(!keys(&mut app, &[Key::Char('r')]).contains(&Effect::Stats));
     assert_eq!(keys(&mut app, &[Key::Char('4')]), [Effect::Stats]);
-    assert!(app.stats.in_flight);
+    assert!(app.work.stats.is_running());
     let all = text(&app);
     assert!(all.contains("computing…"), "{all}");
     let again = keys(
@@ -4260,7 +4315,7 @@ fn stats_view_computes_on_first_visit_then_on_r() {
             error: None,
         },
     );
-    assert!(!app.stats.in_flight);
+    assert!(!app.work.stats.is_running());
     let all = text(&app);
     assert!(all.contains("computed 12:00:00 · 42 transcripts"), "{all}");
     assert!(!keys(&mut app, &[Key::Char('1'), Key::Char('4')]).contains(&Effect::Stats));
@@ -5012,9 +5067,11 @@ fn secret_app() -> App {
     app
 }
 
-/// The preview of the current selection, loaded.
+/// The preview of the current selection, loaded: read once the selection has settled.
 fn load_preview(app: &mut App) {
     let target = app.preview.target.clone().expect("a preview target");
+    tick(app, 0);
+    tick(app, 0);
     let messages = vec![
         Message {
             role: Role::User,
@@ -5066,7 +5123,7 @@ fn secret_states() -> Vec<SecretState> {
                     Key::Char('p'),
                 ];
                 keys(app, &keys_);
-                let request = app.config.request;
+                let request = app.config.work.round();
                 update(
                     app,
                     Event::Config {
@@ -5111,6 +5168,7 @@ fn secret_states() -> Vec<SecretState> {
                 update(
                     app,
                     Event::Logs {
+                        account: zq_account(CLAUDE, "zqalpha"),
                         short_id: "0a1b2c3d".into(),
                         result: Ok("zqlog line\n".into()),
                     },
@@ -5247,13 +5305,10 @@ fn secret_states() -> Vec<SecretState> {
             "pending check",
             |app| {
                 keys(app, &[Key::Char('1')]);
-                app.pending = Some((
-                    1,
-                    zq_request(
-                        "new session “zqsess” as zqalpha",
-                        &["--name", "zqsess"],
-                        zq_account(CLAUDE, "zqalpha"),
-                    ),
+                app.work.launch.start(zq_request(
+                    "new session “zqsess” as zqalpha",
+                    &["--name", "zqsess"],
+                    zq_account(CLAUDE, "zqalpha"),
                 ));
             },
             "“zqsess”",
@@ -5268,6 +5323,8 @@ fn secret_states() -> Vec<SecretState> {
             |app| {
                 keys(app, &[Key::Char('3')]);
                 let target = app.preview.target.clone().expect("a preview target");
+                tick(app, 0);
+                tick(app, 0);
                 update(
                     app,
                     Event::Preview {
@@ -5287,6 +5344,7 @@ fn secret_states() -> Vec<SecretState> {
                 update(
                     app,
                     Event::Logs {
+                        account: zq_account(CLAUDE, "zqalpha"),
                         short_id: "0a1b2c3d".into(),
                         result: Err(format!("zqalpha is logged out: exit 1 in {ZQ_CWD}")),
                     },
@@ -5663,7 +5721,7 @@ fn private_mode_masks_remudas_own_paths_whole() {
         error: Some(refused.clone()),
     };
     // In the form that asked.
-    update(&mut app, checked.clone());
+    update(&mut app, checked);
     assert_eq!(form(&app).error.as_ref(), Some(&refused));
     app.private = true;
     let all = text(&app);
@@ -5673,7 +5731,12 @@ fn private_mode_masks_remudas_own_paths_whole() {
     }
     // As a notice, when no form asked.
     app.overlay = None;
-    app.pending = Some((*check, request.clone()));
+    let check = app.work.launch.start(request.clone()).unwrap();
+    let checked = Event::LaunchChecked {
+        check,
+        request: request.clone(),
+        error: Some(refused),
+    };
     update(&mut app, checked);
     assert_eq!(
         private_notice(&app),
@@ -6218,8 +6281,12 @@ fn config_effects(fx: &[Effect]) -> Vec<&Effect> {
 }
 
 /// Answers the pane's last request for `name` with `view`.
-fn answer_config(app: &mut App, name: &str, view: crate::account_config::ConfigView) {
-    let request = app.config.request;
+fn answer_config(
+    app: &mut App,
+    name: &str,
+    view: crate::account_config::ConfigView,
+) -> Vec<Effect> {
+    let request = app.config.work.round();
     update(
         app,
         Event::Config {
@@ -6227,7 +6294,7 @@ fn answer_config(app: &mut App, name: &str, view: crate::account_config::ConfigV
             account: account(name),
             result: Ok(Box::new(view)),
         },
-    );
+    )
 }
 
 /// The pane's lines at `width`, as text.
@@ -6254,11 +6321,14 @@ fn p_cycles_the_configuration_pane_and_esc_steps_back() {
         keys(&mut app, &[Key::Char('p')]),
         [config_effect(1, "default")]
     );
-    assert!(app.config.open && !app.config.expanded && app.config.loading);
+    assert!(app.config.open && !app.config.expanded && app.config.work.is_running());
     assert_eq!(keys(&mut app, &[Key::Char('p')]), []);
     assert!(app.config.open && app.config.expanded);
     assert_eq!(keys(&mut app, &[Key::Char('p')]), []);
     assert!(!app.config.open && !app.config.expanded);
+    // The read that was out when it closed answers to no pane.
+    answer_config(&mut app, "default", config_view());
+    assert_eq!(app.config.loaded, None);
 
     assert_eq!(
         keys(&mut app, &[Key::Char(' ')]),
@@ -6273,9 +6343,11 @@ fn p_cycles_the_configuration_pane_and_esc_steps_back() {
 
     // A pending launch check goes first.
     keys(&mut app, &[Key::Char('p')]);
-    app.pending = Some((1, request("default", &[], Some(CWD), "new session")));
+    app.work
+        .launch
+        .start(request("default", &[], Some(CWD), "new session"));
     keys(&mut app, &[Key::Esc]);
-    assert_eq!(app.pending, None);
+    assert_eq!(app.work.launch.running(), None);
     assert!(app.config.open);
 
     // Other views keep their own `p`; switching away leaves the pane open, not expanded.
@@ -6301,10 +6373,10 @@ fn the_pane_follows_the_selection_and_drops_stale_answers() {
         },
     );
     assert_eq!(app.config.loaded, None);
-    assert!(app.config.loading);
+    assert!(app.config.work.is_running());
     answer_config(&mut app, "max", config_view());
     assert_eq!(app.config.loaded, Some(Ok(config_view())));
-    assert!(!app.config.loading);
+    assert!(!app.config.work.is_running());
     // A late answer after closing is dropped too.
     keys(&mut app, &[Key::Char('p'), Key::Char('p')]);
     answer_config(&mut app, "max", config_view());
@@ -6312,27 +6384,48 @@ fn the_pane_follows_the_selection_and_drops_stale_answers() {
 }
 
 /// R22: `r` and a new account list read the configuration again (what it showed stays until
-/// the answer); with the pane closed, `r` reads none.
+/// the answer to `r`); with the pane closed, `r` reads none. A new account list while a read
+/// is out starts no second read beside it: the answer of the one out is from before the
+/// change and is not shown, and the account is read once more when it arrives.
 #[test]
 fn r_and_a_new_account_list_read_the_configuration_again() {
+    let none = Vec::<&Effect>::new();
+    let with_new = || vec![account("default"), account("max"), account("new")];
     let mut app = app();
     keys(&mut app, &[Key::Char('p')]);
     answer_config(&mut app, "default", config_view());
     let fx = keys(&mut app, &[Key::Char('r')]);
     assert_eq!(config_effects(&fx), [&config_effect(2, "default")]);
-    assert!(app.config.loaded.is_some() && app.config.loading);
+    assert!(app.config.loaded.is_some() && app.config.work.is_running());
 
-    let fx = update(
-        &mut app,
-        Event::Accounts(vec![account("default"), account("max"), account("new")]),
-    );
-    assert_eq!(config_effects(&fx), [&config_effect(3, "default")]);
+    // The read `r` started is still out when the list changes.
+    let fx = update(&mut app, Event::Accounts(with_new()));
+    assert_eq!(config_effects(&fx), none, "one read at a time");
+    assert_eq!(app.config.loaded, None);
     // The same list again changes nothing.
-    let fx = update(
-        &mut app,
-        Event::Accounts(vec![account("default"), account("max"), account("new")]),
+    let fx = update(&mut app, Event::Accounts(with_new()));
+    assert_eq!(config_effects(&fx), none);
+    let fx = answer_config(&mut app, "default", config_with_model("before"));
+    assert_eq!(fx, [config_effect(3, "default")]);
+    assert_eq!(app.config.loaded, None, "read before the list changed");
+    assert_eq!(
+        answer_config(&mut app, "default", config_with_model("after")),
+        []
     );
-    assert_eq!(config_effects(&fx), Vec::<&Effect>::new());
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("after"))));
+
+    // No read is out: a new list reads at once.
+    let fx = update(&mut app, Event::Accounts(everyone()));
+    assert_eq!(config_effects(&fx), [&config_effect(4, "default")]);
+    answer_config(&mut app, "default", config_with_model("again"));
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("again"))));
+    // `r` while the read after a new list is out: its answer is shown, like any `r`.
+    update(&mut app, Event::Accounts(with_new()));
+    answer_config(&mut app, "default", config_with_model("new list"));
+    keys(&mut app, &[Key::Char('r'), Key::Char('r')]);
+    let fx = answer_config(&mut app, "default", config_with_model("first"));
+    assert_eq!(fx, [config_effect(7, "default")]);
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("first"))));
 
     keys(&mut app, &[Key::Char('p'), Key::Char('p')]);
     let fx = keys(&mut app, &[Key::Char('r')]);
@@ -6425,6 +6518,8 @@ fn the_pane_says_who_reads_the_sources_authentication() {
         role: Role::Source,
         ..config_view()
     };
+    // Read again: an answer belongs to one read.
+    keys(&mut app, &[Key::Char('r')]);
     answer_config(&mut app, "max", source);
     let body = config_text(&app, 200);
     assert!(
@@ -6532,4 +6627,622 @@ fn private_mode_keeps_configuration_names_and_masks_the_rest() {
     ] {
         assert!(!all.contains(hidden), "{hidden}:\n{all}");
     }
+}
+
+// ---- background work is asked for once (R7, R11, R16, R22) -----------------------------
+
+fn count(fx: &[Effect], is: fn(&Effect) -> bool) -> usize {
+    fx.iter().filter(|e| is(e)).count()
+}
+
+/// R16: a held `Enter` (or `f`) checks the launch once: the check already running for that
+/// very launch is the one it waits for, and that one still launches it.
+#[test]
+fn a_held_enter_checks_the_launch_once() {
+    let is_check = |e: &Effect| matches!(e, Effect::CheckLaunch { .. });
+    let mut app = history_with(&["max"]);
+    let fx = keys(&mut app, &[Key::Enter; 5]);
+    assert_eq!(count(&fx, is_check), 1, "{fx:?}");
+    assert_eq!(
+        answer(&mut app, resume_a("max"), None),
+        [Effect::Launch(resume_a("max"))]
+    );
+
+    // Another launch is checked on its own, once.
+    let mut app = history_with(&["max"]);
+    let fx = keys(&mut app, &[Key::Enter, Key::Char('f'), Key::Char('f')]);
+    assert_eq!(count(&fx, is_check), 2, "{fx:?}");
+    assert_eq!(
+        answer(&mut app, fork_a("max"), None),
+        [Effect::Launch(fork_a("max"))]
+    );
+
+    // The new-session form likewise.
+    let mut app = new_session_form();
+    let fx = keys(&mut app, &[Key::Enter; 5]);
+    assert_eq!(count(&fx, is_check), 1, "{fx:?}");
+    let want = request("max", &[], Some(CWD), "new session as max");
+    assert_eq!(answer(&mut app, want.clone(), None), [Effect::Launch(want)]);
+    assert_eq!(app.overlay, None);
+}
+
+/// R7, R16: a held `l` runs one `claude logs` at a time. Asked again while that one is out
+/// (held, or closed and opened again), the logs are read once more when it answers, since it
+/// may have read them before the key; logs that have arrived are read again at once.
+#[test]
+fn a_held_l_runs_claude_logs_one_at_a_time() {
+    let is_logs = |e: &Effect| matches!(e, Effect::Logs { .. });
+    let logs = Effect::Logs {
+        account: account("team"),
+        short_id: "bbbbbbbb".into(),
+    };
+    let answer = |app: &mut App, text: &str| {
+        update(
+            app,
+            Event::Logs {
+                account: account("team"),
+                short_id: "bbbbbbbb".into(),
+                result: Ok(text.into()),
+            },
+        )
+    };
+    let mut app = live_with_background();
+    keys(&mut app, &[Key::Char('j')]);
+    let fx = keys(&mut app, &[Key::Char('l'); 5]);
+    assert_eq!(count(&fx, is_logs), 1, "{fx:?}");
+    assert_eq!(keys(&mut app, &[Key::Esc, Key::Char('l')]), []);
+    assert!(text(&app).contains("loading logs…"), "{}", text(&app));
+    // The run that was out when `l` was pressed again: shown, and read once more.
+    assert_eq!(answer(&mut app, "step 2 of 3"), std::slice::from_ref(&logs));
+    assert!(text(&app).contains("step 2 of 3"), "{}", text(&app));
+    assert_eq!(answer(&mut app, "step 3 of 3"), []);
+    assert!(text(&app).contains("step 3 of 3"), "{}", text(&app));
+    let fx = keys(&mut app, &[Key::Char('l'); 3]);
+    assert_eq!(count(&fx, is_logs), 1, "{fx:?}");
+
+    // Closed before the run that was asked again answers: nothing is read for no one.
+    keys(&mut app, &[Key::Esc]);
+    assert_eq!(answer(&mut app, "step 4"), []);
+    assert_eq!(app.logs, None);
+    assert_eq!(keys(&mut app, &[Key::Char('l')]), [logs]);
+}
+
+/// R7, R16: two accounts may each have a background session of one short id. Each one's logs
+/// are read on their own, and an answer goes to its own account's session.
+#[test]
+fn logs_of_two_accounts_with_one_short_id_are_read_apart() {
+    let logs = |name: &str| Effect::Logs {
+        account: account(name),
+        short_id: "aaaaaaaa".into(),
+    };
+    let answer = |app: &mut App, name: &str| {
+        update(
+            app,
+            Event::Logs {
+                account: account(name),
+                short_id: "aaaaaaaa".into(),
+                result: Ok(format!("the log of {name}")),
+            },
+        )
+    };
+    let mut app = history_with(&["max"]);
+    update(
+        &mut app,
+        Event::Live(vec![
+            background("claude:max", "aaaaaaaa", A, "blocked"),
+            background("claude:team", "aaaaaaaa", B, "blocked"),
+        ]),
+    );
+    keys(&mut app, &[Key::Char('2')]);
+    assert_eq!(keys(&mut app, &[Key::Char('l')]), [logs("max")]);
+    assert_eq!(
+        keys(&mut app, &[Key::Char('j'), Key::Char('l')]),
+        [logs("team")]
+    );
+    // max's answer arrives late: it is not team's log.
+    assert_eq!(answer(&mut app, "max"), []);
+    let all = text(&app);
+    assert!(all.contains("loading logs…"), "{all}");
+    assert!(!all.contains("the log of max"), "{all}");
+    assert_eq!(answer(&mut app, "team"), []);
+    assert!(text(&app).contains("the log of team"), "{}", text(&app));
+    // Back on max, whose answer was dropped: read again.
+    assert_eq!(
+        keys(&mut app, &[Key::Char('k'), Key::Char('l')]),
+        [logs("max")]
+    );
+}
+
+/// R7, R16: moving away from a session and back while its logs are still being read. A session
+/// has one `claude logs` out at a time, whatever was asked in between: going back waits for
+/// that run and reads once more when it answers, so an earlier answer cannot be taken for a
+/// later one, and the answer for a session that was left is for no one.
+#[test]
+fn logs_asked_again_after_moving_away_and_back_wait_for_the_run_that_is_out() {
+    let logs = |name: &str, id: &str| Effect::Logs {
+        account: account(name),
+        short_id: id.into(),
+    };
+    let answer = |app: &mut App, name: &str, id: &str, text: &str| {
+        update(
+            app,
+            Event::Logs {
+                account: account(name),
+                short_id: id.into(),
+                result: Ok(text.into()),
+            },
+        )
+    };
+    let mut app = history_with(&["max"]);
+    update(
+        &mut app,
+        Event::Live(vec![
+            background("claude:max", "aaaaaaaa", A, "blocked"),
+            background("claude:team", "bbbbbbbb", B, "blocked"),
+        ]),
+    );
+    keys(&mut app, &[Key::Char('2')]);
+    assert_eq!(keys(&mut app, &[Key::Char('l')]), [logs("max", "aaaaaaaa")]);
+    assert_eq!(
+        keys(&mut app, &[Key::Char('j'), Key::Char('l')]),
+        [logs("team", "bbbbbbbb")]
+    );
+    // Back on max while its first run is out: no second run beside it.
+    assert_eq!(keys(&mut app, &[Key::Char('k'), Key::Char('l')]), []);
+    assert!(text(&app).contains("loading logs…"), "{}", text(&app));
+    // team's session was left: its answer is for no one, and it is not read again.
+    assert_eq!(answer(&mut app, "team", "bbbbbbbb", "the log of team"), []);
+    assert!(!text(&app).contains("the log of team"), "{}", text(&app));
+    // max's run began before `l` was pressed again: shown, and read once more.
+    assert_eq!(
+        answer(&mut app, "max", "aaaaaaaa", "read first"),
+        [logs("max", "aaaaaaaa")]
+    );
+    assert!(text(&app).contains("read first"), "{}", text(&app));
+    assert_eq!(answer(&mut app, "max", "aaaaaaaa", "read second"), []);
+    assert!(text(&app).contains("read second"), "{}", text(&app));
+    // An answer with no run out (none can come) changes nothing.
+    assert_eq!(answer(&mut app, "max", "aaaaaaaa", "from nowhere"), []);
+    assert!(text(&app).contains("read second"), "{}", text(&app));
+}
+
+/// R8: the selection moved to another session and back while the first preview is still being
+/// read. A transcript has one reading out at a time: coming back waits for it and reads once
+/// more when it answers, and the answer for the transcript that was left is for no one.
+#[test]
+fn a_preview_left_and_selected_again_waits_for_the_reading_that_is_out() {
+    let msg = |t: &str| {
+        vec![Message {
+            role: Role::User,
+            text: t.into(),
+        }]
+    };
+    let answer = |app: &mut App, id: &str, text: &str| {
+        update(
+            app,
+            Event::Preview {
+                path: path(id),
+                result: Ok(msg(text)),
+            },
+        )
+    };
+    let mut app = app();
+    update(
+        &mut app,
+        Event::IndexLoaded(vec![entry("a", "a", 1), entry("b", "b", 2)]),
+    );
+    keys(&mut app, &[Key::Char('3')]);
+    tick(&mut app, 0);
+    assert_eq!(tick(&mut app, 0), [Effect::Preview(path("b"), CLAUDE)]);
+    keys(&mut app, &[Key::Char('j')]);
+    tick(&mut app, 0);
+    assert_eq!(tick(&mut app, 0), [Effect::Preview(path("a"), CLAUDE)]);
+    // Back on `b` while its first reading is out: no second one beside it.
+    keys(&mut app, &[Key::Char('k')]);
+    assert_eq!(tick(&mut app, 0), []);
+    assert_eq!(tick(&mut app, 0), []);
+    assert_eq!(tick(&mut app, 0), []);
+    assert_eq!(answer(&mut app, "a", "of a"), []);
+    assert_eq!(app.preview.loaded, None);
+    // Read before the selection left: shown, and read once more.
+    assert_eq!(
+        answer(&mut app, "b", "read first"),
+        [Effect::Preview(path("b"), CLAUDE)]
+    );
+    assert_eq!(app.preview.loaded, Some((path("b"), Ok(msg("read first")))));
+    assert_eq!(answer(&mut app, "b", "read second"), []);
+    assert_eq!(
+        app.preview.loaded,
+        Some((path("b"), Ok(msg("read second"))))
+    );
+    assert_eq!(tick(&mut app, 0), []);
+}
+
+/// R22: the selection moved to another account and back while the first read is out. An
+/// account has one read out at a time: coming back waits for it and reads once more when it
+/// answers, and the answer for the account that was left is for no one.
+#[test]
+fn the_pane_moved_away_and_back_waits_for_the_read_that_is_out() {
+    let answer = |app: &mut App, request: u64, name: &str, model: &str| {
+        update(
+            app,
+            Event::Config {
+                request,
+                account: account(name),
+                result: Ok(Box::new(config_with_model(model))),
+            },
+        )
+    };
+    let mut app = app();
+    assert_eq!(
+        keys(&mut app, &[Key::Char('p')]),
+        [config_effect(1, "default")]
+    );
+    assert_eq!(keys(&mut app, &[Key::Char('j')]), [config_effect(2, "max")]);
+    // Back on `default` while its first read is out: no second one beside it.
+    assert_eq!(keys(&mut app, &[Key::Char('k')]), []);
+    assert_eq!(answer(&mut app, 2, "max", "of max"), []);
+    assert_eq!(app.config.loaded, None);
+    assert_eq!(
+        answer(&mut app, 1, "default", "read first"),
+        [config_effect(3, "default")]
+    );
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("read first"))));
+    // Its number is spent: the same answer again is for no one.
+    assert_eq!(answer(&mut app, 1, "default", "again"), []);
+    assert_eq!(answer(&mut app, 3, "default", "read second"), []);
+    assert_eq!(
+        app.config.loaded,
+        Some(Ok(config_with_model("read second")))
+    );
+}
+
+/// R22: what was read before the account list was read again is not shown, also when the
+/// read of another account, begun after it, has answered in between and the selection has
+/// come back. A read begun after the list changed is shown like any other.
+#[test]
+fn a_read_from_before_a_new_account_list_stays_hidden_whatever_answers_in_between() {
+    let answer = |app: &mut App, request: u64, name: &str, model: &str| {
+        update(
+            app,
+            Event::Config {
+                request,
+                account: account(name),
+                result: Ok(Box::new(config_with_model(model))),
+            },
+        )
+    };
+    let mut app = app();
+    assert_eq!(
+        keys(&mut app, &[Key::Char('p')]),
+        [config_effect(1, "default")]
+    );
+    let mut accounts = everyone();
+    accounts.push(account("new"));
+    let fx = update(&mut app, Event::Accounts(accounts));
+    assert_eq!(config_effects(&fx), Vec::<&Effect>::new());
+    // Another account, read after the list changed: shown.
+    assert_eq!(keys(&mut app, &[Key::Char('j')]), [config_effect(2, "max")]);
+    assert_eq!(answer(&mut app, 2, "max", "of max"), []);
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("of max"))));
+    // Back on `default`, whose read from before the change is still out.
+    assert_eq!(keys(&mut app, &[Key::Char('k')]), []);
+    assert_eq!(
+        answer(&mut app, 1, "default", "before the change"),
+        [config_effect(3, "default")]
+    );
+    assert_eq!(app.config.loaded, None);
+    // `r` while the read begun after the change is out: that one is shown, like any `r`.
+    assert_eq!(config_effects(&keys(&mut app, &[Key::Char('r')])).len(), 0);
+    assert_eq!(
+        answer(&mut app, 3, "default", "after the change"),
+        [config_effect(4, "default")]
+    );
+    assert_eq!(
+        app.config.loaded,
+        Some(Ok(config_with_model("after the change")))
+    );
+    assert_eq!(answer(&mut app, 4, "default", "after r"), []);
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("after r"))));
+}
+
+/// R8: a preview shown meanwhile (read before the selection left, while the transcript is
+/// read once more) does not stand in for the reading still out. The selection gone and back
+/// again, that reading is waited for, or, when it has answered to no one, made again.
+#[test]
+fn a_preview_shown_meanwhile_does_not_stand_in_for_the_reading_still_out() {
+    let msg = |t: &str| {
+        vec![Message {
+            role: Role::User,
+            text: t.into(),
+        }]
+    };
+    let answer = |app: &mut App, text: &str| {
+        update(
+            app,
+            Event::Preview {
+                path: path("b"),
+                result: Ok(msg(text)),
+            },
+        )
+    };
+    let read_b = [Effect::Preview(path("b"), CLAUDE)];
+    for answers_before_settling in [false, true] {
+        let mut app = app();
+        update(
+            &mut app,
+            Event::IndexLoaded(vec![entry("a", "a", 1), entry("b", "b", 2)]),
+        );
+        keys(&mut app, &[Key::Char('3')]);
+        tick(&mut app, 0);
+        assert_eq!(tick(&mut app, 0), read_b);
+        keys(&mut app, &[Key::Char('j'), Key::Char('k')]);
+        tick(&mut app, 0);
+        assert_eq!(tick(&mut app, 0), []);
+        assert_eq!(answer(&mut app, "read first"), read_b);
+        assert_eq!(app.preview.loaded, Some((path("b"), Ok(msg("read first")))));
+        // Away and back while the second reading is out.
+        keys(&mut app, &[Key::Char('j'), Key::Char('k')]);
+        if answers_before_settling {
+            // It answers to no one; the selection settled, the transcript is read again.
+            assert_eq!(answer(&mut app, "read second"), []);
+            tick(&mut app, 0);
+            assert_eq!(tick(&mut app, 0), read_b);
+            assert_eq!(answer(&mut app, "read third"), []);
+        } else {
+            // The selection settled first: no reading beside the one out, which is shown
+            // and, begun before the selection left, followed by one more.
+            tick(&mut app, 0);
+            assert_eq!(tick(&mut app, 0), []);
+            assert_eq!(answer(&mut app, "read second"), read_b);
+            assert_eq!(
+                app.preview.loaded,
+                Some((path("b"), Ok(msg("read second"))))
+            );
+            assert_eq!(answer(&mut app, "read third"), []);
+        }
+        assert_eq!(app.preview.loaded, Some((path("b"), Ok(msg("read third")))));
+        assert_eq!(tick(&mut app, 0), []);
+    }
+}
+
+/// R16: a check that was cancelled starts nothing, whatever it finds, also when the same
+/// launch is asked for again before it has answered. No second check starts beside it: the
+/// launch is checked again when it answers, and only that check starts it.
+#[test]
+fn a_cancelled_check_asked_for_again_is_checked_again_when_it_answers() {
+    for found in [None, Some("/x does not exist")] {
+        let mut app = history_with(&["max"]);
+        let fx = keys(&mut app, &[Key::Enter]);
+        let first = app.work.launch.round();
+        assert_eq!(fx, [check_of(&app, resume_a("max"))]);
+        keys(&mut app, &[Key::Esc]);
+        assert_eq!(keys(&mut app, &[Key::Enter]), []);
+        assert!(text(&app).contains("checking that aaaaaaaa is not running…"));
+        // The cancelled check answers: neither a launch nor its error.
+        let old = Event::LaunchChecked {
+            check: first,
+            request: resume_a("max"),
+            error: found.map(Marked::from),
+        };
+        let fx = update(&mut app, old);
+        assert_ne!(app.work.launch.round(), first);
+        assert_eq!(fx, [check_of(&app, resume_a("max"))]);
+        assert_eq!(notice(&app), None);
+        assert_eq!(
+            answer(&mut app, resume_a("max"), None),
+            [Effect::Launch(resume_a("max"))]
+        );
+    }
+
+    // The same through the new-session form, closed and filled in again: the check that
+    // follows is the open form's.
+    let mut app = new_session_form();
+    let want = request("max", &[], Some(CWD), "new session as max");
+    let fx = keys(&mut app, &[Key::Enter, Key::Esc]);
+    assert_eq!(fx, [check_of(&app, want.clone())]);
+    assert_eq!(keys(&mut app, &[Key::Char('n'), Key::Enter]), []);
+    let old = Event::LaunchChecked {
+        check: app.work.launch.round(),
+        request: want.clone(),
+        error: None,
+    };
+    let fx = update(&mut app, old);
+    assert_eq!(fx, [check_of(&app, want.clone())]);
+    assert!(app.overlay.is_some());
+    let fx = answer(&mut app, want.clone(), Some("/x does not exist".into()));
+    assert_eq!(fx, []);
+    assert_eq!(form(&app).error.as_deref(), Some("/x does not exist"));
+    assert_eq!(
+        keys(&mut app, &[Key::Enter]),
+        [check_of(&app, want.clone())]
+    );
+    assert_eq!(answer(&mut app, want.clone(), None), [Effect::Launch(want)]);
+    assert_eq!(app.overlay, None);
+}
+
+/// The settings of [`config_view`] with this model: what a read finds after an edit.
+fn config_with_model(model: &str) -> crate::account_config::ConfigView {
+    let mut view = config_view();
+    view.own_settings.model = Some(model.into());
+    view
+}
+
+/// R22: a held `r` reads the configuration one read at a time. Asked again while a read is
+/// out, the configuration is read once more when it answers: that read may have seen the
+/// files as they were before the key, and the one after it shows what has changed.
+#[test]
+fn a_held_r_reads_the_configuration_one_at_a_time() {
+    let mut app = idle_app();
+    keys(&mut app, &[Key::Char('p')]);
+    answer_config(&mut app, "default", config_with_model("old"));
+    let fx = keys(&mut app, &[Key::Char('r'); 5]);
+    assert_eq!(
+        config_effects(&fx),
+        [&config_effect(2, "default")],
+        "{fx:?}"
+    );
+    // Read before the later presses: shown until the read they asked for answers.
+    let fx = answer_config(&mut app, "default", config_with_model("old"));
+    assert_eq!(fx, [config_effect(3, "default")]);
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("old"))));
+    assert_eq!(
+        answer_config(&mut app, "default", config_with_model("new")),
+        []
+    );
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("new"))));
+    let fx = keys(&mut app, &[Key::Char('r'); 5]);
+    assert_eq!(
+        config_effects(&fx),
+        [&config_effect(4, "default")],
+        "{fx:?}"
+    );
+}
+
+/// R22: a held `p` (open, whole view, closed, open, …) reads the configuration one read at a
+/// time. A pane opened again while the read of its account is out reads once more when that
+/// one answers, and shows what has changed since the first read.
+#[test]
+fn a_held_p_reads_the_configuration_one_at_a_time() {
+    let mut app = app();
+    let fx = keys(&mut app, &[Key::Char('p'); 7]);
+    assert_eq!(
+        config_effects(&fx),
+        [&config_effect(1, "default")],
+        "{fx:?}"
+    );
+    assert!(app.config.open);
+    let fx = answer_config(&mut app, "default", config_with_model("old"));
+    assert_eq!(fx, [config_effect(2, "default")]);
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("old"))));
+    assert_eq!(
+        answer_config(&mut app, "default", config_with_model("new")),
+        []
+    );
+    assert_eq!(app.config.loaded, Some(Ok(config_with_model("new"))));
+
+    // Opened again and closed before the read answers: nothing is read for no pane.
+    let mut app = idle_app();
+    keys(&mut app, &[Key::Char('p'); 6]);
+    assert!(!app.config.open);
+    assert_eq!(
+        answer_config(&mut app, "default", config_with_model("old")),
+        []
+    );
+    assert_eq!(app.config.loaded, None);
+    assert_eq!(
+        keys(&mut app, &[Key::Char('p')]),
+        [config_effect(2, "default")]
+    );
+}
+
+/// R10, R10a: a new account list asks every account again; an account that is still being
+/// asked is asked once more when it answers (that answer may be from before the change), never
+/// twice at once.
+#[test]
+fn a_new_account_list_asks_an_account_again_only_once_it_has_answered() {
+    let mut app = app();
+    app.start();
+    update(
+        &mut app,
+        Event::Identity {
+            account: account("default"),
+            identity: Identity::NotLoggedIn,
+        },
+    );
+    let mut accounts = everyone();
+    accounts.push(account("work"));
+    let fx = update(&mut app, Event::Accounts(accounts));
+    // `default` has answered and `work` is new; `max` and `team` are still out.
+    let asked = vec![account("default"), account("work")];
+    assert!(fx.contains(&Effect::Identities(asked)), "{fx:?}");
+    assert!(
+        fx.contains(&Effect::CachedUsage(vec![account("work")])),
+        "{fx:?}"
+    );
+    let answer = Event::Identity {
+        account: account("max"),
+        identity: Identity::NotLoggedIn,
+    };
+    assert_eq!(
+        update(&mut app, answer.clone()),
+        [Effect::Identities(vec![account("max")])]
+    );
+    assert_eq!(update(&mut app, answer), []);
+}
+
+/// R10, R10a: an account removed while it is being asked, and added again, has a new row that
+/// is asked anew while the queries of the old row are still out. The row takes the answers to
+/// its own queries; those of the old row's, arriving afterwards, are not written over them.
+/// Identity, cached usage and live usage alike.
+#[test]
+fn an_answer_to_a_removed_rows_query_is_not_written_into_the_row_added_again() {
+    let u = [Key::Char('u')];
+    let mut app = app();
+    app.start();
+    keys(&mut app, &u);
+    update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("team")]),
+    );
+    let fx = update(&mut app, Event::Accounts(everyone()));
+    let max = vec![account("max")];
+    assert!(fx.contains(&Effect::Identities(max.clone())), "{fx:?}");
+    assert!(fx.contains(&Effect::CachedUsage(max.clone())), "{fx:?}");
+    assert_eq!(keys(&mut app, &u), [Effect::LiveUsage(max)]);
+    let answers = |identity: Identity, percent: f64| {
+        let rows = || vec![row("Session", percent, None, None)];
+        [
+            Event::Identity {
+                account: account("max"),
+                identity,
+            },
+            Event::CachedUsage {
+                account: account("max"),
+                result: cached(rows()),
+            },
+            Event::LiveUsage {
+                account: account("max"),
+                result: Ok(LiveUsage::Rows(rows()).into()),
+                answered_at: ts(NOW),
+            },
+        ]
+    };
+    // The answers to what the new row was asked.
+    for answer in answers(logged_in("max@example.com"), 10.0) {
+        assert_eq!(update(&mut app, answer), []);
+    }
+    assert_eq!(app.accounts[1].account, account("max"));
+    assert_eq!(app.accounts[1].identity, Some(logged_in("max@example.com")));
+    assert_eq!(app.accounts[1].rows()[0].percent, 10.0);
+    assert!(app.accounts[1].live.is_some() && app.accounts[1].cached.is_some());
+    // Those to what the removed row was asked.
+    let before = app.accounts.clone();
+    for answer in answers(Identity::NotLoggedIn, 99.0) {
+        assert_eq!(update(&mut app, answer), []);
+    }
+    assert_eq!(app.accounts, before);
+}
+
+/// R11: when the account list changes while the checks run, they run again once they answer,
+/// and what was found for the old list is not shown as current.
+#[test]
+fn checks_run_again_when_the_accounts_change_meanwhile() {
+    let check = |account: &str| Check {
+        account: Some(format!("claude:{account}")),
+        message: "home does not exist".into(),
+    };
+    let mut app = idle_app();
+    assert!(keys(&mut app, &[Key::Char('r')]).contains(&Effect::Checks));
+    let fx = update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("max")]),
+    );
+    assert!(!fx.contains(&Effect::Checks), "one run at a time: {fx:?}");
+    // Found for the list that still had `team`.
+    let fx = update(&mut app, Event::Checks(vec![check("team")]));
+    assert_eq!(fx, [Effect::Checks]);
+    assert_eq!(app.checks, Some(vec![]));
+    assert_eq!(update(&mut app, Event::Checks(vec![check("max")])), []);
+    assert_eq!(app.checks, Some(vec![check("max")]));
 }

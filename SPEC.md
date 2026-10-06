@@ -1532,8 +1532,12 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   no pane.
 - **When it is read.** In the background, never while drawing: when the pane opens, when the
   selected account changes while it is open, on `r`, and when the account list is read again
-  (after a setup or a removal). For a codex account the pane says that configuration listing is
-  Claude-only.
+  (after a setup or a removal). Asked for again while a read of that account has not answered
+  yet (a held `r` or `p`, the pane closed and opened, the selection moved away and back, the
+  account list read again), no second read starts: the configuration is read once more when
+  that one answers, so that what changed in between is shown. What was read before the account
+  list was read again is not shown. For a codex account the pane says that configuration
+  listing is Claude-only.
 - **For a directory.** What a session loads depends on where it starts (project settings,
   plugins installed for a project, the auto-memory project, project MCP servers). The pane
   describes a new session started in the directory remuda was started in (the default of R16's

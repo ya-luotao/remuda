@@ -39,37 +39,32 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
         Effect::RefreshIndex => {
             thread::spawn(move || refresh_index(&deps, &tx));
         }
-        Effect::Identities => {
-            for account in &deps.accounts {
-                let (deps, tx, account) = (Arc::clone(&deps), tx.clone(), account.clone());
-                thread::spawn(move || {
+        Effect::Identities(accounts) => {
+            for account in accounts {
+                answer(&deps, &tx, move |deps| {
                     let (identity, _warning) =
                         identity::identify(&account, &deps.agents(), &deps.env, IDENTITY_TIMEOUT);
-                    let _ = tx.send(Event::Identity { account, identity });
+                    Event::Identity { account, identity }
                 });
             }
         }
-        Effect::CachedUsage => {
+        Effect::CachedUsage(accounts) => {
             thread::spawn(move || {
-                for account in &deps.accounts {
-                    let result = usage::cached_usage(account, &deps.env);
-                    let _ = tx.send(Event::CachedUsage {
-                        account: account.clone(),
-                        result,
-                    });
+                for account in accounts {
+                    let result = usage::cached_usage(&account, &deps.env);
+                    let _ = tx.send(Event::CachedUsage { account, result });
                 }
             });
         }
-        Effect::LiveUsage(which) => {
-            for account in which {
-                let (deps, tx) = (Arc::clone(&deps), tx.clone());
-                thread::spawn(move || {
+        Effect::LiveUsage(accounts) => {
+            for account in accounts {
+                answer(&deps, &tx, move |deps| {
                     let result = usage::live_usage(&account, &deps.agents(), LIVE_USAGE_TIMEOUT);
-                    let _ = tx.send(Event::LiveUsage {
+                    Event::LiveUsage {
                         account,
                         result,
                         answered_at: (deps.clock)(),
-                    });
+                    }
                 });
             }
         }
@@ -110,27 +105,26 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                 let _ = tx.send(Event::Checks(found));
             });
         }
-        Effect::Logs { account, short_id } => {
-            thread::spawn(move || {
-                let result = live::logs(&deps.agents(), &account, &short_id, live::LOGS_TIMEOUT);
-                let _ = tx.send(Event::Logs { short_id, result });
-            });
-        }
+        Effect::Logs { account, short_id } => answer(&deps, &tx, move |deps| {
+            let result = live::logs(&deps.agents(), &account, &short_id, live::LOGS_TIMEOUT);
+            Event::Logs {
+                account,
+                short_id,
+                result,
+            }
+        }),
         Effect::Control {
             account,
             verb,
             short_id,
-        } => {
-            thread::spawn(move || {
-                let result =
-                    live::control(&deps.agents(), &account, verb, &short_id, CONTROL_TIMEOUT);
-                let _ = tx.send(Event::ControlDone {
-                    verb,
-                    short_id,
-                    result,
-                });
-            });
-        }
+        } => answer(&deps, &tx, move |deps| {
+            let result = live::control(&deps.agents(), &account, verb, &short_id, CONTROL_TIMEOUT);
+            Event::ControlDone {
+                verb,
+                short_id,
+                result,
+            }
+        }),
         Effect::CheckLaunch { check, request } => {
             thread::spawn(move || {
                 let error = check_launch(&deps, &request, &tx);
@@ -141,15 +135,13 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                 });
             });
         }
-        Effect::RolloutWritten(path) => {
-            thread::spawn(move || {
-                let at = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| jiff::Timestamp::try_from(t).ok());
-                let _ = tx.send(Event::RolloutWritten { path, at });
-            });
-        }
+        Effect::RolloutWritten(path) => answer(&deps, &tx, move |_| {
+            let at = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| jiff::Timestamp::try_from(t).ok());
+            Event::RolloutWritten { path, at }
+        }),
         // The accounts are read again first; the same sender keeps them ahead of the result,
         // so the rows are rebuilt by the time it is told.
         Effect::RemoveAccount(account) => {
@@ -165,16 +157,14 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                 let _ = tx.send(Event::AccountRemoved { account, result });
             });
         }
-        Effect::Preview(path, provider) => {
-            thread::spawn(move || {
-                let result = match provider {
-                    Provider::Claude => transcript::preview(&path, PREVIEW_MESSAGES),
-                    Provider::Codex => codex::preview(&path, PREVIEW_MESSAGES),
-                }
-                .map_err(|e| e.to_string());
-                let _ = tx.send(Event::Preview { path, result });
-            });
-        }
+        Effect::Preview(path, provider) => answer(&deps, &tx, move |_| {
+            let result = match provider {
+                Provider::Claude => transcript::preview(&path, PREVIEW_MESSAGES),
+                Provider::Codex => codex::preview(&path, PREVIEW_MESSAGES),
+            }
+            .map_err(|e| e.to_string());
+            Event::Preview { path, result }
+        }),
         Effect::Config {
             request,
             account,
@@ -211,6 +201,19 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
             });
         }
     }
+}
+
+/// Work that answers once and reads nothing of the registry: `work` runs on a thread of its
+/// own, and the event it returns is sent.
+fn answer(
+    deps: &Arc<Deps>,
+    tx: &Sender<Event>,
+    work: impl FnOnce(&Deps) -> Event + Send + 'static,
+) {
+    let (deps, tx) = (Arc::clone(deps), tx.clone());
+    thread::spawn(move || {
+        let _ = tx.send(work(&deps));
+    });
 }
 
 /// Why `request` cannot be launched now, if it cannot: its directory, then (for a resume in
@@ -842,6 +845,37 @@ mod tests {
         );
     }
 
+    /// Identities and cached usage are read for the accounts asked, not for every account:
+    /// one that is still being asked is not asked twice.
+    #[test]
+    fn identities_and_cached_usage_answer_for_the_accounts_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let max = deps.accounts[0].clone();
+        let other = Account {
+            provider: CLAUDE,
+            name: "other".into(),
+            home: Home::Path(dir.path().join("other").display().to_string()),
+        };
+        let deps = Arc::new(Deps {
+            accounts: vec![max.clone(), other.clone()],
+            ..Deps::clone(&deps)
+        });
+        let events = collect(Effect::Identities(vec![other.clone()]), &deps, |_| true);
+        assert!(
+            matches!(events.as_slice(), [Event::Identity { account, .. }] if *account == other),
+            "{events:?}"
+        );
+        let (tx, rx) = mpsc::channel();
+        spawn(Effect::CachedUsage(vec![other.clone()]), &deps, &tx);
+        drop(tx);
+        let events: Vec<Event> = rx.iter().collect();
+        assert!(
+            matches!(events.as_slice(), [Event::CachedUsage { account, .. }] if *account == other),
+            "{events:?}"
+        );
+    }
+
     /// R22: an account's configuration is read in the background and comes back with its
     /// request number; a codex account has none to list.
     #[test]
@@ -919,6 +953,54 @@ mod tests {
                 result: Err("configuration listing is Claude-only".into()),
             }]
         );
+    }
+
+    /// R22: the configuration asked for again (`r`, or the pane closed and opened) while a read
+    /// of it is out. That read may have seen the files before they changed, and its answer
+    /// may only reach the app after the key: the files are read once more when it answers,
+    /// and what changed is shown.
+    #[test]
+    fn configuration_asked_again_during_a_read_shows_what_changed_meanwhile() {
+        use crate::tui::app::{App, Key, update};
+        let p = Key::Char('p');
+        for again in [&[Key::Char('r')][..], &[p, p, p][..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let deps = deps(dir.path());
+            let max = deps.accounts[0].clone();
+            let settings = dir.path().join("max/settings.json");
+            fs::write(&settings, r#"{"model":"old-model"}"#).unwrap();
+            let mut app = App::new(vec![max], TimeZone::UTC, None, jiff::Timestamp::now());
+            update(&mut app, Event::Resize(100, 30));
+            // The worker's answers to the configuration reads among `effects`.
+            let read = |effects: Vec<Effect>| -> Vec<Event> {
+                effects
+                    .into_iter()
+                    .filter(|e| matches!(e, Effect::Config { .. }))
+                    .map(|e| collect(e, &deps, |_| true).remove(0))
+                    .collect()
+            };
+            let model = |app: &App| {
+                let view = app.config.loaded.clone()?.ok()?;
+                view.own_settings.model
+            };
+
+            // The first read has answered, but the key reaches the app before the answer.
+            let mut old = read(update(&mut app, Event::Key(p)));
+            assert_eq!(old.len(), 1);
+            fs::write(&settings, r#"{"model":"new-model"}"#).unwrap();
+            let fx: Vec<Effect> = again
+                .iter()
+                .flat_map(|key| update(&mut app, Event::Key(*key)))
+                .collect();
+            assert_eq!(read(fx), [], "one read at a time");
+            let answers = read(update(&mut app, old.remove(0)));
+            assert_eq!(model(&app).as_deref(), Some("old-model"));
+            assert_eq!(answers.len(), 1, "read once more");
+            for answer in answers {
+                assert_eq!(update(&mut app, answer), []);
+            }
+            assert_eq!(model(&app).as_deref(), Some("new-model"));
+        }
     }
 
     /// R10: a codex account's live usage goes to `codex app-server`, and brings its identity;

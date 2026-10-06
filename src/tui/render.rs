@@ -276,7 +276,7 @@ fn status_line(app: &App) -> Line<'static> {
         };
         return Line::styled(format!(" {}", notice.text.as_str()), style);
     }
-    if let Some((_, request)) = &app.pending {
+    if let Some(request) = app.work.launch.running() {
         let what = match request.resumes() {
             Some(id) => format!("that {} is not running", short_id(&id)),
             None => request.what.clone(),
@@ -539,7 +539,7 @@ fn identity_cells(a: &AccountState) -> [(String, Style); 3] {
 }
 
 fn source_cell(a: &AccountState, now: Timestamp) -> (String, Style) {
-    if a.live_pending {
+    if a.work.live.is_running() {
         return ("live…".to_string(), WARN);
     }
     match (&a.live, &a.cached) {
@@ -1507,7 +1507,7 @@ fn history_list(app: &App, f: &mut Frame, area: Rect) {
             "loading sessions…".to_string()
         } else if !h.query.is_empty() {
             format!("no matches for “{}”", h.query)
-        } else if app.indexing.is_some() || app.index_in_flight {
+        } else if app.indexing.is_some() || app.work.index.is_running() {
             "indexing…".to_string()
         } else if app.index.entries.is_empty() {
             "no sessions found".to_string()
@@ -2098,7 +2098,7 @@ fn stats_view(app: &App, f: &mut Frame, area: Rect) {
 /// prices' date.
 fn stats_status(app: &App) -> Span<'static> {
     let s = &app.stats;
-    match (s.in_flight, s.progress, s.computed) {
+    match (app.work.stats.is_running(), s.progress, s.computed) {
         (true, Some((done, total)), _) if done < total => {
             Span::styled(format!("reading transcripts {done}/{total}…"), WARN)
         }

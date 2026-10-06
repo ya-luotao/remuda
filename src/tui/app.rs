@@ -26,6 +26,7 @@ use crate::stats::{self, Period};
 use crate::transcript::Message;
 use crate::usage::{CachedUsage, LiveResult, LiveUsage, Reading, Snapshot, UsageRow};
 
+use super::work::{Claim, Round, Slot};
 use super::{render, search};
 
 /// Live sessions are re-collected this long after the last collection finished (R7).
@@ -149,8 +150,10 @@ pub enum Event {
         request: LaunchRequest,
         error: Option<Marked>,
     },
-    /// `claude logs <short_id>` as plain text, or why it failed.
+    /// `claude logs <short_id>` under `account` as plain text, or why it failed. Two accounts
+    /// may each have a background session of one short id.
     Logs {
+        account: Account,
         short_id: String,
         result: Result<String, String>,
     },
@@ -343,8 +346,10 @@ pub struct Notice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     RefreshIndex,
-    Identities,
-    CachedUsage,
+    /// `claude auth status` / `codex login status` for these accounts.
+    Identities(Vec<Account>),
+    /// The cached usage of these accounts.
+    CachedUsage(Vec<Account>),
     /// `claude -p /usage` for these accounts.
     LiveUsage(Vec<Account>),
     Live,
@@ -407,15 +412,104 @@ pub struct AccountState {
     pub account: Account,
     /// `None` until `claude auth status` first answers.
     pub identity: Option<Identity>,
-    /// `claude auth status` is running.
-    pub identity_pending: bool,
     /// `None` until first loaded.
     pub cached: Option<Result<CachedUsage, String>>,
-    /// The cached usage is being read.
-    pub cached_pending: bool,
     /// The last live query: rows and when the query answered, or why it failed.
     pub live: Option<Result<(Vec<UsageRow>, Timestamp), String>>,
-    pub live_pending: bool,
+    /// What is being asked of the account.
+    pub work: AccountWork,
+}
+
+/// What is asked of one account in the background: a slot for each [`Query`]. A slot moves
+/// with its account's row, and an account no longer listed takes its slots with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountWork {
+    /// `claude auth status` / `codex login status`.
+    pub identity: Slot,
+    /// The cached usage.
+    pub cached: Slot,
+    /// The live usage query.
+    pub live: Slot,
+}
+
+impl AccountWork {
+    fn slot(&mut self, query: Query) -> &mut Slot {
+        match query {
+            Query::Identity => &mut self.identity,
+            Query::CachedUsage => &mut self.cached,
+            Query::LiveUsage => &mut self.live,
+        }
+    }
+}
+
+/// What is asked of each account, answered by one event for each account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Query {
+    Identity,
+    CachedUsage,
+    LiveUsage,
+}
+
+impl Query {
+    fn effect(self, accounts: Vec<Account>) -> Effect {
+        match self {
+            Query::Identity => Effect::Identities(accounts),
+            Query::CachedUsage => Effect::CachedUsage(accounts),
+            Query::LiveUsage => Effect::LiveUsage(accounts),
+        }
+    }
+}
+
+/// A slot for each kind of background work that is neither an account's ([`AccountWork`]) nor
+/// a pane's ([`ConfigPane::work`], [`Preview::work`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Background {
+    pub index: Slot,
+    /// Stale from a foreground child until a collection started after it has finished: `live`
+    /// may miss what the child started (R16).
+    pub live: Slot,
+    pub attribution: Slot,
+    pub checks: Slot,
+    pub stats: Slot,
+    /// The pre-launch check, and the launch waiting for it.
+    pub launch: Slot<LaunchRequest>,
+    /// `claude logs` of this account's background session of this short id.
+    pub logs: Slot<(Account, String)>,
+}
+
+impl Background {
+    fn slot(&mut self, work: Work) -> &mut Slot {
+        match work {
+            Work::Index => &mut self.index,
+            Work::Live => &mut self.live,
+            Work::Attribution => &mut self.attribution,
+            Work::Checks => &mut self.checks,
+            Work::Stats => &mut self.stats,
+        }
+    }
+}
+
+/// The background work that has no target: one round of each is out at most, and its result
+/// carries no number (there is no other round it could be taken for).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Work {
+    Index,
+    Live,
+    Attribution,
+    Checks,
+    Stats,
+}
+
+impl Work {
+    fn effect(self) -> Effect {
+        match self {
+            Work::Index => Effect::RefreshIndex,
+            Work::Live => Effect::Live,
+            Work::Attribution => Effect::Attribution,
+            Work::Checks => Effect::Checks,
+            Work::Stats => Effect::Stats,
+        }
+    }
 }
 
 impl AccountState {
@@ -423,11 +517,9 @@ impl AccountState {
         AccountState {
             account,
             identity: None,
-            identity_pending: false,
             cached: None,
-            cached_pending: false,
             live: None,
-            live_pending: false,
+            work: AccountWork::default(),
         }
     }
 
@@ -626,7 +718,8 @@ pub struct Preview {
     pub target: Option<PathBuf>,
     /// Ticks the target has stayed the same.
     pub settled: u8,
-    pub loading: Option<PathBuf>,
+    /// The transcript being read.
+    pub work: Slot<PathBuf>,
     pub loaded: Option<(PathBuf, Result<Vec<Message>, String>)>,
     /// `Enter`: the preview takes the whole body.
     pub expanded: bool,
@@ -643,13 +736,14 @@ pub struct ConfigPane {
     pub expanded: bool,
     /// First line shown.
     pub scroll: usize,
-    /// Number of the last [`Effect::Config`]: only its answer is kept.
-    pub request: u64,
     /// The account shown: the selection's when last requested.
     pub account: Option<Account>,
     /// The last answer for `account`; kept while it is read again.
     pub loaded: Option<Result<ConfigView, String>>,
-    pub loading: bool,
+    /// The account being read, under the number of its [`Effect::Config`]: only the answer to
+    /// that one is kept. A change of the account list makes the reads that are out void: what
+    /// was read before it is not shown.
+    pub work: Slot<Account>,
 }
 
 /// The Stats view (R20): computed the first time it opens, then on each `r`.
@@ -660,7 +754,6 @@ pub struct StatsState {
     /// What the last computation could not do: read a directory (the report is incomplete,
     /// R20), write the cache, read the prices.
     pub error: Option<String>,
-    pub in_flight: bool,
     /// The view has been opened: `r` computes again.
     pub requested: bool,
     /// `(done, total)` transcripts read by the computation running.
@@ -677,7 +770,6 @@ impl Default for StatsState {
         StatsState {
             report: None,
             error: None,
-            in_flight: false,
             requested: false,
             progress: None,
             computed: None,
@@ -704,13 +796,11 @@ pub struct App {
     pub accounts_list: ListState,
     /// File-system and environment checks; `None` until they ran.
     pub checks: Option<Vec<Check>>,
-    pub checks_in_flight: bool,
     pub config: ConfigPane,
 
     pub index: Index,
     /// `(done, total)` while a refresh is running.
     pub indexing: Option<(usize, usize)>,
-    pub index_in_flight: bool,
     /// The cache has been loaded (or found missing): an empty list now means no sessions.
     pub index_loaded: bool,
     pub index_refreshed: Option<Timestamp>,
@@ -721,7 +811,6 @@ pub struct App {
     /// Launch log + `history.jsonl`; `attribution` adds live sessions to it.
     pub(super) attribution_base: Attribution,
     pub attribution: Attribution,
-    pub attribution_in_flight: bool,
 
     pub live: Vec<LiveSession>,
     /// Indices into `live` shown, in order: stopped background sessions only when
@@ -731,9 +820,6 @@ pub struct App {
     pub live_list: ListState,
     pub logs: Option<Logs>,
     pub live_loaded: bool,
-    pub live_in_flight: bool,
-    /// A launch ended after the last collection started: `live` may miss what it started.
-    pub live_stale: bool,
     /// When the last collection finished.
     pub live_updated: Option<Timestamp>,
 
@@ -745,18 +831,14 @@ pub struct App {
     pub overlay: Option<Overlay>,
     /// `None` until the index worker has listed them.
     pub stores: Option<Vec<Store>>,
-    /// A launch waiting for its pre-launch check, and that check's number.
-    pub pending: Option<(u64, LaunchRequest)>,
-    /// Pre-launch checks issued so far (the last one's number).
-    pub launch_checks: u64,
+    /// What runs in the background: whether a round of each kind of work is out, and whether it
+    /// runs once more when that round reports.
+    pub work: Background,
     /// The pending launch a foreground child cancelled, told when the child ends.
     pub(super) cancelled: Option<String>,
-    /// The check the open form started: only its answer belongs in the form (C1).
-    pub(super) form_check: Option<u64>,
-    /// Work to run once more when its current run finishes: a launch ended meanwhile.
-    pub(super) index_again: bool,
-    pub(super) attribution_again: bool,
-    pub(super) live_again: bool,
+    /// The pending launch was submitted by the open form: only then does the answer of its
+    /// check belong in the form (C1).
+    pub(super) form_check: bool,
     /// `Ctrl-P`: the screen is drawn from [`super::privacy::redacted`] (R21).
     pub private: bool,
     /// Every account name seen, with its private-mode alias.
@@ -782,26 +864,21 @@ impl App {
             accounts: accounts.into_iter().map(AccountState::new).collect(),
             accounts_list: ListState::default(),
             checks: None,
-            checks_in_flight: false,
             config: ConfigPane::default(),
             index: Index::default(),
             indexing: None,
-            index_in_flight: false,
             index_loaded: false,
             index_refreshed: None,
             index_error: None,
             by_session: HashMap::new(),
             attribution_base: Attribution::default(),
             attribution: Attribution::default(),
-            attribution_in_flight: false,
             live: Vec::new(),
             live_rows: Vec::new(),
             live_show_inactive: false,
             live_list: ListState::default(),
             logs: None,
             live_loaded: false,
-            live_in_flight: false,
-            live_stale: false,
             live_updated: None,
             history: History::default(),
             preview: Preview::default(),
@@ -809,13 +886,9 @@ impl App {
             notice: None,
             overlay: None,
             stores: None,
-            pending: None,
-            launch_checks: 0,
+            work: Background::default(),
             cancelled: None,
-            form_check: None,
-            index_again: false,
-            attribution_again: false,
-            live_again: false,
+            form_check: false,
             private: false,
             aliases,
         }
@@ -883,38 +956,21 @@ impl App {
         self.history.show_all || !is_noise(entry)
     }
 
-    /// `r`: everything except live usage, skipping what is already running (per-account
-    /// work runs until every account has answered).
+    /// `r`: everything except live usage, skipping what is already running (an account still
+    /// being asked is not asked twice).
     fn refresh(&mut self, fx: &mut Vec<Effect>) {
         // Choosing an account for `remuda run` needs identities, usage and checks only.
         let sessions = self.mode == Mode::Browse;
-        if sessions && !self.index_in_flight {
-            self.index_in_flight = true;
-            fx.push(Effect::RefreshIndex);
-        }
-        if !self.accounts.iter().any(|a| a.identity_pending) {
-            for a in &mut self.accounts {
-                a.identity_pending = true;
-            }
-            fx.push(Effect::Identities);
-        }
-        if !self.accounts.iter().any(|a| a.cached_pending) {
-            for a in &mut self.accounts {
-                a.cached_pending = true;
-            }
-            fx.push(Effect::CachedUsage);
-        }
         if sessions {
-            self.start_live(fx);
+            self.run(Work::Index, fx);
         }
-        if sessions && !self.attribution_in_flight {
-            self.attribution_in_flight = true;
-            fx.push(Effect::Attribution);
+        self.ask(Query::Identity, fx);
+        self.ask(Query::CachedUsage, fx);
+        if sessions {
+            self.run(Work::Live, fx);
+            self.run(Work::Attribution, fx);
         }
-        if !self.checks_in_flight {
-            self.checks_in_flight = true;
-            fx.push(Effect::Checks);
-        }
+        self.run(Work::Checks, fx);
         if self.stats.requested {
             self.request_stats(fx);
         }
@@ -924,42 +980,92 @@ impl App {
         self.reload_config(fx);
     }
 
+    /// Starts `work`, unless a round of it is out.
+    fn run(&mut self, work: Work, fx: &mut Vec<Effect>) {
+        if self.work.slot(work).start(()).is_some() {
+            fx.push(work.effect());
+        }
+    }
+
+    /// Runs `work` because what it reads has changed: now, or once more when the round that is
+    /// out reports, so that it sees the change.
+    fn rerun(&mut self, work: Work, fx: &mut Vec<Effect>) {
+        if self.work.slot(work).restart(()).is_some() {
+            fx.push(work.effect());
+        }
+    }
+
+    /// A round of `work` has reported. `false` when the work was asked for again since that
+    /// round began: what it found is from before, and the next round starts here.
+    fn ran(&mut self, work: Work, fx: &mut Vec<Effect>) -> bool {
+        match self.work.slot(work).settle(&()) {
+            Claim::Again(_) | Claim::Void(_) => {
+                fx.push(work.effect());
+                false
+            }
+            // No other round can be out: a result is taken as it comes.
+            Claim::Done | Claim::Stray => true,
+        }
+    }
+
+    /// Asks `query` of every account that is not being asked it already (`r`, `u`).
+    fn ask(&mut self, query: Query, fx: &mut Vec<Effect>) {
+        self.ask_with(query, Slot::start, fx);
+    }
+
+    /// Asks `query` of every account because the account list has changed; an account that is
+    /// being asked is asked once more when it answers.
+    fn ask_again(&mut self, query: Query, fx: &mut Vec<Effect>) {
+        self.ask_with(query, Slot::restart, fx);
+    }
+
+    fn ask_with(
+        &mut self,
+        query: Query,
+        begin: fn(&mut Slot, ()) -> Option<Round>,
+        fx: &mut Vec<Effect>,
+    ) {
+        let asked: Vec<Account> = self
+            .accounts
+            .iter_mut()
+            .filter_map(|a| begin(a.work.slot(query), ()).map(|_| a.account.clone()))
+            .collect();
+        if !asked.is_empty() {
+            fx.push(query.effect(asked));
+        }
+    }
+
+    /// `account` has answered `query`: its row, wherever the account list has moved it, for
+    /// the answer to be written there. `None`, and the answer is dropped, when the account is
+    /// no longer listed, and when its row is not being asked: an account removed and added
+    /// again has a new row, and the answer to what the old one was asked is not this row's.
+    /// An account asked again meanwhile is asked once more.
+    fn answered(
+        &mut self,
+        query: Query,
+        account: &Account,
+        fx: &mut Vec<Effect>,
+    ) -> Option<&mut AccountState> {
+        let row = self.accounts.iter_mut().find(|a| a.account == *account)?;
+        let claim = row.work.slot(query).settle(&());
+        if claim.next().is_some() {
+            fx.push(query.effect(vec![account.clone()]));
+        }
+        claim.counts().then_some(row)
+    }
+
     /// Computes the statistics, unless a computation is running: they are never computed twice
     /// at once (a cold one reads every transcript whole, R20).
     fn request_stats(&mut self, fx: &mut Vec<Effect>) {
         self.stats.requested = true;
-        if !self.stats.in_flight {
-            self.stats.in_flight = true;
-            fx.push(Effect::Stats);
-        }
-    }
-
-    fn start_live(&mut self, fx: &mut Vec<Effect>) {
-        if !self.live_in_flight {
-            self.live_in_flight = true;
-            fx.push(Effect::Live);
-        }
+        self.run(Work::Stats, fx);
     }
 
     /// After a launch: transcripts, running sessions and the launch log have changed. Work
     /// that is already running is repeated when it finishes, so it sees the change.
     fn refresh_sessions(&mut self, fx: &mut Vec<Effect>) {
-        if self.index_in_flight {
-            self.index_again = true;
-        } else {
-            self.index_in_flight = true;
-            fx.push(Effect::RefreshIndex);
-        }
-        if self.live_in_flight {
-            self.live_again = true;
-        } else {
-            self.start_live(fx);
-        }
-        if self.attribution_in_flight {
-            self.attribution_again = true;
-        } else {
-            self.attribution_in_flight = true;
-            fx.push(Effect::Attribution);
+        for work in [Work::Index, Work::Live, Work::Attribution] {
+            self.rerun(work, fx);
         }
         self.preview.loaded = None;
         self.preview.settled = 0;
@@ -968,10 +1074,10 @@ impl App {
     /// Opens `overlay`. A launch waiting for its check is cancelled, as with Esc: its answer
     /// must not act on (or behind) the overlay (C1).
     fn open(&mut self, overlay: Overlay) {
-        if let Some((_, request)) = self.pending.take() {
+        if let Some(request) = self.work.launch.cancel() {
             self.notify(Level::Info, format!("{} cancelled", request.what));
         }
-        self.form_check = None;
+        self.form_check = false;
         self.overlay = Some(overlay);
     }
 
@@ -1008,7 +1114,7 @@ impl App {
             text = text.text(" · ").text(w);
         }
         self.notify_after_child(level, text);
-        self.live_stale = true;
+        self.work.live.invalidate();
         self.refresh_sessions(fx);
     }
 
@@ -1025,7 +1131,7 @@ impl App {
     /// answer, still to come, no longer matches), and the live list (including a collection
     /// already running) no longer counts as current.
     fn foreground(&mut self, effect: Effect, fx: &mut Vec<Effect>) {
-        if let Some((_, request)) = self.pending.take() {
+        if let Some(request) = self.work.launch.cancel() {
             self.cancelled = Some(request.what);
         }
         // A codex resume confirmed after the child would rest on a prompt from before it.
@@ -1033,10 +1139,7 @@ impl App {
             self.cancelled = Some(confirm.request.what.clone());
             self.overlay = None;
         }
-        self.live_stale = true;
-        if self.live_in_flight {
-            self.live_again = true;
-        }
+        self.work.live.invalidate();
         fx.push(effect);
     }
 
@@ -1152,9 +1255,11 @@ impl App {
         self.config.account = Some(account.clone());
         self.config.loaded = None;
         self.config.scroll = 0;
-        self.config.loading = false;
         if account.provider == CLAUDE {
-            self.request_config(account, fx);
+            self.read_config(account, fx);
+        } else {
+            // Nothing is read for it; the read of the account shown before is for no one.
+            self.config.work.cancel();
         }
     }
 
@@ -1166,18 +1271,21 @@ impl App {
         if let Some(account) = self.config.account.clone()
             && account.provider == CLAUDE
         {
-            self.request_config(account, fx);
+            self.read_config(account, fx);
         }
     }
 
-    fn request_config(&mut self, account: Account, fx: &mut Vec<Effect>) {
-        self.config.request += 1;
-        self.config.loading = true;
-        fx.push(Effect::Config {
-            request: self.config.request,
-            account,
-            cwd: self.cwd.clone(),
-        });
+    /// Reads `account`'s configuration (R22). While a read of it is out no second one starts,
+    /// but that one may have read the files before this was asked: it is read once more when
+    /// it answers.
+    fn read_config(&mut self, account: Account, fx: &mut Vec<Effect>) {
+        if let Some(request) = self.config.work.restart(account.clone()) {
+            fx.push(Effect::Config {
+                request,
+                account,
+                cwd: self.cwd.clone(),
+            });
+        }
     }
 
     /// `p` in Accounts: open, expanded, closed (R22).
@@ -1193,10 +1301,12 @@ impl App {
         }
     }
 
-    /// The request number is kept: answers still to come stay dropped.
+    /// A read that is out is given up: its answer is for no pane. A pane opened again for
+    /// that account before it answers waits for it and reads once more, not twice at once.
     fn close_config(&mut self) {
+        self.config.work.cancel();
         self.config = ConfigPane {
-            request: self.config.request,
+            work: std::mem::take(&mut self.config.work),
             ..ConfigPane::default()
         };
     }
@@ -1277,8 +1387,8 @@ impl App {
             }
             Key::Char('r') => self.refresh(fx),
             Key::Char('u') => self.live_usage(fx),
-            Key::Esc if self.pending.is_some() => {
-                if let Some((_, request)) = self.pending.take() {
+            Key::Esc if self.work.launch.is_running() => {
+                if let Some(request) = self.work.launch.cancel() {
                     self.notify(Level::Info, format!("{} cancelled", request.what));
                 }
             }
@@ -1297,7 +1407,7 @@ impl App {
             Key::Esc
                 if self.view == View::Live && self.logs.is_some() && !self.preview.expanded =>
             {
-                self.logs = None;
+                self.close_logs();
             }
             Key::Char('t') if self.view == View::Stats => {
                 self.stats.period = self.stats.period.next();
@@ -1385,16 +1495,7 @@ impl App {
 
     /// `u`: live usage for every account that is not already being queried.
     fn live_usage(&mut self, fx: &mut Vec<Effect>) {
-        let mut idle = Vec::new();
-        for a in &mut self.accounts {
-            if !a.live_pending {
-                a.live_pending = true;
-                idle.push(a.account.clone());
-            }
-        }
-        if !idle.is_empty() {
-            fx.push(Effect::LiveUsage(idle));
-        }
+        self.ask(Query::LiveUsage, fx);
     }
 
     fn on_pick_mode_key(&mut self, key: Key, fx: &mut Vec<Effect>) {
@@ -1434,8 +1535,8 @@ impl App {
             Overlay::Form(form) => match key {
                 Key::Esc => {
                     self.overlay = None;
-                    self.pending = None;
-                    self.form_check = None;
+                    self.work.launch.cancel();
+                    self.form_check = false;
                 }
                 Key::Enter => self.submit(fx),
                 Key::Tab | Key::Down => form.focus = (form.focus + 1) % form.fields.len(),
@@ -1464,8 +1565,7 @@ impl App {
                         self.notify(Level::Error, text);
                     }
                     Key::Char('y') => {
-                        let check = self.next_check(&request);
-                        fx.push(Effect::CheckLaunch { check, request });
+                        self.check_launch(request, fx);
                     }
                     _ => self.notify(Level::Info, "cancelled"),
                 }
@@ -1528,28 +1628,25 @@ impl App {
             return;
         };
         let outcome = match &form.kind {
-            FormKind::NewSession { account } => {
-                self.new_session_request(form, account).map(|request| {
-                    let check = self.next_check(&request);
-                    Effect::CheckLaunch { check, request }
-                })
-            }
+            FormKind::NewSession { account } => match self.new_session_request(form, account) {
+                // The form stays up until the check answers.
+                Ok(request) => {
+                    self.check_launch(request, fx);
+                    self.form_check = true;
+                    return;
+                }
+                Err(e) => Err(e),
+            },
             FormKind::Setup => self.setup_effect(form),
         };
         match outcome {
-            Ok(effect @ Effect::Setup { .. }) => {
+            Ok(effect) => {
                 // The name is told when the setup ends, registered or not (R21).
                 if let Effect::Setup { provider, name, .. } = &effect {
                     self.aliases.note(&format!("{provider}:{name}"));
                 }
                 self.overlay = None;
                 self.foreground(effect, fx);
-            }
-            Ok(effect) => {
-                if let Effect::CheckLaunch { check, .. } = &effect {
-                    self.form_check = Some(*check);
-                }
-                fx.push(effect);
             }
             Err(e) => {
                 if let Some(Overlay::Form(form)) = &mut self.overlay {
@@ -1656,11 +1753,6 @@ impl App {
         })
     }
 
-    /// The row of `account`, wherever the account list has moved it.
-    fn row_mut(&mut self, account: &Account) -> Option<&mut AccountState> {
-        self.accounts.iter_mut().find(|a| a.account == *account)
-    }
-
     /// The registry changed: account rows are rebuilt (known accounts keep their state) and
     /// everything per account is read again. The same accounts again change nothing.
     fn set_accounts(&mut self, accounts: Vec<Account>, fx: &mut Vec<Effect>) {
@@ -1680,19 +1772,15 @@ impl App {
                     .unwrap_or_else(|| AccountState::new(account))
             })
             .collect();
-        for a in &mut self.accounts {
-            a.identity_pending = true;
-            a.cached_pending = true;
-        }
-        fx.push(Effect::Identities);
-        fx.push(Effect::CachedUsage);
-        if !self.checks_in_flight {
-            self.checks_in_flight = true;
-            fx.push(Effect::Checks);
-        }
+        self.ask_again(Query::Identity, fx);
+        self.ask_again(Query::CachedUsage, fx);
+        self.rerun(Work::Checks, fx);
         self.refresh_sessions(fx);
-        // Read again at the end of the update: a setup or a removal may have changed it.
+        // Read again at the end of the update: a setup or a removal may have changed it. A
+        // read that is out is from before: its answer is not shown, and no second read
+        // starts beside it; the account is read once more when it answers.
         self.config.account = None;
+        self.config.work.invalidate();
         self.clamp_lists();
     }
 
@@ -1759,10 +1847,19 @@ impl App {
             result: None,
         });
         self.preview.scroll = 0;
-        fx.push(Effect::Logs {
-            account,
-            short_id: short,
-        });
+        // While `claude logs` is out for this very session no second one starts; it runs once
+        // more when that one answers, which may have read the log before this was asked.
+        if self
+            .work
+            .logs
+            .restart((account.clone(), short.clone()))
+            .is_some()
+        {
+            fx.push(Effect::Logs {
+                account,
+                short_id: short,
+            });
+        }
     }
 
     /// `x` / `D`: asks before `claude stop|rm` (only background sessions; `rm` only once
@@ -2045,8 +2142,7 @@ impl App {
             cwd: Some(cwd),
         };
         if fork {
-            let check = self.next_check(&request);
-            fx.push(Effect::CheckLaunch { check, request });
+            self.check_launch(request, fx);
             return;
         }
         // The prompt says whether the rollout was written just now: the index's mtime until the
@@ -2144,22 +2240,24 @@ impl App {
             cwd: cwd.map(PathBuf::from),
             what: format!("{verb} {short} as {name}"),
         };
-        let check = self.next_check(&request);
-        fx.push(Effect::CheckLaunch { check, request });
+        self.check_launch(request, fx);
     }
 
-    /// Makes `request` the pending launch under a new check number, returned.
-    fn next_check(&mut self, request: &LaunchRequest) -> u64 {
-        self.launch_checks += 1;
-        self.pending = Some((self.launch_checks, request.clone()));
-        self.launch_checks
+    /// Makes `request` the pending launch and starts its check, unless a check of that very
+    /// launch is out. Pending already (a held `Enter`): that check is the one it waits for.
+    /// Cancelled and not yet answered: it is checked again when that one answers, which
+    /// itself starts nothing (R16).
+    fn check_launch(&mut self, request: LaunchRequest, fx: &mut Vec<Effect>) {
+        if let Some(check) = self.work.launch.start(request.clone()) {
+            fx.push(Effect::CheckLaunch { check, request });
+        }
     }
 
     /// Whether `session_id` may be resumed in place as far as the live list knows (R16).
     /// Not before that list is known, nor while it predates the last launch. The pre-launch
     /// check ([`Effect::CheckLaunch`]) asks every account again.
     fn running_check(&self, session_id: &str) -> Result<(), Busy> {
-        if !self.live_loaded || self.live_stale {
+        if !self.live_loaded || self.work.live.stale() {
             return Err(Busy::Loading);
         }
         match self
@@ -2287,7 +2385,7 @@ impl App {
             .live_updated
             .is_some_and(|t| now.duration_since(t) >= LIVE_EVERY)
         {
-            self.start_live(fx);
+            self.run(Work::Live, fx);
         }
         let Some(target) = self.preview.target.clone() else {
             return;
@@ -2297,19 +2395,21 @@ impl App {
             .loaded
             .as_ref()
             .is_some_and(|(p, _)| *p == target);
-        if loaded || self.preview.loading.as_ref() == Some(&target) {
+        if loaded || self.preview.work.running() == Some(&target) {
             return;
         }
         self.preview.settled = self.preview.settled.saturating_add(1);
-        if self.preview.settled >= PREVIEW_DEBOUNCE_TICKS {
-            self.preview.loading = Some(target.clone());
-            let provider = self
-                .index
-                .entries
-                .get(&target)
-                .map_or(CLAUDE, |e| e.provider);
-            fx.push(Effect::Preview(target, provider));
+        if self.preview.settled >= PREVIEW_DEBOUNCE_TICKS
+            && self.preview.work.start(target.clone()).is_some()
+        {
+            fx.push(self.preview_effect(target));
         }
+    }
+
+    /// The reading of the transcript at `path`, as its provider writes it.
+    fn preview_effect(&self, path: PathBuf) -> Effect {
+        let provider = self.index.entries.get(&path).map_or(CLAUDE, |e| e.provider);
+        Effect::Preview(path, provider)
     }
 
     /// Merges newly read entries into the index.
@@ -2370,7 +2470,7 @@ impl App {
         if self.logs.as_ref().map(|l| &l.key) != self.selected_live().map(LiveSession::key).as_ref()
             || self.view != View::Live
         {
-            self.logs = None;
+            self.close_logs();
         }
         let target = match self.view {
             View::History => self.selected_entry().map(|e| e.path.clone()),
@@ -2380,10 +2480,30 @@ impl App {
             View::Accounts | View::Stats => return,
         };
         if target != self.preview.target {
+            // A reading that is out is of the transcript left: for no one, unless the
+            // selection comes back before it answers. What is shown of that transcript is
+            // then from before that reading, and does not stand in for it: coming back
+            // reads.
+            if let Some(left) = self.preview.work.cancel()
+                && self
+                    .preview
+                    .loaded
+                    .as_ref()
+                    .is_some_and(|(p, _)| *p == left)
+            {
+                self.preview.loaded = None;
+            }
             self.preview.target = target;
             self.preview.settled = 0;
             self.preview.scroll = 0;
         }
+    }
+
+    /// The logs go; a run that is out is for no one, unless they are asked for again before
+    /// it answers.
+    fn close_logs(&mut self) {
+        self.logs = None;
+        self.work.logs.cancel();
     }
 }
 
@@ -2497,27 +2617,21 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             app.index.entries = entries.into_iter().map(|e| (e.path.clone(), e)).collect();
             app.index_loaded = true;
             app.indexing = None;
-            app.index_in_flight = false;
             app.index_refreshed = Some(app.now);
             app.index_error = error;
             app.reindex_sessions();
             app.rebuild_history();
-            if std::mem::take(&mut app.index_again) {
-                app.index_in_flight = true;
-                fx.push(Effect::RefreshIndex);
-            }
+            app.ran(Work::Index, &mut fx);
         }
         // A result for an account that is no longer listed is dropped.
         Event::Identity { account, identity } => {
-            if let Some(a) = app.row_mut(&account) {
+            if let Some(a) = app.answered(Query::Identity, &account, &mut fx) {
                 a.identity = Some(identity);
-                a.identity_pending = false;
             }
         }
         Event::CachedUsage { account, result } => {
-            if let Some(a) = app.row_mut(&account) {
+            if let Some(a) = app.answered(Query::CachedUsage, &account, &mut fx) {
                 a.cached = Some(result);
-                a.cached_pending = false;
             }
         }
         Event::LiveUsage {
@@ -2525,8 +2639,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             result,
             answered_at,
         } => {
-            if let Some(a) = app.row_mut(&account) {
-                a.live_pending = false;
+            if let Some(a) = app.answered(Query::LiveUsage, &account, &mut fx) {
                 a.live = Some(match result {
                     Ok(LiveResult { usage, identity }) => {
                         // Codex's live query also tells the email and plan (R10); a later
@@ -2550,16 +2663,12 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             let selected = app.selected_live().map(LiveSession::key);
             app.live = sessions;
             app.live_loaded = true;
-            app.live_in_flight = false;
             app.live_updated = Some(app.now);
             app.rebuild_live(selected);
             app.merge_attribution();
-            if std::mem::take(&mut app.live_again) {
-                // Started before something changed (e.g. a launch ended): not yet current.
-                app.start_live(&mut fx);
-            } else {
-                app.live_stale = false;
-            }
+            // Started before something changed (e.g. a launch ended): collected again, and
+            // stale until then if a foreground child has run.
+            app.ran(Work::Live, &mut fx);
         }
         Event::Attribution(base) => {
             // Names first seen here are numbered by name (R21).
@@ -2568,30 +2677,33 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 app.aliases.note(name);
             }
             app.attribution_base = base;
-            app.attribution_in_flight = false;
             app.merge_attribution();
             // Accounts are searched.
             if !app.history.query.is_empty() {
                 app.rebuild_history();
             }
-            if std::mem::take(&mut app.attribution_again) {
-                app.attribution_in_flight = true;
-                fx.push(Effect::Attribution);
-            }
+            app.ran(Work::Attribution, &mut fx);
         }
         Event::Checks(checks) => {
-            // A check may name an account that is not registered (`[share.claude] from`).
-            for name in checks.iter().filter_map(|c| c.account.as_deref()) {
-                app.aliases.note(name);
+            // Asked again since they started (the account list changed): these are the checks
+            // of the list as it was, and those that start now are the ones shown.
+            if app.ran(Work::Checks, &mut fx) {
+                // A check may name an account that is not registered (`[share.claude] from`).
+                for name in checks.iter().filter_map(|c| c.account.as_deref()) {
+                    app.aliases.note(name);
+                }
+                app.checks = Some(checks);
             }
-            app.checks = Some(checks);
-            app.checks_in_flight = false;
         }
+        // The reading waited for is that of the transcript wanted, and the only one out for it.
         Event::Preview { path, result } => {
-            if app.preview.loading.as_ref() == Some(&path) {
-                app.preview.loading = None;
+            let claim = app.preview.work.settle(&path);
+            // Left and wanted again before it answered: read once more. What this reading
+            // found is shown meanwhile.
+            if claim.next().is_some() {
+                fx.push(app.preview_effect(path.clone()));
             }
-            if app.preview.target.as_ref() == Some(&path) {
+            if claim.counts() && app.preview.target.as_ref() == Some(&path) {
                 app.preview.loaded = Some((path, result));
             }
         }
@@ -2600,7 +2712,23 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             account,
             result,
         } => {
-            if request == app.config.request && app.config.account.as_ref() == Some(&account) {
+            // The read waited for, by its number: the account shown.
+            let claim = app.config.work.claim(request, &account);
+            let shown = app.config.account.as_ref() == Some(&account);
+            // Asked again since this read began (`r`, the pane opened or the selection came
+            // back, the account list changed): what it read may be from before, so the
+            // account is read once more.
+            if let Some(request) = claim.next() {
+                fx.push(Effect::Config {
+                    request,
+                    account: account.clone(),
+                    cwd: app.cwd.clone(),
+                });
+            }
+            // What was read before the account list changed is void, and not shown: the read
+            // that has just started tells. That is this read's own mark, whichever other
+            // account was read and answered in between.
+            if claim.counts() && shown {
                 // The source may be a name not seen yet (R21).
                 if let Ok(view) = &result
                     && let Some(source) = view.role.source()
@@ -2608,7 +2736,6 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                     app.aliases.note(source);
                 }
                 app.config.loaded = Some(result.map(|view| *view));
-                app.config.loading = false;
                 app.clamp_lists();
             }
         }
@@ -2627,39 +2754,63 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             request,
             error,
         } => {
-            if app.pending.as_ref() == Some(&(check, request.clone())) {
-                app.pending = None;
-                // What the app has seen meanwhile counts too (R16).
-                let error = error.or_else(|| {
-                    let id = request.resumes()?;
-                    app.running_check(&id).err().map(|busy| busy.text().into())
-                });
-                // Only the form that started this check hears about it (C1).
-                let form = match &mut app.overlay {
-                    Some(Overlay::Form(form)) if app.form_check == Some(check) => Some(form),
-                    _ => None,
-                };
-                match (error, form) {
-                    (Some(e), Some(form)) => form.error = Some(e),
-                    (Some(e), None) => {
-                        let text = Marked::from(format!("{}: ", request.what)).join(&e);
-                        app.notify(Level::Error, text);
-                    }
-                    (None, form) => {
-                        if form.is_some() {
-                            app.overlay = None;
-                            app.form_check = None;
+            // Only the check waited for, by its number and for this very launch, starts it: one
+            // that was cancelled starts nothing, whatever it found (R16).
+            match app.work.launch.claim(check, &request) {
+                Claim::Stray => {}
+                // Cancelled, and the same launch asked for before it answered: what it found
+                // is from before that, so the launch is checked again.
+                Claim::Again(check) | Claim::Void(check) => {
+                    fx.push(Effect::CheckLaunch { check, request });
+                }
+                Claim::Done => {
+                    // What the app has seen meanwhile counts too (R16).
+                    let error = error.or_else(|| {
+                        let id = request.resumes()?;
+                        app.running_check(&id).err().map(|busy| busy.text().into())
+                    });
+                    // Only the form that submitted this launch hears about it (C1).
+                    let form = match &mut app.overlay {
+                        Some(Overlay::Form(form)) if app.form_check => Some(form),
+                        _ => None,
+                    };
+                    match (error, form) {
+                        (Some(e), Some(form)) => form.error = Some(e),
+                        (Some(e), None) => {
+                            let text = Marked::from(format!("{}: ", request.what)).join(&e);
+                            app.notify(Level::Error, text);
                         }
-                        app.foreground(Effect::Launch(request), &mut fx);
+                        (None, form) => {
+                            if form.is_some() {
+                                app.overlay = None;
+                            }
+                            app.foreground(Effect::Launch(request), &mut fx);
+                        }
                     }
+                    app.form_check = false;
                 }
             }
         }
-        Event::Logs { short_id, result } => {
-            if let Some(logs) = &mut app.logs
+        // The run waited for is that of the session shown: the session of that account, since
+        // two accounts may each have one of this short id. It is the only run out for it.
+        Event::Logs {
+            account,
+            short_id,
+            result,
+        } => {
+            let target = (account, short_id);
+            let claim = app.work.logs.settle(&target);
+            let (account, short_id) = target;
+            if claim.counts()
+                && let Some(logs) = &mut app.logs
+                && logs.key.0 == account.qualified()
                 && logs.short_id == short_id
             {
                 logs.result = Some(result);
+            }
+            // Asked for again since this run began: what it read may be from before.
+            if claim.next().is_some() {
+                fx.push(Effect::Logs { account, short_id });
             }
         }
         Event::ControlDone {
@@ -2685,11 +2836,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 ),
             };
             app.notify(level, text);
-            if app.live_in_flight {
-                app.live_again = true;
-            } else {
-                app.start_live(&mut fx);
-            }
+            app.rerun(Work::Live, &mut fx);
         }
         Event::StatsProgress { done, total } => app.stats.progress = Some((done, total)),
         Event::Stats { report, error } => {
@@ -2700,10 +2847,10 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             }
             app.stats.report = Some(report);
             app.stats.error = error;
-            app.stats.in_flight = false;
             app.stats.progress = None;
             app.stats.computed = Some(app.now);
             app.clamp_lists();
+            app.ran(Work::Stats, &mut fx);
         }
         Event::Accounts(accounts) => app.set_accounts(accounts, &mut fx),
         Event::AccountRemoved { account, result } => {
@@ -2737,11 +2884,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
         } => {
             app.on_setup_done(provider, &name, result, links);
             // Like after a launch: only a collection started now makes the live list current.
-            if app.live_in_flight {
-                app.live_again = true;
-            } else {
-                app.start_live(&mut fx);
-            }
+            app.rerun(Work::Live, &mut fx);
         }
         Event::Launched {
             request,

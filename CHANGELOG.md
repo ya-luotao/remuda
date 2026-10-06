@@ -50,6 +50,26 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Fixed
 
+- TUI: a held key no longer starts a thread or an agent command for every repeat. `Enter` or
+  `f` on a session checks that launch once (each check runs `claude agents --json` for every
+  account): the check already running is the one waited for, and a check that was cancelled
+  (Esc, an overlay, a foreground launch) still starts nothing when it answers; the same launch
+  asked for again meanwhile is checked again once it has (SPEC R16). `l`
+  runs one `claude logs` at a time, and `r` and `p` one read of the account's configuration:
+  asked again while one is out, they are read once more when it answers, so what changed
+  meanwhile is still shown (SPEC R22).
+- TUI: the logs of a background session could be shown for a session of another account with
+  the same short id, when the first answer arrived after the selection had moved. An answer
+  now goes to its own account's session only (SPEC R7).
+- TUI: after the selection moved away from a session and back while its logs or its preview
+  were still being read, the earlier reading could arrive last and replace the later one. A
+  session's logs, a transcript's preview and an account's configuration now have one read out
+  at a time: coming back waits for it and reads once more when it answers.
+- TUI: when the account list changed (a setup, a removal) while the checks of the accounts view
+  were running, the checks found for the old list stayed on screen as current. They now run
+  again for the new list, and only those are shown (SPEC R11). Identities and cached usage are
+  asked per account: `r` asks again the accounts that have answered while a slow one is still
+  out, and no account is asked twice at once.
 - `remuda add`, `setup` and `remove` run at the same time no longer lose each other's changes
   (eight concurrent `add`s could leave seven accounts, all exiting 0). The registry is read,
   checked and written under an exclusive lock on the directory of the file being replaced:
