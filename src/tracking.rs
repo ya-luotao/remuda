@@ -95,7 +95,8 @@ impl Found {
 /// and examines no entry itself), so that what a failure means is decided here (R8): a
 /// directory or an entry that does not exist is not there; a directory that exists but cannot
 /// be listed, or whose entries cannot be examined (it can be read but not searched), is
-/// recorded, and [`refresh`] keeps what the cache has below it.
+/// recorded, and [`refresh`] keeps what the cache has below it. A single file out of reach (a
+/// symlink whose target is) is left out like one that cannot be opened, and not recorded.
 #[derive(Debug, Default)]
 pub(crate) struct Listing {
     files: Vec<Listed>,
@@ -136,20 +137,24 @@ impl Listing {
     }
 
     /// Whether `entry` is a directory, following symlinks. `false` when that cannot be told,
-    /// which is recorded unless it is gone.
+    /// which is recorded unless it is gone: a symlink whose target is out of reach may be a
+    /// directory, and nothing is known of what is below it.
     pub(crate) fn is_dir(&mut self, entry: &Found) -> bool {
         match fs::metadata(&entry.path) {
             Ok(meta) => meta.is_dir(),
             Err(e) => {
-                self.unexamined(entry, &e);
+                if self.unexamined(entry, &e) {
+                    self.failed(&entry.path, &e);
+                }
                 false
             }
         }
     }
 
     /// Lists `entry` for `session_id` if it is a regular file, following symlinks. Anything
-    /// else is skipped, and so is an entry that cannot be examined, which is recorded unless
-    /// it is gone.
+    /// else is skipped, and so is an entry that cannot be examined: its directory is recorded
+    /// when that is why, while a symlink whose target alone is out of reach is one file that
+    /// cannot be read, left out like one that cannot be opened.
     pub(crate) fn file(&mut self, entry: &Found, session_id: String) {
         match fs::metadata(&entry.path) {
             Ok(meta) if meta.is_file() => self.push(Listed {
@@ -158,7 +163,9 @@ impl Listing {
                 stat: Stat::of(&meta),
             }),
             Ok(_) => {}
-            Err(e) => self.unexamined(entry, &e),
+            Err(e) => {
+                self.unexamined(entry, &e);
+            }
         }
     }
 
@@ -171,13 +178,26 @@ impl Listing {
         self.files
     }
 
-    /// `entry` was listed but cannot be examined. What a symlink points to may be out of
-    /// reach on its own; any other entry is out of reach because its directory is (it cannot
-    /// be searched): nothing is known about the files of that directory.
-    fn unexamined(&mut self, entry: &Found, error: &io::Error) {
-        match entry.path.parent() {
-            Some(dir) if !entry.kind.is_symlink() => self.failed(dir, error),
-            _ => self.failed(&entry.path, error),
+    /// `entry` was listed but cannot be examined, following symlinks. Either its directory
+    /// cannot be searched, so that nothing is known about the files of that directory, which
+    /// is recorded; or, returning `true`, `entry` is a symlink that is there and whose target
+    /// alone is out of reach (or gone), which is for the caller to judge.
+    fn unexamined(&mut self, entry: &Found, error: &io::Error) -> bool {
+        // The link itself can be examined exactly when its directory can be searched.
+        let link = entry
+            .kind
+            .is_symlink()
+            .then(|| fs::symlink_metadata(&entry.path));
+        match (link, entry.path.parent()) {
+            (Some(Ok(_)), _) | (_, None) => true,
+            (Some(Err(e)), Some(dir)) => {
+                self.failed(dir, &e);
+                false
+            }
+            (None, Some(dir)) => {
+                self.failed(dir, error);
+                false
+            }
         }
     }
 
@@ -377,15 +397,16 @@ pub(crate) fn refresh<D: Sync, F: Files<D>>(
     }
     // A file not listed vanished, unless it is below a directory that could not be read and
     // was a file of the directory given that this one was met listing: nothing is known about
-    // that one. A failure says nothing for the files of a directory no longer given.
+    // that one. A failure says nothing for the files of a directory no longer given, and none
+    // for a file at the very path that failed: what the cache holds there was a file, not a
+    // directory with files below it.
     cache.retain(|path, item| {
         if seen.contains(path) {
             return true;
         }
-        match unreadable
-            .iter_mut()
-            .find(|(dir, u)| path.starts_with(&u.path) && F::listed_under(item, &dirs[*dir]))
-        {
+        match unreadable.iter_mut().find(|(dir, u)| {
+            path != &u.path && path.starts_with(&u.path) && F::listed_under(item, &dirs[*dir])
+        }) {
             Some((_, unreadable)) => {
                 unreadable.kept += 1;
                 true
@@ -1182,27 +1203,108 @@ mod tests {
         assert!(s.unreadable.is_empty());
     }
 
+    /// R8: a symlink whose target is out of reach is one file that cannot be read when it is
+    /// listed as a file: what the cache has of it is dropped, and nothing is reported. A
+    /// directory that cannot be searched keeps its files also when they all are symlinks.
+    #[test]
+    fn a_symlinked_file_out_of_reach_is_dropped_not_kept() {
+        let (tmp, a) = sandbox();
+        let root = tmp.path().canonicalize().unwrap();
+        let (away, links) = (root.join("away"), a.join("links"));
+        fs::create_dir(&away).unwrap();
+        fs::create_dir(&links).unwrap();
+        for target in ["t0", "t1", "t2"] {
+            write(&away.join(target), "x\n");
+        }
+        let symlink = |target: &str, link: &Path| {
+            std::os::unix::fs::symlink(away.join(target), link).unwrap();
+        };
+        let (f, link) = (a.join("f"), a.join("link"));
+        write(&f, "x\n");
+        symlink("t0", &link);
+        symlink("t1", &links.join("l1"));
+        symlink("t2", &links.join("l2"));
+        let dirs = [Dir::walking(&a)];
+        let mut cache = Cache::new();
+        let s = run(&mut cache, &dirs);
+        assert_eq!((counts(&s), s.files), ((0, 0, 4, 0), 4));
+        let before = cache.clone();
+
+        // The targets are out of reach, each link is there: single files, all dropped.
+        chmod(&away, 0o000);
+        let s = run(&mut cache, &dirs);
+        chmod(&away, 0o755);
+        assert_eq!((counts(&s), s.files, s.kept()), ((1, 0, 0, 3), 1, 0));
+        assert!(s.unreadable.is_empty(), "{:?}", s.unreadable);
+        assert_eq!(cache.keys().collect::<Vec<_>>(), [&f]);
+
+        // The directory holding links cannot be searched: nothing is known of them. They are
+        // kept, the directory is reported, and the link beside it is as usual.
+        let mut cache = before.clone();
+        chmod(&links, 0o444);
+        let s = run(&mut cache, &dirs);
+        chmod(&links, 0o755);
+        assert_eq!((counts(&s), s.files, s.kept()), ((2, 0, 0, 0), 4, 2));
+        assert_eq!(s.unreadable.len(), 1, "{:?}", s.unreadable);
+        assert_eq!(s.unreadable[0].path, links);
+        assert_eq!(cache, before);
+    }
+
+    /// R8: what is kept is what lies below the directory that could not be read. A cached
+    /// file at the very path that failed was a file, not a directory: it is dropped.
+    #[test]
+    fn a_file_at_the_path_that_cannot_be_read_is_not_kept() {
+        let (_tmp, a) = sandbox();
+        let sub = a.join("sub");
+        fs::create_dir(&sub).unwrap();
+        let (f, deep) = (a.join("f"), sub.join("deep"));
+        write(&f, "x\n");
+        write(&deep, "x\n");
+        let mut cache = Cache::new();
+        run(&mut cache, &[Dir::of(&a, &[&f, &deep])]);
+
+        let denied = io::ErrorKind::PermissionDenied;
+        let dirs = [Dir::of(&a, &[]).failing(&f, denied).failing(&sub, denied)];
+        let s = run(&mut cache, &dirs);
+        assert_eq!((counts(&s), s.files, s.kept()), ((0, 0, 0, 1), 1, 1));
+        let kept: Vec<(&Path, usize)> = s
+            .unreadable
+            .iter()
+            .map(|u| (u.path.as_path(), u.kept))
+            .collect();
+        assert_eq!(kept, [(f.as_path(), 0), (sub.as_path(), 1)]);
+        assert_eq!(cache.keys().collect::<Vec<_>>(), [&deep]);
+    }
+
     /// R8: listing tells what is gone from what cannot be read: a directory that cannot be
-    /// listed, one whose entries cannot be examined, a symlink to somewhere out of reach.
+    /// listed, one whose entries cannot be examined, a symlink to somewhere out of reach
+    /// (asked as a directory: recorded; listed as a file: one file left out).
     #[test]
     fn a_listing_records_what_it_cannot_read() {
         let (_tmp, a) = sandbox();
-        let (file, dir, locked, searchless) = (
+        let (file, dir, locked, searchless, linksonly) = (
             a.join("file"),
             a.join("dir"),
             a.join("locked"),
             a.join("searchless"),
+            a.join("linksonly"),
         );
         write(&file, "x\n");
         write(&a.join("soon gone"), "x\n");
-        for d in [&dir, &locked, &searchless] {
+        for d in [&dir, &locked, &searchless, &linksonly] {
             fs::create_dir(d).unwrap();
         }
+        fs::create_dir(locked.join("inner")).unwrap();
         write(&locked.join("inside"), "x\n");
         write(&searchless.join("one"), "x\n");
         write(&searchless.join("two"), "x\n");
-        std::os::unix::fs::symlink(locked.join("inside"), a.join("link")).unwrap();
-        std::os::unix::fs::symlink(a.join("nowhere"), a.join("dangling")).unwrap();
+        let symlink = |target: &Path, link: &Path| {
+            std::os::unix::fs::symlink(target, link).unwrap();
+        };
+        symlink(&locked.join("inside"), &a.join("link"));
+        symlink(&locked.join("inner"), &a.join("dirlink"));
+        symlink(&a.join("nowhere"), &a.join("dangling"));
+        symlink(&file, &linksonly.join("l"));
 
         let mut listing = Listing::default();
         let found = listing.read_dir(&a);
@@ -1212,10 +1314,11 @@ mod tests {
                 .find(|e| e.name() == Some(name))
                 .unwrap_or_else(|| panic!("no {name}"))
         };
-        assert_eq!(found.len(), 7);
+        assert_eq!(found.len(), 9);
         assert_eq!(entry("file").path(), file);
-        assert!(entry("dir").is_dir() && !entry("file").is_dir() && !entry("link").is_dir());
+        assert!(entry("dir").is_dir() && !entry("file").is_dir() && !entry("dirlink").is_dir());
         assert!(listing.is_dir(entry("dir")) && !listing.is_dir(entry("file")));
+        assert!(listing.is_dir(entry("dirlink")), "a symlink is followed");
         assert!(listing.read_dir(&a.join("missing")).is_empty());
         assert!(listing.read_dir(&file).is_empty(), "not a directory");
         // Gone since it was listed, or leading nowhere: not there.
@@ -1229,16 +1332,28 @@ mod tests {
 
         chmod(&locked, 0o000);
         chmod(&searchless, 0o444);
+        chmod(&linksonly, 0o444);
         assert!(listing.read_dir(&locked).is_empty());
-        // Its target is out of reach: the link alone, not the directory it is in.
+        // Its target is out of reach, the link is there. Listed as a file, it is one file
+        // that cannot be read: left out, and nothing recorded.
         listing.file(entry("link"), "link".into());
+        assert_eq!(listing.unreadable.len(), 1, "{:?}", listing.unreadable);
+        // Asked as a directory, nothing is known of what is below it: the link, not the
+        // directory it is in.
+        assert!(!listing.is_dir(entry("dirlink")));
         // Listed, but nothing in it can be examined: the directory, once.
         for inside in listing.read_dir(&searchless) {
             assert!(!listing.is_dir(&inside));
             listing.file(&inside, "inside".into());
         }
-        chmod(&locked, 0o755);
-        chmod(&searchless, 0o755);
+        // The same where what cannot be examined is a link: it is its directory that cannot
+        // be searched, not its target that is out of reach.
+        for inside in listing.read_dir(&linksonly) {
+            listing.file(&inside, "inside".into());
+        }
+        for d in [&locked, &searchless, &linksonly] {
+            chmod(d, 0o755);
+        }
         let unreadable: Vec<&Path> = listing
             .unreadable
             .iter()
@@ -1246,7 +1361,12 @@ mod tests {
             .collect();
         assert_eq!(
             unreadable,
-            [locked.as_path(), &a.join("link"), searchless.as_path()]
+            [
+                locked.as_path(),
+                &a.join("dirlink"),
+                searchless.as_path(),
+                linksonly.as_path()
+            ]
         );
         assert!(
             listing

@@ -762,6 +762,60 @@ fn a_file_rewritten_with_an_earlier_mtime_before_it_is_opened_is_rescanned_cold(
     assert_eq!((s.reused, s.bytes_read), (1, 0), "cached as it was opened");
 }
 
+/// R8: a transcript that is a symlink to somewhere out of reach is a single transcript that
+/// cannot be read: it is left out, like one that cannot be opened, and is no directory that
+/// keeps what the index has. A project directory that is such a symlink is a directory that
+/// cannot be read: its entries stay, and it is reported.
+#[test]
+fn a_symlinked_transcript_out_of_reach_drops_out_and_a_symlinked_project_keeps_its_entries() {
+    let c = Corpus::new();
+    let store = c.store().path;
+    let away = c.tmp.path().canonicalize().unwrap().join("away");
+    fs::create_dir_all(away.join("project")).unwrap();
+    fs::write(away.join("linked.jsonl"), user("linked", "/w/l", &ts(1))).unwrap();
+    fs::write(
+        away.join("project/p.jsonl"),
+        user("in project", "/w/p", &ts(2)),
+    )
+    .unwrap();
+    let linked = store.join("-w-a/linked.jsonl");
+    let project = store.join("-w-linked");
+    symlink(away.join("linked.jsonl"), &linked).unwrap();
+    symlink(away.join("project"), &project).unwrap();
+    c.write("a", &user("a", "/w/a", &ts(3)));
+    let mut index = Index::default();
+    let s = c.refresh(&mut index);
+    assert_eq!((s.files, s.cold), (3, 3));
+    let in_project = entry(&index, &project.join("p.jsonl"));
+
+    chmod(&away, 0o000);
+    let s = c.refresh(&mut index);
+    chmod(&away, 0o755);
+    assert_eq!(
+        (s.files, s.removed, s.reused, s.kept()),
+        (2, 1, 1, 1),
+        "{:?}",
+        s.unreadable
+    );
+    assert!(!index.entries.contains_key(&linked));
+    assert_eq!(entry(&index, &project.join("p.jsonl")), in_project);
+    let unreadable: Vec<(&Path, usize)> = s
+        .unreadable
+        .iter()
+        .map(|u| (u.path.as_path(), u.kept))
+        .collect();
+    assert_eq!(unreadable, [(project.as_path(), 1)]);
+
+    // In reach again: the transcript is indexed again, the project's is not read again.
+    let s = c.refresh(&mut index);
+    assert_eq!((s.files, s.cold, s.reused), (3, 1, 2));
+    assert!(s.unreadable.is_empty());
+    assert_eq!(
+        entry(&index, &linked).first_user_text.as_deref(),
+        Some("linked")
+    );
+}
+
 #[test]
 fn sorted_is_newest_first() {
     let c = Corpus::new();

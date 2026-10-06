@@ -1328,6 +1328,49 @@ fn a_cached_file_that_can_no_longer_be_read_leaves_the_saved_cache() {
     }
 }
 
+/// R20, R8: a transcript that is a symlink to somewhere out of reach is a single transcript
+/// that cannot be read. It stops counting, like one that cannot be opened; it is no directory
+/// whose counts stay, and the refresh is not incomplete for it.
+#[test]
+fn a_symlinked_transcript_out_of_reach_stops_counting() {
+    let mut f = Fixture::new();
+    f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+    let away = f.root.join("away");
+    let target = write_file(
+        &away.join("b.jsonl"),
+        &cl::assistant_usage(
+            S_B,
+            "msg_b1",
+            "claude-test",
+            cl::usage(7, 7, 0, 0),
+            &cl::ts(5),
+        ),
+    );
+    let linked = f.projects().join(format!("-w-proj/{S_B}.jsonl"));
+    symlink(&target, &linked).unwrap();
+    let both = toks(10, 300, 100, 47, 0);
+    assert_eq!(of(&f.all().overall, "claude-test"), both);
+    assert!(f.cache.files.contains_key(&linked));
+
+    chmod(&away, 0o000);
+    let s = f.refresh();
+    chmod(&away, 0o755);
+    assert_eq!(
+        (s.files, s.removed, s.reused, s.kept()),
+        (1, 1, 1, 0),
+        "{:?}",
+        s.unreadable
+    );
+    assert!(s.unreadable.is_empty(), "{:?}", s.unreadable);
+    assert_eq!(s.incomplete(), None);
+    assert!(!f.cache.files.contains_key(&linked));
+    let table = f.report().table(Period::All).clone();
+    assert_eq!(of(&table.overall, "claude-test"), toks(3, 300, 100, 40, 0));
+
+    // In reach again: it counts again.
+    assert_eq!(of(&f.all().overall, "claude-test"), both);
+}
+
 /// The row of `model` in the cache entry of `path`, as the cache stores it.
 fn cached_row(f: &Fixture, path: &Path, model: &str) -> Vec<Value> {
     let file = serde_json::to_value(&f.cache.files[path]).unwrap();

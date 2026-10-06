@@ -377,7 +377,10 @@ remuda help [<command>]                            help for remuda or a command
     status line. Nothing is read again once the directory can be read and its transcripts have
     not changed. The entries of a store that is no longer listed drop out all the same, also
     where they lie below a directory another store cannot read. A single transcript that cannot
-    be opened or read is left out, as before.
+    be opened or read is left out, as before; so is one that is a symlink to somewhere out of
+    reach, which is one transcript and not a directory (the entry the index had for it drops
+    out, and nothing is reported), while a project directory that is such a symlink is a
+    directory that cannot be read.
 - Cache: `$REMUDA_HOME/state/index.json`, with a schema version; on a version mismatch it is
   rebuilt. Written atomically; may be deleted at any time (R3).
 - The index is built in the background: the UI does not wait for it and shows progress and the rows
