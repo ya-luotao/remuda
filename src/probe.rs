@@ -165,20 +165,37 @@ fn run(
             // What the command wrote is what was written by now, to either pipe: that
             // much is taken, as soon as it was read. A process the command left behind is
             // not waited for, whether it holds the pipes open in silence or goes on writing.
-            // (The deadline bounds only how far behind the reading may be.)
+            // (The deadline, one for both pipes, bounds only how far behind the reading
+            // may be.)
             let (out, err) = (stdout.mark(), run.stderr.mark());
             let until = run.deadline.max(Instant::now() + GRACE);
-            let outcome = Outcome::Exited {
-                code: status.code(),
-                stdout: stdout.text_to(out, until),
-                stderr: run.stderr.text_to(err, until),
-            };
-            run.leave();
+            let outcome = exited(
+                status,
+                stdout.text_to(out, until),
+                run.stderr.text_to(err, until),
+            );
+            if outcome != Outcome::TimedOut {
+                run.leave();
+            }
             outcome
         }
         // Dropping the run terminates its process group.
         Ok(None) => Outcome::TimedOut,
         Err(e) => Outcome::SpawnFailed(e.to_string()),
+    }
+}
+
+/// What a command that exited with `status` comes to, given what could be read of each of its
+/// streams in time. Output of which a part is missing is not the command's answer, and is not
+/// handed on as one: the run then counts as timed out, as it would have before it exited.
+fn exited(status: ExitStatus, stdout: Option<String>, stderr: Option<String>) -> Outcome {
+    match (stdout, stderr) {
+        (Some(stdout), Some(stderr)) => Outcome::Exited {
+            code: status.code(),
+            stdout,
+            stderr,
+        },
+        _ => Outcome::TimedOut,
     }
 }
 
@@ -453,26 +470,33 @@ impl Capture {
     }
 
     /// The first `mark` bytes that were not taken yet, as text, once the thread has read that
-    /// far: no wait when it has, and none for anything written after the mark. Fewer when the
-    /// pipe gave fewer (it cannot be read), or at `until`, with what was read by then.
-    fn text_to(&self, mark: usize, until: Instant) -> String {
+    /// far: no wait when it has, and none for anything written after the mark. `None` when it
+    /// has not read that far by `until`, or cannot: nothing is taken then, since a part of
+    /// what was written is not what was written.
+    fn text_to(&self, mark: usize, until: Instant) -> Option<String> {
         loop {
             let ended = !matches!(self.ended.try_recv(), Err(mpsc::TryRecvError::Empty));
             let mut read = self.read.lock().unwrap_or_else(|e| e.into_inner());
-            if read.len() >= mark || ended || Instant::now() >= until {
-                let taken = mark.min(read.len());
-                return String::from_utf8_lossy(&read.drain(..taken).collect::<Vec<u8>>())
-                    .into_owned();
+            if read.len() >= mark {
+                let taken: Vec<u8> = read.drain(..mark).collect();
+                return Some(String::from_utf8_lossy(&taken).into_owned());
+            }
+            if ended || Instant::now() >= until {
+                return None;
             }
             drop(read);
             thread::sleep(POLL);
         }
     }
 
-    /// Everything written to the pipe so far, as text ([`Capture::mark`], then
-    /// [`Capture::text_to`]).
+    /// Everything written to the pipe so far, as text, or as much of it as was read by
+    /// `until`: for a line to say why a process went away, where a part is better than
+    /// nothing.
     fn text_by(&self, until: Instant) -> String {
-        self.text_to(self.mark(), until)
+        self.text_to(self.mark(), until).unwrap_or_else(|| {
+            let mut read = self.read.lock().unwrap_or_else(|e| e.into_inner());
+            String::from_utf8_lossy(&std::mem::take(&mut *read)).into_owned()
+        })
     }
 
     /// How many bytes wait in the pipe; 0 when that cannot be told.
@@ -779,11 +803,55 @@ mod tests {
         // The writer is not left blocked on a full pipe: what nobody takes is still read.
         drop(capture);
         noise.join().unwrap();
-        assert_eq!(text, "answer\n");
-        assert_eq!(later, "noise\n");
+        assert_eq!(text.as_deref(), Some("answer\n"));
+        assert_eq!(later.as_deref(), Some("noise\n"));
         assert!(
             took < Duration::from_secs(10),
             "took {took:?}: waited for the writer"
+        );
+    }
+
+    /// R4 (GitHub review round 3): what a command wrote and was not all read by the deadline
+    /// is not handed on as its output, cut short: there is none, nothing is taken, and the
+    /// run counts as timed out. (One byte more than was written stands for the bytes a
+    /// reading thread that is behind has not come to: it never reads that far.)
+    #[test]
+    fn output_that_was_not_all_read_in_time_is_no_output() {
+        let (reader, mut writer) = io::pipe().unwrap();
+        let capture = Capture::of(Some(OwnedFd::from(reader)));
+        writer.write_all(b"half an ans").unwrap();
+        let mark = capture.mark() + 1;
+        assert_eq!(capture.text_to(mark, Instant::now() + GRACE), None);
+        // The same when the pipe ends short of the mark: it cannot be read that far.
+        let (short, ends) = io::pipe().unwrap();
+        let ended = Capture::of(Some(OwnedFd::from(short)));
+        drop(ends);
+        assert_eq!(
+            ended.text_to(1, Instant::now() + Duration::from_secs(60)),
+            None
+        );
+        // Nothing was taken: when the rest has been read, all of it is there.
+        writer.write_all(b"w").unwrap();
+        assert_eq!(
+            capture
+                .text_to(mark, Instant::now() + Duration::from_secs(60))
+                .as_deref(),
+            Some("half an answ")
+        );
+        // A run of which either stream is cut short has timed out, whatever its exit status;
+        // one that has both is the command's exit.
+        use std::os::unix::process::ExitStatusExt;
+        let status = ExitStatus::from_raw(0);
+        let whole = || Some("whole".to_string());
+        assert_eq!(exited(status, None, whole()), Outcome::TimedOut);
+        assert_eq!(exited(status, whole(), None), Outcome::TimedOut);
+        assert_eq!(
+            exited(status, whole(), Some(String::new())),
+            Outcome::Exited {
+                code: Some(0),
+                stdout: "whole".into(),
+                stderr: String::new()
+            }
         );
     }
 

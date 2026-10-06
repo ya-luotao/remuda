@@ -228,7 +228,9 @@ the UI, not reported as an error:
   Once the command has exited, remuda takes what was printed by then, as soon as it has all
   of it and without waiting for a process the command left holding its output open, whether
   that process is silent or goes on printing, and leaves the process running: what an agent
-  starts on the side (an update, say) is the agent's business.
+  starts on the side (an update, say) is the agent's business. If not all of it could be read
+  by the command's timeout (remuda itself was behind), the command counts as timed out: a part
+  of an answer is never taken for the answer.
   On a timeout the whole group is terminated. (`codex app-server` serves until it is told to stop:
   its group is terminated once it has answered as well.) Such a group is not the terminal's
   foreground group, and two things follow:
