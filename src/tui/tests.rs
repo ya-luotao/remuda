@@ -2574,6 +2574,8 @@ fn populated_accounts() -> App {
             result: Err("no /h/team/.claude.json".into()),
         },
     );
+    // max alone is asked for its live usage.
+    app.accounts[1].work.live.start(());
     update(
         &mut app,
         Event::LiveUsage {
@@ -2949,6 +2951,8 @@ fn tiny_terminal_does_not_panic() {
 #[test]
 fn accounts_table_stays_compact_on_a_wide_terminal() {
     let mut app = populated_accounts();
+    // The cache is read again.
+    app.accounts[0].work.cached.start(());
     update(
         &mut app,
         Event::CachedUsage {
@@ -3161,7 +3165,8 @@ fn codex_accounts_show_identity_and_usage() {
     let mut app = codex_app();
     // Wide enough for the timeline's legend.
     update(&mut app, Event::Resize(160, 30));
-    keys(&mut app, &[Key::Char('1')]);
+    // `r`: identities and cached usage are asked again.
+    keys(&mut app, &[Key::Char('1'), Key::Char('r')]);
     let method = Identity::LoggedIn {
         email: None,
         org: None,
@@ -3266,6 +3271,7 @@ fn codex_accounts_show_identity_and_usage() {
     assert_eq!(all.matches(&format!("g week ({spark})")).count(), 1);
 
     // A later identity refresh (`codex login status`) shows the login method again.
+    keys(&mut app, &[Key::Char('r')]);
     update(
         &mut app,
         Event::Identity {
@@ -6850,6 +6856,58 @@ fn a_new_account_list_asks_an_account_again_only_once_it_has_answered() {
         [Effect::Identities(vec![account("max")])]
     );
     assert_eq!(update(&mut app, answer), []);
+}
+
+/// R10, R10a: an account removed while it is being asked, and added again, has a new row that
+/// is asked anew while the queries of the old row are still out. The row takes the answers to
+/// its own queries; those of the old row's, arriving afterwards, are not written over them.
+/// Identity, cached usage and live usage alike.
+#[test]
+fn an_answer_to_a_removed_rows_query_is_not_written_into_the_row_added_again() {
+    let u = [Key::Char('u')];
+    let mut app = app();
+    app.start();
+    keys(&mut app, &u);
+    update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("team")]),
+    );
+    let fx = update(&mut app, Event::Accounts(everyone()));
+    let max = vec![account("max")];
+    assert!(fx.contains(&Effect::Identities(max.clone())), "{fx:?}");
+    assert!(fx.contains(&Effect::CachedUsage(max.clone())), "{fx:?}");
+    assert_eq!(keys(&mut app, &u), [Effect::LiveUsage(max)]);
+    let answers = |identity: Identity, percent: f64| {
+        let rows = || vec![row("Session", percent, None, None)];
+        [
+            Event::Identity {
+                account: account("max"),
+                identity,
+            },
+            Event::CachedUsage {
+                account: account("max"),
+                result: cached(rows()),
+            },
+            Event::LiveUsage {
+                account: account("max"),
+                result: Ok(LiveUsage::Rows(rows()).into()),
+            },
+        ]
+    };
+    // The answers to what the new row was asked.
+    for answer in answers(logged_in("max@example.com"), 10.0) {
+        assert_eq!(update(&mut app, answer), []);
+    }
+    assert_eq!(app.accounts[1].account, account("max"));
+    assert_eq!(app.accounts[1].identity, Some(logged_in("max@example.com")));
+    assert_eq!(app.accounts[1].rows()[0].percent, 10.0);
+    assert!(app.accounts[1].live.is_some() && app.accounts[1].cached.is_some());
+    // Those to what the removed row was asked.
+    let before = app.accounts.clone();
+    for answer in answers(Identity::NotLoggedIn, 99.0) {
+        assert_eq!(update(&mut app, answer), []);
+    }
+    assert_eq!(app.accounts, before);
 }
 
 /// R11: when the account list changes while the checks run, they run again once they answer,

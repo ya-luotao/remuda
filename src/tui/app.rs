@@ -1012,9 +1012,11 @@ impl App {
         }
     }
 
-    /// `account` has answered `query`: its row, wherever the account list has moved it, and
-    /// `None` when it is no longer listed (the answer is dropped). An account asked again
-    /// meanwhile is asked once more.
+    /// `account` has answered `query`: its row, wherever the account list has moved it, for
+    /// the answer to be written there. `None`, and the answer is dropped, when the account is
+    /// no longer listed, and when its row is not being asked: an account removed and added
+    /// again has a new row, and the answer to what the old one was asked is not this row's.
+    /// An account asked again meanwhile is asked once more.
     fn answered(
         &mut self,
         query: Query,
@@ -1022,10 +1024,11 @@ impl App {
         fx: &mut Vec<Effect>,
     ) -> Option<&mut AccountState> {
         let row = self.accounts.iter_mut().find(|a| a.account == *account)?;
-        if row.work.slot(query).settle(&()).next().is_some() {
+        let claim = row.work.slot(query).settle(&());
+        if claim.next().is_some() {
             fx.push(query.effect(vec![account.clone()]));
         }
-        Some(row)
+        claim.counts().then_some(row)
     }
 
     /// Computes the statistics, unless a computation is running: they are never computed twice
