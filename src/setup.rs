@@ -17,42 +17,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::home_items::{self, Id, Membership, SetupLink, Source, Unlinked};
 use crate::provider::Provider;
 use crate::registry::{self, Account, Home, Registry};
-use crate::{Env, paths, share};
-
-/// The items of the source's home that a new member's home links to (R18), in this order: the
-/// session store and its file backups, then the configuration. An item the source does not
-/// have gets no link.
-pub const LINKS: [&str; 13] = [
-    "projects",
-    "file-history",
-    "settings.json",
-    "CLAUDE.md",
-    "skills",
-    "commands",
-    "agents",
-    "hooks",
-    "plugins",
-    "rules",
-    "agent-memory",
-    "output-styles",
-    "keybindings.json",
-];
-
-/// Never linked, whatever the source has (R18): the login's identity and caches, attribution
-/// (R9), running sessions (R7), and what an organization sets for its accounts. Nothing else
-/// outside [`LINKS`] is linked either; these are the ones that break an account when shared.
-pub const NEVER_LINKED: [&str; 5] = [
-    ".claude.json",
-    "history.jsonl",
-    "sessions",
-    "remote-settings.json",
-    "policy-limits.json",
-];
+use crate::{Env, paths};
 
 /// The source's settings file: linked only when it holds no authentication (R18).
-const SETTINGS: &str = "settings.json";
+const SETTINGS: &str = Id::Settings.name();
 
 /// A checked setup: the account to create and what its home is linked to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,7 +46,7 @@ pub struct Share {
     pub from: Option<PathBuf>,
 }
 
-/// What [`share_links`] did, each list in [`LINKS`] order.
+/// What [`share_links`] did, each list in the order of [`Source::setup_links`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Linked {
     pub linked: Vec<&'static str>,
@@ -85,16 +56,6 @@ pub struct Linked {
     pub failed: Vec<(&'static str, String)>,
     /// Why `settings.json` got no link although the source has one.
     pub settings: Option<Unlinked>,
-}
-
-/// Why the source's `settings.json` is not linked (R18): a member that links it reads all of
-/// it, and authentication stays per account.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Unlinked {
-    /// It sets these authentication settings (`key` / `env.NAME`, [`share::withheld`]).
-    Authentication(Vec<String>),
-    /// It cannot be read as a JSON object, so it cannot be checked.
-    Unreadable,
 }
 
 /// One line for the user about the links of a new home.
@@ -127,15 +88,15 @@ pub fn plan(config: &Path, provider: Provider, name: &str, env: &Env) -> Result<
     }
     // A new account has no `share = false` and is not the source: a claude one is a member
     // whenever `[share.claude]` is set.
-    let share = Registry::load(config)?
-        .sharing
-        .source_for(&account)
-        .map(|source| Share {
-            source: source.qualified(),
-            from: source
-                .home_dir(env)
-                .filter(|from| from.is_absolute() && from.is_dir()),
-        });
+    let sharing = Registry::load(config)?.sharing;
+    let share = match home_items::membership(&sharing, &account, env) {
+        Membership::Member { source, home } => Some(Share {
+            source,
+            from: Some(home.home().to_path_buf()).filter(|from| from.is_absolute()),
+        }),
+        Membership::SourceMissing { source } => Some(Share { source, from: None }),
+        Membership::Alone | Membership::Source | Membership::OptedOut { .. } => None,
+    };
     Ok(Plan {
         root,
         account,
@@ -196,14 +157,14 @@ pub fn create_and_register(config: &Path, plan: &Plan) -> Result<Option<Linked>>
     Ok(linked)
 }
 
-/// Links each item of [`LINKS`] that `source` has into `home`, the directory [`create_home`]
-/// has just made (R12, R13, R18): `<home>/<item>` pointing at `<source>/<item>`, written from
-/// `source` as given, not canonicalized. The links are made through the home's descriptor,
-/// not its path. Checked again first, through the same descriptor: the directory must be
-/// empty, or nothing is linked and that is the error. `settings.json` is left out when the
-/// source's sets authentication or cannot be read ([`Unlinked`]). A link that cannot be made
-/// is listed and the others are still made. Nothing is replaced (`symlinkat` fails where a
-/// name exists) and nothing is removed.
+/// Links each item `setup` links ([`Source::setup_links`]) that `source` has into
+/// `home`, the directory [`create_home`] has just made (R12, R13, R18): `<home>/<item>`
+/// pointing at `<source>/<item>`, written from `source` as given, not canonicalized. The
+/// links are made through the home's descriptor, not its path. Checked again first, through
+/// the same descriptor: the directory must be empty, or nothing is linked and that is the
+/// error. `settings.json` is left out when the source's sets authentication or cannot be read
+/// ([`Unlinked`]). A link that cannot be made is listed and the others are still made. Nothing
+/// is replaced (`symlinkat` fails where a name exists) and nothing is removed.
 pub fn share_links(home: &NewHome, source: &Path) -> Result<Linked> {
     if !home
         .is_empty()
@@ -212,26 +173,15 @@ pub fn share_links(home: &NewHome, source: &Path) -> Result<Linked> {
         bail!("{} is not empty", home.path.display());
     }
     let mut out = Linked::default();
-    for item in LINKS {
-        let target = source.join(item);
-        if fs::metadata(&target).is_err() {
-            out.absent.push(item);
-            continue;
-        }
-        if item == SETTINGS {
-            out.settings = match share::read_settings(&target) {
-                Ok(settings) => Some(share::withheld(&settings))
-                    .filter(|keys| !keys.is_empty())
-                    .map(Unlinked::Authentication),
-                Err(_) => Some(Unlinked::Unreadable),
-            };
-            if out.settings.is_some() {
-                continue;
-            }
-        }
-        match home.link(item, &target) {
-            Ok(()) => out.linked.push(item),
-            Err(e) => out.failed.push((item, e.to_string())),
+    // Each item is looked at as the loop reaches it, a moment before its link is made.
+    for (item, link) in Source::at(source).setup_links() {
+        match link {
+            SetupLink::Absent => out.absent.push(item.name),
+            SetupLink::Refused(why) => out.settings = Some(why),
+            SetupLink::Target(target) => match home.link(item.name, &target) {
+                Ok(()) => out.linked.push(item.name),
+                Err(e) => out.failed.push((item.name, e.to_string())),
+            },
         }
     }
     Ok(out)
@@ -309,7 +259,7 @@ pub fn link_notes(plan: &Plan, linked: Option<&Linked>, paths: bool) -> Vec<Note
     // shares `projects` and has no `settings.json` of its own, because the source's was left
     // out or there was none, needs one.
     let no_settings = linked.settings.is_some() || linked.absent.contains(&SETTINGS);
-    if no_settings && linked.linked.contains(&"projects") {
+    if no_settings && linked.linked.contains(&Id::Projects.name()) {
         notes.push(Note {
             warning: true,
             text: format!(
@@ -540,6 +490,7 @@ mod tests {
 
     use super::*;
     use crate::registry::CLAUDE;
+    use crate::test_homes::ClaudeHome;
 
     fn names(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
@@ -554,22 +505,15 @@ mod tests {
     /// empty home `<root>/remuda/homes/claude/work`, held open, with its path.
     fn fixture() -> (tempfile::TempDir, PathBuf, NewHome, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source");
-        fs::create_dir_all(source.join("projects")).unwrap();
-        fs::write(source.join("settings.json"), r#"{"model": "opus"}"#).unwrap();
-        symlink(source.join("nowhere"), source.join("skills")).unwrap();
+        let source = ClaudeHome::at(dir.path().join("source"))
+            .dir("projects")
+            .settings(r#"{"model": "opus"}"#)
+            .dangling("skills")
+            .into_path();
         let root = dir.path().join("remuda");
         let home = create_home(&root, CLAUDE, "work").unwrap();
         let path = root.join("homes/claude/work");
         (dir, source, home, path)
-    }
-
-    /// R18: nothing that is never linked is on the list.
-    #[test]
-    fn the_list_leaves_out_what_is_never_linked() {
-        for item in NEVER_LINKED {
-            assert!(!LINKS.contains(&item), "{item}");
-        }
     }
 
     /// R13: the new home is an empty directory with mode 0700 below `$REMUDA_HOME`, which is
@@ -655,7 +599,10 @@ mod tests {
         let (_dir, source, home, path) = fixture();
         let linked = share_links(&home, &source).unwrap();
         assert_eq!(linked.linked, ["projects", "settings.json"]);
-        assert_eq!(linked.absent.len(), LINKS.len() - 2);
+        assert_eq!(
+            linked.absent.len(),
+            Source::at(&source).setup_links().count() - 2
+        );
         assert!(linked.absent.contains(&"skills"), "a dangling item");
         assert_eq!(linked.failed, []);
         assert_eq!(linked.settings, None);

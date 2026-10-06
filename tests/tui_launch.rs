@@ -11,6 +11,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 
 use common::Sandbox;
+use common::homes::ClaudeHome;
 use remuda::launch::{self, EnvChange};
 use remuda::provider::Provider;
 use remuda::registry::{Account, Home};
@@ -397,9 +398,9 @@ fn tui_launches_name_authentication_read_through_a_link() {
 #[test]
 fn tui_launches_get_shared_configuration() {
     let sb = Sandbox::new();
-    let source = sb.home().join(".claude");
-    fs::create_dir_all(&source).unwrap();
-    fs::write(source.join("CLAUDE.md"), "be brief").unwrap();
+    let source = ClaudeHome::at(sb.home().join(".claude"))
+        .claude_md("be brief")
+        .into_path();
     let max = sb.make_claude_home("max");
     sb.write_config(&format!(
         "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{}\"\n\

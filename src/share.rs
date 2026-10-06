@@ -23,29 +23,28 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::Env;
+use crate::home_items::{self, Id, Membership, Relations};
 use crate::registry::{Account, Sharing};
 
 /// With it set, `--add-dir` also loads `CLAUDE.md` from the added directory (R18).
-pub const CLAUDE_MD_VAR: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
+const CLAUDE_MD_VAR: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
 /// The instruction items of a home that `--add-dir=$REMUDA_HOME/shared/claude` shares through
-/// a link each.
-pub const INSTRUCTIONS: [&str; 4] = ["CLAUDE.md", "skills", "commands", "agents"];
+/// a link each, as the catalog of [`home_items`] says.
+const INSTRUCTIONS: [&str; 4] = home_items::add_dir_links();
 /// The rules of a home, shared through the same `--add-dir` as copies: claude does not load
 /// rules of an added directory through links (R18).
-pub const RULES: &str = "rules";
+const RULES: &str = home_items::add_dir_copies();
 /// Directory levels of `rules/` that are shared.
-pub const MAX_RULES_DEPTH: usize = 16;
+const MAX_RULES_DEPTH: usize = 16;
 /// Rule files shared at most.
-pub const MAX_RULES: usize = 1000;
-/// Where a home keeps the memory of its user-scope subagents.
-pub const AGENT_MEMORY: &str = "agent-memory";
+const MAX_RULES: usize = 1000;
 /// With it set, claude keeps user-scope agent memory under it instead of the home (R18).
 pub const MEMORY_DIR_VAR: &str = "CLAUDE_CODE_REMOTE_MEMORY_DIR";
 /// The settings key that moves auto-memory.
 pub const MEMORY_KEY: &str = "autoMemoryDirectory";
 /// Roots longer than this many UTF-16 code units are truncated and hashed by claude
 /// (**[unverified]** in R18): no auto-memory is injected for them.
-pub const MAX_PROJECT_NAME: usize = 200;
+const MAX_PROJECT_NAME: usize = 200;
 
 /// `$REMUDA_HOME/shared/claude`, next to `config.toml` (R13, R18).
 pub fn dir(config: &Path) -> PathBuf {
@@ -100,21 +99,17 @@ pub struct Plan {
     /// The source (`provider:name`) and its home; `None`: nothing is injected (not a member, or
     /// the source's home is missing).
     pub source: Option<(String, PathBuf)>,
-    /// The home's instruction items against the source's: `--add-dir` when
-    /// [`Instructions::needs_injection`].
-    pub instructions: Instructions,
-    /// Components the home already shares with the source (same realpath, R12): not injected.
-    pub settings_shared: bool,
-    pub memory_shared: bool,
-    pub plugins_shared: bool,
-    pub agent_memory_shared: bool,
+    /// How each item of the home relates to the source's ([`home_items::Source::relate`]).
+    /// One that is linked is shared already (same realpath, R12) and not injected; the
+    /// instruction items get `--add-dir` when [`home_items::Instructions::needs_injection`].
+    pub items: Relations,
     /// The content of the single `--settings` (authentication removed, `autoMemoryDirectory`
     /// included when remuda adds it); empty: no `--settings`.
     pub settings: Map<String, Value>,
     /// The `autoMemoryDirectory` remuda adds (also in `settings`), if any.
     pub memory: Option<String>,
     /// The source's home, when [`MEMORY_DIR_VAR`] is set to it: together with `memory`, or when
-    /// `projects` is the source's already (`memory_shared`). The variable also moves auto-memory,
+    /// `projects` is the source's already (linked). The variable also moves auto-memory,
     /// to `<source home>/projects/<project>/memory`: with `memory` injected that is where it goes
     /// anyway; through a linked `projects` it is where it already is, now by a path without the
     /// link, which claude's own permission check for its memory directory needs.
@@ -197,18 +192,19 @@ pub fn plan(
             .is_some_and(|(from, value)| Path::new(value) == from),
         ..Plan::default()
     };
-    let Some(source) = sharing.source_for(account) else {
+    let Membership::Member {
+        source: name,
+        home: source,
+    } = home_items::membership(sharing, account, env)
+    else {
         return Ok(plan);
     };
-    let (Some(from), Some(home)) = (source.home_dir(env), account.home_dir(env)) else {
+    let Some(home) = account.home_dir(env) else {
         return Ok(plan);
     };
-    if !from.is_dir() {
-        return Ok(plan);
-    }
-    let name = source.qualified();
+    let from = source.home().to_path_buf();
     plan.source = Some((name.clone(), from.clone()));
-    plan.instructions = instructions(&from, &home);
+    plan.items = source.relate(&home);
 
     // claude takes only the last `--settings`, and `--setting-sources` may leave out the
     // user's layer the shared settings stand in for: either way, the user decides (R18).
@@ -217,19 +213,15 @@ pub fn plan(
             .into_iter()
             .find(|o| a == o || a.strip_prefix(o).is_some_and(|v| v.starts_with('=')))
     });
-    let own_path = home.join("settings.json");
-    let settings_shared = resolves_to(&own_path, &from.join("settings.json"));
-    let memory_shared = resolves_to(&home.join("projects"), &from.join("projects"));
-    let plugins_shared = resolves_to(&home.join("plugins"), &from.join("plugins"));
-    plan.settings_shared = settings_shared;
-    plan.memory_shared = memory_shared;
-    plan.plugins_shared = plugins_shared;
-    plan.agent_memory_shared = resolves_to(&home.join(AGENT_MEMORY), &from.join(AGENT_MEMORY));
+    let own_path = Id::Settings.at(&home);
+    let settings_shared = plan.items.linked(Id::Settings);
+    let memory_shared = plan.items.linked(Id::Projects);
+    let plugins_shared = plan.items.linked(Id::Plugins);
     // A home that links the source's `settings.json` reads all of it: authentication is
     // withheld only from injected settings, so its sessions are told (R11 says it too). A file
     // that cannot be read says nothing here: R11 reports it.
-    if settings_shared && let Ok(settings) = read_settings(&from.join("settings.json")) {
-        let keys = withheld(&settings);
+    if settings_shared {
+        let keys = source.withheld();
         if !keys.is_empty() {
             plan.notices.push(format!(
                 "warning: {} reads the authentication settings of {name} through its \
@@ -264,11 +256,10 @@ pub fn plan(
 
     // A launch that shares everything by symlink does not fail on a malformed settings file
     // (the read above ignores it); one that injects something does.
-    let settings_path = from.join("settings.json");
-    let source_settings = if reads {
-        read_settings(&settings_path)?
-    } else {
-        read_settings(&settings_path).unwrap_or_default()
+    let source_settings = match source.into_settings() {
+        Ok(settings) => settings,
+        Err(e) if reads => return Err(e),
+        Err(_) => Map::new(),
     };
     // The home's own settings: read only when it is a file that is not the source's (a
     // directory or a dangling link defines nothing).
@@ -305,7 +296,7 @@ pub fn plan(
         {
             injected.insert(MEMORY_KEY.to_string(), Value::String(memory.clone()));
             plan.memory = Some(memory);
-            if !plan.agent_memory_shared && !users {
+            if !plan.items.linked(Id::AgentMemory) && !users {
                 plan.agent_memory = Some(from.clone());
             }
         }
@@ -377,7 +368,7 @@ fn apply_source(plan: &Plan, config: &Path) -> Result<Shared> {
     let Some((name, from)) = &plan.source else {
         return Ok(shared);
     };
-    if plan.instructions.needs_injection() {
+    if plan.items.instructions().needs_injection() {
         let shared_dir = dir(config);
         match ensure_links(&shared_dir, from) {
             Ok(()) => {
@@ -396,7 +387,7 @@ fn apply_source(plan: &Plan, config: &Path) -> Result<Shared> {
     shared.notices.extend(plan.notices.iter().cloned());
     // The variable moves auto-memory too: only where it already is (a linked `projects`), or
     // with the settings that pin it there.
-    let mut memory_placed = plan.memory_shared;
+    let mut memory_placed = plan.items.linked(Id::Projects);
     if !plan.settings.is_empty() {
         let json = serde_json::to_string(&Value::Object(plan.settings.clone()))?;
         match write_settings(&settings_dir(config), &json, SystemTime::now()) {
@@ -559,7 +550,7 @@ fn prune_settings(dir: &Path, now: SystemTime) {
 }
 
 /// Settings keys that choose credentials, provider or organization: never injected (R18).
-pub const AUTH_KEYS: [&str; 8] = [
+const AUTH_KEYS: [&str; 8] = [
     "apiKeyHelper",
     "proxyAuthHelper",
     "otelHeadersHelper",
@@ -571,7 +562,7 @@ pub const AUTH_KEYS: [&str; 8] = [
 ];
 /// `env` names starting with one of these choose a provider, credentials, an endpoint or host
 /// authentication (R18).
-pub const AUTH_ENV_PREFIXES: [&str; 21] = [
+const AUTH_ENV_PREFIXES: [&str; 21] = [
     "ANTHROPIC_",
     "AWS_",
     "AZURE_",
@@ -595,7 +586,7 @@ pub const AUTH_ENV_PREFIXES: [&str; 21] = [
     "_CLAUDE_CODE_",
 ];
 /// `env` names containing one of these may hold a secret or an endpoint (R18).
-pub const AUTH_ENV_PARTS: [&str; 10] = [
+const AUTH_ENV_PARTS: [&str; 10] = [
     "TOKEN",
     "KEY",
     "SECRET",
@@ -609,7 +600,7 @@ pub const AUTH_ENV_PARTS: [&str; 10] = [
 ];
 /// `env` names withheld exactly: the account's own files (R2), and proxy URLs, which can carry
 /// credentials (R18).
-pub const AUTH_ENV_EXACT: [&str; 5] = [
+const AUTH_ENV_EXACT: [&str; 5] = [
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "HTTP_PROXY",
@@ -624,7 +615,7 @@ pub const AUTH_ENV_EXACT: [&str; 5] = [
 /// `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL*`, `ANTHROPIC_CUSTOM_MODEL_OPTION*`,
 /// excepted from the `ANTHROPIC_` prefix) and counts ending in `_TOKENS` (excepted from the
 /// `TOKEN` part); any other rule still withholds them.
-pub fn withheld_env(name: &str) -> bool {
+fn withheld_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if AUTH_ENV_EXACT.contains(&upper.as_str()) {
         return true;
@@ -722,8 +713,8 @@ impl Project {
     pub fn memory_dir(&self, source: &Path) -> Option<String> {
         let project = encode_project(self.root.as_ref()?.to_str()?)?;
         Some(
-            source
-                .join("projects")
+            Id::Projects
+                .at(source)
                 .join(project)
                 .join("memory")
                 .display()
@@ -733,7 +724,7 @@ impl Project {
 }
 
 /// The start directory as claude takes its own cwd: absolute, real, NFC (R18).
-pub fn start_dir(cwd: &Path) -> Option<PathBuf> {
+fn start_dir(cwd: &Path) -> Option<PathBuf> {
     let real = fs::canonicalize(cwd).ok()?;
     Some(PathBuf::from(real.to_str()?.nfc().collect::<String>()))
 }
@@ -758,64 +749,6 @@ fn reads_root_local_settings(root: &Path, start: &Path, env: &Env) -> bool {
             Ok(u) => u == me,
             Err(e) => e.kind() == io::ErrorKind::NotFound,
         }
-}
-
-/// Whether both paths exist and resolve to the same file or directory.
-pub fn resolves_to(path: &Path, source: &Path) -> bool {
-    match (fs::canonicalize(path), fs::canonicalize(source)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
-    }
-}
-
-/// How a home's instruction items relate to the source's: an item the source does not have
-/// has nothing to share and counts as neither.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Instructions {
-    /// Items that already resolve to the source's (symlinks).
-    pub shared: Vec<&'static str>,
-    /// Items of the source that the home does not reach.
-    pub missing: Vec<&'static str>,
-}
-
-impl Instructions {
-    /// `--add-dir` is injected unless every item the source has already resolves to it.
-    pub fn needs_injection(&self) -> bool {
-        !self.missing.is_empty()
-    }
-
-    /// Some items shared through symlinks and others not: with the injected `--add-dir`, the
-    /// shared ones load twice (R11).
-    pub fn partial(&self) -> bool {
-        !self.shared.is_empty() && !self.missing.is_empty()
-    }
-}
-
-pub fn instructions(source: &Path, home: &Path) -> Instructions {
-    let mut out = Instructions::default();
-    for item in items() {
-        let from = source.join(item);
-        // Rules count only when there is one to share.
-        let has = if item == RULES {
-            !rule_files(&from).is_empty()
-        } else {
-            from.exists()
-        };
-        if !has {
-            continue;
-        }
-        if resolves_to(&home.join(item), &from) {
-            out.shared.push(item);
-        } else {
-            out.missing.push(item);
-        }
-    }
-    out
-}
-
-/// Every instruction item: the linked ones, then the rules.
-pub fn items() -> impl Iterator<Item = &'static str> {
-    INSTRUCTIONS.into_iter().chain([RULES])
 }
 
 /// The rule files of the `rules` directory `dir` (R18): its `**/*.md` regular files down to
@@ -1430,7 +1363,7 @@ pub fn open_regular(path: &Path) -> io::Result<fs::File> {
 }
 
 /// The whole of the regular file `path` ([`open_regular`]).
-pub fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
+fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     io::Read::read_to_end(&mut open_regular(path)?, &mut bytes)?;
     Ok(bytes)
@@ -1572,7 +1505,7 @@ impl Installs {
     /// Whether an install of `plugin` here is one claude loads for a session in `start` (R18,
     /// its `wb`): with `user` or `managed` scope, with `projectPath` equal to `start`, or with
     /// `projectPath` and `start` in git repositories of the same root.
-    pub fn installed_for(&self, plugin: &str, start: Option<&Path>) -> bool {
+    fn installed_for(&self, plugin: &str, start: Option<&Path>) -> bool {
         let Installs::Known(plugins) = self else {
             return false;
         };
@@ -1643,7 +1576,7 @@ pub fn installed_plugins(home: &Path) -> Installs {
         version: u64,
         plugins: BTreeMap<String, Vec<Value>>,
     }
-    let path = home.join("plugins").join("installed_plugins.json");
+    let path = Id::Plugins.at(home).join("installed_plugins.json");
     let bytes = match read_regular(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Installs::Missing,
@@ -1686,7 +1619,7 @@ pub fn installed_plugins(home: &Path) -> Installs {
 /// claude's name for a project directory (R18): every UTF-16 code unit that is not an ASCII
 /// letter or digit becomes `-` (a character outside the Basic Multilingual Plane becomes `--`);
 /// `None` beyond [`MAX_PROJECT_NAME`] code units, where claude truncates and hashes.
-pub fn encode_project(root: &str) -> Option<String> {
+fn encode_project(root: &str) -> Option<String> {
     let units: Vec<u16> = root.nfc().collect::<String>().encode_utf16().collect();
     if units.len() > MAX_PROJECT_NAME {
         return None;
@@ -1704,7 +1637,7 @@ pub fn encode_project(root: &str) -> Option<String> {
 
 /// The project root of `start` as claude 2.1.281 finds it, without running git (R18): its
 /// [`git_root`], or with no `.git` anywhere up to `/`, `start` itself. NFC.
-pub fn project_root(start: &Path) -> PathBuf {
+fn project_root(start: &Path) -> PathBuf {
     git_root(start).unwrap_or_else(|| nfc_path(start.to_path_buf()))
 }
 
@@ -1716,7 +1649,7 @@ pub fn project_root(start: &Path) -> PathBuf {
 /// into network locations (on macOS `/net`, `/Network`, `/home/<user>`, `/.vol`, `/.file`, and
 /// `//` UNC paths) and keeps walking up; in those rare layouts remuda may choose a different
 /// root.
-pub fn git_root(start: &Path) -> Option<PathBuf> {
+fn git_root(start: &Path) -> Option<PathBuf> {
     let mut dir = start;
     loop {
         if is_git_entry(&dir.join(".git")) {
@@ -1814,6 +1747,10 @@ mod tests {
 
     use super::*;
     use crate::registry::{CLAUDE, CODEX, Home};
+    use crate::test_homes::ClaudeHome;
+
+    /// Where a home keeps the memory of its user-scope subagents.
+    const AGENT_MEMORY: &str = Id::AgentMemory.name();
 
     fn map(v: Value) -> Map<String, Value> {
         match v {
@@ -2218,12 +2155,12 @@ mod tests {
     /// A source home with `CLAUDE.md`, `skills` and `agents` (no `commands`), plus a file
     /// that must never be reachable through the shared directory.
     fn source_home(root: &Path, name: &str) -> PathBuf {
-        let home = root.join(name);
-        fs::create_dir_all(home.join("skills/review")).unwrap();
-        fs::create_dir_all(home.join("agents")).unwrap();
-        fs::write(home.join("CLAUDE.md"), "be brief").unwrap();
-        fs::write(home.join(".credentials.json"), "secret").unwrap();
-        home
+        ClaudeHome::at(root.join(name))
+            .skill("review")
+            .dir("agents")
+            .claude_md("be brief")
+            .file(".credentials.json", "secret")
+            .into_path()
     }
 
     /// R18, R13: `.claude` is a directory of one link per item the source has, pointing at
@@ -2565,34 +2502,6 @@ mod tests {
             ["CLAUDE.md", "agents", "skills"]
         );
         assert_eq!(tree(&stale_path), stale_before);
-    }
-
-    /// R11, R18: only the items the source has count; an item that resolves to the source's
-    /// is shared.
-    #[test]
-    fn instruction_items_by_realpath() {
-        let dir = tempfile::tempdir().unwrap();
-        let (source, home) = (dir.path().join("source"), dir.path().join("home"));
-        fs::create_dir_all(source.join("skills")).unwrap();
-        fs::create_dir_all(source.join("agents")).unwrap();
-        fs::write(source.join("CLAUDE.md"), "be brief").unwrap();
-        fs::create_dir_all(home.join("commands")).unwrap();
-        let got = instructions(&source, &home);
-        assert_eq!(got.shared, Vec::<&str>::new());
-        assert_eq!(got.missing, ["CLAUDE.md", "skills", "agents"]);
-        assert!(got.needs_injection() && !got.partial());
-
-        symlink(source.join("CLAUDE.md"), home.join("CLAUDE.md")).unwrap();
-        symlink(source.join("skills"), home.join("skills")).unwrap();
-        let got = instructions(&source, &home);
-        assert_eq!(got.shared, ["CLAUDE.md", "skills"]);
-        assert_eq!(got.missing, ["agents"]);
-        assert!(got.needs_injection() && got.partial());
-
-        // `commands` exists only in the home: nothing of the source's to share there.
-        symlink(source.join("agents"), home.join("agents")).unwrap();
-        let got = instructions(&source, &home);
-        assert!(!got.needs_injection() && !got.partial(), "{got:?}");
     }
 
     /// R18: `rules/**/*.md` regular files, symlinks followed, sorted; a link back into the
@@ -3047,32 +2956,6 @@ mod tests {
         assert_eq!(alone, Shared::default());
     }
 
-    /// R11, R18: the rules are an instruction item only when the source has a rule file, and
-    /// shared when the home's `rules` resolves to the source's.
-    #[test]
-    fn rules_count_as_an_item_when_the_source_has_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let (source, home) = (dir.path().join("source"), dir.path().join("home"));
-        fs::create_dir_all(source.join("rules/empty")).unwrap();
-        fs::write(source.join("rules/README"), "no rule yet").unwrap();
-        fs::write(source.join("CLAUDE.md"), "be brief").unwrap();
-        fs::create_dir_all(&home).unwrap();
-        symlink(source.join("CLAUDE.md"), home.join("CLAUDE.md")).unwrap();
-        let got = instructions(&source, &home);
-        assert!(!got.needs_injection(), "{got:?}");
-
-        fs::write(source.join("rules/style.md"), "be terse").unwrap();
-        let got = instructions(&source, &home);
-        assert_eq!(got.shared, ["CLAUDE.md"]);
-        assert_eq!(got.missing, ["rules"]);
-        assert!(got.partial());
-
-        symlink(source.join("rules"), home.join("rules")).unwrap();
-        let got = instructions(&source, &home);
-        assert_eq!(got.shared, ["CLAUDE.md", "rules"]);
-        assert!(!got.needs_injection());
-    }
-
     /// R18: the memory of user-scope subagents is redirected to the source's home only
     /// together with the injected auto-memory location: not when `projects` or `agent-memory`
     /// is the source's already, when the user passes `--settings`, when a settings file
@@ -3103,7 +2986,7 @@ mod tests {
                 .find(|(k, _)| k == MEMORY_DIR_VAR)
                 .map(|(_, v)| v.clone());
             assert_eq!(var.is_some(), plan.agent_memory.is_some());
-            assert!(var.is_none() || plan.memory.is_some() || plan.memory_shared);
+            assert!(var.is_none() || plan.memory.is_some() || plan.items.linked(Id::Projects));
             var
         };
         let env = Env::new();
@@ -3124,7 +3007,7 @@ mod tests {
         // `agent-memory` is the source's already.
         symlink(source_home.join(AGENT_MEMORY), max.join(AGENT_MEMORY)).unwrap();
         let got = plan(&sharing, &account, &[], Some(&root), &env).unwrap();
-        assert!(got.agent_memory_shared && got.agent_memory.is_none());
+        assert!(got.items.linked(Id::AgentMemory) && got.agent_memory.is_none());
         assert!(got.memory.is_some());
         fs::remove_file(max.join(AGENT_MEMORY)).unwrap();
 
@@ -3134,7 +3017,10 @@ mod tests {
         symlink(source_home.join("projects"), max.join("projects")).unwrap();
         assert_eq!(var(&[], &env), Some(source_home.display().to_string()));
         let got = plan(&sharing, &account, &[], Some(&root), &env).unwrap();
-        assert!(got.memory_shared && got.memory.is_none(), "{got:?}");
+        assert!(
+            got.items.linked(Id::Projects) && got.memory.is_none(),
+            "{got:?}"
+        );
         assert!(!got.settings.contains_key(MEMORY_KEY), "{got:?}");
         // Still the user's call: their own `--settings` or variable, or a chosen location.
         assert_eq!(var(&["--settings", "/mine.json"], &env), None);
@@ -3945,7 +3831,7 @@ mod tests {
             got.source,
             Some(("claude:src".to_string(), source_home.clone()))
         );
-        assert_eq!(got.instructions.missing, ["CLAUDE.md"]);
+        assert_eq!(got.items.instructions().unlinked, ["CLAUDE.md"]);
         assert_eq!(
             Value::Object(got.settings.clone()),
             json!({"autoMemoryDirectory": memory, "model": "opus"})
