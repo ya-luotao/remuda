@@ -244,14 +244,20 @@ pub(crate) struct Progress<'a, T> {
     pub(crate) item: Option<&'a T>,
 }
 
-/// What a refresh did.
+/// What a refresh did. It left the cache as it was exactly when `reused + kept() == files`
+/// (nothing was read into it) and `removed == 0` (nothing was dropped from it).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefreshStats {
     /// Files in the cache after the refresh.
     pub files: usize,
+    /// Listed and unchanged: not read.
     pub reused: usize,
+    /// Listed as grown: to be read on from where the cache left it.
     pub incremental: usize,
+    /// Listed as new or otherwise changed: to be read whole. Like `incremental`, counted when
+    /// listed, whether or not the read then succeeded.
     pub cold: usize,
+    /// Cached files dropped: no longer listed, or listed as changed and no longer readable.
     pub removed: usize,
     pub bytes_read: u64,
     /// The directories that exist but could not be listed, in listing order: the refresh is
@@ -429,9 +435,12 @@ pub(crate) fn refresh<D: Sync, F: Files<D>>(
                         Slot::Vacant(slot) => slot.insert(item),
                     })
                 }
-                // Vanished or unreadable since listing: drop it rather than keep it stale.
+                // Vanished or unreadable since listing: drop it rather than keep it stale. What
+                // the cache had of it is removed like a file that vanished.
                 None => {
-                    cache.remove(path);
+                    if cache.remove(path).is_some() {
+                        stats.removed += 1;
+                    }
                     None
                 }
             };
@@ -895,7 +904,8 @@ mod tests {
         assert_eq!(s.bytes_read, 15);
     }
 
-    /// R8: a file listed but gone when opened drops out, and is still counted as done.
+    /// R8: a file listed but gone when opened drops out, and is still counted as done. What
+    /// the cache had of it is removed, and counted as removed: the cache changed.
     #[test]
     fn a_file_gone_when_opened_drops_out() {
         let (_tmp, a) = sandbox();
@@ -920,8 +930,14 @@ mod tests {
             seen.push((p.done, p.total, p.item.is_some()))
         });
         assert_eq!(seen, [(0, 1, false), (1, 1, false)]);
-        assert_eq!((counts(&s), s.files), ((1, 1, 0, 0), 1));
+        assert_eq!((counts(&s), s.files), ((1, 1, 0, 1), 1));
         assert_eq!(cache.keys().collect::<Vec<_>>(), [&f]);
+
+        // Listed, never cached and gone when opened: nothing was there to remove.
+        let before = cache.clone();
+        let s = run(&mut cache, &dirs);
+        assert_eq!((counts(&s), s.files), ((1, 0, 1, 0), 1));
+        assert_eq!(cache, before);
     }
 
     /// R8: files that vanished and files of directories no longer given drop out.

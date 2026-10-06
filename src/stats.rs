@@ -220,8 +220,8 @@ impl Cache {
     }
 
     /// After [`refresh`] reported `refreshed`: writes the cache unless the refresh changed
-    /// nothing and the file exists (it is tens of MB on a large corpus). Returns whether it
-    /// was written.
+    /// nothing (it read nothing into the cache and dropped nothing from it) and the file exists
+    /// (it is tens of MB on a large corpus). Returns whether it was written.
     pub fn save_if_changed(&self, path: &Path, refreshed: &RefreshStats) -> Result<bool> {
         let changed =
             refreshed.reused + refreshed.kept() != refreshed.files || refreshed.removed > 0;

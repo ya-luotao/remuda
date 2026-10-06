@@ -1260,6 +1260,74 @@ fn a_file_rewritten_with_an_earlier_mtime_before_it_is_opened_is_read_whole() {
     assert_eq!((s.reused, s.bytes_read), (1, 0), "cached as it was opened");
 }
 
+/// R20: a transcript the cache holds that is listed as changed and can no longer be read is
+/// dropped, and that is a change to save: the saved cache does not keep it, whether or not the
+/// refresh also kept what is below a directory it could not read (R8).
+#[test]
+fn a_cached_file_that_can_no_longer_be_read_leaves_the_saved_cache() {
+    for with_an_unreadable_directory in [false, true] {
+        let mut f = Fixture::new();
+        f.write(&format!("{S_A}.jsonl"), &msg_a1_records().concat());
+        f.write(
+            &format!("{S_A}/subagents/agent-1.jsonl"),
+            &cl::assistant_usage(
+                S_A,
+                "msg_sub",
+                "claude-test",
+                cl::usage(7, 7, 0, 0),
+                &cl::ts(5),
+            ),
+        );
+        let b = f.write(
+            &format!("{S_B}.jsonl"),
+            &cl::assistant_usage(
+                S_B,
+                "msg_b1",
+                "claude-test",
+                cl::usage(7, 7, 0, 0),
+                &cl::ts(5),
+            ),
+        );
+        f.all();
+        let saved = f.root.join("remuda/state/stats.json");
+        f.cache.save(&saved).unwrap();
+        assert_eq!(Cache::load(&saved).files.len(), 3);
+
+        // Grown, then no longer readable: listed, and not opened.
+        append(
+            &b,
+            &cl::assistant_usage(
+                S_B,
+                "msg_b2",
+                "claude-test",
+                cl::usage(1, 1, 0, 0),
+                &cl::ts(6),
+            ),
+        );
+        let session = f.projects().join("-w-proj").join(S_A);
+        chmod(&b, 0o000);
+        if with_an_unreadable_directory {
+            chmod(&session, 0o000);
+        }
+        let s = f.refresh();
+        chmod(&b, 0o644);
+        chmod(&session, 0o755);
+        let kept = usize::from(with_an_unreadable_directory);
+        assert_eq!(
+            (s.files, s.incremental, s.removed, s.kept(), s.bytes_read),
+            (2, 1, 1, kept, 0),
+            "{s:?}"
+        );
+        assert_eq!(s.reused, 2 - kept);
+        assert!(!f.cache.files.contains_key(&b));
+        assert!(
+            f.cache.save_if_changed(&saved, &s).unwrap(),
+            "dropping a cached file is a change"
+        );
+        assert_eq!(Cache::load(&saved), f.cache);
+    }
+}
+
 /// The row of `model` in the cache entry of `path`, as the cache stores it.
 fn cached_row(f: &Fixture, path: &Path, model: &str) -> Vec<Value> {
     let file = serde_json::to_value(&f.cache.files[path]).unwrap();
