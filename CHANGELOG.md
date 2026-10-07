@@ -81,8 +81,21 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 - In text remuda did not write, `/login` and `/rewind` are now paths like any other `/name`
   in private mode (a directory may have such a name); they stay readable where remuda's own
   messages name them.
+- A live claude usage query whose answer has no usage line but says why now shows that reason
+  in one line instead of the whole text (SPEC R10, R23): `no usage limits told for now` when
+  `/usage` says only how the account is billed (its subscription or its overages), and `not
+  logged in to a Claude subscription, or using an API key` when it prints the session's cost
+  instead, as claude 2.1.292 does for an account that is not logged in. `remuda usage --live`,
+  the TUI and `remuda pick` (which still falls back to the cache) say it so, in place of
+  "output not recognized". An answer with a usage line that cannot be read is still shown as
+  it is.
 
 ### Fixed
+
+- Claude's live reset times written `Oct 9, 2:59pm (UTC)` or with a year (`Jan 2, 2027 at 3pm
+  (UTC)`, `Jan 2, 2027, 3pm (UTC)`) are now read as instants (SPEC R10); they were wording
+  remuda could not read, so the timeline drew the cached reset of the same limit in their
+  stead, or none.
 
 - The TUI went on launching as an account that `remuda remove` had taken out of the registry in
   another terminal: a new session, a fork, a resume or an attach as that account still started; a

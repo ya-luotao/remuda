@@ -928,6 +928,9 @@ fn gather_one(
         Some((Ok(LiveUsage::Rows(rows)), answered_at)) => {
             *said = Some(Said::Live(rows, answered_at));
         }
+        Some((Ok(LiveUsage::Untold(untold)), _)) => entry
+            .notes
+            .push(format!("live: {}; using cached usage", untold.reason())),
         Some((Ok(LiveUsage::Unrecognized(_)), _)) => entry
             .notes
             .push("live output not recognized; using cached usage".to_string()),

@@ -2586,6 +2586,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                         }
                         match usage {
                             LiveUsage::Rows(rows) => Ok((rows, answered_at)),
+                            LiveUsage::Untold(untold) => Err(untold.reason().to_string()),
                             LiveUsage::Unrecognized(_) => Err("output not recognized".to_string()),
                         }
                     }

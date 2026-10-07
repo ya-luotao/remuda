@@ -1113,6 +1113,43 @@ fn a_live_answer_read_in_part_falls_back_to_the_cache() {
     );
 }
 
+/// R10, R23: a live answer that tells no usage (claude 2.1.292: how the account is billed and no
+/// usage line; or the session's cost, for an account not logged in to a subscription) falls
+/// back to the cache like a failed query, the note giving its reason. The decision is the
+/// cache's.
+#[test]
+fn a_live_answer_that_tells_no_usage_falls_back_with_its_reason() {
+    for (said, note) in [
+        (
+            "You are currently using your subscription to power your Claude Code usage\n\n\
+             What's contributing to your limits usage?\n",
+            "live: no usage limits told for now; using cached usage",
+        ),
+        (
+            "Total cost:            $0.0000\nTotal duration (API):  0s\n",
+            "live: not logged in to a Claude subscription, or using an API key; using cached usage",
+        ),
+    ] {
+        let (sb, max, _) = two_accounts("");
+        sb.set_live_usage(Some(&max), said);
+        let out = pick(&sb, false, &["--live", "--json"]);
+        let v: Value = serde_json::from_str(&out.stdout).unwrap();
+        let max = v["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["account"] == "claude:max")
+            .unwrap_or_else(|| panic!("no claude:max: {v:#}"));
+        assert_eq!(max["source"], "cached");
+        assert_eq!(max["feasible"], true);
+        assert_eq!(max["headroom"], 60.0);
+        let out = pick(&sb, false, &["--live"]);
+        assert_eq!(field(&out, "account"), "claude:max");
+        assert!(out.stdout.contains(note), "{note}:\n{}", out.stdout);
+        assert!(!out.stdout.contains("not recognized"), "{}", out.stdout);
+    }
+}
+
 /// The `--json` report's fields.
 #[test]
 fn json_report() {

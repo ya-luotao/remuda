@@ -410,8 +410,32 @@ const LIVE_USAGE_UNSET: &[&str] = &[NONESSENTIAL_TRAFFIC_VAR];
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveUsage {
     Rows(Vec<UsageRow>),
+    /// Claude's answer told no usage, and said why (R10): no usage line, none left unread.
+    Untold(Untold),
     /// Output with no recognizable limits, kept verbatim (codex: the result as indented JSON).
     Unrecognized(String),
+}
+
+/// Why `claude -p /usage` told no usage (R10), as the words it printed instead show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Untold {
+    /// How the account is billed (its subscription, or its overages), without a usage line:
+    /// claude could not get the account's limits just now.
+    Unavailable,
+    /// The session's cost (`Total cost: …`) instead of limits: what claude prints for an
+    /// account that is not logged in to a Claude subscription, or not using one (an API key).
+    NotSubscribed,
+}
+
+impl Untold {
+    /// The reason in a few words. No `/` in it: in private mode the TUI masks a word with a
+    /// `/` as a path (R21).
+    pub fn reason(self) -> &'static str {
+        match self {
+            Untold::Unavailable => "no usage limits told for now",
+            Untold::NotSubscribed => "not logged in to a Claude subscription, or using an API key",
+        }
+    }
 }
 
 /// A live query's usage, and the identity the same query told (R10): codex's `account/read`,
@@ -464,10 +488,40 @@ fn live_claude(
     let output = agents
         .run_ok_without(account, LIVE_USAGE_ARGS, LIVE_USAGE_UNSET, timeout)
         .map_err(|failure| failure.to_string())?;
-    Ok(match parse_live(&output.stdout).complete() {
+    Ok(classify_live(output.stdout))
+}
+
+/// The start of the line in which `claude -p /usage` says how the account is billed: by its
+/// subscription, or by its overages (verified on 2.1.292).
+const BILLED_LINES: [&str; 2] = [
+    "You are currently using your subscription to power your Claude Code usage",
+    "You are currently using your overages to power your Claude Code usage",
+];
+
+/// What `claude -p /usage` answered (R10): its usage lines, all of them read; else, with no
+/// usage line at all, why it told none (how the account is billed, or the session's cost);
+/// else the text as it is. A usage line that cannot be read leaves the whole answer
+/// unrecognized, whatever else it says.
+pub fn classify_live(stdout: String) -> LiveUsage {
+    match parse_live(&stdout).complete() {
         Ok(rows) => LiveUsage::Rows(rows),
-        Err(_) => LiveUsage::Unrecognized(output.stdout),
-    })
+        Err(0)
+            if stdout
+                .lines()
+                .any(|line| BILLED_LINES.iter().any(|b| line.trim().starts_with(b))) =>
+        {
+            LiveUsage::Untold(Untold::Unavailable)
+        }
+        Err(0)
+            if stdout
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .is_some_and(|line| line.trim().starts_with("Total cost:")) =>
+        {
+            LiveUsage::Untold(Untold::NotSubscribed)
+        }
+        Err(_) => LiveUsage::Unrecognized(stdout),
+    }
 }
 
 /// What one `codex app-server` run told about an account (R4, R10): the two things it is
@@ -532,6 +586,7 @@ pub fn live_report(
         Ok(LiveResult { usage, identity }) => {
             let who = identity.as_ref().map(who_and_plan).unwrap_or_default();
             match usage {
+                LiveUsage::Untold(untold) => (format!("{name}  live: {}\n", untold.reason()), true),
                 LiveUsage::Unrecognized(stdout) => {
                     let raw: String = stdout
                         .lines()
@@ -1084,6 +1139,96 @@ mod tests {
             live_usage(&max, &agents, T),
             Ok(LiveUsage::Unrecognized("Usage is unavailable.\n".into()).into())
         );
+    }
+
+    /// What claude 2.1.292 printed for `/usage` when it could not get the account's limits
+    /// (with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, an account whose limits it had not
+    /// fetched within the hour).
+    const LIVE_UNAVAILABLE: &str = "You are currently using your subscription to power your Claude Code usage\n\n\
+        What's contributing to your limits usage?\n\
+        Approximate, based on local sessions on this machine \u{2014} does not include other devices or claude.ai. Behaviors are independent characteristics, not a breakdown.\n\n\
+        Last 24h \u{b7} 3915 requests \u{b7} 29 sessions\n";
+
+    /// What claude 2.1.292 printed for `/usage` in an empty `CLAUDE_CONFIG_DIR` (not logged in).
+    const LIVE_NOT_SUBSCRIBED: &str = "Total cost:            $0.0000\n\
+        Total duration (API):  0s\n\
+        Total duration (wall): 0s\n\
+        Total code changes:    0 lines added, 0 lines removed\n\
+        Usage:                 0 input, 0 output, 0 cache read, 0 cache write\n";
+
+    const OVERAGES: &str = "You are currently using your overages to power your Claude Code usage. We will \
+        automatically switch you back to your subscription rate limits when they reset";
+
+    /// R10: an answer without a single usage line says why it tells none: how the account is
+    /// billed (its subscription or its overages), or the session's cost instead of limits.
+    /// Anything else, or a usage line that cannot be read, is the text as it is; usage lines
+    /// read whole are the usage, whatever else the answer says.
+    #[test]
+    fn an_answer_without_usage_lines_says_why() {
+        assert_eq!(
+            classify_live(LIVE_UNAVAILABLE.into()),
+            LiveUsage::Untold(Untold::Unavailable)
+        );
+        assert_eq!(
+            classify_live(format!("{OVERAGES}\n")),
+            LiveUsage::Untold(Untold::Unavailable)
+        );
+        assert_eq!(
+            classify_live(format!("\n{LIVE_NOT_SUBSCRIBED}")),
+            LiveUsage::Untold(Untold::NotSubscribed)
+        );
+        // The overages line heads usage lines too: they are the usage.
+        let over = LIVE.replace(
+            "You are currently using your subscription to power your Claude Code usage",
+            OVERAGES,
+        );
+        assert_eq!(classify_live(over), LiveUsage::Rows(parse_live(LIVE).items));
+        for unrecognized in [
+            String::new(),
+            "Usage is unavailable.\n".to_string(),
+            // A usage line that cannot be read: the reason is not given for the whole answer.
+            format!("{LIVE_UNAVAILABLE}Current week (all models): limit reached\n"),
+            // The cost, but not where claude prints it instead of the limits.
+            format!("Something else\n{LIVE_NOT_SUBSCRIBED}"),
+        ] {
+            assert_eq!(
+                classify_live(unrecognized.clone()),
+                LiveUsage::Unrecognized(unrecognized.clone()),
+                "{unrecognized:?}"
+            );
+        }
+    }
+
+    /// R10: an answer that tells no usage is the query's answer, shown as its reason in one
+    /// line, not as the text claude printed.
+    #[test]
+    fn a_live_answer_that_tells_no_usage_gives_its_reason() {
+        let max = claude_account("max");
+        let agents = Scripted::new().on(USAGE, Scripted::exited(0, LIVE_UNAVAILABLE, ""));
+        assert_eq!(
+            live_usage(&max, &agents, T),
+            Ok(LiveUsage::Untold(Untold::Unavailable).into())
+        );
+        assert_eq!(
+            live_report(&max, &agents, &TimeZone::UTC, Timestamp::now, T),
+            (
+                "claude:max  live: no usage limits told for now\n".to_string(),
+                true
+            )
+        );
+        let agents = Scripted::new().on(USAGE, Scripted::exited(0, LIVE_NOT_SUBSCRIBED, ""));
+        assert_eq!(
+            live_report(&max, &agents, &TimeZone::UTC, Timestamp::now, T),
+            (
+                "claude:max  live: not logged in to a Claude subscription, or using an API key\n"
+                    .to_string(),
+                true
+            )
+        );
+        // In private mode the TUI masks a word with a `/` as a path (R21).
+        for untold in [Untold::Unavailable, Untold::NotSubscribed] {
+            assert!(!untold.reason().contains('/'), "{untold:?}");
+        }
     }
 
     /// R10: one `codex app-server` run answers the rate limits and the identity; the identity
