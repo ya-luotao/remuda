@@ -131,7 +131,7 @@ the bare name means `claude:default`, and the Codex one is `codex:default`.
 | `remuda add [--provider <claude\|codex>] <name> <path>` | Register an existing home directory as an account. The provider defaults to `claude`. |
 | `remuda setup [--provider <claude\|codex>] <name> [--email <EMAIL>]` | Create a new home under `$REMUDA_HOME/homes/<provider>/<name>`, register it, and run the agent's login (`claude auth login` or `codex login`). With `[share.claude]`, a new Claude home is first linked to the source's session store and configuration. `--email` prefills the Claude login. |
 | `remuda remove <account>` | Unregister an account. Its home and everything in it are left in place, and its path is printed so `remuda add` can register it again. `default` and the source of `[share.claude]` cannot be removed. |
-| `remuda pick [--provider <P>] [--live] [--timeout <SECONDS>] [--offline] [--json\|--print-request] [--wait [--max-wait <SECONDS>]] [--run [-- <args>...]]` | Recommend the account, model and effort to launch now. Rules keep only what has at least `min_headroom` percent left on every window that applies (default 10) and rank it; with `TYPESAFE_API_KEY` set and `[pick] notes`, Jev chooses among those options. `--print-request` shows what would be sent, `--offline` never sends, `--run` launches the choice as `remuda run` does. `--timeout` applies to each `--live` query (default 90). Exits 1 when nothing is feasible; with `--wait`, waits until something is (it never queries live by itself), and `--max-wait` gives up when the next check would come later. See [Recommendations](docs/GUIDE.md#recommendations). |
+| `remuda pick [--provider <P>] [--live] [--timeout <SECONDS>] [--offline] [--json\|--print-request] [--wait [--max-wait <SECONDS>]] [--run] [-- <args>...]` | Recommend the account, model and effort to launch now; with `-- --resume <id>` (or codex `-- resume <id>`), the account to resume that session as, preferring the one that ran it lately (its prompt cache is warm). Rules keep only what has at least `min_headroom` percent left on every window that applies (default 10) and rank it; with `TYPESAFE_API_KEY` set and `[pick] notes`, Jev chooses among those options. `--print-request` shows what would be sent, `--offline` never sends, `--run` launches the choice as `remuda run` does. `--timeout` applies to each `--live` query (default 90). Exits 1 when nothing is feasible; with `--wait`, waits until something is (it never queries live by itself), and `--max-wait` gives up when the next check would come later. See [Recommendations](docs/GUIDE.md#recommendations). |
 | `remuda help [<command>]` | Show help for remuda or a command. |
 
 Account names match `[A-Za-z0-9_-]+`. Because `run` forwards `-h` and `--help` to the agent, use
@@ -244,6 +244,7 @@ cache_write_1h = 10
 
 [pick]                       # optional: what `remuda pick` may recommend
 exclude = ["codex:research"]
+affinity_minutes = 60        # resuming a session: how long its last account stays preferred
 notes = "Keep claude:work for long refactors."   # sent to Jev, with account names aliased
 
 [pick.claude]

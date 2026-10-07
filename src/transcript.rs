@@ -62,6 +62,75 @@ pub fn preview(path: &Path, n: usize) -> io::Result<Vec<Message>> {
     }
 }
 
+/// What the end of a session's transcript (or rollout) says, for `pick` (R23): when it was last
+/// written to, in which directory, and with which model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionTail {
+    pub ts_last: Option<String>,
+    pub cwd_last: Option<String>,
+    /// Claude: the last assistant record's `message.model` (not a `<synthetic>` placeholder);
+    /// codex: the last `turn_context`'s `model`.
+    pub model: Option<String>,
+}
+
+/// The end of the transcript at `path`: read in a tail window that grows like the preview's
+/// (64 KB, 256 KB, 1 MB, 4 MB) until it holds the last time and a model, or reaches the start.
+/// The time and the directory are [`Tail`]'s.
+pub fn session_tail(path: &Path, provider: Provider) -> io::Result<SessionTail> {
+    let file = File::open(path)?;
+    let size = file.metadata()?.len();
+    let mut window = WINDOW;
+    loop {
+        let start = size.saturating_sub(window);
+        let read_from = start.saturating_sub(1);
+        let buf = read_at(&file, read_from, size - read_from)?;
+        let lines = complete_lines(&buf, start > 0);
+        let mut tail = Tail::new(provider);
+        tail.feed_backwards(&lines.lines);
+        let model = lines.lines.iter().rev().find_map(|line| match provider {
+            Provider::Claude => assistant_model(line),
+            Provider::Codex => codex::turn_context_model(line),
+        });
+        let found = SessionTail {
+            ts_last: tail.ts_last,
+            cwd_last: tail.cwd_last,
+            model,
+        };
+        if (found.ts_last.is_some() && found.model.is_some()) || start == 0 || window >= PREVIEW_CAP
+        {
+            return Ok(found);
+        }
+        window *= 4;
+    }
+}
+
+/// The model of a claude assistant record; `None` for any other record, and for the
+/// `<synthetic>` model claude names on the messages it makes up itself (an interruption, an
+/// API error).
+fn assistant_model(line: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Record {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        message: Option<Body>,
+    }
+    #[derive(Deserialize)]
+    struct Body {
+        model: Option<String>,
+    }
+    if !contains(line, b"\"model\"") {
+        return None;
+    }
+    let record: Record = serde_json::from_slice(line).ok()?;
+    if record.kind.as_deref() != Some("assistant") {
+        return None;
+    }
+    record
+        .message?
+        .model
+        .filter(|m| !m.is_empty() && !m.starts_with('<'))
+}
+
 #[derive(Deserialize)]
 struct PreviewRecord {
     #[serde(rename = "type")]
@@ -399,6 +468,71 @@ mod tests {
         assert_eq!(l.end, None);
         let l = complete_lines(b"", false);
         assert!(l.lines.is_empty());
+    }
+
+    /// R23 (Resuming): the last time, directory and model of a transcript; claude's
+    /// `<synthetic>` messages name no model, and a model further back than the last record is
+    /// found.
+    #[test]
+    fn session_tail_reads_the_last_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let assistant = |model: &str, ts: &str| {
+            format!(
+                r#"{{"type":"assistant","cwd":"/w","timestamp":"{ts}","message":{{"model":"{model}","content":[]}}}}"#
+            )
+        };
+        let lines = [
+            assistant("claude-opus-5-5", "2026-10-08T10:00:00Z"),
+            assistant("claude-fable-5-1", "2026-10-08T10:01:00Z"),
+            assistant("<synthetic>", "2026-10-08T10:02:00Z"),
+            r#"{"type":"user","cwd":"/x","timestamp":"2026-10-08T10:03:00Z","message":{"content":"hi"}}"#
+                .to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let tail = session_tail(&path, Provider::Claude).unwrap();
+        assert_eq!(
+            tail,
+            SessionTail {
+                ts_last: Some("2026-10-08T10:03:00Z".into()),
+                cwd_last: Some("/x".into()),
+                model: Some("claude-fable-5-1".into()),
+            }
+        );
+        // A model past the first window is found as the window grows.
+        let mut text = assistant("claude-opus-5-5", "2026-10-08T10:00:00Z") + "\n";
+        let filler = format!(
+            r#"{{"type":"user","cwd":"/w","timestamp":"2026-10-08T10:05:00Z","message":{{"content":"{}"}}}}"#,
+            "x".repeat(1000)
+        );
+        for _ in 0..100 {
+            text.push_str(&filler);
+            text.push('\n');
+        }
+        std::fs::write(&path, text).unwrap();
+        let tail = session_tail(&path, Provider::Claude).unwrap();
+        assert_eq!(tail.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(tail.ts_last.as_deref(), Some("2026-10-08T10:05:00Z"));
+
+        // Codex: the last `turn_context`'s model.
+        let turn = |model: &str, ts: &str| {
+            format!(
+                r#"{{"timestamp":"{ts}","type":"turn_context","payload":{{"cwd":"/c","model":"{model}"}}}}"#
+            )
+        };
+        let lines = [
+            turn("gpt-6-astra", "2026-10-08T10:00:00Z"),
+            turn("gpt-6-sol", "2026-10-08T10:01:00Z"),
+            r#"{"timestamp":"2026-10-08T10:02:00Z","type":"event_msg","payload":{"type":"x"}}"#
+                .to_string(),
+        ];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let tail = session_tail(&path, Provider::Codex).unwrap();
+        assert_eq!(tail.model.as_deref(), Some("gpt-6-sol"));
+        assert_eq!(tail.cwd_last.as_deref(), Some("/c"));
+        assert_eq!(tail.ts_last.as_deref(), Some("2026-10-08T10:02:00Z"));
+
+        assert!(session_tail(&dir.path().join("missing"), Provider::Claude).is_err());
     }
 
     #[test]

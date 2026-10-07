@@ -119,12 +119,12 @@ The exceptions, all for a type or a small helper:
 | `checks` | Warnings for the Accounts view, among them what a member's home links and does not (the relations of `home_items`, put into words) | R11 |
 | `index` | The session index over claude transcripts and codex rollouts: its stores, how they are listed, the head and tail windows of one file, its cache | R8, R17 |
 | `tracking` | Keeping a cache up to date with the files below a set of directories: which are reused, read on or read whole, the worker threads, what vanished, progress, and a directory that cannot be listed. Private; `index` and `stats` each give it an adapter | R8, R20 |
-| `transcript` | Reading claude transcripts without loading them whole: windows, complete lines, preview | R8 |
-| `attribution` | Which accounts a session belongs to: launch log, live sessions, `history.jsonl` | R9 |
+| `transcript` | Reading claude transcripts without loading them whole: windows, complete lines, preview; a session's last time, directory and model for `pick` (`session_tail`) | R8, R23 |
+| `attribution` | Which accounts a session belongs to: launch log, live sessions, `history.jsonl`; the latest launch that ran a session (`last_launch`, R23) | R9, R23 |
 | `stats` | Token counting, deduplication across copies, periods, sections, chart buckets, text table; its sources, how they are listed, its cache | R20 |
 | `pricing` | Built-in prices and `[prices]` overrides; the cost of one request in picodollars | R20 |
 | `account_config` | What an account's sessions load and where each item comes from, on top of `share::plan` | R22 |
-| `pick` | `[pick]`; candidates, which windows apply to a model, and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options; when `--wait` tries again (`next_attempt`) | R3, R23 |
+| `pick` | `[pick]`; candidates, which windows apply to a model, and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options; the session the arguments resume or fork and what the launch log and the session index say of it (`session_args`, `read_session`); when `--wait` tries again (`next_attempt`) | R3, R23 |
 | `wait` | `--wait`: when to try again from the windows that block and their resets (`schedule`, its named constants), the loop of attempts with an injected clock and sleep (`until`), the status line | R10, R23 |
 | `jev` | The request to Jev (aliased state, Choice and Score questions), `curl` transport, response parsing | R23 |
 | `privacy` | `Marked`, a message in the pieces it was put together from (remuda's words, a path, text from elsewhere); account-name aliases, whole-word aliasing of names in free text, and aliasing of every `provider:name` in the `pick` notes | R21, R23 |

@@ -140,8 +140,10 @@ enum Command {
         /// Launch the recommendation as `remuda run` does; arguments after `--` go to the agent
         #[arg(long)]
         run: bool,
-        /// Arguments for the agent (with --run), after `--`
-        #[arg(last = true, requires = "run", value_name = "ARGS")]
+        /// Arguments for the agent, after `--`: in the command shown, and launched with --run.
+        /// `--resume <id>` (claude) or `resume|fork <id>` (codex) recommends the account to
+        /// resume that session as, preferring the one that ran it lately (its prompt cache is warm)
+        #[arg(last = true, value_name = "ARGS")]
         args: Vec<String>,
     },
     /// Launch claude as an account; all arguments after the account go to claude verbatim
@@ -285,9 +287,42 @@ struct PickOptions {
 /// `--run` exactly as `remuda run` would. Exits 1 when nothing is feasible.
 fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
     let registry = Registry::load(config)?;
-    let settings = &registry.pick;
     let only = o.provider.as_deref().map(parse_provider).transpose()?;
     let accounts = registry.all(&ctx.env);
+    // A session the arguments resume or fork (R23 Resuming): only its provider's accounts can
+    // resume it, the account that ran it lately is preferred, and nothing is injected.
+    let resume = pick::session_args(&o.args)?;
+    let only = match (only, &resume) {
+        (Some(only), Some(resume)) if only != resume.provider => bail!(
+            "--provider {only}, but the arguments {} a {} session",
+            resume.kind.name(),
+            resume.provider
+        ),
+        (Some(only), _) => Some((only, format!("--provider {only}"))),
+        (None, Some(resume)) => Some((
+            resume.provider,
+            format!("the session resumed is {}'s", resume.provider),
+        )),
+        (None, None) => None,
+    };
+    let state = owned::state_dir(config);
+    let session = resume.map(|resume| {
+        pick::read_session(
+            resume,
+            &accounts,
+            &ctx.env,
+            &owned::launch_log(&state),
+            &state.join("index.json"),
+        )
+    });
+    let resumed;
+    let settings = match &session {
+        Some(_) => {
+            resumed = registry.pick.for_resume();
+            &resumed
+        }
+        None => &registry.pick,
+    };
     let claude = claude_program(ctx).ok();
     let codex = program(ctx, Provider::Codex).ok();
     let sources = pick::Sources {
@@ -299,6 +334,10 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
         },
         live: o.live,
         provider: only,
+        seen_by: session
+            .as_ref()
+            .and_then(|s| s.seen_by.as_ref())
+            .map(|seen| seen.keys().cloned().collect()),
     };
     // With `--wait`, each attempt gathers again (the cache, or with `--live` a new query) until
     // one finds a feasible pair (R23); without it, one attempt.
@@ -308,21 +347,29 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
         // Everything below reads the usage at `now`, the time it was all gathered: a live query
         // may have taken a while (R23).
         let (entries, now) = pick::gather(&accounts, settings, &sources);
-        let candidates = pick::candidates(&entries, settings, now);
+        let candidates = pick::candidates(&entries, settings, now, session.as_ref());
         let feasible = pick::ranked(&candidates);
         let wait = (o.wait.is_some() && feasible.is_empty())
             .then(|| pick::next_attempt(&candidates, &entries, now));
-        // About to wait with `--run`: arguments that cannot start a new session are refused now,
-        // not once a pair is feasible, for each provider a pair may still come from: one with
-        // an account that nothing time does not change blocks (R23).
-        if o.run && wait.as_ref().and_then(wait::Wait::next).is_some() {
-            for provider in Provider::ALL {
-                let open = entries
+        // Arguments that neither start a new session nor name one to resume are refused here,
+        // before anything is sent, with `--run` or without (the command shown is one remuda
+        // would launch), for each provider a pair may come from (R23): with a feasible pair,
+        // the providers of the feasible pairs, as a launch would read them; with none (and
+        // before a wait rather than after it), every provider with an account that nothing
+        // time does not change blocks. A session's arguments pass for its provider; the
+        // others' accounts are blocked.
+        for provider in Provider::ALL {
+            let checked = if feasible.is_empty() {
+                entries
                     .iter()
-                    .any(|e| e.account.provider == provider && e.blocked.is_none());
-                if open {
-                    pick::run_args(provider, None, None, &o.args)?;
-                }
+                    .any(|e| e.account.provider == provider && e.blocked.is_none())
+            } else {
+                feasible
+                    .iter()
+                    .any(|c| entries[candidates[*c].entry].account.provider == provider)
+            };
+            if checked {
+                pick::run_args(provider, None, None, &o.args)?;
             }
         }
         Ok(((entries, now, candidates, feasible), wait))
@@ -336,9 +383,23 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
     )?;
     if feasible.is_empty() {
         if o.json {
-            let report = pick::to_json(&entries, &candidates, None, settings);
+            let report = pick::to_json(
+                &entries,
+                &candidates,
+                None,
+                settings,
+                &o.args,
+                session.as_ref(),
+                now,
+            );
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
+            // The session's facts do not wait for a choice: who ran it, and why it cannot be
+            // resumed as that account (R23 Resuming).
+            if let Some(session) = &session {
+                let rows = pick::session_rows(session, &entries, &candidates, None, settings, now);
+                print!("{}", pick::format_session(&rows));
+            }
             print!("{}", pick::format_not_feasible(&entries, &candidates));
         }
         eprintln!("remuda: nothing to recommend: no account and model is feasible");
@@ -347,18 +408,19 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
         }
         return Ok(ExitCode::FAILURE);
     }
-    // Arguments that cannot start a new session are refused before anything is sent.
-    if o.run {
-        for c in &feasible {
-            let provider = entries[candidates[*c].entry].account.provider;
-            pick::run_args(provider, None, None, &o.args)?;
-        }
-    }
     let mut aliases = Aliases::default();
     for account in &accounts {
         aliases.note(&account.qualified());
     }
-    let request = jev::request(&entries, &candidates, settings, &aliases, now, &ctx.tz);
+    let request = jev::request(
+        &entries,
+        &candidates,
+        settings,
+        &aliases,
+        now,
+        &ctx.tz,
+        session.as_ref(),
+    );
     let key = ctx.env.get(jev::KEY_VAR).map(String::as_str);
     let skip = jev::skip_reason(o.offline, key, settings, &request);
     if o.print_request {
@@ -381,14 +443,30 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
     let decision = pick::decide(&candidates, &entries, settings, asked)
         .expect("a feasible candidate was found above");
     if o.json {
-        let report = pick::to_json(&entries, &candidates, Some(&decision), settings);
+        let report = pick::to_json(
+            &entries,
+            &candidates,
+            Some(&decision),
+            settings,
+            &o.args,
+            session.as_ref(),
+            now,
+        );
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(ExitCode::SUCCESS);
     }
     if !o.run {
         print!(
             "{}",
-            pick::format_text(&entries, &candidates, &decision, settings, now)
+            pick::format_text(
+                &entries,
+                &candidates,
+                &decision,
+                settings,
+                now,
+                &o.args,
+                session.as_ref()
+            )
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -402,8 +480,26 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
     )?;
     eprintln!(
         "remuda: pick: {}",
-        pick::summary(&entries, &candidates, &decision)
+        pick::summary(&entries, &candidates, &decision, session.as_ref(), now)
     );
+    if let Some(session) = &session {
+        let rows = pick::session_rows(
+            session,
+            &entries,
+            &candidates,
+            Some(decision.chosen),
+            settings,
+            now,
+        );
+        for (label, text) in rows {
+            let label = if label.is_empty() {
+                String::new()
+            } else {
+                format!("{label} ")
+            };
+            eprintln!("remuda: pick: {label}{text}");
+        }
+    }
     if let Some(hint) = pick::live_hint(&entries[chosen.entry], chosen) {
         eprintln!("remuda: pick: usage unknown: {hint}");
     }

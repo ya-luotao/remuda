@@ -10,11 +10,11 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::{Map, Value, json};
 
-use crate::pick::{self, Answers, Asked, Candidate, Config, Entry, Reason};
+use crate::pick::{self, Answers, Asked, Candidate, Config, Entry, Reason, Session};
 use crate::privacy::{self, Aliases};
 use crate::probe::{self, Outcome};
 use crate::provider::Provider;
-use crate::usage::{self, Source};
+use crate::usage::{self, Source, Window};
 
 pub const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 /// The model asked; the response names the version that answered.
@@ -55,7 +55,8 @@ fn effort_meaning(level: &str) -> Option<&'static str> {
 /// The request for the feasible `candidates` (R23): a `launch` Choice over the rules' best
 /// [`pick::MAX_OPTIONS`] pairs, when there are two or more, and an effort Score for each provider
 /// with at least two `efforts` and an option. The criteria are a JSON object: their order carries
-/// no meaning.
+/// no meaning. Resuming `session`, the state says which account ran it lately, by alias only
+/// (R23 Resuming).
 pub fn request(
     entries: &[Entry],
     candidates: &[Candidate],
@@ -63,6 +64,7 @@ pub fn request(
     aliases: &Aliases,
     now: Timestamp,
     tz: &TimeZone,
+    session: Option<&Session>,
 ) -> Request {
     let offered: Vec<(String, usize)> = pick::ranked(candidates)
         .into_iter()
@@ -84,7 +86,7 @@ pub fn request(
             let entry = &entries[candidate.entry];
             (
                 label.clone(),
-                Value::String(option_text(entry, candidate, config, now)),
+                Value::String(option_text(entry, candidate, config, now, session)),
             )
         })
         .collect();
@@ -132,7 +134,7 @@ pub fn request(
         efforts.push((provider, levels.clone()));
     }
     let body = json!({
-        "state": state_text(entries, candidates, &offered, config, aliases, now, tz),
+        "state": state_text(entries, candidates, &offered, config, aliases, now, tz, session),
         "model": MODEL,
         "questions": questions,
     });
@@ -144,10 +146,96 @@ pub fn request(
     }
 }
 
+/// `12 minutes ago`, `3 hours ago`, `2 days ago`: the time from `at` to `now`, in words.
+fn ago_words(at: Timestamp, now: Timestamp) -> String {
+    let secs = (now.as_second() - at.as_second()).max(0);
+    let (n, unit) = match secs / 60 {
+        0 => return "less than a minute ago".to_string(),
+        m if m < 120 => (m, "minute"),
+        m if m < 48 * 60 => (m / 60, "hour"),
+        m => (m / (24 * 60), "day"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
+/// The sentence of the state about the session resumed (R23 Resuming): which account ran it
+/// lately and when, by alias, and whether its prompt cache is warm, has likely expired, or is
+/// not considered (`affinity_minutes = 0`); never the session's id, title, directory, or model.
+fn session_text(
+    session: &Session,
+    entries: &[Entry],
+    config: &Config,
+    aliases: &Aliases,
+    now: Timestamp,
+) -> String {
+    let Some(last) = &session.last else {
+        return "no account is known to have run the session to be resumed.".to_string();
+    };
+    let ago = ago_words(last.active_at, now);
+    // The account as it ran the session: the same name and home (R2). Under that name with
+    // another home it is another login, and its alias would name that one.
+    if !entries.iter().any(|e| last.is(&e.account)) {
+        return format!(
+            "an account that is no longer registered ran the session to be resumed {ago}."
+        );
+    }
+    let who = aliases.qualified(&last.account);
+    if config.affinity_minutes == 0 {
+        format!(
+            "{who} ran the session to be resumed {ago}; the user does not prefer the account \
+             that ran a session (affinity is off), so whether its prompt cache is warm was not \
+             considered."
+        )
+    } else if session.warm(config, now).is_some() {
+        format!(
+            "{who} ran the session to be resumed {ago} (its prompt cache is warm); resuming it \
+             as another account writes the whole conversation into that account's cache again."
+        )
+    } else {
+        format!("{who} ran the session to be resumed {ago} (its prompt cache has likely expired).")
+    }
+}
+
 /// An option's description: its binding window, the windows of unknown usage (reset since
-/// cached), the per-model windows that may apply to the agent's default model, and how old the
-/// data is.
-fn option_text(entry: &Entry, c: &Candidate, config: &Config, now: Timestamp) -> String {
+/// cached), the per-model windows that may apply to the agent's default model, how old the
+/// data is, and whether its account's prompt cache holds the session resumed.
+fn option_text(
+    entry: &Entry,
+    c: &Candidate,
+    config: &Config,
+    now: Timestamp,
+    session: Option<&Session>,
+) -> String {
+    let warm = match session.and_then(|s| s.last.as_ref()) {
+        Some(last) if c.affine => format!(
+            "; ran the session to be resumed {} (prompt cache warm)",
+            ago_words(last.active_at, now)
+        ),
+        _ => String::new(),
+    };
+    // Resuming, its windows by their kind only (R23 Resuming).
+    let neutral;
+    let c = match session {
+        Some(session) => {
+            let known = session.model_for(&entry.account.qualified()).is_some();
+            neutral = Candidate {
+                binding: c.binding.as_ref().map(|w| neutral_window(w, known)),
+                reset_passed: c
+                    .reset_passed
+                    .iter()
+                    .map(|w| neutral_window(w, known))
+                    .collect(),
+                default_model_windows: c
+                    .default_model_windows
+                    .iter()
+                    .map(|w| neutral_window(w, known))
+                    .collect(),
+                ..c.clone()
+            };
+            &neutral
+        }
+        None => c,
+    };
     let unknown = pick::reset_passed_text(c);
     let limit = match (&c.binding, unknown) {
         (Some(binding), None) => format!("tightest: {}", pick::binding_text(binding, now)),
@@ -156,7 +244,7 @@ fn option_text(entry: &Entry, c: &Candidate, config: &Config, now: Timestamp) ->
             pick::binding_text(binding, now)
         ),
         (None, Some(unknown)) => format!("usage unknown: {unknown}"),
-        (None, None) => return "no usage data".to_string(),
+        (None, None) => return format!("no usage data{warm}"),
     };
     let also: String = c
         .default_model_windows
@@ -170,13 +258,42 @@ fn option_text(entry: &Entry, c: &Candidate, config: &Config, now: Timestamp) ->
         _ => "of unknown age".to_string(),
     };
     let stale = if entry.stale(config) { " (stale)" } else { "" };
-    format!("{limit}{also}; data {age}{stale}")
+    format!("{limit}{also}; data {age}{stale}{warm}")
+}
+
+/// `w` named by its kind only, for a request about resuming a session (R23 Resuming): `session
+/// window`, `weekly window`, a codex `<N>h window` / `<N>d window`, else `window`; a per-model one
+/// `… of the session's model` when the session's model is `known` (it applies because it is
+/// that model's), else `… of one model`. A per-model window is named after the model the
+/// session uses, which is the transcript's, unchecked text, or the agent's quota name for it:
+/// neither is sent. What the window holds and when it resets are kept.
+fn neutral_window(w: &Window, known: bool) -> Window {
+    let base = w.label.split(" (").next().unwrap_or_default();
+    let duration = base
+        .strip_suffix(" window")
+        .and_then(|d| d.strip_suffix(['m', 'h', 'd']))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let kind = match base {
+        "Session" => "session window".to_string(),
+        "Week" => "weekly window".to_string(),
+        _ if duration => base.to_string(),
+        _ => "window".to_string(),
+    };
+    let mut neutral = w.clone();
+    neutral.label = match (&w.model, known) {
+        (None, _) => kind,
+        (Some(_), true) => format!("{kind} of the session's model"),
+        (Some(_), false) => format!("{kind} of one model"),
+    };
+    neutral
 }
 
 /// The state Jev reads (R23): the local time, the rules already applied, each account with an
 /// option (aliased) and its usage, the models, the user's notes (qualified account names
 /// aliased, otherwise as written), and the task slot. No email, organization, plan, path,
-/// working directory or session content: nothing of an entry's local notes is used.
+/// working directory or session content: nothing of an entry's local notes is used. Resuming a
+/// session, one sentence on which account ran it lately, and its model in place of `models`.
+#[allow(clippy::too_many_arguments)]
 pub fn state_text(
     entries: &[Entry],
     candidates: &[Candidate],
@@ -185,6 +302,7 @@ pub fn state_text(
     aliases: &Aliases,
     now: Timestamp,
     tz: &TimeZone,
+    session: Option<&Session>,
 ) -> String {
     let mut out = String::new();
     out.push_str(
@@ -201,6 +319,17 @@ pub fn state_text(
          unknown: not checked); excluded accounts are not listed.\n",
         config.min_headroom
     ));
+    if let Some(session) = session {
+        out.push_str(&format!(
+            "resuming a session: {}\n",
+            session_text(session, entries, config, aliases, now)
+        ));
+    }
+    let default_model = if session.is_some() {
+        "the session's model"
+    } else {
+        "the agent's default model"
+    };
     let mut listed: Vec<usize> = Vec::new();
     for (_, c) in offered {
         let e = candidates[*c].entry;
@@ -231,16 +360,25 @@ pub fn state_text(
             }
         };
         out.push_str(&format!("  usage: {data}\n"));
-        let models = &config.choices(provider).models;
+        // Resuming, the windows that apply are those of the model of the copy this account
+        // would resume. It is matched here and never sent: a transcript's model is any text.
+        let session_models: Vec<String> = session
+            .and_then(|s| s.model_for(&entry.account.qualified()))
+            .map(str::to_string)
+            .into_iter()
+            .collect();
+        let models = match session {
+            Some(_) => &session_models,
+            None => &config.choices(provider).models,
+        };
         for w in entry.usage.iter().flat_map(|u| &u.windows) {
             // Without models, the agent's default model is unknown: a per-model window is shown
             // as one that may apply.
+            let maybe_text =
+                format!(" (per-model; applies only if {default_model} is in this family)");
             let (applies, maybe) = match &w.model {
                 None => (true, ""),
-                Some(_) if models.is_empty() => (
-                    true,
-                    " (per-model; applies only if the agent's default model is in this family)",
-                ),
+                Some(_) if models.is_empty() => (true, maybe_text.as_str()),
                 Some(name) => (
                     models.iter().any(|m| pick::limits_model(provider, m, name)),
                     "",
@@ -249,6 +387,11 @@ pub fn state_text(
             if !applies {
                 continue;
             }
+            // Resuming, by its kind only: its label may name the session's model.
+            let w = match session {
+                Some(_) => &neutral_window(w, !session_models.is_empty()),
+                None => w,
+            };
             let state = match w.used() {
                 Some(used) => format!(
                     "{} used{}",
@@ -293,7 +436,10 @@ pub fn state_text(
             format!("{p}: {list}")
         })
         .collect();
-    out.push_str(&format!("\nmodels: {}\n", models.join("; ")));
+    match session {
+        Some(_) => out.push_str("\nmodels: the session's own (nothing is injected)\n"),
+        None => out.push_str(&format!("\nmodels: {}\n", models.join("; "))),
+    }
     out.push_str(&format!(
         "\nuser notes (written by the user; follow them when they apply):\n{}\n",
         alias_notes(&config.notes, aliases)
@@ -611,13 +757,464 @@ mod tests {
         (entries, config, aliases)
     }
 
+    /// R23 (Resuming): the state says which account ran the session lately, by alias, and
+    /// nothing of the session itself; the warm account's option says so too; no effort is
+    /// asked, and the windows are those of the session's model.
+    #[test]
+    fn resuming_names_the_warm_account_by_alias_only() {
+        use crate::pick::{LastRun, Resume, Session, SessionKind};
+        let (mut entries, config, mut aliases) = fixture();
+        let now = ts(NOW);
+        let id = "766560c5-0000-4000-8000-000000000000";
+        entries[1].blocked = Some("not a claude account (the session resumed is claude's)".into());
+        entries.push(Entry {
+            account: Account {
+                provider: Provider::Claude,
+                name: "team".into(),
+                home: Home::Path("/Users/you/.team".into()),
+            },
+            blocked: None,
+            usage: Some(cached(
+                jiff::SignedDuration::from_mins(5),
+                vec![row("Week (all models)", 50.0, "2026-09-28T21:05:00Z")],
+            )),
+            notes: Vec::new(),
+        });
+        aliases.note("claude:team");
+        let config = config.for_resume();
+        // Both claude accounts share the store that holds the session.
+        let seen = |model: &str| {
+            ["claude:max", "claude:team"]
+                .into_iter()
+                .map(|a| (a.to_string(), Some(model.to_string())))
+                .collect()
+        };
+        let mut session = Session {
+            resume: Resume {
+                provider: Provider::Claude,
+                kind: SessionKind::Resume,
+                id: id.into(),
+            },
+            last: Some(LastRun {
+                account: "claude:team".into(),
+                home: "/Users/you/.team".into(),
+                launched_at: now - jiff::SignedDuration::from_mins(40),
+                active_at: now - jiff::SignedDuration::from_mins(12),
+            }),
+            seen_by: Some(seen("claude-fable-5-1")),
+        };
+        let c = pick::candidates(&entries, &config, now, Some(&session));
+        let r = request(
+            &entries,
+            &c,
+            &config,
+            &aliases,
+            now,
+            &TimeZone::UTC,
+            Some(&session),
+        );
+        let body = r.body.to_string();
+        let state = r.body["state"].as_str().unwrap();
+        assert!(
+            state.contains(
+                "resuming a session: claude:account-2 ran the session to be resumed 12 minutes \
+                 ago (its prompt cache is warm); resuming it as another account writes the whole \
+                 conversation into that account's cache again.\n"
+            ),
+            "{state}"
+        );
+        assert!(
+            state.contains("\nmodels: the session's own (nothing is injected)\n"),
+            "{state}"
+        );
+        for secret in [
+            id,
+            "claude:team",
+            "/Users/you",
+            "766560c5",
+            "claude-fable-5-1",
+        ] {
+            assert!(!body.contains(secret), "{secret} in {body}");
+        }
+        assert!(r.efforts.is_empty(), "no effort is asked when resuming");
+        // The Fable week leaves max infeasible: team alone, so `launch` is not asked either.
+        assert_eq!(r.offered.len(), 1);
+        assert!(r.body["questions"].get("launch").is_none());
+
+        // With an Opus session, both are offered, the warm one marked.
+        session.seen_by = Some(seen("claude-opus-5-5"));
+        let c = pick::candidates(&entries, &config, now, Some(&session));
+        let r = request(
+            &entries,
+            &c,
+            &config,
+            &aliases,
+            now,
+            &TimeZone::UTC,
+            Some(&session),
+        );
+        let criteria = &r.body["questions"]["launch"]["criteria"];
+        assert!(
+            criteria["claude:account-2 / default"]
+                .as_str()
+                .unwrap()
+                .ends_with("; ran the session to be resumed 12 minutes ago (prompt cache warm)"),
+            "{criteria}"
+        );
+        assert!(
+            !criteria["claude:account-1 / default"]
+                .as_str()
+                .unwrap()
+                .contains("resumed"),
+            "{criteria}"
+        );
+        assert_eq!(r.offered[0].0, "claude:account-2 / default");
+        // The Fable week does not apply to an Opus session: not shown, not even as a "maybe".
+        let state = r.body["state"].as_str().unwrap();
+        assert!(
+            state.contains("account claude:account-1 (claude)"),
+            "{state}"
+        );
+        assert!(!state.contains("Week (Fable)"), "{state}");
+
+        // Affinity off: the cache is not said to have expired, however recent the run.
+        let mut off = config.clone();
+        off.affinity_minutes = 0;
+        session.last.as_mut().unwrap().active_at = now - jiff::SignedDuration::from_secs(20);
+        let c = pick::candidates(&entries, &off, now, Some(&session));
+        let r = request(
+            &entries,
+            &c,
+            &off,
+            &aliases,
+            now,
+            &TimeZone::UTC,
+            Some(&session),
+        );
+        let state = r.body["state"].as_str().unwrap();
+        assert!(
+            state.contains(
+                "resuming a session: claude:account-2 ran the session to be resumed less than a \
+                 minute ago; the user does not prefer the account that ran a session (affinity is \
+                 off), so whether its prompt cache is warm was not considered.\n"
+            ),
+            "{state}"
+        );
+        assert!(!state.contains("expired"), "{state}");
+
+        // Run as `claude:team` with another home: another login, not this account.
+        session.last.as_mut().unwrap().home = "/Users/you/.old-team".into();
+        session.last.as_mut().unwrap().active_at = now - jiff::SignedDuration::from_mins(12);
+        let c = pick::candidates(&entries, &config, now, Some(&session));
+        assert!(c.iter().all(|c| !c.affine));
+        let r = request(
+            &entries,
+            &c,
+            &config,
+            &aliases,
+            now,
+            &TimeZone::UTC,
+            Some(&session),
+        );
+        let state = r.body["state"].as_str().unwrap();
+        assert!(
+            state.contains(
+                "resuming a session: an account that is no longer registered ran the session to \
+                 be resumed 12 minutes ago.\n"
+            ),
+            "{state}"
+        );
+        assert!(!state.contains("claude:account-2 ran"), "{state}");
+        session.last.as_mut().unwrap().home = "/Users/you/.team".into();
+
+        // Past the window, and without a record.
+        session.last.as_mut().unwrap().active_at = now - jiff::SignedDuration::from_hours(3);
+        let c = pick::candidates(&entries, &config, now, Some(&session));
+        let r = request(
+            &entries,
+            &c,
+            &config,
+            &aliases,
+            now,
+            &TimeZone::UTC,
+            Some(&session),
+        );
+        assert!(
+            r.body["state"].as_str().unwrap().contains(
+                "resuming a session: claude:account-2 ran the session to be resumed 3 hours ago \
+                 (its prompt cache has likely expired).\n"
+            ),
+            "{}",
+            r.body["state"]
+        );
+        session.last = None;
+        let r = request(
+            &entries,
+            &c,
+            &config,
+            &aliases,
+            now,
+            &TimeZone::UTC,
+            Some(&session),
+        );
+        assert!(
+            r.body["state"].as_str().unwrap().contains(
+                "resuming a session: no account is known to have run the session to be resumed.\n"
+            ),
+            "{}",
+            r.body["state"]
+        );
+    }
+
+    /// R23 (Resuming, The request): a transcript's model is any text the transcript holds. It is
+    /// matched against the usage windows locally and never sent, for either provider.
+    #[test]
+    fn the_session_model_is_never_sent() {
+        use crate::pick::{LastRun, Resume, Session, SessionKind};
+        const SECRET: &str = "/Users/private-client/projects/SECRET-MODEL";
+        let (entries, config, aliases) = fixture();
+        let now = ts(NOW);
+        for (provider, account, home) in [
+            (Provider::Claude, "claude:max", "/Users/you/.max"),
+            (Provider::Codex, "codex:work", "/Users/you/.work"),
+        ] {
+            let mut entries = entries.clone();
+            for entry in &mut entries {
+                if entry.account.provider != provider {
+                    entry.blocked = Some("not of the session's provider".into());
+                }
+            }
+            let session = Session {
+                resume: Resume {
+                    provider,
+                    kind: SessionKind::Resume,
+                    id: "766560c5-0000-4000-8000-000000000000".into(),
+                },
+                last: Some(LastRun {
+                    account: account.into(),
+                    home: home.into(),
+                    launched_at: now,
+                    active_at: now,
+                }),
+                seen_by: Some([(account.to_string(), Some(SECRET.to_string()))].into()),
+            };
+            let config = config.for_resume();
+            let c = pick::candidates(&entries, &config, now, Some(&session));
+            let r = request(
+                &entries,
+                &c,
+                &config,
+                &aliases,
+                now,
+                &TimeZone::UTC,
+                Some(&session),
+            );
+            let body = r.body.to_string();
+            for leak in [SECRET, "SECRET-MODEL", "private-client"] {
+                assert!(!body.contains(leak), "{provider}: {leak:?} in {body}");
+            }
+            assert!(
+                body.contains("ran the session to be resumed"),
+                "{provider}: {body}"
+            );
+        }
+    }
+
+    /// R23 (Resuming): resuming, windows go to Jev by their kind only. A per-model window's
+    /// label names a model, which may be the session's (from its transcript, or the agent's quota
+    /// name for it): here a path, in the binding window, a window reset since, the per-model
+    /// windows that may apply, and the state, for both providers, with the session's model known
+    /// and unknown. Not once in the request.
+    #[test]
+    fn resuming_names_windows_by_kind_only() {
+        use crate::pick::{LastRun, Resume, Session, SessionKind};
+        const SECRET: &str = "/Users/private_client/projects/SECRET_MODEL";
+        let (entries, config, aliases) = fixture();
+        let now = ts(NOW);
+        let rows = vec![
+            row("Session", 10.0, "2026-09-26T19:25:00Z"),
+            row("Week (all models)", 20.0, "2026-09-28T21:05:00Z"),
+            row(&format!("Week ({SECRET})"), 50.0, "2026-09-28T21:05:00Z"),
+            // Reset ten minutes ago, after it was cached: of unknown usage.
+            row(&format!("Session ({SECRET})"), 90.0, "2026-09-26T17:55:00Z"),
+        ];
+        for (provider, account, home) in [
+            (Provider::Claude, "claude:max", "/Users/you/.max"),
+            (Provider::Codex, "codex:work", "/Users/you/.work"),
+        ] {
+            let mut entries = entries.clone();
+            for entry in &mut entries {
+                if entry.account.provider == provider {
+                    entry.usage = Some(cached(jiff::SignedDuration::from_mins(25), rows.clone()));
+                } else {
+                    entry.blocked = Some("not of the session's provider".into());
+                }
+            }
+            for known in [true, false] {
+                let session = Session {
+                    resume: Resume {
+                        provider,
+                        kind: SessionKind::Resume,
+                        id: "766560c5-0000-4000-8000-000000000000".into(),
+                    },
+                    last: Some(LastRun {
+                        account: account.into(),
+                        home: home.into(),
+                        launched_at: now,
+                        active_at: now,
+                    }),
+                    seen_by: Some(
+                        [(account.to_string(), known.then(|| SECRET.to_string()))].into(),
+                    ),
+                };
+                let config = config.for_resume();
+                let c = pick::candidates(&entries, &config, now, Some(&session));
+                let mine = c.iter().find(|c| c.feasible()).unwrap();
+                // Locally, the windows are matched by the model as named.
+                assert_eq!(
+                    mine.binding.as_ref().map(|w| w.label.as_str()),
+                    Some(if known {
+                        "Week (/Users/private_client/projects/SECRET_MODEL)"
+                    } else {
+                        "Week (all models)"
+                    })
+                );
+                let r = request(
+                    &entries,
+                    &c,
+                    &config,
+                    &aliases,
+                    now,
+                    &TimeZone::UTC,
+                    Some(&session),
+                );
+                let body = r.body.to_string();
+                for leak in [SECRET, "SECRET_MODEL", "private_client"] {
+                    assert!(
+                        !body.contains(leak),
+                        "{provider} {known}: {leak:?} in {body}"
+                    );
+                }
+                let state = r.body["state"].as_str().unwrap();
+                if known {
+                    assert!(
+                        state.contains("  weekly window of the session's model: 50% used"),
+                        "{provider}: {state}"
+                    );
+                    assert!(
+                        state.contains("  session window of the session's model: usage unknown"),
+                        "{provider}: {state}"
+                    );
+                } else {
+                    assert!(
+                        state.contains("  weekly window of one model: 50% used"),
+                        "{provider}: {state}"
+                    );
+                }
+                assert!(
+                    state.contains("  weekly window: 20% used"),
+                    "{provider}: {state}"
+                );
+                assert!(
+                    state.contains("  session window: 10% used"),
+                    "{provider}: {state}"
+                );
+                // The option's own description, binding window and windows reset since
+                // included.
+                let text = option_text(&entries[mine.entry], mine, &config, now, Some(&session));
+                for leak in [SECRET, "SECRET_MODEL", "private_client"] {
+                    assert!(
+                        !text.contains(leak),
+                        "{provider} {known}: {leak:?} in {text}"
+                    );
+                }
+                if known {
+                    assert!(
+                        text.starts_with("tightest: weekly window of the session's model 50% left")
+                            && text.contains(
+                                "usage unknown: session window of the session's model: reset since \
+                             cached"
+                            ),
+                        "{provider}: {text}"
+                    );
+                } else {
+                    assert!(
+                        text.contains("; also: weekly window of one model 50% used"),
+                        "{provider}: {text}"
+                    );
+                }
+            }
+        }
+        // Not resuming, the labels are as today: the agent's own, of configured models.
+        let c = pick::candidates(&entries, &config, now, None);
+        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC, None);
+        assert!(
+            r.body["state"]
+                .as_str()
+                .unwrap()
+                .contains("  Week (all models): 77% used")
+        );
+    }
+
+    /// R23 (Resuming): the warm account's option says so when its usage is unknown too.
+    #[test]
+    fn a_warm_option_without_usage_data_says_so() {
+        use crate::pick::{LastRun, Resume, Session, SessionKind};
+        let (mut entries, config, mut aliases) = fixture();
+        let now = ts(NOW);
+        entries[0].usage = None;
+        entries[1].blocked = Some("not of the session's provider".into());
+        entries.push(Entry {
+            account: Account {
+                provider: Provider::Claude,
+                name: "team".into(),
+                home: Home::Path("/Users/you/.team".into()),
+            },
+            blocked: None,
+            usage: None,
+            notes: Vec::new(),
+        });
+        aliases.note("claude:team");
+        let config = config.for_resume();
+        let session = Session {
+            resume: Resume {
+                provider: Provider::Claude,
+                kind: SessionKind::Resume,
+                id: "766560c5-0000-4000-8000-000000000000".into(),
+            },
+            last: Some(LastRun {
+                account: "claude:team".into(),
+                home: "/Users/you/.team".into(),
+                launched_at: now,
+                active_at: now - jiff::SignedDuration::from_mins(3),
+            }),
+            seen_by: None,
+        };
+        let c = pick::candidates(&entries, &config, now, Some(&session));
+        let r = request(
+            &entries,
+            &c,
+            &config,
+            &aliases,
+            now,
+            &TimeZone::UTC,
+            Some(&session),
+        );
+        let criteria = &r.body["questions"]["launch"]["criteria"];
+        assert_eq!(
+            criteria["claude:account-2 / default"],
+            "no usage data; ran the session to be resumed 3 minutes ago (prompt cache warm)"
+        );
+        assert_eq!(criteria["claude:account-1 / default"], "no usage data");
+    }
+
     /// R23: the state as Jev reads it, golden.
     #[test]
     fn state_is_plain_text_with_aliases() {
         let (entries, config, aliases) = fixture();
         let now = ts(NOW);
-        let c = pick::candidates(&entries, &config, now);
-        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC);
+        let c = pick::candidates(&entries, &config, now, None);
+        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC, None);
         assert_eq!(
             r.body["state"].as_str().unwrap(),
             "remuda pick: choose which coding-agent account and model to launch now, and at \
@@ -684,8 +1281,8 @@ mod tests {
         let (entries, mut config, aliases) = fixture();
         config.claude.models.clear();
         let now = ts(NOW);
-        let c = pick::candidates(&entries, &config, now);
-        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC);
+        let c = pick::candidates(&entries, &config, now, None);
+        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC, None);
         let state = r.body["state"].as_str().unwrap();
         assert!(
             state.contains(
@@ -722,8 +1319,8 @@ mod tests {
             jiff::SignedDuration::from_hours(30),
             vec![row("Week (all models)", 100.0, "2026-09-25T18:05:00Z")],
         ));
-        let c = pick::candidates(&entries, &config, now);
-        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC);
+        let c = pick::candidates(&entries, &config, now, None);
+        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC, None);
         let state = r.body["state"].as_str().unwrap();
         for line in [
             "  usage: cached 3h ago (stale: may be higher now)\n",
@@ -758,8 +1355,8 @@ mod tests {
 
         // Without models, a per-model window past its reset is still one that may apply.
         config.claude.models.clear();
-        let c = pick::candidates(&entries, &config, now);
-        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC);
+        let c = pick::candidates(&entries, &config, now, None);
+        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC, None);
         let state = r.body["state"].as_str().unwrap();
         assert!(
             state.contains(
@@ -877,8 +1474,8 @@ mod tests {
         config.claude.models.truncate(1);
         let entries: Vec<Entry> = entries.into_iter().take(1).collect();
         let now = ts(NOW);
-        let c = pick::candidates(&entries, &config, now);
-        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC);
+        let c = pick::candidates(&entries, &config, now, None);
+        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC, None);
         assert_eq!(r.offered.len(), 1);
         assert!(!r.launch);
         assert!(r.body["questions"].get("launch").is_none());
@@ -958,9 +1555,9 @@ mod tests {
         let (entries, mut config, aliases) = fixture();
         config.claude.models = (0..300).map(|i| format!("claude-opus-{i}")).collect();
         let now = ts(NOW);
-        let c = pick::candidates(&entries, &config, now);
+        let c = pick::candidates(&entries, &config, now, None);
         assert_eq!(pick::ranked(&c).len(), 301);
-        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC);
+        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC, None);
         assert_eq!(r.offered.len(), pick::MAX_OPTIONS);
         assert_eq!(
             r.body["questions"]["launch"]["criteria"]
@@ -977,8 +1574,8 @@ mod tests {
     fn skip_reasons() {
         let (entries, mut config, aliases) = fixture();
         let now = ts(NOW);
-        let c = pick::candidates(&entries, &config, now);
-        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC);
+        let c = pick::candidates(&entries, &config, now, None);
+        let r = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC, None);
         assert_eq!(
             skip_reason(true, Some("k"), &config, &r),
             Some(Reason::Offline)
