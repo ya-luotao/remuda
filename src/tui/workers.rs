@@ -4,14 +4,15 @@
 //! ([`super::accounts::Listing::read`]).
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::index::{self, Index};
 use crate::provider::{Provider, codex};
 use crate::registry::{self, Account};
+use crate::usage::{Snapshot, history};
 use crate::{account_config, attribution, checks, identity, live, owned, stats, transcript, usage};
 
 use super::Deps;
@@ -62,22 +63,56 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
         }
         Effect::CachedUsage(accounts) => {
             thread::spawn(move || {
+                // Every account's usage is sent before any is recorded: a history lock waited
+                // for holds up no row (R24).
+                let mut points = Vec::new();
+                let mut pending = None;
                 for account in listed(&deps, &tx, accounts) {
                     let result = usage::cached_usage(&account, &deps.env);
+                    if let Ok(cached) = &result {
+                        points.extend(history::points(
+                            &account.qualified(),
+                            &Snapshot::cached(cached).at((deps.clock)()),
+                        ));
+                    }
+                    // Counted before it is shown: leaving the TUI waits for it (R24).
+                    if !points.is_empty() && pending.is_none() {
+                        pending = Some(Pending::begin());
+                    }
                     let _ = tx.send(Event::CachedUsage { account, result });
+                }
+                if let Some(pending) = pending {
+                    record_usage(&deps, points, pending);
                 }
             });
         }
         Effect::LiveUsage(accounts) => {
             thread::spawn(move || {
                 for account in listed(&deps, &tx, accounts) {
-                    answer(&deps, &tx, move |deps| {
+                    let (deps, tx) = (Arc::clone(&deps), tx.clone());
+                    thread::spawn(move || {
                         let result =
                             usage::live_usage(&account, &deps.agents(), LIVE_USAGE_TIMEOUT);
-                        Event::LiveUsage {
+                        let answered_at = (deps.clock)();
+                        // Only usage that was told: not a failure, nor an answer without it.
+                        let points = match &result {
+                            Ok(usage::LiveResult {
+                                usage: usage::LiveUsage::Rows(rows),
+                                ..
+                            }) => history::points(
+                                &account.qualified(),
+                                &Snapshot::live(rows, answered_at).at(answered_at),
+                            ),
+                            _ => Vec::new(),
+                        };
+                        let pending = (!points.is_empty()).then(Pending::begin);
+                        let _ = tx.send(Event::LiveUsage {
                             account,
                             result,
-                            answered_at: (deps.clock)(),
+                            answered_at,
+                        });
+                        if let Some(pending) = pending {
+                            record_usage(&deps, points, pending);
                         }
                     });
                 }
@@ -223,6 +258,59 @@ fn answer(
     thread::spawn(move || {
         let _ = tx.send(work(&deps));
     });
+}
+
+/// Records the points of usage readings in the history (R24): the one way the TUI's cached
+/// readings and live answers get there. Called once the readings have been sent (all of a
+/// batch of cached usage; a live answer in the thread of its own account), so a lock waited
+/// for holds up nothing on screen; the TUI never compacts the history, and what keeps it from
+/// being written is not told.
+fn record_usage(deps: &Deps, points: Vec<history::Point>, _pending: Pending) {
+    let _ = history::record(
+        &deps.state_dir,
+        points,
+        (deps.clock)(),
+        false,
+        &owned::Flock,
+    );
+}
+
+/// How long leaving the TUI waits for the recordings of readings it has shown (R16, R24): the
+/// history is a by-product, and a lock another remuda holds must not keep the TUI from ending.
+pub const RECORD_DRAIN: Duration = Duration::from_secs(2);
+
+/// The recordings of usage readings under way: from before the reading is shown until its
+/// points are written (or could not be). Process-wide: one TUI runs in a process.
+static RECORDING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// One recording under way ([`RECORDING`]), until dropped.
+struct Pending;
+
+impl Pending {
+    fn begin() -> Pending {
+        *RECORDING.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Pending
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        *RECORDING.0.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        RECORDING.1.notify_all();
+    }
+}
+
+/// Waits, at most `within`, for the recordings of usage readings under way to end, so that
+/// leaving the TUI does not lose a reading it has shown (R24). `false`: some were still under
+/// way (waiting for a lock another remuda holds, say), and are left: the history is a
+/// by-product.
+pub fn finish_recording(within: Duration) -> bool {
+    let count = RECORDING.0.lock().unwrap_or_else(|e| e.into_inner());
+    let (count, _) = RECORDING
+        .1
+        .wait_timeout_while(count, within, |n| *n > 0)
+        .unwrap_or_else(|e| e.into_inner());
+    *count == 0
 }
 
 /// The accounts of `asked` (the app's rows when it asked) that the registry still lists, home
@@ -1347,6 +1435,282 @@ mod tests {
                 // event later.
                 answered_at: answered(),
             }]
+        );
+    }
+
+    /// Every event of `effect`, once the threads doing it are gone: the workers record a
+    /// reading once it has been sent, so the history is written by then.
+    fn finished(effect: Effect, deps: &Arc<Deps>) -> Vec<Event> {
+        let (tx, rx) = mpsc::channel();
+        spawn(effect, deps, &tx);
+        drop(tx);
+        rx.iter().collect()
+    }
+
+    fn recorded(deps: &Deps) -> Vec<history::Point> {
+        history::load(&owned::usage_history(&deps.state_dir))
+            .unwrap()
+            .unwrap_or_default()
+    }
+
+    /// R24, R16: the TUI's cached readings and live answers are recorded in the history, at
+    /// the time each was read (the cache's, the answer's), through the one entry the two share;
+    /// a failed query is not.
+    #[test]
+    fn usage_read_in_the_tui_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let max = max(&deps);
+        let fetched: jiff::Timestamp = "2026-09-24T11:00:00Z".parse().unwrap();
+        fs::write(
+            dir.path().join("max/.claude.json"),
+            format!(
+                r#"{{"cachedUsageUtilization": {{"fetchedAtMs": {},
+                  "utilization": {{"limits": [{{"kind": "session", "percent": 34,
+                  "resets_at": "2026-09-24T15:00:00Z"}}]}}}}}}"#,
+                fetched.as_millisecond()
+            ),
+        )
+        .unwrap();
+        let events = finished(Effect::CachedUsage(vec![max.clone()]), &deps);
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::CachedUsage { result: Ok(_), .. })
+            ),
+            "{events:?}"
+        );
+        let session = history::Point {
+            ts: fetched,
+            account: "claude:max".into(),
+            label: "Session".into(),
+            model: None,
+            percent: 34.0,
+            resets_at: Some("2026-09-24T15:00:00Z".parse().unwrap()),
+            source: usage::Source::Cached,
+        };
+        assert_eq!(recorded(&deps), std::slice::from_ref(&session));
+        // Read again: the same reading, not recorded twice.
+        finished(Effect::CachedUsage(vec![max.clone()]), &deps);
+        // A failed live query (no claude) records nothing.
+        let events = finished(Effect::LiveUsage(vec![max]), &deps);
+        assert!(
+            matches!(events.as_slice(), [Event::LiveUsage { result: Err(_), .. }]),
+            "{events:?}"
+        );
+        assert_eq!(recorded(&deps), std::slice::from_ref(&session));
+
+        let work = Account {
+            provider: Provider::Codex,
+            name: "work".into(),
+            home: Home::Path(dir.path().join("work").display().to_string()),
+        };
+        let registered = format!(
+            "[[account]]\nprovider = \"codex\"\nname = \"work\"\nhome = \"{}\"\n",
+            work.home
+        );
+        let codex = crate::probe::script(
+            dir.path(),
+            "codex",
+            "read a; read b; read c; read d; \
+             echo '{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":4,\
+             \"windowDurationMins\":300,\"resetsAt\":1790262000}}}}'; \
+             echo '{\"id\":3,\"result\":{}}'; cat >/dev/null",
+        );
+        let deps = Arc::new(Deps {
+            codex: Some(codex),
+            ..Deps::clone(&deps_with(dir.path(), &registered))
+        });
+        finished(Effect::LiveUsage(vec![work]), &deps);
+        let live = history::Point {
+            ts: answered(),
+            account: "codex:work".into(),
+            label: "Session".into(),
+            model: None,
+            percent: 4.0,
+            resets_at: Some(jiff::Timestamp::from_second(1790262000).unwrap()),
+            source: usage::Source::Live,
+        };
+        assert_eq!(recorded(&deps), [session, live]);
+        let lines = fs::read_to_string(owned::usage_history(&deps.state_dir)).unwrap();
+        assert_eq!(lines.lines().count(), 2, "{lines}");
+    }
+
+    /// The tests that hold the history's lock or wait for the recordings under way, one at a
+    /// time: [`finish_recording`] waits for every recording of the process.
+    fn recording_alone() -> std::sync::MutexGuard<'static, ()> {
+        static ALONE: Mutex<()> = Mutex::new(());
+        ALONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// [`deps`] with a usage cache in `max`'s home (a session at 34%), and the account.
+    fn with_a_cache(dir: &std::path::Path) -> (Arc<Deps>, Account) {
+        let deps = deps(dir);
+        let max = max(&deps);
+        fs::write(
+            dir.join("max/.claude.json"),
+            r#"{"cachedUsageUtilization": {"fetchedAtMs": 1790247600000,
+              "utilization": {"limits": [{"kind": "session", "percent": 34}]}}}"#,
+        )
+        .unwrap();
+        (deps, max)
+    }
+
+    /// The cached usage of `max`, once it has been sent (and so shown): its recording may still
+    /// be under way.
+    fn shown(deps: &Arc<Deps>, max: &Account) -> mpsc::Receiver<Event> {
+        let (tx, rx) = mpsc::channel();
+        spawn(Effect::CachedUsage(vec![max.clone()]), deps, &tx);
+        drop(tx);
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                Event::CachedUsage { .. } => return rx,
+                _ => continue,
+            }
+        }
+    }
+
+    /// R24, R16: leaving the TUI waits for the recording of a reading it has shown, so that the
+    /// reading is not lost: here the history's lock is held by another remuda for a moment.
+    #[test]
+    fn leaving_waits_for_a_reading_shown_to_be_recorded() {
+        let _alone = recording_alone();
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, max) = with_a_cache(dir.path());
+        let path = owned::usage_history(&deps.state_dir);
+        let held = owned::lock_state_file(&path, &owned::Flock).unwrap();
+        let _rx = shown(&deps, &max);
+        let other = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        assert!(
+            finish_recording(RECORD_DRAIN),
+            "the recording did not end in time"
+        );
+        let labels: Vec<String> = recorded(&deps).into_iter().map(|p| p.label).collect();
+        assert_eq!(labels, ["Session"], "recorded once leaving is done waiting");
+        other.join().unwrap();
+    }
+
+    /// R24, R16: leaving the TUI waits a while at most: a recording still held up by a lock
+    /// another remuda keeps is left after [`RECORD_DRAIN`], unwritten, and the TUI ends.
+    #[test]
+    fn leaving_does_not_wait_long_for_a_recording_held_up() {
+        let _alone = recording_alone();
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, max) = with_a_cache(dir.path());
+        let path = owned::usage_history(&deps.state_dir);
+        let held = owned::lock_state_file(&path, &owned::Flock).unwrap();
+        let rx = shown(&deps, &max);
+        let started = Instant::now();
+        assert!(!finish_recording(RECORD_DRAIN));
+        let waited = started.elapsed();
+        assert!(
+            waited >= RECORD_DRAIN - Duration::from_millis(50),
+            "{waited:?}"
+        );
+        assert!(waited < RECORD_DRAIN + Duration::from_secs(1), "{waited:?}");
+        assert!(!path.exists(), "nothing written while the lock is held");
+        // Let the worker end before the next test waits for recordings.
+        drop(held);
+        let _: Vec<Event> = rx.iter().collect();
+    }
+
+    /// R24, R16: while another remuda holds the history's lock (a `remuda usage` compacting,
+    /// or one suspended), every account's cached usage and live answer still reaches the
+    /// screen; they are recorded once the lock is free.
+    #[test]
+    fn a_history_lock_holds_up_no_usage() {
+        let _alone = recording_alone();
+        let dir = tempfile::tempdir().unwrap();
+        let other = Account {
+            provider: CLAUDE,
+            name: "other".into(),
+            home: Home::Path(dir.path().join("other").display().to_string()),
+        };
+        let codex_home = |name: &str| Account {
+            provider: Provider::Codex,
+            name: name.into(),
+            home: Home::Path(dir.path().join(name).display().to_string()),
+        };
+        let (work, play) = (codex_home("work"), codex_home("play"));
+        let mut registered = String::new();
+        for (provider, account) in [("claude", &other), ("codex", &work), ("codex", &play)] {
+            registered.push_str(&format!(
+                "[[account]]\nprovider = \"{provider}\"\nname = \"{}\"\nhome = \"{}\"\n",
+                account.name, account.home
+            ));
+        }
+        let codex = crate::probe::script(
+            dir.path(),
+            "codex",
+            "read a; read b; read c; read d; \
+             echo '{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":4,\
+             \"windowDurationMins\":300}}}}'; \
+             echo '{\"id\":3,\"result\":{}}'; cat >/dev/null",
+        );
+        let deps = Arc::new(Deps {
+            codex: Some(codex),
+            ..Deps::clone(&deps_with(dir.path(), &registered))
+        });
+        let max = max(&deps);
+        fs::create_dir_all(dir.path().join("other")).unwrap();
+        for (home, percent) in [("max", 34), ("other", 56)] {
+            fs::write(
+                dir.path().join(home).join(".claude.json"),
+                format!(
+                    r#"{{"cachedUsageUtilization": {{"fetchedAtMs": 1790247600000,
+                      "utilization": {{"limits": [{{"kind": "session", "percent": {percent}}}]}}}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let history = owned::usage_history(&deps.state_dir);
+        let held = owned::lock_state_file(&history, &owned::Flock).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        spawn(
+            Effect::CachedUsage(vec![max.clone(), other.clone()]),
+            &deps,
+            &tx,
+        );
+        spawn(
+            Effect::LiveUsage(vec![work.clone(), play.clone()]),
+            &deps,
+            &tx,
+        );
+        drop(tx);
+        let mut cached = Vec::new();
+        let mut live = Vec::new();
+        while cached.len() < 2 || live.len() < 2 {
+            match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Event::CachedUsage { account, result }) => {
+                    assert!(result.is_ok(), "{result:?}");
+                    cached.push(account);
+                }
+                Ok(Event::LiveUsage {
+                    account, result, ..
+                }) => {
+                    assert!(result.is_ok(), "{result:?}");
+                    live.push(account);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    panic!("held up by the history's lock: cached {cached:?}, live {live:?}: {e}")
+                }
+            }
+        }
+        assert_eq!(cached, [max, other]);
+        assert!(!history.exists(), "nothing recorded while the lock is held");
+        drop(held);
+        // The workers end once they have recorded.
+        let _: Vec<Event> = rx.iter().collect();
+        let mut accounts: Vec<String> = recorded(&deps).into_iter().map(|p| p.account).collect();
+        accounts.sort();
+        assert_eq!(
+            accounts,
+            ["claude:max", "claude:other", "codex:play", "codex:work"]
         );
     }
 

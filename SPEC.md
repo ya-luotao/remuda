@@ -25,7 +25,7 @@ them. By area:
 | Across accounts | [R18](#r18-shared-configuration) shared configuration |
 | Statistics | [R20](#r20-token-statistics) token statistics and cost |
 | Privacy | [R21](#r21-private-mode-tui) private mode |
-| Recommendation | [R23](#r23-recommendation-pick) `pick` |
+| Recommendation | [R23](#r23-recommendation-pick) `pick` · [R24](#r24-usage-history) usage history |
 
 How the entries map onto the code is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -155,8 +155,8 @@ switching to a different, logged-out account.
   problems are all reported as errors naming the file; remuda neither guesses nor skips. A bare
   name in `[pick]` resolves as in R1, so it becomes an error once another provider has an account
   of that name: `add` and `setup` refuse such an account (R14), and `provider:name` avoids it.
-- Runtime state (index cache, statistics cache, launch log) lives in `$REMUDA_HOME/state/` and may
-  be deleted and rebuilt at any time.
+- Runtime state (index cache, statistics cache, launch log, usage history of R24) lives in
+  `$REMUDA_HOME/state/` and may be deleted and rebuilt at any time.
 - Runtime state is the user's alone: the launch log holds the arguments of every launch, prompts
   among them (R6), and the caches hold titles and directories. `state/` is created with mode
   0700 and its files with mode 0600. A `state/` or a launch log from before that the group or
@@ -260,6 +260,8 @@ remuda run [<account>] [args]                      launch the agent under an acc
 remuda usage [<account>] [--live] [--timeout S]    per-account usage as plain text (R10); with
        [--wait [--max-wait S]]                     --wait, one account's once none of its
                                                    windows is used up
+remuda usage --history [<account>] [--days N]      the usage recorded so far, with each current
+                                                   window's pace (R24)
 remuda list [--timeout S]                          accounts, login identity, home (R10a)
 remuda sessions [--limit N]                        recent sessions: time, account attribution,
                                                    title, cwd (R8, R9)
@@ -632,7 +634,12 @@ appeared in no `history.jsonl`.
   leniently: an unknown `kind` is shown under its own name, and a missing severity, model name,
   or reset time is not shown.
 - `remuda usage [--live]` prints the same information as plain text for direct use from the shell;
-  a codex account's live header also shows its email and plan.
+  a codex account's live header also shows its email and plan. A window that resets within
+  `REMINDER_WITHIN` (60 minutes) of the time it is read at, with at least `REMINDER_LEFT` (25%)
+  left, is followed by a line saying so, since what is left then goes unused:
+  `  note: resets in 42 min with 71% left` (the minutes rounded up). A window whose reset is
+  unknown or has passed since gets none. The note is in `remuda usage` alone: not in the TUI,
+  nor in `remuda pick`. What `remuda usage` reads is also recorded (R24).
 - **`remuda usage --wait <account>`** waits until the account has no window used up, then
   prints its usage as `remuda usage <account>` does, exit 0. A window is used up when its usage
   is known and less than `[pick] min_headroom` percent is left (R3: `usage --wait` reads `[pick]`
@@ -662,9 +669,13 @@ appeared in no `history.jsonl`.
   time, or the time a live query answered (not the time it was started: a query may take as long
   as its timeout; nor the time the answer is first shown: in the TUI it may wait behind a
   foreground agent). Every place that shows or uses it (`remuda usage`, the table and the
-  timeline, `remuda pick`) reads it against the current time in the same way; a command that
-  waits for an agent takes the current time after the wait (`remuda usage --live` when each
-  answer arrives, `remuda pick` as R23 says):
+  timeline, `remuda pick`) reads it against the current time in the same way, taken once the
+  usage has been read, not when the command started; a command that waits for an agent takes
+  the current time after the wait (`remuda usage` when it has read each account's cache, and
+  `remuda usage --wait` likewise at each of its attempts; `remuda usage --live` when each answer
+  arrives, `remuda pick` as R23 says). So a reset that falls while `remuda usage` runs, before an
+  account's cache is read, has reset since for that account: its old percentage is not shown,
+  noted, recorded (R24), or waited on:
   - Reset wording is read as the next such time after it was said, not after now.
   - A window whose reset fell after its usage was recorded and is not after now has **reset
     since**: the percentage recorded is obsolete, and what the window holds now is unknown until
@@ -784,9 +795,9 @@ The complete set of remuda's write operations:
 
 - `$REMUDA_HOME/config.toml`, `$REMUDA_HOME/state/**`, `$REMUDA_HOME/shared/**` (R18).
   Where the user put a symlink: a `config.toml`, a `state`, or a file in `state/` that is a
-  symlink (a cache, the launch log) is written through (R3); where it points, remuda touches
-  only its own files (the
-  registry, the caches, the launch log, the settings files of R18). Modes there (R3): the
+  symlink (a cache, the launch log, the usage history of R24) is written through (R3); where it
+  points, remuda touches only its own files (the registry, the caches, the launch log, the usage
+  history, the settings files of R18). Modes there (R3): the
   directory a `state` symlink points at keeps its mode, and so does the file that a
   `config.toml` or a file in `state/` that is itself a symlink points at; a regular file
   remuda owns by name in a directory reached through a `state` symlink is still created with
@@ -959,6 +970,14 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
   home (R2), is not launched, and remuda exits with an error that says so. A provider's
   `default` is implicit (R1) and cannot have been removed.
 - **Configuration** (`p` or Space in Accounts): the selected account's configuration (R22).
+- **Usage readings are recorded** (R24): the cached usage the Accounts view reads (when it
+  starts, on a refresh, for an account the registry adds) and every answer of `u`'s live
+  queries, as `remuda usage` records them, once they are shown: the cached usage of every
+  account read at once first. Leaving the TUI (quitting, or choosing the account of
+  `remuda run`) waits for the recordings of the readings it has shown, at most `RECORD_DRAIN`
+  (2 seconds): what is still under way then (held up by a lock another remuda holds) is not
+  recorded, and the TUI ends all the same. The TUI never compacts the history and does not show
+  it, so private mode (R21) has nothing of it to hide.
 - **Preview** (`p` or Space in History / Live): expands or collapses the preview (R8); `Enter`
   resumes or attaches, as above.
 
@@ -1789,9 +1808,10 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
 `remuda pick` recommends which account and model to launch now, and at what effort. Rules decide
 what is feasible and rank it; with a key, TypeSafe's Jev model chooses among the feasible options.
 It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4) or, with
-`--live`, R10's live queries, and writes nothing except, with `--run`, the launch log (R6).
-Given a session to resume or fork, it also reads the launch log and the session index (R8) to
-prefer the account whose prompt cache holds it (**Resuming**, below).
+`--live`, R10's live queries, and writes nothing except, with `--run`, the launch log (R6): the
+usage it reads is not recorded in the usage history (R24). Given a session to resume or fork, it
+also reads the launch log and the session index (R8) to prefer the account whose prompt cache
+holds it (**Resuming**, below).
 
 - **Candidates.** Each account R1 lists (`default` included) with each model of its provider's
   `models`, or with the agent's default (nothing injected) when there are none; resuming or
@@ -2041,3 +2061,100 @@ prefer the account whose prompt cache holds it (**Resuming**, below).
   - Resuming (**Resuming**), the session's facts (the launch log, the session index, the ends
     of its copies) are read once, before the first attempt; whether the account that ran it is
     warm is judged at each attempt's instant, so a long wait can let its cache go cold.
+
+
+## R24. Usage history
+
+Each usage reading `remuda usage` and the TUI take is kept, a point per window, so that the
+usage of a window can be followed to its reset. Nothing else records usage: `remuda pick` writes
+nothing (R23), and `remuda list` reads no usage.
+
+- **The file.** `$REMUDA_HOME/state/usage-history.jsonl`, one JSON object per line, appended:
+  `{"ts", "account", "label", "model", "percent", "resets_at", "source"}`. `ts` is the time of
+  the reading as R10 has it: the cache time (claude's `fetchedAtMs`, the codex rollout record's
+  `timestamp`) or the time a live answer arrived; never the time remuda ran, so the same cache
+  read again is the same reading. `account` is `provider:name`; `label` the window's label
+  (R10); `model` the name in its parentheses, null for `all models` and for a window without
+  one; `percent` the percentage used; `resets_at` the reset when it was ahead at the reading,
+  else null (none told, wording not read, or already behind when recorded); `source` `cached` or
+  `live`. Times are RFC 3339. A window is identified by `account`, `label`, and `model`.
+- **What is recorded.** `remuda usage` records what it reads, cached or with `--live`; with
+  `--wait` (R10), every reading it takes, the one printed at the end included, once the wait is
+  over and that reading is printed; `remuda usage --history` records nothing. The TUI records
+  the cached usage it reads for the Accounts view and each answer of `u` (R16). Not recorded: a
+  reading whose time is unknown (a cache without `fetchedAtMs`); a window that has reset since
+  it was read (`reset since cached`, R10, as of the time the cache was read, not when the
+  command started), whose percentage is unknown; a live query that failed, or whose answer told no usage or
+  was not recognized (R10); a point older than the 45 days kept. A point already in the history,
+  of the same window with the same `ts`, `percent`, and `resets_at`, is not recorded again, so
+  a cache read between two live answers adds nothing.
+- **Writing.** The points of one run of `remuda usage` (every account) or of one batch of the
+  TUI (the cached usage of the accounts it reads at once, or one account's live answer) are one
+  write. Every write takes an exclusive lock and holds it while it reads the history, leaves out
+  the points already there, and writes. As for the registry (R3), the lock is on the directory
+  of the file that is replaced, and no lock file is created: the state directory's own or,
+  where `usage-history.jsonl` is a symlink, that of the file it points at. So every path to one
+  history takes the same lock, two `$REMUDA_HOME`s whose histories link to one file included.
+  The link is resolved once, before the lock is taken, and looked at again under the lock: one
+  pointed elsewhere meanwhile gets nothing; nor does a link that leads nowhere (unlike the launch
+  log's, R3, its target is not created). From then on the file is read, checked, appended to, and
+  replaced by its name in the directory that is locked, through that directory's descriptor, never
+  through the link: a link pointed elsewhere after that redirects nothing, and the file it points
+  at then is neither read nor written. A history of the state directory that is replaced by a
+  symlink meanwhile is not written through it. The history is never created with any mode but
+  0600: where `usage-history.jsonl` is a file of `state/` and is missing (also removed after it
+  was read), it is created with mode 0600, as the launch log is (R3); the file a symlink points
+  at is never created, so one removed after it was read gets nothing, neither appended to nor
+  replaced.
+  The write is either one append (one `write` on a file opened with `O_APPEND`, like the launch
+  log; a last line left unfinished is ended first), or, when it compacts, one replacement
+  (temporary file + rename, R3). Readings taken at the same time, also by two `remuda usage` and
+  the TUI, so lose no point, and the same reading taken twice at once is recorded once. Only
+  `remuda usage` compacts: points older than 45 days and lines that are not points are dropped,
+  and of what remains and the new points together, beyond 50,000 lines, the first written (new
+  points too, when they alone are more); the file is replaced only when that drops a line. The
+  history is a file of `state/`, written as R3 says (created with mode 0600, a symlink in its
+  place written through) and, appended to or replaced, under the launch log's rules: nothing is
+  written to it when it is not a regular file, nor when it is a symlink to a file the group or
+  others can access (whose mode remuda leaves as it is); a history that is not a regular file is
+  not read either (a FIFO would hold remuda up). The history is a by-product: on a file system
+  without locks nothing is recorded or compacted (a write without the lock could lose another's
+  point), and a `state/` that cannot be created, written, or locked records nothing; `remuda
+  usage` and the TUI say nothing of it and go on. The TUI records a batch once all of it is on
+  the screen: a lock another remuda holds (one compacting, or one suspended) holds up no
+  account's usage. Leaving the TUI waits for such recordings at most 2 seconds (R16), so a
+  reading shown just before is not lost, and a lock held elsewhere delays the end no longer.
+- **Window length.** The pace needs a window's length, which remuda reads from its label (R10):
+  `Session` is 5 hours and `Week …` 7 days (claude's `session`, `weekly_all`, and
+  `weekly_scoped` limits, its older `five_hour` and `seven_day` fields, its live `Current session`
+  and `Current week` lines; codex's windows of 5 and 168 hours); codex's `<N>h window`, `<N>d
+  window`, and `<N>m window` are as long as they say (`N` in ASCII digits, the window at most ten
+  years long); a claude limit of unknown kind, labeled by
+  its kind, is 5 hours for `five_hour` and 7 days for `seven_day…`. Others are of unknown length,
+  and a window of unknown length gets no pace.
+  Codex's labels round its windows to whole hours (R10), so a codex window of 90 minutes counts
+  as 2 hours.
+- **`remuda usage --history [<account>] [--days N]`** prints, for each account (the one named,
+  else every account R1 lists, in order), each window it has points for since `N` days ago
+  (default 7, at most 3650), in the order first recorded: the label, then its points in time
+  order, grouped by window. A point starts a new window when it was read at or after the reset
+  of the one before, or when its reset is further than the window's half-length, at most an hour,
+  from that one (an hour when the length is unknown): claude's live resets are told to the minute
+  or the hour, its cache's to the second. A point without a reset stays in the window before. The
+  last window, when its reset is ahead or unknown, is the current one, listed a point a line:
+  `<time>  <used>%  resets <reset>` (without `resets` when the point has none). Every other window
+  is one line: `window ended <reset>: peaked NN%` (its highest percentage; `window to <reset>`
+  for one whose reset is still ahead, `earlier window` for one whose reset is unknown). Times are
+  in the local time zone, as `remuda usage` prints them. An account without points then:
+  `<account>  no usage history in the last N days`. Without a history:
+  `no usage history yet (<path>)`. Both exit 0; a history that cannot be read is an error. It
+  does not combine with `--live`, `--wait`, or `--max-wait`.
+- **Pace.** The current window, of known length `L` and with a reset `R` told, gets a line from
+  its latest point, read at `t` with `u`% used: the window started at `R − L`, and
+  `e = (t − (R − L)) / L` of it had elapsed then (`e < 1`, since `t` was before `R`). `used u%
+  with E% of the window elapsed` (`E` is `e` in whole percent, rounded down), then: at 100%,
+  `: limit reached (resets R)`; when `u/100 > e`, `: ahead of an even pace; at this pace 100% by
+  T (resets R)`, `T = (R − L) + (t − (R − L)) · 100 / u`; otherwise `: behind an even pace; at
+  this pace P% at reset`, `P = u / e` rounded. With `e ≤ 0` (a point read before the window's
+  start, which a reset further than `L` ahead or a clock behind would make) the line ends after
+  the elapsed share, with no projection.

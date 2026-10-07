@@ -1,4 +1,4 @@
-//! R23: `remuda pick`. Every test runs with the fake curl first on PATH (R15); the key is a
+//! R23, R24: `remuda pick` (which records no usage history). Every test runs with the fake curl first on PATH (R15); the key is a
 //! sentinel that must never show in output or in curl's arguments.
 
 mod common;
@@ -2418,6 +2418,29 @@ fn per_model_windows_without_models_are_shown_not_counted() {
             .contains("(per-model; applies only if the agent's default model is in this family)"),
         "{body:#}"
     );
+}
+
+/// R23, R24: `pick` writes nothing without `--run`: the usage it reads, cached or live, is not
+/// recorded in the usage history (only `remuda usage` and the TUI record it).
+#[test]
+fn pick_records_no_usage_history() {
+    let (sb, max, _) = two_accounts(MODELS);
+    sb.set_live_usage(
+        Some(&max),
+        "Current session: 9% used \u{b7} resets Sep 24 at 3:19am (Asia/Shanghai)\n",
+    );
+    for args in [&[][..], &["--json"], &["--live"], &["--print-request"]] {
+        let out = pick(&sb, false, args);
+        assert_eq!(out.code, Some(0), "{args:?}: {}{}", out.stdout, out.stderr);
+    }
+    assert!(!sb.invocations().is_empty(), "--live asked claude");
+    assert!(
+        !sb.remuda_home().join("state").exists(),
+        "pick wrote in state/"
+    );
+    // The same usage read by `remuda usage` is recorded: what pick leaves out is its own.
+    sb.remuda().arg("usage").assert().success();
+    assert!(sb.remuda_home().join("state/usage-history.jsonl").is_file());
 }
 
 // --- wait --------------------------------------------------------------------------------

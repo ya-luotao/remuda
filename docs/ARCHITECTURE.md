@@ -114,6 +114,7 @@ The exceptions, all for a type or a small helper:
 | `setup` | Create the new home (through `owned`), link a member's to the source's session store and configuration (`share_links`, over the catalog of `home_items`), and register it; the login command | R5, R12, R13, R17, R18 |
 | `identity` | Parses `claude auth status --json`, `codex login status` and `account/read`; the `.claude.json` fallback | R10a |
 | `usage` | Cached and live usage for both providers as rows (what the agent said; a partly read answer is not used), window labels, the text of `remuda usage` | R10 |
+| `usage::history` | The usage history: the points of a reading, recorded under the lock of the directory of the file replaced (`owned::lock_state_file`; leaving out what is there, appending, or compacting), the window lengths read from labels, each current window's pace, the text of `remuda usage --history` | R24 |
 | `usage::snapshot` | Rows read at an instant: each window's reset (ahead, passed since, unknown), its percentage and severity (unknown once it has reset since), the snapshot's age and staleness. The one place that compares a reset with now; `usage`, `pick`, `jev` and the TUI take it from here | R10, R23 |
 | `live` | Running claude sessions: parses `agents --json`, `sessions/*.json` fallback checked against `ps`; attach, logs, stop, rm | R7, R16 |
 | `checks` | Warnings for the Accounts view, among them what a member's home links and does not (the relations of `home_items`, put into words) | R11 |
@@ -460,13 +461,19 @@ carries.
      ├── index.json               session index cache                            index
      ├── stats.json               token statistics cache                         stats
      ├── launches.jsonl           one line per launch (append-only)              launch
+     ├── usage-history.jsonl      one line per usage window read (45 days)       usage::history
      └── settings/                injected settings                              share
          ├── <sha256>.json        one per content (0600), pruned after 30 days
          └── .lock                taken while choosing or pruning a file
 ```
 
-`launches.jsonl` is the only file in `state/` whose loss costs information: attribution of
-sessions started through remuda falls back to `history.jsonl`.
+`launches.jsonl` and `usage-history.jsonl` are the files in `state/` whose loss costs
+information: attribution of sessions started through remuda falls back to `history.jsonl`, and
+`remuda usage --history` starts again from the next reading. Both are appended to; the usage
+history is also replaced atomically when `remuda usage` compacts it (old points dropped), under
+the lock every write to it takes: that of the directory of the file replaced (`state/`, or where
+a history that is a symlink points), so a point appended meanwhile, through any path to the
+file, is not lost.
 
 The modules in the right column decide what a file holds; `owned` is the one that writes it.
 What every write there has in common lives in that module and is tested there once:
@@ -485,11 +492,17 @@ What every write there has in common lives in that module and is tested there on
  owned::update_registry  lock the directory of the file that is replaced ($REMUDA_HOME, or
                          where a symlinked config points), run the edit, write it there
  owned::save_cache       0600 whatever was there; through a symlinked cache file
+ owned::lock_state_file  lock a state file for reading and replacing it: the directory of the
+                         file replaced (where a symlink points), checked again under the lock;
+                         read, check, append, replace through that directory's descriptor,
+                         never through the link again; created only in state/, 0600
  owned::append_log       regular file only, the user's alone, opened without blocking
 ```
 
 The symlinks remuda writes through are the three R3 names; everything else is opened without
-following one. Reads do not go through `owned`, so a command that only reads creates nothing.
+following one. Reads do not go through `owned`, so a command that only reads creates nothing;
+`remuda usage` and the TUI's usage readings are not only reads: they record what they read
+(R24).
 
 ## Tests
 
@@ -510,7 +523,7 @@ tests include that same file (`src/lib.rs`), so there is one builder.
 | `index.rs`, `codex_index.rs`, `preview.rs`, `sessions_cli.rs` | Session index and preview (R8, R17) |
 | `attribution.rs` | Attribution (R9) |
 | `live.rs` | Running sessions (R7) |
-| `usage_cli.rs`, `list_identity.rs`, `codex_cli.rs` | Usage and identity (R4, R10, R10a, R17) |
+| `usage_cli.rs`, `list_identity.rs`, `codex_cli.rs` | Usage, its history, and identity (R4, R10, R10a, R17, R24) |
 | `stats.rs`, `stats_cli.rs` | Token statistics and cost (R20) |
 | `tui_cli.rs` | Bare `remuda` needs a terminal (R5) |
 
@@ -551,4 +564,5 @@ cargo run --release --example codex_timing -- [<codex home>]
 | Add or change a message with a path in it (a check, a notice, a problem) | Build it as `privacy::Marked` where it is made: `.words()` for what remuda says, `.path()` for each path, `.text()` for anything read from a file or a child; the tests of `checks` and `account_config` fail on a path formatted into words. An error the TUI shows: return the message as the error and read it with `Marked::from_error`; `tests/private_messages.rs` draws the result |
 | Add a model price | SPEC R20 table and `pricing` |
 | Change what a usage window means once its reset has passed, or how old usage counts | SPEC R10 / R23, `usage::snapshot` (`Snapshot::at`); every surface reads it from there |
+| Record usage from another place, or change what the history keeps | SPEC R24, `usage::history` (`record`: its lock is what keeps concurrent writers from losing points); `pick` must stay out of it (R23) |
 | Change what `remuda pick` sends to Jev | SPEC R23, `jev::request` and `jev::state_text`; the privacy test in `tests/pick_cli.rs` |
