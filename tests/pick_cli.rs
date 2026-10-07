@@ -1364,6 +1364,8 @@ fn run_respects_the_users_options_and_refuses_unnamed_sessions() {
         &["--resume"],
         &["--session-id", id],
         &["--resume", id, "-c"],
+        // A fork, like a resume, names exactly one session.
+        &["--resume", id, "--resume", "other", "--fork-session"],
     ] {
         for run in [true, false] {
             let (sb, _, _) = two_accounts(&format!("{NOTES}{MODELS}"));

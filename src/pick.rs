@@ -340,7 +340,15 @@ fn opens(provider: Provider, args: &[String]) -> Opens {
     match provider {
         Provider::Claude => match launch::classify(args) {
             Intent::NewSession => Opens::New,
-            Intent::Fork { of } => Opens::Session(SessionKind::Fork, of),
+            // R6 takes the first of several resumes for the fork: here, as for a resume, there
+            // must be exactly one. Without it and `--fork-session`, what is left must start a
+            // new session.
+            Intent::Fork { of }
+                if launch::classify(&without_fork(&without_resume(args, &of)))
+                    == Intent::NewSession =>
+            {
+                Opens::Session(SessionKind::Fork, of)
+            }
             // `--session-id <id>` alone reads so too: that is a new session's id. Without the
             // resume, what is left must start a new session: no other resume, continue or id.
             Intent::Existing {
@@ -365,6 +373,14 @@ fn opens(provider: Provider, args: &[String]) -> Opens {
             _ => Opens::New,
         },
     }
+}
+
+/// `args` without `--fork-session`.
+fn without_fork(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|a| *a != "--fork-session")
+        .cloned()
+        .collect()
 }
 
 /// `args` without their first `--resume <id>`, `-r <id>` or `--resume=<id>`.
@@ -2806,6 +2822,7 @@ mod tests {
             &["--resume", "x", "-c"],
             &["--resume", "x", "--session-id", "y"],
             &["--resume", "x", "--fork-session", "--session-id", "y"],
+            &["--resume", "x", "--resume", "y", "--fork-session"],
             &["agents"],
         ] {
             let err = run_args(Provider::Claude, None, None, &strings(refused)).unwrap_err();
@@ -2891,6 +2908,11 @@ mod tests {
             &["--resume", id, "--resume", "other"],
             &["--resume", id, "--session-id", "other"],
             &["--resume", id, "--fork-session", "--session-id", "other"],
+            // A fork names exactly one session too (R6 would fork the first).
+            &["--resume", id, "--resume", "other", "--fork-session"],
+            &["-r", id, "--resume", "other", "--fork-session"],
+            &["--resume", id, "--fork-session", "--resume=other"],
+            &["--resume", id, "--fork-session", "-c"],
             &["resume", "--last"],
             &["fork"],
         ] {

@@ -1894,9 +1894,10 @@ prefer the account whose prompt cache holds it (**Resuming**, below).
   into the new account's cache: it takes longer and spends that account's limits. So `pick`
   prefers the account that ran it, among the feasible pairs only: **affinity orders, it never
   makes a pair feasible**.
-  - The arguments after `--` name the session: for claude, `--resume <id>` (`-r <id>`,
-    `--resume=<id>`) with no other resume, continue, or `--session-id` option, or the fork
-    `--resume <id> --fork-session` (R6's classification); for codex, `resume <id>` or
+  - The arguments after `--` name the session: for claude, exactly one `--resume <id>`
+    (`-r <id>`, `--resume=<id>`) with no other resume, continue, or `--session-id` option, alone
+    or with `--fork-session` for a fork (R6's classification; where R6 forks the first of
+    several resumes, `pick` refuses them, as it refuses every other form); for codex, `resume <id>` or
     `fork <id>` first (R17). Only that provider's accounts are candidates (a conflicting
     `--provider` is an error, and arguments that name a session for both readings are refused
     as ambiguous). Each account is one candidate, with nothing injected: neither `models` nor
