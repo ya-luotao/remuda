@@ -106,6 +106,7 @@ remuda add work ~/.claude-work        # register an existing Claude home, as is
 remuda setup personal                 # or create a new account and log in to it
 
 remuda usage                          # usage left on every account (add --live to ask each agent now)
+remuda usage --history                # how each window's usage went, and its pace to the reset
 remuda                                # open the TUI: accounts, live sessions, history, stats
 
 remuda run work                       # launch claude as `work`; extra args go to claude unchanged
@@ -124,7 +125,8 @@ the bare name means `claude:default`, and the Codex one is `codex:default`.
 | --- | --- |
 | `remuda` | Open the TUI. Requires a terminal on standard input and output. |
 | `remuda run [<account>] [args...]` | Launch the account's agent, replacing the `remuda` process. `args` are passed to the agent verbatim. Without an account, the TUI account picker opens first; that form takes no other arguments. |
-| `remuda usage [<account>] [--live] [--timeout <SECONDS>]` | Print usage limits for every account, or for one. Without `--live`, reads the agent's local cache. With `--live`, asks each account's agent in parallel (`claude -p /usage`, `codex app-server`) and exits 1 if any query fails. `--timeout` applies to each live query (default 90). |
+| `remuda usage [<account>] [--live] [--timeout <SECONDS>]` | Print usage limits for every account, or for one. Without `--live`, reads the agent's local cache. With `--live`, asks each account's agent in parallel (`claude -p /usage`, `codex app-server`) and exits 1 if any query fails. `--timeout` applies to each live query (default 90). A window that resets within the hour with at least 25% left gets a note. What is read is recorded in `state/usage-history.jsonl` (45 days). |
+| `remuda usage --history [<account>] [--days <N>]` | Print the usage recorded over the last `N` days (default 7): each current window point by point with its pace (ahead of or behind an even pace, and where that pace ends up at the reset), earlier windows a line each with their peak. Records nothing itself. |
 | `remuda list [--timeout <SECONDS>]` | Print every account with its login identity (email, organization and plan; for Codex, the login method only) and home. `--timeout` applies to each identity query (default 15). |
 | `remuda sessions [--limit <N>]` | Print the newest sessions: time, attributed accounts, title and working directory (default 30). |
 | `remuda stats [<account>] [--period today\|7d\|30d\|all]` | Print tokens per account and model for a period (default `all`); with an account, only the sections that include it. The first run reads every transcript whole, which can take tens of seconds on a large history; later runs read only what changed. Shows each model's estimated cost (≈ API list price, prices built in as of 2026-10-07; an estimate, not a bill). |

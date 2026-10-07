@@ -17,6 +17,7 @@ use crate::provider::{Provider, codex};
 use crate::registry::Account;
 use crate::{Env, text};
 
+pub mod history;
 pub mod snapshot;
 
 pub use snapshot::{Reading, Reset, Snapshot, Source, Window};
@@ -293,11 +294,18 @@ pub const WARN_AT: f64 = 75.0;
 /// ... and from this one critical (R10).
 pub const CRIT_AT: f64 = 90.0;
 
+/// A window that resets within this many seconds of now ...
+pub const REMINDER_WITHIN: i64 = 60 * 60;
+/// ... with at least this percentage left gets a note in `remuda usage` (R10).
+pub const REMINDER_LEFT: f64 = 25.0;
+
 /// Indented, aligned rows of `reading`'s windows: label, percent, `!`/`!!` for warning/critical
 /// ([`Window::severity`]), reset time. A window whose reset has passed since the usage was
-/// recorded has `-` for its percent and says so (R10).
-pub fn format_rows(reading: &Reading, tz: &TimeZone) -> String {
-    let cells: Vec<(&str, String, &str, String)> = reading
+/// recorded has `-` for its percent and says so (R10). A window that resets within
+/// [`REMINDER_WITHIN`] of `now` with at least [`REMINDER_LEFT`] percent left is followed by a
+/// note saying so: what is left then goes unused (R10).
+pub fn format_rows(reading: &Reading, tz: &TimeZone, now: Timestamp) -> String {
+    let cells: Vec<(&str, String, &str, String, Option<String>)> = reading
         .windows
         .iter()
         .map(|w| {
@@ -319,19 +327,42 @@ pub fn format_rows(reading: &Reading, tz: &TimeZone) -> String {
                 ),
                 (Some(used), _, None) => (format_percent(used), String::new()),
             };
-            (w.label.as_str(), percent, mark, resets)
+            (w.label.as_str(), percent, mark, resets, reminder(w, now))
         })
         .collect();
     let label_w = cells.iter().map(|c| text::width(c.0)).max().unwrap_or(0);
     let pct_w = cells.iter().map(|c| c.1.len()).max().unwrap_or(0);
     cells
         .iter()
-        .map(|(label, pct, mark, resets)| {
+        .map(|(label, pct, mark, resets, note)| {
             let label = text::pad(label, label_w);
             let line = format!("  {label}  {pct:>pct_w$} {mark:<2}  {resets}");
-            format!("{}\n", line.trim_end())
+            let note = note
+                .as_ref()
+                .map(|note| format!("  note: {note}\n"))
+                .unwrap_or_default();
+            format!("{}\n{note}", line.trim_end())
         })
         .collect()
+}
+
+/// `resets in 42 min with 71% left`, for a window whose reset is ahead and within
+/// [`REMINDER_WITHIN`] of `now`, with at least [`REMINDER_LEFT`] percent left (R10). A window
+/// that has reset since, or whose reset is unknown, gets none.
+fn reminder(w: &Window, now: Timestamp) -> Option<String> {
+    let Reset::Ahead(at) = w.reset else {
+        return None;
+    };
+    let secs = at.as_second() - now.as_second();
+    let left = w.left()?;
+    if secs > REMINDER_WITHIN || left < REMINDER_LEFT {
+        return None;
+    }
+    let minutes = ((secs + 59) / 60).max(1);
+    Some(format!(
+        "resets in {minutes} min with {} left",
+        format_percent(left)
+    ))
 }
 
 /// `34%`, `12.5%`.
@@ -382,16 +413,26 @@ fn cached_claude(account: &Account, env: &Env) -> Result<CachedUsage, String> {
 
 /// `remuda usage` block for one account from its cached usage (R10).
 pub fn cached_report(account: &Account, env: &Env, tz: &TimeZone, now: Timestamp) -> String {
+    cached_text(account, &cached_usage(account, env), tz, now)
+}
+
+/// [`cached_report`] of the cached usage `cached` already read.
+pub fn cached_text(
+    account: &Account,
+    cached: &Result<CachedUsage, String>,
+    tz: &TimeZone,
+    now: Timestamp,
+) -> String {
     let name = account.qualified();
-    match cached_usage(account, env) {
+    match cached {
         Err(notice) => format!("{name}  no cached usage ({notice})\n"),
         Ok(cached) => {
-            let reading = Snapshot::cached(&cached).at(now);
+            let reading = Snapshot::cached(cached).at(now);
             let when = match (reading.age_text(), reading.fetched_at) {
                 (Some(age), Some(at)) => format!("cached {age} ({})", format_time(at, tz)),
                 _ => "cached (time unknown)".to_string(),
             };
-            format!("{name}  {when}\n{}", format_rows(&reading, tz))
+            format!("{name}  {when}\n{}", format_rows(&reading, tz, now))
         }
     }
 }
@@ -580,8 +621,19 @@ pub fn live_report(
     clock: fn() -> Timestamp,
     timeout: Duration,
 ) -> (String, bool) {
+    let result = live_usage(account, agents, timeout);
+    live_text(account, &result, tz, clock())
+}
+
+/// [`live_report`] of the answer `result`, read at `answered_at`: when it arrived.
+pub fn live_text(
+    account: &Account,
+    result: &Result<LiveResult, String>,
+    tz: &TimeZone,
+    answered_at: Timestamp,
+) -> (String, bool) {
     let name = account.qualified();
-    match live_usage(account, agents, timeout) {
+    match result {
         Err(e) => (format!("{name}  error: {e}\n"), false),
         Ok(LiveResult { usage, identity }) => {
             let who = identity.as_ref().map(who_and_plan).unwrap_or_default();
@@ -598,10 +650,12 @@ pub fn live_report(
                     )
                 }
                 LiveUsage::Rows(rows) => {
-                    let now = clock();
-                    let reading = Snapshot::live(&rows, now).at(now);
+                    let reading = Snapshot::live(rows, answered_at).at(answered_at);
                     (
-                        format!("{name}  live{who}\n{}", format_rows(&reading, tz)),
+                        format!(
+                            "{name}  live{who}\n{}",
+                            format_rows(&reading, tz, answered_at)
+                        ),
                         true,
                     )
                 }
@@ -1330,7 +1384,7 @@ mod tests {
     /// A live answer's rows as text, read when they were answered.
     fn live_text(rows: &[UsageRow]) -> String {
         let now = ts("2026-09-23T12:00:00Z");
-        format_rows(&Snapshot::live(rows, now).at(now), &TimeZone::UTC)
+        format_rows(&Snapshot::live(rows, now).at(now), &TimeZone::UTC, now)
     }
 
     fn normalized(out: &str) -> Vec<String> {
@@ -1343,18 +1397,29 @@ mod tests {
     fn formats_rows_with_markers() {
         let cached = parse_cached(CACHE).unwrap();
         let fetched = cached.fetched_at.unwrap();
-        let out = format_rows(&Snapshot::cached(&cached).at(fetched), &TimeZone::UTC);
+        let out = format_rows(
+            &Snapshot::cached(&cached).at(fetched),
+            &TimeZone::UTC,
+            fetched,
+        );
+        // Read when cached (15:19), 21 minutes before the session resets with 66% left: the
+        // note of R10 follows its row.
         assert_eq!(
             normalized(&out),
             [
                 "Session 34% resets Sep 23 15:39",
+                "note: resets in 21 min with 66% left",
                 "Week (all models) 77% ! resets Sep 25 04:59",
                 "Week (Fable) 100% !! resets Sep 25 04:59",
             ]
         );
         assert!(out.lines().all(|l| l.starts_with("  ")), "{out}");
         // Percent columns line up.
-        let pct_end: Vec<usize> = out.lines().map(|l| l.find('%').unwrap()).collect();
+        let pct_end: Vec<usize> = out
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("note:"))
+            .map(|l| l.find('%').unwrap())
+            .collect();
         assert!(pct_end.windows(2).all(|w| w[0] == w[1]), "{out}");
         let live = live_text(&parse_live(LIVE).items);
         assert!(live.contains("9%"), "{live}");
@@ -1383,7 +1448,7 @@ mod tests {
         let cached = parse_cached(CACHE).unwrap();
         // After the session's reset (Sep 23 15:39), before the week's.
         let reading = Snapshot::cached(&cached).at(ts("2026-09-24T00:00:00Z"));
-        let out = format_rows(&reading, &TimeZone::UTC);
+        let out = format_rows(&reading, &TimeZone::UTC, ts("2026-09-24T00:00:00Z"));
         assert_eq!(
             normalized(&out),
             [
@@ -1404,7 +1469,11 @@ mod tests {
         // Every reset passed: the exhausted per-model week is not marked critical any more.
         let later = Snapshot::cached(&cached).at(ts("2026-10-01T00:00:00Z"));
         assert_eq!(
-            normalized(&format_rows(&later, &TimeZone::UTC)),
+            normalized(&format_rows(
+                &later,
+                &TimeZone::UTC,
+                ts("2026-10-01T00:00:00Z")
+            )),
             [
                 "Session - reset since cached (Sep 23 15:39)",
                 "Week (all models) - reset since cached (Sep 25 04:59)",
@@ -1414,18 +1483,59 @@ mod tests {
         // A live answer naming a reset already behind keeps its percentage, and its wording.
         let now = ts("2026-09-24T00:00:00Z");
         let rows = [row("Session", 95.0, None, text("Sep 23 at 11pm (UTC)"))];
-        let live = format_rows(&Snapshot::live(&rows, now).at(now), &TimeZone::UTC);
+        let live = format_rows(&Snapshot::live(&rows, now).at(now), &TimeZone::UTC, now);
         assert_eq!(
             normalized(&live),
             ["Session 95% !! resets Sep 23 at 11pm (UTC)"]
         );
         // The same answer, asked before that reset and read after it.
         let asked = ts("2026-09-23T20:00:00Z");
-        let aged = format_rows(&Snapshot::live(&rows, asked).at(now), &TimeZone::UTC);
+        let aged = format_rows(&Snapshot::live(&rows, asked).at(now), &TimeZone::UTC, now);
         assert_eq!(
             normalized(&aged),
             ["Session - reset since asked (Sep 23 23:00)"]
         );
+    }
+
+    /// R10: a window that resets within an hour with at least 25% left is followed by a note;
+    /// one further off, with less left, that has reset since, or without a reset is not.
+    #[test]
+    fn a_window_about_to_reset_with_much_left_gets_a_note() {
+        let now = ts("2026-10-08T12:00:00Z");
+        let rows = [
+            row("A", 29.0, None, at("2026-10-08T12:42:00Z")),
+            row("B", 29.0, None, at("2026-10-08T13:00:00Z")),
+            row("C", 29.0, None, at("2026-10-08T13:00:01Z")),
+            row("D", 76.0, None, at("2026-10-08T12:10:00Z")),
+            row("E", 75.0, None, at("2026-10-08T12:00:30Z")),
+            row("F", 10.0, None, None),
+            row("G", 10.0, None, text("Oct 8 at 12:20pm (UTC)")),
+        ];
+        let out = format_rows(&Snapshot::live(&rows, now).at(now), &TimeZone::UTC, now);
+        assert_eq!(
+            normalized(&out),
+            [
+                "A 29% resets Oct 8 12:42",
+                "note: resets in 42 min with 71% left",
+                "B 29% resets Oct 8 13:00",
+                "note: resets in 60 min with 71% left",
+                "C 29% resets Oct 8 13:00",
+                "D 76% ! resets Oct 8 12:10",
+                "E 75% ! resets Oct 8 12:00",
+                "note: resets in 1 min with 25% left",
+                "F 10%",
+                "G 10% resets Oct 8 at 12:20pm (UTC)",
+                "note: resets in 20 min with 90% left",
+            ]
+        );
+        assert!(out.contains("\n  note: resets in 42 min"), "{out}");
+        // Cached usage read after the reset: no percentage, no note.
+        let cached = CachedUsage {
+            fetched_at: Some(ts("2026-10-08T11:00:00Z")),
+            rows: vec![row("A", 29.0, None, at("2026-10-08T11:30:00Z"))],
+        };
+        let out = format_rows(&Snapshot::cached(&cached).at(now), &TimeZone::UTC, now);
+        assert!(!out.contains("note"), "{out}");
     }
 
     #[test]

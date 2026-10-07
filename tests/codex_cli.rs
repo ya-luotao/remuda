@@ -544,7 +544,13 @@ fn live_usage_asks_codex_app_server() {
         1,
         "claude asked once, for its own account"
     );
-    assert!(!sb.remuda_home().join("state").exists());
+    // No launch is logged; what was read is recorded (R24), and nothing else is written.
+    assert!(!sb.launch_log().exists());
+    let state: Vec<_> = fs::read_dir(sb.remuda_home().join("state"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(state, ["usage-history.jsonl"]);
 }
 
 /// R10: `account/read` failing does not fail the query: the usage is shown, without an identity.

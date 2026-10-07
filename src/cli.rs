@@ -18,6 +18,7 @@ use crate::privacy::Aliases;
 use crate::provider::Provider;
 use crate::registry::{self, Account, Home, Registry};
 use crate::stats::{self, Period};
+use crate::usage::history;
 use crate::{Env, owned, paths};
 use crate::{attribution, jev, launch, live, pick, probe, setup, text, transcript, tui, usage};
 
@@ -61,6 +62,13 @@ enum Command {
         /// Seconds to wait for each account's live query (claude scans local session history: 2-20 s; codex: about 1-2 s)
         #[arg(long, value_name = "SECONDS", default_value = "90", value_parser = parse_timeout)]
         timeout: Duration,
+        /// Show the recorded usage history (state/usage-history.jsonl) and each current window's pace instead
+        #[arg(long, conflicts_with = "live")]
+        history: bool,
+        /// With --history: how many days back
+        #[arg(long, value_name = "N", default_value = "7", requires = "history",
+              value_parser = clap::value_parser!(u32).range(1..=3650))]
+        days: u32,
     },
     /// Recent sessions, newest first: time, accounts, title, cwd
     Sessions {
@@ -199,7 +207,12 @@ fn dispatch(cli: Cli, ctx: &Context) -> Result<ExitCode> {
             account,
             live,
             timeout,
-        }) => usage(&config, account, live, timeout, ctx),
+            history,
+            days,
+        }) => match history {
+            true => usage_history(&config, account, days, ctx),
+            false => usage(&config, account, live, timeout, ctx),
+        },
         Some(Command::Sessions { limit }) => sessions(&config, limit, ctx),
         Some(Command::Stats { account, period }) => stats(&config, account, period, ctx),
         Some(Command::Setup {
@@ -555,6 +568,7 @@ fn usage(
         Some(reference) => vec![registry.resolve(&reference)?],
         None => registry.all(&ctx.env),
     };
+    let mut points = Vec::new();
     let reports: Vec<(String, bool)> = if live {
         // A missing claude fails the whole command; a missing codex, each codex account (R10).
         let claude = match accounts.iter().any(|a| a.provider == Provider::Claude) {
@@ -566,27 +580,84 @@ fn usage(
             claude: claude.as_deref(),
             codex: codex.as_deref(),
         };
-        probe::parallel(&accounts, |account| {
-            usage::live_report(account, &agents, &ctx.tz, ctx.clock, timeout)
-        })
+        let answers = probe::parallel(&accounts, |account| {
+            let result = usage::live_usage(account, &agents, timeout);
+            let answered_at = (ctx.clock)();
+            let text = usage::live_text(account, &result, &ctx.tz, answered_at);
+            // Only usage that was told: not a failure, nor an answer without it (R24).
+            let points = match &result {
+                Ok(usage::LiveResult {
+                    usage: usage::LiveUsage::Rows(rows),
+                    ..
+                }) => history::points(
+                    &account.qualified(),
+                    &usage::Snapshot::live(rows, answered_at).at(answered_at),
+                ),
+                _ => Vec::new(),
+            };
+            (text, points)
+        });
+        answers
+            .into_iter()
+            .map(|(text, mut more)| {
+                points.append(&mut more);
+                text
+            })
+            .collect()
     } else {
         accounts
             .iter()
             .map(|account| {
-                (
-                    usage::cached_report(account, &ctx.env, &ctx.tz, ctx.now),
-                    true,
-                )
+                let cached = usage::cached_usage(account, &ctx.env);
+                if let Ok(cached) = &cached {
+                    let reading = usage::Snapshot::cached(cached).at(ctx.now);
+                    points.extend(history::points(&account.qualified(), &reading));
+                }
+                (usage::cached_text(account, &cached, &ctx.tz, ctx.now), true)
             })
             .collect()
     };
     let text: Vec<&str> = reports.iter().map(|(text, _)| text.as_str()).collect();
     print!("{}", text.join("\n"));
+    // Recorded once printed: the lock may be waited for. The history is a by-product: what
+    // keeps it from being written is not told (R24).
+    let state = owned::state_dir(config);
+    let _ = history::record(&state, points, (ctx.clock)(), true, &owned::Flock);
     Ok(if reports.iter().all(|(_, ok)| *ok) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// `remuda usage --history` (R24): what the history records for each account, or for one,
+/// over the last `days` days. Records nothing itself.
+fn usage_history(
+    config: &Path,
+    account: Option<String>,
+    days: u32,
+    ctx: &Context,
+) -> Result<ExitCode> {
+    let registry = Registry::load(config)?;
+    let accounts = match account {
+        Some(reference) => vec![registry.resolve(&reference)?],
+        None => registry.all(&ctx.env),
+    };
+    let path = owned::usage_history(&owned::state_dir(config));
+    let points = match history::load(&path) {
+        Ok(Some(points)) => points,
+        Ok(None) => {
+            println!("no usage history yet ({})", path.display());
+            return Ok(ExitCode::SUCCESS);
+        }
+        Err(e) => bail!("cannot read {}: {e:#}", path.display()),
+    };
+    let names: Vec<String> = accounts.iter().map(Account::qualified).collect();
+    print!(
+        "{}",
+        history::report(&points, &names, days, ctx.now, &ctx.tz)
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Titles wider than this (in display columns) are shortened in `remuda sessions`.

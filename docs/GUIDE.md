@@ -330,6 +330,16 @@ Accounts with `share = false` and the source itself are not checked.
 - **Usage limits** come from what each agent records locally (Claude's usage cache in
   `.claude.json`, the rate limits in Codex rollouts), or, with `remuda usage --live` or `u` in the
   TUI, from asking the agent itself (`claude -p /usage`, `codex app-server`).
+- **Usage history** is what remuda itself kept of those readings: each reading of `remuda usage`
+  and of the TUI's Accounts view (cached or live) is recorded in `state/usage-history.jsonl`, at
+  the time the agent took it, for 45 days. `remuda pick` records nothing. `remuda usage
+  --history` shows it per window, with the pace of the current window: `used 71% with 48% of the
+  window elapsed: ahead of an even pace; at this pace 100% by Oct 8 20:00` says the window runs
+  out before its reset at that rate; `behind an even pace; at this pace 83% at reset` says 17%
+  would go unused. The window lengths come from the labels (`Session` 5 hours, `Week` 7 days,
+  codex's `<N>h window`), so a codex window is counted to the hour. `remuda usage` also adds
+  `note: resets in 42 min with 71% left` under a window that resets within the hour with a
+  quarter or more left.
 - **Identity** comes from `claude auth status --json` and `codex login status`. `remuda list`
   shows a Codex account's login method only; its email and plan appear after a live usage query.
 - **Live sessions** come from `claude agents --json`. They are not available for Codex, because

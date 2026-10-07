@@ -14,6 +14,20 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   overrides every account's `/login`, like `ANTHROPIC_API_KEY`), when `ANTHROPIC_BASE_URL` is set
   (every account's requests go to that endpoint), and when
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (SPEC R11). The values are never shown.
+- Usage history (SPEC R24): every usage reading of `remuda usage` (cached or `--live`) and of the
+  TUI's Accounts view (its cached usage and `u`) is recorded in `state/usage-history.jsonl`, a
+  line per window, at the time the agent took it; the same reading is recorded once, and points
+  older than 45 days are dropped. `remuda pick` records nothing. Concurrent writers lose no point,
+  also through two `$REMUDA_HOME`s whose histories are symlinks to one file; nothing is written
+  to a history that is a symlink to a file others can read.
+  On a file system without locks, or with a `state/` remuda cannot write, nothing is recorded and
+  nothing is said.
+- `remuda usage --history [<account>] [--days N]` shows the recorded usage of the last `N` days
+  (default 7): the current window point by point with its pace (ahead of or behind an even pace,
+  and when it would reach 100% or what it would reach at the reset), earlier windows a line each
+  with their peak (SPEC R24).
+- `remuda usage` adds `note: resets in 42 min with 71% left` under a window that resets within
+  60 minutes with at least 25% left (SPEC R10).
 
 ### Changed
 
