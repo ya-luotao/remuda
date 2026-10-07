@@ -351,19 +351,25 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
         let feasible = pick::ranked(&candidates);
         let wait = (o.wait.is_some() && feasible.is_empty())
             .then(|| pick::next_attempt(&candidates, &entries, now));
-        // About to wait: arguments that neither start a new session nor name one to resume
-        // are refused now, not once a pair is feasible, with `--run` or without (the command
-        // shown is one remuda would launch), for each provider a pair may still come from: one
-        // with an account that nothing time does not change blocks (R23). A session's
-        // arguments pass for its provider; the others' accounts are blocked.
-        if wait.as_ref().and_then(wait::Wait::next).is_some() {
-            for provider in Provider::ALL {
-                let open = entries
+        // Arguments that neither start a new session nor name one to resume are refused here,
+        // before anything is sent, with `--run` or without (the command shown is one remuda
+        // would launch), for each provider a pair may come from (R23): with a feasible pair,
+        // the providers of the feasible pairs, as a launch would read them; with none (and
+        // before a wait rather than after it), every provider with an account that nothing
+        // time does not change blocks. A session's arguments pass for its provider; the
+        // others' accounts are blocked.
+        for provider in Provider::ALL {
+            let checked = if feasible.is_empty() {
+                entries
                     .iter()
-                    .any(|e| e.account.provider == provider && e.blocked.is_none());
-                if open {
-                    pick::run_args(provider, None, None, &o.args)?;
-                }
+                    .any(|e| e.account.provider == provider && e.blocked.is_none())
+            } else {
+                feasible
+                    .iter()
+                    .any(|c| entries[candidates[*c].entry].account.provider == provider)
+            };
+            if checked {
+                pick::run_args(provider, None, None, &o.args)?;
             }
         }
         Ok(((entries, now, candidates, feasible), wait))
@@ -401,12 +407,6 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
             eprintln!("remuda: {line}");
         }
         return Ok(ExitCode::FAILURE);
-    }
-    // Arguments that neither start a new session nor name one to resume are refused before
-    // anything is sent, with `--run` or without: the command shown is one remuda would launch.
-    for c in &feasible {
-        let provider = entries[candidates[*c].entry].account.provider;
-        pick::run_args(provider, None, None, &o.args)?;
     }
     let mut aliases = Aliases::default();
     for account in &accounts {

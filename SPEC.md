@@ -1922,7 +1922,12 @@ prefer the account whose prompt cache holds it (**Resuming**, below).
   check that the session is running elsewhere (R16's check is the TUI's). Other arguments that
   do not start a new session (R6's classification for claude; `resume` or `fork` without an id,
   or with `--last`, first for codex) are refused before anything is sent, with `--run` or
-  without: the command shown is one remuda would launch. Arguments after `--` need no `--run`;
+  without (the command shown is one remuda would launch), and when no pair is feasible as
+  well as when one is. With a feasible pair they are checked for the providers of the feasible
+  pairs, as the launch would read them; with none, for each provider with an account that
+  nothing permanent blocks (not excluded, of `--provider` or of the session's provider, logged
+  in, `codex` on PATH, able to see the session resumed), before saying that nothing is
+  feasible. Arguments after `--` need no `--run`;
   without it they are only shown in the command. `--json` and `--print-request` do not combine
   with `--run`.
 - **Resuming.** Prompt caches are per account (verified on claude 2.1.292: a session begun as
@@ -2029,11 +2034,10 @@ prefer the account whose prompt cache holds it (**Resuming**, below).
     end. Ctrl-C, Ctrl-\, a hangup, or SIGTERM ends remuda by that signal, whether it sleeps or
     an attempt is under way: a query under way, or being started, is told first (R4), and
     none is left running. `--print-request` does not combine with `--wait`. The arguments after
-    `--`, with `--run` or without (**`--run`**): when a pair is feasible, they are checked as
-    without `--wait`; when remuda is about to wait, they are checked then, for each provider
-    with an account that nothing permanent blocks (not excluded, of `--provider` or of the
-    session's provider, logged in, `codex` on PATH, able to see the session resumed), and
-    refused before the wait instead of after it.
+    `--` are checked at each attempt as without `--wait` (**`--run`**): when a pair is feasible,
+    for the feasible pairs' providers; when remuda is about to wait, for each provider with an
+    account that nothing permanent blocks, so they are refused before the wait instead of after
+    it.
   - Resuming (**Resuming**), the session's facts (the launch log, the session index, the ends
     of its copies) are read once, before the first attempt; whether the account that ran it is
     warm is judged at each attempt's instant, so a long wait can let its cache go cold.

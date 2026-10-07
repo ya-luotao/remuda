@@ -2601,6 +2601,89 @@ fn wait_refuses_an_unnamed_session_before_waiting() {
     assert!(sb.invocations().is_empty());
 }
 
+/// R23 `--run`: arguments that neither start a new session nor name one to resume are refused
+/// whatever is feasible: with every pair short of headroom too, before saying there is nothing
+/// to recommend, with `--run`, without it, and with `--json`.
+#[test]
+fn unnamed_sessions_are_refused_when_nothing_is_feasible() {
+    let (sb, _) = used_up_for_an_hour();
+    assert_eq!(pick(&sb, false, &[]).code, Some(1), "nothing is feasible");
+    for refused in [&["--resume"][..], &["-c"]] {
+        for mode in [&[][..], &["--run"], &["--json"]] {
+            let args = [mode, &["--"], refused].concat();
+            let out = pick(&sb, false, &args);
+            assert_eq!(out.code, Some(1), "{args:?}: {}{}", out.stdout, out.stderr);
+            assert!(
+                out.stderr.contains(&format!(
+                    "`pick --run` starts a new session; these arguments do not: {}",
+                    refused.join(" ")
+                )),
+                "{args:?}: {}",
+                out.stderr
+            );
+            assert!(
+                !out.stderr.contains("nothing to recommend"),
+                "{args:?}: {}",
+                out.stderr
+            );
+            assert!(out.stdout.is_empty(), "{args:?}: {}", out.stdout);
+        }
+    }
+    assert!(sb.invocations().is_empty());
+}
+
+/// R23 `--run`: with a feasible pair, the arguments are checked as the providers of the
+/// feasible pairs read them, not as an open account's provider that is short of headroom would.
+/// Claude is logged in but used up; codex is feasible: `-c` is codex's option here, not claude's
+/// `--continue`, and codex is launched with it, with `--wait` or without.
+#[test]
+fn a_feasible_pair_checks_only_its_providers_arguments() {
+    let sb = Sandbox::new();
+    sb.install_codex();
+    let work = sb.make_codex_home("c/work");
+    sb.set_codex_login(Some(&work), "Logged in using ChatGPT");
+    let max = sb.make_claude_home("h/max");
+    sb.write_claude_json(
+        Some(&max),
+        &claude_json("max@example.com", 60, &[limit("weekly_all", 100.0, DAY)]),
+    );
+    configure(
+        &sb,
+        &[("claude", "max", &max), ("codex", "work", &work)],
+        "[pick]\nexclude = [\"claude:default\"]\n",
+    );
+    let out = pick(&sb, false, &["--offline"]);
+    assert_eq!(field(&out, "account"), "codex:work");
+    assert!(
+        why_not(&out, "claude:max / default").starts_with("Week (all models): 100% used"),
+        "{}",
+        out.stdout
+    );
+    for wait in [&[][..], &["--wait"]] {
+        let args = [
+            &["--offline", "--run"][..],
+            wait,
+            &["--", "-c", "model_reasoning_effort=high"],
+        ]
+        .concat();
+        let out = pick(&sb, false, &args);
+        assert_eq!(out.code, Some(0), "{args:?}: {}{}", out.stdout, out.stderr);
+        assert!(
+            !out.stderr.contains("starts a new session"),
+            "{args:?}: {}",
+            out.stderr
+        );
+    }
+    let launches: Vec<Vec<String>> = sb
+        .codex_invocations()
+        .into_iter()
+        .map(|i| i.args)
+        .filter(|args| args.first().map(String::as_str) == Some("-c"))
+        .collect();
+    assert_eq!(launches, [["-c", "model_reasoning_effort=high"]; 2]);
+    assert!(launched(&sb).is_empty(), "claude was not launched");
+}
+
 /// R23 `--wait` with Resuming: a named session is waited for like any recommendation, among
 /// the accounts that can resume it. Nothing to wait for when no account can see it (that time
 /// does not change); giving up, the text still tells the session's facts; and once something is
