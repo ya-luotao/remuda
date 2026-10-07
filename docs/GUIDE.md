@@ -14,6 +14,14 @@ cancels. Confirmations accept `y`; any other key except `Ctrl-P` cancels. In the
 opened by `remuda run` without an account, `Enter` launches the selected account and `Esc` or `q`
 exits without launching anything.
 
+A terminal started from inside a Claude session (by its Bash tool, for example a background
+launcher or a `screen` session) may carry `CLAUDE_CODE_CHILD_SESSION=1`. Claude then saves no
+transcript and no prompt history for an interactive session started there, and says
+"Transcript saving is off" at the bottom of the screen; Remuda passes the variable on like the
+rest of the environment, so such a session never appears in the session list and cannot be
+resumed. Set `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` in that terminal if it is your own. `-p`
+runs are saved either way.
+
 Resuming a Claude session that is still running elsewhere is refused, because two processes
 writing the same session would overwrite each other. Codex has no source of running sessions, so
 resuming a Codex session in place always asks for confirmation. A fork only reads the original
@@ -253,10 +261,11 @@ models = ["gpt-6-astra"]
 ## Cost estimates
 
 The statistics price each request at the provider's public API list price, built into remuda (as
-of 2026-09-24). Claude's 5-minute and 1-hour cache writes are priced separately, as are fast mode
+of 2026-10-07). Claude's 5-minute and 1-hour cache writes are priced separately, as are fast mode
 (twice the price on the models that offer it) and US-only inference (1.1 times the price on the
-models from 4.6 on), as the transcripts record them. A Codex request with more than 272K input
-tokens is priced at the long-context price on the models that have one.
+models from 4.6 on), as the transcripts record them. Codex's cache writes are priced at 1.25
+times the input price from GPT-5.6 on, and at the input price before. A Codex request with more
+than 272K input tokens is priced at the long-context price on the models that have one.
 
 To price a model remuda does not know, or to use another price, add a `[prices."<model>"]` table
 to `config.toml`, in USD per million tokens:
@@ -271,7 +280,7 @@ cache_write_1h = 10
 ```
 
 `input` and `output` are required; `cache_read` (for Codex, the cached-input price),
-`cache_write_5m` and `cache_write_1h` are optional, and a count whose price is left out is not
+`cache_write_5m` (for Codex, the cache-write price) and `cache_write_1h` are optional, and a count whose price is left out is not
 priced. The table applies to the model id as recorded, or to it without a trailing date
 (`claude-haiku-4-5` also prices `claude-haiku-4-5-20251001`).
 
@@ -283,10 +292,17 @@ search.
 ## Account checks
 
 The Accounts view warns about conditions that silently break multi-account setups: an
-`ANTHROPIC_API_KEY` that overrides every login, dangling symlinks, missing or logged-out homes, a
-shared `projects` store without `cleanupPeriodDays`, and problems with the shared configuration:
-a missing source home, a plugin whose install is gone, instruction items that would load twice,
-and rules limited to `paths` that are not applied where the rules are injected.
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN` that overrides every
+login, an `ANTHROPIC_BASE_URL` that sends every account's requests elsewhere, dangling symlinks,
+missing or logged-out homes, a shared `projects` store without `cleanupPeriodDays`, and problems
+with the shared configuration: a missing source home, a plugin whose install is gone, instruction
+items that would load twice, and rules limited to `paths` that are not applied where the rules
+are injected. The values of those variables are never shown.
+
+With `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` set, claude's `/usage` asks for nothing new and
+only repeats a reading taken within the hour, if there is one. Remuda's live usage query removes
+the variable for that one command, so `remuda usage --live` and `u` get a new reading; sessions
+you launch keep it, and the Accounts view says so.
 
 For each member of `[share.claude]` it also checks the links of the home, and says which link
 to make:
@@ -321,7 +337,7 @@ Accounts with `share = false` and the source itself are not checked.
 - **Token statistics** are counted from the agents' own transcripts. Each request counts once,
   even when a message is written in several records, a session is forked, or a store is shared
   by several accounts. Each request is also priced at the provider's public API list
-  price (built in, as of 2026-09-24), which estimates what the usage would cost on the API; for
+  price (built in, as of 2026-10-07), which estimates what the usage would cost on the API; for
   subscription logins it is not a bill. No agent is run and nothing is fetched.
 - **Recommendations** (`remuda pick`) read the same usage and `[pick]`; the only request remuda
   makes itself goes to TypeSafe, and only with a key and notes (see

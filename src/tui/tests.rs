@@ -4591,8 +4591,9 @@ fn stats_view_computes_on_first_visit_then_on_r() {
 }
 
 /// R20: every section, bold totals, models with `…` when too long, `-` for counts a provider
-/// does not record and for a cost not priced, `no tokens` for an empty account, then Overall
-/// and the models not priced. At 80 columns REASONING gives way.
+/// does not record and for a cost not priced (codex records cache write: 0 here), `no tokens`
+/// for an empty account, then Overall and the models not priced. At 80 columns REASONING gives
+/// way.
 #[test]
 fn stats_view_shows_sections_models_and_totals() {
     let app = stats_app();
@@ -4605,8 +4606,8 @@ fn stats_view_shows_sections_models_and_totals() {
         "claude-haiku-4… 30 0 0 5 35 $12.34",
         "max no tokens",
         "team no tokens",
-        "codex:work 1.5K 200 - 30 1.7K -",
-        "gpt-test 1.5K 200 - 30 1.7K -",
+        "codex:work 1.5K 200 0 30 1.7K -",
+        "gpt-test 1.5K 200 0 30 1.7K -",
         "default + max 5 0 0 5 10 -",
         "claude-test 5 0 0 5 10 -",
         "unattributed 9 0 0 9 18 -",
@@ -4614,7 +4615,7 @@ fn stats_view_shows_sections_models_and_totals() {
         "",
         "Overall 1.6K 1.2M 160 139 1.2M $12.34+",
         "claude-test 22 1.2M 160 104 1.2M -",
-        "gpt-test 1.5K 200 - 30 1.7K -",
+        "gpt-test 1.5K 200 0 30 1.7K -",
         "claude-haiku-4… 30 0 0 5 35 $12.34",
         "not priced: claude-test, gpt-test",
     ];

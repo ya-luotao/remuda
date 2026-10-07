@@ -23,8 +23,8 @@ use crate::transcript::{complete_lines, contains, read_at};
 use crate::{Env, owned};
 
 /// Bump whenever [`Row`], [`FileStats`] or the counting rules change: a mismatching cache is
-/// rebuilt (2: cache write by lifetime, fast / US flags).
-pub const SCHEMA_VERSION: u32 = 2;
+/// rebuilt (2: cache write by lifetime, fast / US flags; 3: codex's cache write).
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Read size; an unfinished line is carried over to the next read.
 const CHUNK: u64 = 8 * 1024 * 1024;
@@ -41,7 +41,7 @@ pub struct Tokens {
     /// Without cache reads and writes.
     pub input: u64,
     pub cache_read: u64,
-    /// Cache writes with a 5-minute lifetime, and those recorded without one.
+    /// Cache writes with a 5-minute lifetime, and those recorded without one (codex's).
     pub cache_write_5m: u64,
     /// Cache writes with a 1-hour lifetime.
     pub cache_write_1h: u64,
@@ -673,6 +673,8 @@ struct CodexInfo {
 struct CodexUsage {
     input_tokens: Option<u64>,
     cached_input_tokens: Option<u64>,
+    /// Part of `input_tokens`, like `cached_input_tokens`; not in the deduplication key.
+    cache_write_input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     reasoning_output_tokens: Option<u64>,
     total_tokens: Option<u64>,
@@ -728,8 +730,9 @@ impl<'a> Counter<'a> {
         i
     }
 
-    /// Adds a request, or merges it into the row of its key: the largest of each count and
-    /// the earliest timestamp. Requests without tokens are not kept.
+    /// Adds a request, or merges it into the row of its key: the largest of each count (claude;
+    /// codex keeps the first usage whole, R20) and the earliest timestamp. Requests without
+    /// tokens are not kept.
     fn put(&mut self, row: Row) {
         if row.tokens.is_zero() {
             return;
@@ -737,7 +740,9 @@ impl<'a> Counter<'a> {
         match self.rows.get(&row.key) {
             Some(&i) => {
                 let old = &mut self.file.rows[i];
-                old.tokens.max_each(&row.tokens);
+                if self.file.provider == Provider::Claude {
+                    old.tokens.max_each(&row.tokens);
+                }
                 old.ts = earliest(old.ts, row.ts);
                 old.copy |= row.copy;
                 old.fast |= row.fast;
@@ -884,10 +889,14 @@ impl<'a> Counter<'a> {
                     return;
                 }
                 self.file.codex_total = Some(total);
-                let Some(last) = info.last_token_usage.map(|u| u.numbers()) else {
+                let Some(last) = info.last_token_usage else {
                     return;
                 };
-                let [input, cached, output, reasoning, _] = last;
+                let [input, cached, output, reasoning, _] = last.numbers();
+                // What was read from the cache and what was written to it are both part of
+                // `input_tokens` (R20).
+                let uncached = input.saturating_sub(cached);
+                let write = last.cache_write_input_tokens.unwrap_or(0).min(uncached);
                 let model = match self.file.codex_model.clone() {
                     Some(name) => self.model(&name),
                     None => PENDING,
@@ -901,9 +910,9 @@ impl<'a> Counter<'a> {
                     fast: false,
                     geo_us: false,
                     tokens: Tokens {
-                        input: input.saturating_sub(cached),
+                        input: uncached - write,
                         cache_read: cached,
-                        cache_write_5m: 0,
+                        cache_write_5m: write,
                         cache_write_1h: 0,
                         output,
                         reasoning,
@@ -1163,7 +1172,12 @@ pub fn report(
                     if candidate.rank() < winner.rank() {
                         *winner = candidate;
                     }
-                    winner.tokens = tokens;
+                    // A codex request's usage is the copy that counts, whole: two requests
+                    // with the same total may split their input differently between input and
+                    // cache write (R20).
+                    if file.provider == Provider::Claude {
+                        winner.tokens = tokens;
+                    }
                     winner.fast = fast;
                     winner.geo_us = geo_us;
                 }
@@ -1454,7 +1468,7 @@ const COLUMNS: [&str; 8] = [
 /// the `overall` section; then a line saying the cost is an estimate at API list prices, and
 /// one naming the models not priced, if any. With `filter` (`provider:name`), only the sections
 /// including that account, and no overall section. Counts are [`human_count`]s; a count the
-/// providers of a row do not record is `-` (cache write: claude only; reasoning: codex only);
+/// providers of a row do not record is `-` (reasoning: codex only);
 /// costs are [`Cost::cell`]s. Columns align over the whole output.
 pub fn format(table: &Table, filter: Option<&str>, tz: &TimeZone) -> String {
     let sections: Vec<&Section> = table
@@ -1553,7 +1567,7 @@ fn format_rows(models: &[ModelRow]) -> Vec<[String; 8]> {
 
 /// The counts of `tokens` as shown, in column order (input, cache read, cache write, output,
 /// reasoning, total), as [`human_count`]s, then `cost` as its [`Cost::cell`]. A count none of
-/// `providers` records is `-`: cache write is claude's, reasoning codex's.
+/// `providers` records is `-`: reasoning is codex's.
 pub fn counts(tokens: &Tokens, cost: &Cost, providers: &[Provider]) -> [String; 7] {
     let count = |n: u64, recorded_by: Provider| match providers.contains(&recorded_by) {
         true => human_count(n),
@@ -1562,7 +1576,7 @@ pub fn counts(tokens: &Tokens, cost: &Cost, providers: &[Provider]) -> [String; 
     [
         human_count(tokens.input),
         human_count(tokens.cache_read),
-        count(tokens.cache_write(), Provider::Claude),
+        human_count(tokens.cache_write()),
         human_count(tokens.output),
         count(tokens.reasoning, Provider::Codex),
         human_count(tokens.total()),
@@ -1791,7 +1805,8 @@ mod tests {
     }
 
     /// R20: the COST column shows each model's cost, `-` for one not priced, and `+` on a total
-    /// that leaves some out, named below.
+    /// that leaves some out, named below. Reasoning is `-` for claude; codex records cache write
+    /// (`cache_write_input_tokens`), so its cache write is a count, here 0.
     #[test]
     fn format_aligns_columns_and_dashes_what_a_provider_does_not_record() {
         let claude = ModelRow {
@@ -1842,23 +1857,23 @@ claude:max
   no tokens
 
 codex:work
-  gpt-test      1.5K         200            -      30         12   1.7K        -
-  total         1.5K         200            -      30         12   1.7K        -
+  gpt-test      1.5K         200            0      30         12   1.7K        -
+  total         1.5K         200            0      30         12   1.7K        -
 
 claude:default + claude:max
   claude-test      8        1.2M          160      90          -   1.2M   $12.34
   total            8        1.2M          160      90          -   1.2M   $12.34
 
 unattributed
-  gpt-test      1.5K         200            -      30         12   1.7K        -
-  total         1.5K         200            -      30         12   1.7K        -
+  gpt-test      1.5K         200            0      30         12   1.7K        -
+  total         1.5K         200            0      30         12   1.7K        -
 
 overall
   claude-test      8        1.2M          160      90          -   1.2M   $12.34
-  gpt-test      1.5K         200            -      30         12   1.7K        -
+  gpt-test      1.5K         200            0      30         12   1.7K        -
   total         1.5K        1.2M          160     120         12   1.2M  $12.34+
 
-Cost ≈ API list price (prices as of 2026-09-24): an estimate, not a bill.
+Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.
 Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
 "
         );
@@ -1874,7 +1889,7 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
                 "MODEL          INPUT  CACHE READ  CACHE WRITE  OUTPUT  REASONING  TOTAL    COST",
                 "claude:max",
                 "claude:default + claude:max",
-                "Cost ≈ API list price (prices as of 2026-09-24): an estimate, not a bill.",
+                "Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.",
             ]
         );
         let all = Table {
@@ -1889,7 +1904,7 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
             "Tokens · all time\n\n\
              MODEL  INPUT  CACHE READ  CACHE WRITE  OUTPUT  REASONING  TOTAL  COST\n\
              overall\n  no tokens\n\n\
-             Cost ≈ API list price (prices as of 2026-09-24): an estimate, not a bill.\n"
+             Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.\n"
         );
     }
 

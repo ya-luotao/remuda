@@ -398,6 +398,14 @@ pub fn cached_report(account: &Account, env: &Env, tz: &TimeZone, now: Timestamp
 
 pub const LIVE_USAGE_ARGS: &[&str] = &["-p", "/usage", "--no-session-persistence"];
 
+/// Set, it makes claude's `/usage` send no request and only repeat a reading another run took
+/// within the hour, or print no usage line at all (R10, verified on 2.1.292).
+pub const NONESSENTIAL_TRAFFIC_VAR: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+
+/// What the live query removes from the environment it inherits (R10): the user asked for a
+/// live reading. Only this one command; launches and the other commands keep it.
+const LIVE_USAGE_UNSET: &[&str] = &[NONESSENTIAL_TRAFFIC_VAR];
+
 /// What a live query answered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveUsage {
@@ -468,17 +476,17 @@ pub fn live_usage(
     }
 }
 
-/// Runs `claude -p /usage --no-session-persistence` for `account` (R10): never through
-/// `launch::prepare`, so no `--session-id` is injected and nothing is logged. An answer with a
-/// usage line that cannot be read is not recognized as a whole: its other lines are not the
-/// account's usage.
+/// Runs `claude -p /usage --no-session-persistence` for `account` (R10), without
+/// [`NONESSENTIAL_TRAFFIC_VAR`]: never through `launch::prepare`, so no `--session-id` is
+/// injected and nothing is logged. An answer with a usage line that cannot be read is not
+/// recognized as a whole: its other lines are not the account's usage.
 fn live_claude(
     account: &Account,
     agents: &dyn Runner,
     timeout: Duration,
 ) -> Result<LiveUsage, String> {
     let output = agents
-        .run_ok(account, LIVE_USAGE_ARGS, timeout)
+        .run_ok_without(account, LIVE_USAGE_ARGS, LIVE_USAGE_UNSET, timeout)
         .map_err(|failure| failure.to_string())?;
     Ok(classify_live(output.stdout))
 }
@@ -1085,6 +1093,19 @@ mod tests {
             )
         );
         assert!(agents.ran().is_empty());
+    }
+
+    /// R10: the live query runs without `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, which would
+    /// keep `/usage` from asking for a new reading; nothing else is removed.
+    #[test]
+    fn live_claude_runs_without_disable_nonessential_traffic() {
+        let max = claude_account("max");
+        let agents = Scripted::new().on(USAGE, Scripted::exited(0, LIVE, ""));
+        live_usage(&max, &agents, T).unwrap();
+        assert_eq!(
+            agents.unset_for(USAGE),
+            [["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]]
+        );
     }
 
     /// R10 (review #14): the week is used up and its line no longer reads `<N>% used`: the

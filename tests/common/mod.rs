@@ -27,13 +27,16 @@ use tempfile::TempDir;
 /// `@@invocation`, `cwd=<physical cwd>`, `ccd=<unset|set:VALUE>` (CLAUDE_CONFIG_DIR),
 /// `css=<unset|set:VALUE>` (CLAUDE_SECURESTORAGE_CONFIG_DIR),
 /// `acm=<unset|set:VALUE>` (CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD, R18),
-/// `rmd=<unset|set:VALUE>` (CLAUDE_CODE_REMOTE_MEMORY_DIR, R18), then `arg=<argv[i]>` per
-/// argument.
+/// `rmd=<unset|set:VALUE>` (CLAUDE_CODE_REMOTE_MEMORY_DIR, R18),
+/// `dnt=<unset|set:VALUE>` (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, R10), then `arg=<argv[i]>`
+/// per argument.
 ///
 /// Fixtures live in `$CLAUDE_CONFIG_DIR/<name>`, or `$HOME/.<name>` when it is unset:
 /// - `fake-sleep`: if present, `exec sleep <its contents>` (simulates a hang);
 /// - `auth status --json` prints `fake-auth.json`, `-p /usage ...` prints `fake-usage.txt`;
-///   a missing fixture exits 1;
+///   a missing fixture exits 1. With CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC set (non-empty),
+///   `-p /usage ...` prints what claude 2.1.292 prints then when no reading was taken within the
+///   hour: no `Current` line (R10);
 /// - `agents --json` prints `fake-agents.json`; without it, falls through to the default below
 ///   (no output), so `remuda run <account> agents --json` still passes through cleanly. With
 ///   `--all` (anywhere after `--json`), `fake-agents-all.json` is preferred when it exists
@@ -83,6 +86,11 @@ if [ -n "${FAKE_CLAUDE_OUT+x}" ]; then
       printf 'rmd=set:%s\0' "$CLAUDE_CODE_REMOTE_MEMORY_DIR"
     else
       printf 'rmd=unset\0'
+    fi
+    if [ -n "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC+x}" ]; then
+      printf 'dnt=set:%s\0' "$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+    else
+      printf 'dnt=unset\0'
     fi
     for a in "$@"; do
       printf 'arg=%s\0' "$a"
@@ -145,6 +153,13 @@ if [ "$1" = agents ] && [ "$2" = --json ]; then
   [ -f "${fixtures}fake-agents.json" ] && serve "${fixtures}fake-agents.json"
 fi
 if [ "$1" = -p ] && [ "$2" = /usage ]; then
+  if [ -n "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-}" ]; then
+    printf '%s\n' "You are currently using your subscription to power your Claude Code usage" \
+      "What's contributing to your limits usage?" \
+      "Approximate, based on local sessions on this machine" \
+      "Last 24h · 3 requests · 1 sessions"
+    exit 0
+  fi
   serve "${fixtures}fake-usage.txt"
 fi
 if [ "$1" = logs ]; then
@@ -329,6 +344,8 @@ pub struct Invocation {
     pub add_dir_claude_md: Option<String>,
     /// `CLAUDE_CODE_REMOTE_MEMORY_DIR` (R18); `None` when unset.
     pub memory_dir: Option<String>,
+    /// `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` (R10); `None` when unset.
+    pub nonessential_traffic: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -787,6 +804,7 @@ pub fn parse_invocations(bytes: &[u8]) -> Vec<Invocation> {
         let securestorage_dir = parse_var(iter.next().and_then(|f| f.strip_prefix("css=")));
         let add_dir_claude_md = parse_var(iter.next().and_then(|f| f.strip_prefix("acm=")));
         let memory_dir = parse_var(iter.next().and_then(|f| f.strip_prefix("rmd=")));
+        let nonessential_traffic = parse_var(iter.next().and_then(|f| f.strip_prefix("dnt=")));
         let mut args = Vec::new();
         while let Some(f) = iter.peek() {
             if *f == "@@invocation" {
@@ -802,6 +820,7 @@ pub fn parse_invocations(bytes: &[u8]) -> Vec<Invocation> {
             securestorage_dir,
             add_dir_claude_md,
             memory_dir,
+            nonessential_traffic,
             args,
         });
     }

@@ -350,9 +350,25 @@ remuda help [<command>]                            help for remuda or a command
   args, and session ID (or unknown). `args` are the user's arguments as the agent got them,
   without what remuda injected: a prompt given on the command line is in the log, which is why
   the log is readable by the user alone (R3).
-- **[unverified]**: whether variables inherited when launching from within a claude session, such
-  as `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, and `CLAUDE_CODE_MESSAGING_*`, affect the child claude;
-  if they do, define a list of variables to strip.
+- Launching from within a claude session. A claude session gives the processes of its tools and
+  hooks `CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ID`,
+  `CLAUDE_CODE_SESSION_ATTENDED`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_MESSAGING_SOCKET`,
+  `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_CODE_BRIDGE_SESSION_ID`, `CLAUDE_CODE_EXECPATH`,
+  `CLAUDE_PID`, and `CLAUDE_EFFORT`, and a remuda started there passes them on, like the rest of
+  its environment. Basis (verified on 2.1.292, each variable alone and all of them together, in a
+  temporary home against a local stand-in for the API): none of them keeps the child from
+  starting or puts it in another session (its ID is the injected `--session-id`, else a new one,
+  never the inherited `CLAUDE_CODE_SESSION_ID`), and none changes a `-p` run. One changes an
+  interactive session: with `CLAUDE_CODE_CHILD_SESSION` inherited, claude writes no transcript and
+  no prompt history for it, and says "Transcript saving is off — inherited
+  CLAUDE_CODE_CHILD_SESSION marker"; the launch log has its ID, the index never will. remuda
+  strips none of them: that marker is claude's own finding that it runs nested, which remuda
+  cannot tell from a terminal that inherited it by mistake, and claude documents the override,
+  `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`, which is the user's to set (with it, the session
+  above was saved). The commands remuda runs for an account (R7, R10, R10a) keep them too.
+- **[unverified]**: an inherited `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN`
+  of a session that is still running; only a socket path that does not exist was tried, and claude
+  documents that each session exports its own.
 
 ## R7. Running sessions
 
@@ -512,7 +528,12 @@ appeared in no `history.jsonl`.
      - Claude: `claude -p /usage --no-session-persistence`. Basis (verified on 2.1.280): `/usage`
        is a local command that supports non-interactive use and does not call the model (0
        tokens, no cost); with `--no-session-persistence` it leaves no transcript. It takes
-       anywhere from 2 to 20 seconds (it scans the local session history).
+       anywhere from 2 to 20 seconds (it scans the local session history). The query runs
+       without `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, removed from the environment it
+       inherits: with that set, `/usage` sends no request and prints only a reading that another
+       run took within the hour, or no `Current` line at all (verified on 2.1.292), and the user
+       asked for a live reading. Only this query goes without it: launches (R6) and the other
+       commands run for an account keep it, and R11 says so.
      - Codex: one `codex app-server` (R4) per account, which is sent both
        `account/rateLimits/read` with `{"excludeResetCreditDetails": true}` and `account/read`
        with `{"refreshToken": false}`, and answers both (about a second or two). The rate limits
@@ -638,7 +659,24 @@ appeared in no `history.jsonl`.
 
 ## R11. Checks in the accounts view
 
-- `ANTHROPIC_API_KEY` is set: warning (it overrides `/login` for every account).
+- Variables of the environment that change what claude does for every account, one warning each,
+  in this order, never with the value (the tokens are secrets); remuda counts an empty value as
+  not set:
+  - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`: it overrides `/login`
+    for every account.
+  - `ANTHROPIC_BASE_URL`: every account's requests go to that endpoint instead of Anthropic's.
+  - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: claude's `/usage` then repeats an old reading at
+    most; remuda removes it for its own live query (R10), but claude launched as any account
+    keeps it.
+
+  Basis: claude's authentication precedence (code.claude.com/docs/en/iam) puts
+  `ANTHROPIC_AUTH_TOKEN` (sent as `Authorization: Bearer`), `ANTHROPIC_API_KEY`, and
+  `CLAUDE_CODE_OAUTH_TOKEN` before the credentials of `/login`, and a `/login` run while
+  `CLAUDE_CODE_OAUTH_TOKEN` is set lasts only that session; `ANTHROPIC_BASE_URL` overrides "the API
+  endpoint to route requests through a proxy or gateway" (code.claude.com/docs/en/env-vars).
+  Verified on 2.1.292 in a home that is not logged in: either token alone makes
+  `claude auth status --json` answer `"loggedIn": true, "authMethod": "oauth_token"`, and the
+  request goes out with it as the bearer token, to the `ANTHROPIC_BASE_URL` given.
 - The home contains symlinks whose targets do not exist.
 - `projects` is shared by several accounts and one of the participating accounts does not set
   `cleanupPeriodDays`: warning (the default 30-day cleanup deletes everyone's sessions in the
@@ -1330,15 +1368,15 @@ stays reserved so that the entries after it keep theirs.
 
 Token counts per account and model, read from the agents' own transcripts, for a period, and their
 estimated cost: what the requests would cost at the providers' public API list prices (prices as
-of 2026-09-24). Most accounts are subscription logins, so the cost is an estimate for comparison
+of 2026-10-07). Most accounts are subscription logins, so the cost is an estimate for comparison
 (≈ API list price), not a bill. Computing them runs no agent command and makes no network request:
 the prices are built into remuda and can be overridden in `config.toml` (R3).
 
 - **Counts.** Input, cache read, cache write, output, and reasoning. The total is input + cache
   read + cache write + output (reasoning is part of output). A count a provider does not record is
-  shown as `-`: claude records no reasoning apart from output, codex no cache write. Claude's
-  cache write is counted by cache lifetime, 5 minutes and 1 hour, which are priced differently,
-  and shown as one count.
+  shown as `-`: claude records no reasoning apart from output. Claude's cache write is counted by
+  cache lifetime, 5 minutes and 1 hour, which are priced differently, and shown as one count;
+  codex's has no lifetime.
 - **Claude** (verified on 2.1.71–2.1.281 against 1,064,472 records in 19,431 transcripts): an
   assistant record (`"type": "assistant"`) carries `message.id`, `message.model`, and
   `message.usage` with `input_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`
@@ -1375,15 +1413,28 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
 - **Codex** (verified on 0.155.1 against 106,795 `token_count` events in 1,464 rollouts): an
   `event_msg` of type `token_count` with an `info` carries `total_token_usage`, the session's
   cumulative usage, and `last_token_usage`, the latest request's; each has `input_tokens` (cached
-  included), `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens` (part of output),
-  and `total_tokens`. An event whose `total_token_usage` equals the previous one's in the same
-  rollout is skipped: codex repeats events (16,750 in the corpus), and after compacting it records
-  the new context size with an unchanged total (673). Every other event counts its
-  `last_token_usage`: input without cached, cached as cache read, output, reasoning. An event
+  and cache write included), `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`
+  (part of output), and `total_tokens`, and from a later codex `cache_write_input_tokens`, a
+  count that is 0 when absent. An event whose `total_token_usage` equals the previous one's in the
+  same rollout is skipped: codex repeats events (16,750 in the corpus), and after compacting it
+  records the new context size with an unchanged total (673). Every other event counts its
+  `last_token_usage`: input without cached and cache write, cached as cache read, cache write
+  (at most the input without cached), output, reasoning. An event
   belongs to the model of the last `turn_context` before it (`payload.model`); events before the
   first `turn_context` take the model of the first one after them, else `unknown`. Rollouts:
   `sessions/**/rollout-*.jsonl` and `archived_sessions/rollout-*.jsonl` of every codex home,
   including those hidden from History (R17).
+- **Codex cache write** (verified on 0.160.0 against 120,903 `token_count` events in 1,888
+  rollouts, of which 120,543 in 1,780 rollouts record `cache_write_input_tokens`, every one 0; and
+  in codex's source at `rust-v0.160.0`, commit `a956835d`): codex takes `input_tokens` from the
+  Responses API's `usage.input_tokens`, and `cached_input_tokens` and `cache_write_input_tokens`
+  from its `input_tokens_details` (`cached_tokens`, `cache_write_tokens`), with `total_tokens` =
+  `input_tokens` + `output_tokens` (`codex-rs/codex-api/src/sse/responses.rs`, test
+  `parses_cache_write_token_usage`: input 100 = cached 40 + cache write 60, total 110). OpenAI's
+  prompt-caching guide: an input token is priced at the uncached-input, the cached-input, or the
+  cache-write price. So the cache write is part of `input_tokens`, and each input token is
+  counted once: as input, as cache read, or as cache write. The deduplication key below stays the
+  five other counts of `total_token_usage`: the cache write is part of its `input_tokens`.
 - **Copies count once.** A fork holds its parent's history: claude copies the parent's records
   with their `message.id` and timestamp and marks them `forkedFrom`; a codex fork may replay the
   parent's `token_count` events with the fork's timestamps and the parent's cumulative totals; a
@@ -1393,7 +1444,11 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   came from forks; the other two were the first requests of unrelated `codex exec` runs with
   identical usage, which are counted once (a known limitation). The copy that counts is, in
   order: one not known to be a copy (a `forkedFrom` record), the one with the earliest timestamp,
-  the one whose path sorts first.
+  the one whose path sorts first. A claude message counts the largest value of each count among
+  its copies. A codex request counts the usage of the copy that counts, whole, and within a
+  rollout the first usage recorded with its total: two requests with the same total can split
+  their input differently between input and cache write, and the largest of each would count
+  tokens that neither request had.
 - **Accounts.** A message counts for the session of the transcript whose copy counts. A claude
   session's accounts are those of R9 without running sessions (the launch log and
   `history.jsonl`); a codex rollout's are the accounts of its home (R17). A session attributed to
@@ -1418,20 +1473,21 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   | `claude-haiku-4-5` | 1 | 1.25 | 2 | 0.10 | 5 |
   | `claude-3-5-haiku` | 0.80 | 1 | 1.60 | 0.08 | 4 |
 
-  Codex, USD per million tokens:
+  Codex, USD per million tokens (a cache write costs 1.25 times the input price from GPT-5.6 on;
+  before, it has no price of its own and costs the input price):
 
-  | Model | Input | Cached input | Output | Long context |
-  | --- | ---: | ---: | ---: | :---: |
-  | `gpt-6-astra` | 10 | 1 | 50 | yes |
-  | `gpt-6-sol` | 2 | 0.20 | 10 | yes |
-  | `gpt-5.6-sol` | 4 | 0.40 | 20 | yes |
-  | `gpt-5.6-terra` | 2 | 0.20 | 12 | yes |
-  | `gpt-5.5` | 5 | 0.50 | 30 | yes |
-  | `gpt-5.4` | 2.50 | 0.25 | 15 | yes |
-  | `gpt-5.3-codex`, `gpt-5.2-codex`, `gpt-5.2` | 1.75 | 0.175 | 14 | no |
-  | `gpt-5.1-codex-max`, `gpt-5.1-codex`, `gpt-5-codex`, `gpt-5` | 1.25 | 0.125 | 10 | no |
-  | `gpt-5.1-codex-mini` | 0.25 | 0.025 | 2 | no |
-  | `o4-mini` | 1.10 | 0.275 | 4.40 | no |
+  | Model | Input | Cached input | Cache write | Output | Long context |
+  | --- | ---: | ---: | ---: | ---: | :---: |
+  | `gpt-6-astra` | 10 | 1 | 12.50 | 50 | yes |
+  | `gpt-6-sol` | 2 | 0.20 | 2.50 | 10 | yes |
+  | `gpt-5.6-sol` | 4 | 0.40 | 5 | 20 | yes |
+  | `gpt-5.6-terra` | 2 | 0.20 | 2.50 | 12 | yes |
+  | `gpt-5.5` | 5 | 0.50 | 5 | 30 | yes |
+  | `gpt-5.4` | 2.50 | 0.25 | 2.50 | 15 | yes |
+  | `gpt-5.3-codex`, `gpt-5.2-codex`, `gpt-5.2` | 1.75 | 0.175 | 1.75 | 14 | no |
+  | `gpt-5.1-codex-max`, `gpt-5.1-codex`, `gpt-5-codex`, `gpt-5` | 1.25 | 0.125 | 1.25 | 10 | no |
+  | `gpt-5.1-codex-mini` | 0.25 | 0.025 | 0.25 | 2 | no |
+  | `o4-mini` | 1.10 | 0.275 | 1.10 | 4.40 | no |
 
   `gpt-5.6-sol`'s price is a promotional one, through 2026-11-21. Other codex models have no
   public API price (`codex-auto-review`, codex's own routing id, and `gpt-5.3-codex-spark`, for
@@ -1445,11 +1501,12 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
     `claude-fable-5`, `claude-mythos-5-1`, `claude-mythos-5`, `claude-opus-5-5`, `claude-opus-5`,
     `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-5`, and
     `claude-sonnet-4-6`; with fast mode, both apply.
-  - Codex: input without cached at the input price, cached input at the cached price, and output
-    (reasoning included, not priced again) at the output price.
+  - Codex: input without cached and cache write at the input price, cached input at the cached
+    price, cache write at the cache-write price, and output (reasoning included, not priced
+    again) at the output price.
   - Codex long context, on the models marked above: a request with more than 272,000 input
-    tokens, cached included, is priced whole at twice the input and cached prices and 1.5 times
-    the output price.
+    tokens, cached and cache write included, is priced whole at twice the input, cached, and
+    cache-write prices and 1.5 times the output price.
   - A model is found by its id without a trailing `-YYYYMMDD` (`claude-haiku-4-5-20251001` is
     `claude-haiku-4-5`), exactly: `claude-fable-5` and `claude-fable-5-1` differ, and no prefix
     matches. Claude's prices apply to claude's requests, codex's to codex's.
@@ -1457,7 +1514,7 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
     recorded or else without its date: it replaces the built-in price or prices a model that has
     none. Fast mode, US-only inference, and codex long context apply to it as to the built-in
     model of the same id. A count whose price it leaves out is not priced. For codex,
-    `cache_read` is the cached-input price.
+    `cache_read` is the cached-input price and `cache_write_5m` the cache-write price.
   - A request is not priced when its model has no price (`unknown` included) or a nonzero count
     of it has none; its tokens are still counted. A cost that leaves such requests out is shown
     followed by `+` (`$12.34+`), one with nothing priced as `-`, and the models with such

@@ -106,7 +106,7 @@ The exceptions, all for a type or a small helper:
 | `provider::codex` | Rollout parsing: head/tail windows, titles from `session_index.jsonl`, preview, cached rate limits | R10, R17 |
 | `provider::app_server` | JSON-RPC client for `codex app-server` (`account/read`, `account/rateLimits/read`) | R4, R10 |
 | `probe` | Run a short command in its own process group with captured output and a timeout, taking its output once it exited and terminating the group when it times out; JSON-RPC over stdio on the same core, its group terminated on every way out; run many in parallel; run `curl` with its configuration on stdin | R4, R10, R23 |
-| `account_command` | Run an agent's command for an account: pick the provider's program, set or remove the home variable, run it, and word the failure (`Runner`, `OnPath`); the shape of a parse that may be partial (`Parsed`) | R2, R4, R10, R10a |
+| `account_command` | Run an agent's command for an account: pick the provider's program, set or remove the home variable (and remove the variables a caller names), run it, and word the failure (`Runner`, `OnPath`); the shape of a parse that may be partial (`Parsed`) | R2, R4, R10, R10a |
 | `interrupt` | The terminal's signals, owned in one place: sat out while a foreground child has the terminal, passed on to the process groups of running commands and of commands being started, before remuda ends by them; a place for each of at most 1024 commands at a time, which one more waits for | R4, R6 |
 | `launch` | Classify arguments, inject `--session-id`, set or unset the home variable, the launch record, `exec` and foreground runs | R2, R6, R16, R17 |
 | `share` | Shared configuration injected at launch, the fallback for what a home does not link: `plan` (reads only; a `Plan` carries the relation of every shared item) and `apply` (item links, rule copies, settings file: what they are; `owned` writes them) | R18 |
@@ -211,7 +211,7 @@ separate caches, because they need different parts of each file.
   codex rollouts (+ archived) ┤ stats::sources
                               ▼
                         stats::refresh ──────────────────► stats.json   (one row per request,
-                              │                                          whole files; schema 2)
+                              │                                          whole files; schema 3)
                               ▼
                         stats::report(period, prices)  ◄── pricing (built-in + [prices])
                               │

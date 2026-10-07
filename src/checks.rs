@@ -13,6 +13,7 @@ use crate::index::Store;
 use crate::privacy::Marked;
 use crate::registry::{Account, CLAUDE, Home, Sharing};
 use crate::share::{self, Installs};
+use crate::usage;
 
 /// One problem worth a warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,18 +44,39 @@ fn listed(mut message: Marked, names: &[String]) -> Marked {
 }
 
 pub const API_KEY_VAR: &str = "ANTHROPIC_API_KEY";
+pub const AUTH_TOKEN_VAR: &str = "ANTHROPIC_AUTH_TOKEN";
+pub const OAUTH_TOKEN_VAR: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+pub const BASE_URL_VAR: &str = "ANTHROPIC_BASE_URL";
+
+/// Variables that change what claude does for every account (R11), in the order they are told,
+/// with what they do. A value is never told: the tokens are secrets, and a URL is not
+/// remuda's to show.
+const ENV_OVERRIDES: &[(&str, &str)] = &[
+    (API_KEY_VAR, "it overrides every account's /login"),
+    (AUTH_TOKEN_VAR, "it overrides every account's /login"),
+    (OAUTH_TOKEN_VAR, "it overrides every account's /login"),
+    (
+        BASE_URL_VAR,
+        "every account's requests go to that endpoint instead of Anthropic's",
+    ),
+    (
+        usage::NONESSENTIAL_TRAFFIC_VAR,
+        "claude's /usage then only repeats a reading taken within the hour, if any; remuda \
+         removes it for its own live usage queries, but claude launched as any account keeps it",
+    ),
+];
 
 /// All file-system and environment checks, in a stable order: environment, then per account
 /// (registry order), then shared stores. `stores` is [`crate::index::stores`] of `accounts`.
 pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
     let mut checks = Vec::new();
-    if env.get(API_KEY_VAR).is_some_and(|v| !v.is_empty()) {
-        checks.push(Check {
-            account: None,
-            message: say(format!(
-                "{API_KEY_VAR} is set: it overrides every account's /login"
-            )),
-        });
+    for (var, what) in ENV_OVERRIDES {
+        if env.get(*var).is_some_and(|v| !v.is_empty()) {
+            checks.push(Check {
+                account: None,
+                message: say(format!("{var} is set: {what}")),
+            });
+        }
     }
     // Claude and codex homes alike: only directory listings and `lstat`/`stat`/`readlink`, so
     // codex's `auth.json` (credentials, R4) is never opened.
@@ -447,7 +469,7 @@ mod tests {
     }
 
     /// R21: no path hides in what a message gives as words or as a name: remuda's words hold
-    /// no `/` but that of the two slash commands they name, and nothing outside a path piece
+    /// no `/` but that of the three slash commands they name, and nothing outside a path piece
     /// holds the directory the fixtures are in. Every test here runs its checks through this,
     /// so a path formatted into the words of any message fails the test that produces it.
     fn marked_right(checks: &[Check]) {
@@ -459,7 +481,10 @@ mod tests {
                 match kind {
                     Piece::Path => continue,
                     Piece::Words => {
-                        let said = piece.replace("/login", "").replace("/rewind", "");
+                        let said = piece
+                            .replace("/login", "")
+                            .replace("/rewind", "")
+                            .replace("/usage", "");
                         assert!(!said.contains('/'), "{piece:?} in {check:?}");
                     }
                     Piece::Text => {}
@@ -545,6 +570,58 @@ mod tests {
         );
         f.env.insert(API_KEY_VAR.into(), String::new());
         assert_eq!(run(&[], &f.env, &[]), []);
+    }
+
+    /// R11: each variable that takes every account's requests away from its own login, or its
+    /// live usage away from a new reading, is told once, in a fixed order, and never with its
+    /// value; an empty one is not set.
+    #[test]
+    fn login_and_endpoint_overrides_in_the_environment() {
+        let mut f = Root::new();
+        let values = [
+            ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "zq-traffic"),
+            ("ANTHROPIC_BASE_URL", "https://zq-gateway.example/v1"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-zq"),
+            ("ANTHROPIC_AUTH_TOKEN", "zq-bearer"),
+        ];
+        for (var, value) in values {
+            f.env.insert(var.into(), value.into());
+        }
+        let got = run(&[], &f.env, &[]);
+        let said = [
+            "ANTHROPIC_AUTH_TOKEN is set: it overrides every account's /login",
+            "CLAUDE_CODE_OAUTH_TOKEN is set: it overrides every account's /login",
+            "ANTHROPIC_BASE_URL is set: every account's requests go to that endpoint instead \
+             of Anthropic's",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set: claude's /usage then only repeats \
+             a reading taken within the hour, if any; remuda removes it for its own live usage \
+             queries, but claude launched as any account keeps it",
+        ];
+        assert_eq!(
+            messages(&got),
+            said.iter().map(|m| (None, *m)).collect::<Vec<_>>()
+        );
+        assert_eq!(shapes(&got), said);
+        for check in &got {
+            for (_, value) in values {
+                assert!(!check.message.as_str().contains(value), "{check:?}");
+            }
+        }
+        // After the API key, which keeps its place first.
+        f.env.insert(API_KEY_VAR.into(), "sk-test".into());
+        let got = run(&[], &f.env, &[]);
+        assert_eq!(got.len(), 5);
+        assert_eq!(
+            messages(&got)[0],
+            (
+                None,
+                "ANTHROPIC_API_KEY is set: it overrides every account's /login"
+            )
+        );
+        for (var, _) in values {
+            f.env.insert(var.into(), String::new());
+        }
+        assert_eq!(run(&[], &f.env, &[]).len(), 1);
     }
 
     #[test]
