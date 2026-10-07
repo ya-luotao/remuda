@@ -10,6 +10,21 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Added
 
+- `remuda pick` recommends the account to resume or fork a session as: `remuda pick -- --resume
+  <id>` (claude, also with `--fork-session`) or `-- resume <id>` / `-- fork <id>` (codex). Prompt
+  caches are per account, so the account that ran the session within `[pick] affinity_minutes`
+  (new, default 60; 0 turns it off) ranks first among the feasible ones, from the launch log and
+  the end of its own copy of the session's transcript; it never makes an account feasible, and
+  an account registered again under that name with another home is not it. Accounts whose
+  store does not hold the session are not feasible. Nothing is injected: the model of the copy
+  each account would resume is the one whose windows are counted. The text output has a
+  `session` line, also when nothing is feasible and, with `--run`, on stderr; `--json` has a
+  `session` object and `affine` on each candidate; Jev is told which account (by alias) ran the
+  session and how long ago, never its id, title, directory or model, and reads the usage
+  windows by their kind only (`weekly window of the session's model`), since a window's label
+  may name that model. Of several copies of the session in one store, the one written to last
+  counts. `pick --run`
+  launches a resume exactly as `remuda run <account> --resume <id>` (SPEC R23, R3).
 - The Accounts view warns when `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN` is set (it
   overrides every account's `/login`, like `ANTHROPIC_API_KEY`), when `ANTHROPIC_BASE_URL` is set
   (every account's requests go to that endpoint), and when
@@ -17,6 +32,9 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Changed
 
+- `remuda pick -- <args>` no longer needs `--run`: without it, the arguments go into the
+  `command` shown, each word quoted for the shell where it needs it. Arguments that neither start a new session nor name one to resume (`-c`,
+  `--resume` without an id) are refused with or without `--run` (SPEC R23).
 - Codex statistics read `cache_write_input_tokens`, which codex 0.160 records (SPEC R20): the
   tokens written to the cache are part of `input_tokens`, so they are now counted as cache write
   instead of input, and priced at the cache-write price, 1.25 times the input price on

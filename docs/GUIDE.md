@@ -211,6 +211,7 @@ exclude = ["claude:team"]      # never recommended
 prefer = ["claude:max"]        # breaks the last ties
 min_headroom = 10              # percent left required on every window that applies
 stale_after = 120              # minutes after which cached usage is marked stale
+affinity_minutes = 60          # resuming a session: how long its last account stays preferred
 notes = """
 Keep claude:max for long refactors. codex:work is the company's; weekdays only.
 """
@@ -255,8 +256,38 @@ models = ["gpt-6-astra"]
   candidate. With nothing feasible, `pick` lists the reasons and exits 1.
 - **Launching.** `remuda pick --run [-- <args>...]` launches the recommendation as `remuda run`
   would: claude gets `--model` and `--effort`, codex `-m` and `-c model_reasoning_effort=`,
-  before your arguments; an option your arguments already set is left alone. Arguments that
-  resume or fork a session are refused.
+  before your arguments; an option your arguments already set is left alone. Without `--run`,
+  the arguments after `--` only go into the `command` shown, quoted for the shell so that it
+  can be copied and run as is. Arguments that neither start a new
+  session nor name one (`-c`, `--resume` without an id, `codex resume --last`) are refused.
+- **Resuming.** `remuda pick -- --resume <id>` (claude; also `--resume <id> --fork-session`) or
+  `remuda pick -- resume <id>` (codex; also `fork <id>`) recommends the account to resume that
+  session as. Prompt caches are per account: resuming as another account than the one that ran
+  the session lately writes the whole conversation into the new account's cache again, which is
+  slower and spends its limits. So the account that ran it within `affinity_minutes` (from the
+  launch log, and the end of its own copy of the transcript in the session index) ranks first
+  among the feasible ones; it is never made feasible by it. The account is the one launched
+  with that very home: a name registered again with another home is another login, and is not
+  preferred. Where accounts do not share their sessions, each account's model and activity are
+  those of the copy in its own store. An account whose sessions are not shared with
+  the session's store cannot resume it and is not offered (once `remuda sessions` or the TUI has
+  indexed the session). Nothing is injected: the session keeps its own model, whose limits are
+  the ones counted. The output says who ran the session and how long ago, and, when that
+  account cannot be recommended, why, and what resuming elsewhere costs:
+
+  ```text
+  $ remuda pick -- --resume 766560c5-…
+  account     claude:max
+  model       the session's (claude-opus-5-5)
+  …
+  session     resume 766560c5-…: claude:max ran it 12m ago (prompt cache warm: preferred); model claude-opus-5-5
+  command     remuda run claude:max --resume 766560c5-…
+  ```
+
+  `--run` launches it exactly as `remuda run <account> --resume <id>` would, after saying on
+  stderr who ran the session and, when that account is not the one launched, why; like `run`,
+  it does not check whether the session is running elsewhere. Jev is told which account (by
+  alias) ran the session and how long ago; never its id, title, directory or model.
 
 ## Cost estimates
 

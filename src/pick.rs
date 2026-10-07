@@ -5,6 +5,7 @@
 //! [`crate::usage::snapshot`]'s to say.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -14,16 +15,24 @@ use toml_edit::DocumentMut;
 
 use crate::account_command::Runner;
 use crate::identity::{self, Identity};
+use crate::index::{self, Index};
 use crate::launch::{self, Intent};
-use crate::provider::Provider;
+use crate::provider::{Provider, codex};
 use crate::registry::{Account, Registry};
+use crate::transcript::{self, SessionTail};
 use crate::usage::{self, CachedUsage, LiveUsage, Reading, Snapshot, Source, UsageRow, Window};
-use crate::{Env, probe};
+use crate::{Env, attribution, probe};
 
 /// Percent left required on every window that applies, unless `[pick] min_headroom` says (R23).
 pub const DEFAULT_MIN_HEADROOM: u32 = 10;
 /// Minutes after which cached usage is stale, unless `[pick] stale_after` says (R23).
 pub const DEFAULT_STALE_AFTER: u32 = 120;
+/// Minutes after its last activity that the account which ran a session stays preferred for
+/// resuming it, unless `[pick] affinity_minutes` says (R23): claude writes its prompt cache for
+/// an hour (1h ephemeral, verified on 2.1.292).
+pub const DEFAULT_AFFINITY_MINUTES: u32 = 60;
+/// The longest `[pick] affinity_minutes`: a day.
+pub const MAX_AFFINITY_MINUTES: u32 = 1440;
 /// The longest `[pick] notes`, in characters (R3).
 pub const MAX_NOTES: usize = 4000;
 /// Jev's pair is taken from this confidence on (R23).
@@ -34,6 +43,8 @@ pub const ACCOUNT_PROBABILITY: f64 = 0.70;
 pub const EFFORT_CONFIDENCE: f64 = 0.50;
 /// The most options one Choice may offer (R23).
 pub const MAX_OPTIONS: usize = 255;
+/// Why an account whose store does not hold the session resumed is not feasible (R23).
+pub const NOT_SEEN: &str = "cannot see this session (its store is not this account's)";
 /// How long `codex login status` may take (R4: about 0.05 s), as for `remuda list`.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -47,6 +58,8 @@ pub struct Config {
     pub min_headroom: u32,
     /// Minutes.
     pub stale_after: u32,
+    /// Minutes; 0: a session's last account is never preferred.
+    pub affinity_minutes: u32,
     /// Free text sent to Jev; empty: none.
     pub notes: String,
     pub claude: Choices,
@@ -60,6 +73,7 @@ impl Default for Config {
             prefer: Vec::new(),
             min_headroom: DEFAULT_MIN_HEADROOM,
             stale_after: DEFAULT_STALE_AFTER,
+            affinity_minutes: DEFAULT_AFFINITY_MINUTES,
             notes: String::new(),
             claude: Choices::default(),
             codex: Choices::default(),
@@ -77,11 +91,12 @@ pub struct Choices {
     pub default_effort: Option<String>,
 }
 
-const KEYS: [&str; 7] = [
+const KEYS: [&str; 8] = [
     "exclude",
     "prefer",
     "min_headroom",
     "stale_after",
+    "affinity_minutes",
     "notes",
     "claude",
     "codex",
@@ -128,6 +143,15 @@ impl Config {
                     Some(n) if n > 0 && n <= i64::from(u32::MAX) => config.stale_after = n as u32,
                     _ => bail!("[pick]: `stale_after` must be a positive integer (minutes)"),
                 },
+                "affinity_minutes" => match value.as_integer() {
+                    Some(n) if (0..=i64::from(MAX_AFFINITY_MINUTES)).contains(&n) => {
+                        config.affinity_minutes = n as u32
+                    }
+                    _ => bail!(
+                        "[pick]: `affinity_minutes` must be an integer from 0 to \
+                         {MAX_AFFINITY_MINUTES} (minutes)"
+                    ),
+                },
                 "notes" => {
                     let Some(notes) = value.as_str() else {
                         bail!("[pick]: `notes` must be a string");
@@ -149,6 +173,17 @@ impl Config {
         match provider {
             Provider::Claude => &self.claude,
             Provider::Codex => &self.codex,
+        }
+    }
+
+    /// This configuration for resuming or forking a session (R23): the session's model is the
+    /// session's, and nothing is injected, so neither `models` nor `efforts` nor
+    /// `default_effort` has a say.
+    pub fn for_resume(&self) -> Config {
+        Config {
+            claude: Choices::default(),
+            codex: Choices::default(),
+            ..self.clone()
         }
     }
 }
@@ -263,6 +298,308 @@ pub fn limits_model(provider: Provider, model: &str, name: &str) -> bool {
     }
 }
 
+/// Whether a session is resumed in place or forked (R23 Resuming).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    Resume,
+    Fork,
+}
+
+impl SessionKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            SessionKind::Resume => "resume",
+            SessionKind::Fork => "fork",
+        }
+    }
+}
+
+/// The session the arguments after `--` resume or fork (R23 Resuming).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resume {
+    /// Whose arguments name it: only this provider's accounts can resume it.
+    pub provider: Provider,
+    pub kind: SessionKind,
+    pub id: String,
+}
+
+/// What arguments do for one provider's agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Opens {
+    New,
+    Session(SessionKind, String),
+    /// Neither a new session nor one named: a continue, a resume without an id, a subcommand.
+    Other,
+}
+
+/// What `args` do for `provider`'s agent (R23): claude by R6's classification, accepting of
+/// the existing sessions only `--resume <id>` (`-r <id>`, `--resume=<id>`) with nothing else
+/// resuming, and the fork `--resume <id> --fork-session`; codex by `resume <id>` / `fork <id>`
+/// first (R17).
+fn opens(provider: Provider, args: &[String]) -> Opens {
+    match provider {
+        Provider::Claude => match launch::classify(args) {
+            Intent::NewSession => Opens::New,
+            Intent::Fork { of } => Opens::Session(SessionKind::Fork, of),
+            // `--session-id <id>` alone reads so too: that is a new session's id. Without the
+            // resume, what is left must start a new session: no other resume, continue or id.
+            Intent::Existing {
+                session_id: Some(id),
+                fork_of: None,
+            } if launch::classify(&without_resume(args, &id)) == Intent::NewSession => {
+                Opens::Session(SessionKind::Resume, id)
+            }
+            _ => Opens::Other,
+        },
+        Provider::Codex => match args.first().map(String::as_str) {
+            Some("resume" | "fork") => match launch::codex_intent(args) {
+                Intent::Existing {
+                    session_id: Some(id),
+                    ..
+                } => Opens::Session(SessionKind::Resume, id),
+                Intent::Existing {
+                    fork_of: Some(id), ..
+                } => Opens::Session(SessionKind::Fork, id),
+                _ => Opens::Other,
+            },
+            _ => Opens::New,
+        },
+    }
+}
+
+/// `args` without their first `--resume <id>`, `-r <id>` or `--resume=<id>`.
+fn without_resume(args: &[String], id: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut done = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if !done {
+            if matches!(arg, "--resume" | "-r") && args.get(i + 1).map(String::as_str) == Some(id) {
+                done = true;
+                i += 2;
+                continue;
+            }
+            if arg.strip_prefix("--resume=") == Some(id) {
+                done = true;
+                i += 1;
+                continue;
+            }
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    out
+}
+
+/// The session `args` resume or fork, by whichever agent's reading names one (R23 Resuming);
+/// `None` when neither does: a new session, or arguments [`run_args`] refuses. Arguments both
+/// readings take for a session (`resume x --resume y`) are refused as ambiguous.
+pub fn session_args(args: &[String]) -> Result<Option<Resume>> {
+    let mut named = Provider::ALL
+        .into_iter()
+        .filter_map(|provider| match opens(provider, args) {
+            Opens::Session(kind, id) => Some(Resume { provider, kind, id }),
+            _ => None,
+        });
+    let first = named.next();
+    if let (Some(a), Some(b)) = (&first, named.next()) {
+        bail!(
+            "these arguments name a session for claude ({}) and for codex ({}): ambiguous",
+            a.id,
+            b.id
+        );
+    }
+    Ok(first)
+}
+
+/// The account that last ran a session, and when (R23 Resuming).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastRun {
+    /// `provider:name`.
+    pub account: String,
+    /// The home string the launch log has for it, byte for byte (R2): an account registered
+    /// again under that name with another home is another login, with another cache.
+    pub home: String,
+    pub launched_at: Timestamp,
+    /// The later of the launch and the last record of what it ran, where that can be told.
+    pub active_at: Timestamp,
+}
+
+impl LastRun {
+    /// Whether `account` is the one that ran it: the same name and the same home string.
+    pub fn is(&self, account: &Account) -> bool {
+        account.qualified() == self.account && account.home.to_string() == self.home
+    }
+}
+
+/// The session resumed or forked, and what remuda knows of it (R23 Resuming).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub resume: Resume,
+    /// From the launch log; `None` when remuda never launched it.
+    pub last: Option<LastRun>,
+    /// For each account that can see the session (`provider:name`), the model of the copy it
+    /// would resume: the one in its own store, from the end of that transcript; `None` when
+    /// unknown. `None` as a whole when the session index does not have the session, and so
+    /// cannot say who sees it.
+    pub seen_by: Option<BTreeMap<String, Option<String>>>,
+}
+
+impl Session {
+    /// Seconds since its last account's last activity at `now`; never negative.
+    pub fn age(&self, now: Timestamp) -> Option<i64> {
+        let last = self.last.as_ref()?;
+        Some((now.as_second() - last.active_at.as_second()).max(0))
+    }
+
+    /// The run within `affinity_minutes` of `now`: its account's prompt cache is warm.
+    pub fn warm(&self, config: &Config, now: Timestamp) -> Option<&LastRun> {
+        let age = self.age(now)?;
+        (config.affinity_minutes > 0 && age <= i64::from(config.affinity_minutes) * 60)
+            .then_some(self.last.as_ref())
+            .flatten()
+    }
+
+    /// The model of the copy `account` (`provider:name`) would resume, when known.
+    pub fn model_for(&self, account: &str) -> Option<&str> {
+        self.seen_by.as_ref()?.get(account)?.as_deref()
+    }
+
+    /// The model every copy has, when they agree and it is known: what to say of the session
+    /// when no account is chosen.
+    pub fn model(&self) -> Option<&str> {
+        let mut models = self.seen_by.as_ref()?.values();
+        let first = models.next()?.as_deref()?;
+        models.all(|m| m.as_deref() == Some(first)).then_some(first)
+    }
+}
+
+/// What remuda knows of the session `resume` names (R23 Resuming), read without a request or a
+/// scan of the stores: the latest launch that ran it (`launch_log`, R6), and, through the
+/// session index (`index`, R8), the stores of `accounts` that hold a copy of it and the end of
+/// each copy. Every fact is tied to a store: the activity is that of the copy in the store of
+/// the account that launched it (under the home it was launched with), and each account's
+/// model that of the copy in its own store. A copy in another store is another account's.
+pub fn read_session(
+    resume: Resume,
+    accounts: &[Account],
+    env: &Env,
+    launch_log: &Path,
+    index: &Path,
+) -> Session {
+    let index = Index::load(index);
+    let provider = resume.provider;
+    let stores: Vec<index::Store> = index::stores(accounts, env)
+        .into_iter()
+        .filter(|s| s.provider == provider)
+        .collect();
+    let store_of = |account: &str| {
+        stores
+            .iter()
+            .find(|s| s.accounts.iter().any(|a| a == account))
+    };
+    let launched = attribution::last_launch(launch_log, provider, &resume.id);
+    let cwd = launched.as_ref().and_then(|l| l.cwd.clone());
+    // The end of session `id`'s copy in `store` ([`copy_in`]).
+    let tail_in = |store: &index::Store, id: &str| {
+        let tails: Vec<SessionTail> = transcripts(&index, provider, id)
+            .filter(|e| e.store == store.path)
+            .filter_map(|e| transcript::session_tail(&e.path, provider).ok())
+            .collect();
+        copy_in(tails, cwd.as_deref())
+    };
+    let last = launched.map(|launched| {
+        // What it ran (the session itself, or the fork it made) in the store of the account
+        // as launched. Its last record counts only when written in the launch's directory: one
+        // written elsewhere is someone else's.
+        let account = accounts
+            .iter()
+            .find(|a| a.qualified() == launched.account && a.home.to_string() == launched.home);
+        let active = account
+            .and_then(|a| store_of(&a.qualified()))
+            .zip(launched.session_id.as_deref())
+            .and_then(|(store, sid)| tail_in(store, sid))
+            .filter(|tail| same_dir(tail.cwd_last.as_deref(), launched.cwd.as_deref()))
+            .and_then(|tail| tail.ts_last?.parse::<Timestamp>().ok());
+        LastRun {
+            active_at: active.map_or(launched.ts, |at| at.max(launched.ts)),
+            launched_at: launched.ts,
+            account: launched.account,
+            home: launched.home,
+        }
+    });
+    let indexed = transcripts(&index, provider, &resume.id).next().is_some();
+    let seen_by = indexed.then(|| {
+        let mut seen = BTreeMap::new();
+        for store in &stores {
+            if transcripts(&index, provider, &resume.id).any(|e| e.store == store.path) {
+                let model = tail_in(store, &resume.id).and_then(|tail| tail.model);
+                for account in &store.accounts {
+                    seen.insert(account.clone(), model.clone());
+                }
+            }
+        }
+        seen
+    });
+    Session {
+        resume,
+        last,
+        seen_by,
+    }
+}
+
+/// Of the copies of one session in one store (their ends, `tails`), the one it goes on in
+/// (R23 Resuming): the one written to last; of those written to last at the same time, the
+/// one whose last record is in the launch's directory `cwd`. `None` when there is none, or
+/// that does not single one out: then neither its time nor its model is known. A copy whose
+/// last time cannot be read was written to before any whose can.
+fn copy_in(tails: Vec<SessionTail>, cwd: Option<&str>) -> Option<SessionTail> {
+    let time = |t: &SessionTail| {
+        t.ts_last
+            .as_deref()
+            .and_then(|t| t.parse::<Timestamp>().ok())
+    };
+    let latest = tails.iter().map(time).max()?;
+    let mut last: Vec<SessionTail> = tails.into_iter().filter(|t| time(t) == latest).collect();
+    if last.len() > 1 {
+        last.retain(|t| same_dir(t.cwd_last.as_deref(), cwd));
+    }
+    match <[SessionTail; 1]>::try_from(last) {
+        Ok([one]) => Some(one),
+        Err(_) => None,
+    }
+}
+
+/// The index entries of session `id` whose file is there and is that session's by its name.
+fn transcripts<'a>(
+    index: &'a Index,
+    provider: Provider,
+    id: &'a str,
+) -> impl Iterator<Item = &'a index::Entry> {
+    index.entries.values().filter(move |e| {
+        let name = e.path.file_name().and_then(|n| n.to_str());
+        let named = match provider {
+            Provider::Claude => e.path.file_stem().and_then(|n| n.to_str()) == Some(id),
+            Provider::Codex => name.and_then(codex::rollout_id) == Some(id),
+        };
+        e.provider == provider && e.session_id == id && named && e.path.is_file()
+    })
+}
+
+/// Whether a transcript's last directory is the launch's: both known, and equal as written or
+/// once resolved.
+fn same_dir(tail: Option<&str>, launch: Option<&str>) -> bool {
+    let (Some(tail), Some(launch)) = (tail, launch) else {
+        return false;
+    };
+    tail == launch
+        || matches!(
+            (std::fs::canonicalize(tail), std::fs::canonicalize(launch)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
 /// One account, as gathered: why it cannot be recommended at all, or its usage.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
@@ -316,6 +653,9 @@ pub struct Candidate {
     pub default_model_windows: Vec<Window>,
     /// 1-based position among the feasible pairs by the rules.
     pub rules_rank: Option<usize>,
+    /// Its account ran the session resumed within `affinity_minutes` (R23 Resuming): its
+    /// prompt cache is warm. A fact, not feasibility: a pair that is not feasible may have it.
+    pub affine: bool,
 }
 
 impl Candidate {
@@ -325,10 +665,23 @@ impl Candidate {
 }
 
 /// Every candidate of `entries`, feasibility decided and the feasible ones ranked by the rules
-/// (R23); in entry order, each account's models in `models` order.
-pub fn candidates(entries: &[Entry], config: &Config, now: Timestamp) -> Vec<Candidate> {
+/// (R23); in entry order, each account's models in `models` order. Resuming `session`, each
+/// account is one candidate without a model (the session's is the session's), whose windows
+/// are those of the session's model when it is known; the account that ran it lately is marked
+/// [`Candidate::affine`].
+pub fn candidates(
+    entries: &[Entry],
+    config: &Config,
+    now: Timestamp,
+    session: Option<&Session>,
+) -> Vec<Candidate> {
+    let warm = session.and_then(|s| s.warm(config, now));
     let mut out = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
+        // The account as it ran the session: the same name and home (R2).
+        let affine = warm.is_some_and(|run| run.is(&entry.account));
+        // The model of the copy this account would resume: the one in its own store.
+        let session_model = session.and_then(|s| s.model_for(&entry.account.qualified()));
         if let Some(blocked) = &entry.blocked {
             out.push(Candidate {
                 entry: i,
@@ -340,20 +693,24 @@ pub fn candidates(entries: &[Entry], config: &Config, now: Timestamp) -> Vec<Can
                 reset_passed: Vec::new(),
                 default_model_windows: Vec::new(),
                 rules_rank: None,
+                affine,
             });
             continue;
         }
         let provider = entry.account.provider;
         let models: Vec<Option<&String>> = match &config.choices(provider).models {
+            _ if session.is_some() => vec![None],
             models if models.is_empty() => vec![None],
             models => models.iter().map(Some).collect(),
         };
         for (rank, model) in models.into_iter().enumerate() {
+            // The model whose windows apply: the one injected, else the session's.
+            let model_of_windows = model.map(String::as_str).or(session_model);
             let windows: Vec<&Window> = entry
                 .usage
                 .iter()
                 .flat_map(|u| &u.windows)
-                .filter(|w| match (&w.model, model) {
+                .filter(|w| match (&w.model, model_of_windows) {
                     (None, _) => true,
                     (Some(name), Some(model)) => limits_model(provider, model, name),
                     (Some(_), None) => false,
@@ -376,7 +733,7 @@ pub fn candidates(entries: &[Entry], config: &Config, now: Timestamp) -> Vec<Can
                 .filter(|w| w.reset_passed())
                 .map(|w| (*w).clone())
                 .collect();
-            let default_model_windows: Vec<Window> = match model {
+            let default_model_windows: Vec<Window> = match model_of_windows {
                 Some(_) => Vec::new(),
                 None => entry
                     .usage
@@ -410,6 +767,7 @@ pub fn candidates(entries: &[Entry], config: &Config, now: Timestamp) -> Vec<Can
                 reset_passed,
                 default_model_windows,
                 rules_rank: None,
+                affine,
             });
         }
     }
@@ -417,7 +775,9 @@ pub fn candidates(entries: &[Entry], config: &Config, now: Timestamp) -> Vec<Can
     out
 }
 
-/// Numbers the feasible candidates by the rules (R23): known headroom before unknown (stale
+/// Numbers the feasible candidates by the rules (R23): resuming a session, the account whose
+/// prompt cache is warm first (among the feasible only: affinity orders, it never admits);
+/// then known headroom before unknown (stale
 /// data is still known; no usage data, or every window reset since, is not); then the model's
 /// position in `models`; the 10-point headroom band, higher first (90% left and more is one
 /// band); fresh before stale; the binding window's reset, sooner first; `prefer` order;
@@ -435,6 +795,7 @@ pub fn rank_rules(candidates: &mut [Candidate], entries: &[Entry], config: &Conf
             .position(|p| *p == qualified)
             .unwrap_or(config.prefer.len());
         (
+            !c.affine,
             c.headroom.is_none(),
             c.model_rank,
             std::cmp::Reverse(c.headroom.map_or(0, band)),
@@ -703,8 +1064,9 @@ pub fn decide(
 
 /// The options `remuda run` gets for `model` and `effort` (R23): claude `--model <m> --effort
 /// <e>`, codex `-m <m> -c model_reasoning_effort=<e>`, before `user_args`. One the user's
-/// arguments already set is not injected, with a notice. Refuses arguments that do not start a
-/// new session.
+/// arguments already set is not injected, with a notice. Arguments that resume or fork a
+/// named session get nothing: they are passed as given (R23 Resuming). Refuses arguments that
+/// do neither and do not start a new session.
 pub fn run_args(
     provider: Provider,
     model: Option<&str>,
@@ -718,14 +1080,20 @@ pub fn run_args(
             "{what} is already in the arguments; not injecting the recommended {value}"
         ));
     };
+    match opens(provider, user_args) {
+        Opens::New => {}
+        Opens::Session(..) => return Ok((user_args.to_vec(), notices)),
+        Opens::Other if provider == Provider::Claude => bail!(
+            "`pick --run` starts a new session; these arguments do not: {}",
+            user_args.join(" ")
+        ),
+        Opens::Other => bail!(
+            "`pick --run` starts a new session; `codex {}` does not",
+            user_args[0]
+        ),
+    }
     match provider {
         Provider::Claude => {
-            if launch::classify(user_args) != Intent::NewSession {
-                bail!(
-                    "`pick --run` starts a new session; these arguments do not: {}",
-                    user_args.join(" ")
-                );
-            }
             let has = |name: &str| {
                 let prefix = format!("{name}=");
                 user_args
@@ -748,15 +1116,6 @@ pub fn run_args(
             }
         }
         Provider::Codex => {
-            if matches!(
-                user_args.first().map(String::as_str),
-                Some("resume" | "fork")
-            ) {
-                bail!(
-                    "`pick --run` starts a new session; `codex {}` does not",
-                    user_args[0]
-                );
-            }
             let has_model = user_args.iter().any(|a| {
                 a == "--model"
                     || a.starts_with("--model=")
@@ -793,7 +1152,7 @@ pub fn run_args(
     }
     let args = [injected, user_args.to_vec()].concat();
     // A model id must not turn the launch into something else (a claude subcommand).
-    if provider == Provider::Claude && launch::classify(&args) != Intent::NewSession {
+    if provider == Provider::Claude && launch::classify(&args) != launch::classify(user_args) {
         bail!(
             "the recommended options would not start a new session: {}",
             args.join(" ")
@@ -812,8 +1171,12 @@ pub struct Sources<'a> {
     pub agents: &'a dyn Runner,
     /// Query usage live (R10) instead of reading the cache; a failed query falls back to it.
     pub live: Option<Duration>,
-    /// Only this provider's accounts are candidates.
-    pub provider: Option<Provider>,
+    /// Only this provider's accounts are candidates, and why (`--provider claude`, or whose
+    /// session is resumed).
+    pub provider: Option<(Provider, String)>,
+    /// Only these accounts (`provider:name`) can see the session resumed: the others are not
+    /// asked anything (R23 Resuming). `None`: every account.
+    pub seen_by: Option<Vec<String>>,
 }
 
 /// Each of `accounts` with its usage, or why it is blocked (R23): excluded, another provider,
@@ -876,10 +1239,16 @@ fn gather_one(
         entry.blocked = Some("excluded ([pick] exclude)".to_string());
         return entry;
     }
-    if let Some(only) = sources.provider
-        && only != provider
+    if let Some((only, why)) = &sources.provider
+        && *only != provider
     {
-        entry.blocked = Some(format!("not a {only} account (--provider {only})"));
+        entry.blocked = Some(format!("not a {only} account ({why})"));
+        return entry;
+    }
+    if let Some(seen_by) = &sources.seen_by
+        && !seen_by.contains(&account.qualified())
+    {
+        entry.blocked = Some(NOT_SEEN.to_string());
         return entry;
     }
     // What the live query answered, when one is asked, and when the answer arrived: it is
@@ -958,11 +1327,18 @@ fn gather_one(
     entry
 }
 
-/// `remuda run <account> <options>` for the decision, as words.
-pub fn command(entry: &Entry, candidate: &Candidate, effort: Option<&str>) -> Vec<String> {
+/// `remuda run <account> <options> <args>` for the decision, as words: `args` are the user's,
+/// after `--`, which must be ones [`run_args`] takes (without a `--` of their own after the
+/// account: `remuda run` gives the agent every word after the account, R5).
+pub fn command(
+    entry: &Entry,
+    candidate: &Candidate,
+    effort: Option<&str>,
+    args: &[String],
+) -> Vec<String> {
     let provider = entry.account.provider;
-    let (args, _) = run_args(provider, candidate.model.as_deref(), effort, &[])
-        .expect("injected options alone start a new session");
+    let (args, _) = run_args(provider, candidate.model.as_deref(), effort, args)
+        .expect("the arguments were checked before deciding");
     [
         vec![
             "remuda".to_string(),
@@ -972,6 +1348,28 @@ pub fn command(entry: &Entry, candidate: &Candidate, effort: Option<&str>) -> Ve
         args,
     ]
     .concat()
+}
+
+/// `words` as one POSIX shell command line that gives back the same words: each is left as is
+/// when it is made only of characters no shell treats specially, else single-quoted (a `'` in
+/// it as `'\''`). An empty word is `''`. The user's arguments go into the command shown: a
+/// prompt with spaces, quotes or `$(` must replay as the one word it was.
+pub fn shell_line(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| {
+            let plain = !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-+=:,./@%".contains(&b));
+            if plain {
+                word.clone()
+            } else {
+                format!("'{}'", word.replace('\'', r"'\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `claude:max / claude-opus-5-5`; `/ default` without a model.
@@ -1077,24 +1475,138 @@ fn effort_text(decision: &Decision) -> String {
     }
 }
 
-/// The plain-text report of `remuda pick` (R23).
+/// `12m ago`: the time from `at` to `now`.
+fn ago(at: Timestamp, now: Timestamp) -> String {
+    format!("{} ago", format_in(now, at))
+}
+
+/// What the report says of the session resumed (R23 Resuming), whether or not a candidate is
+/// `chosen`: the `session` line (its kind and id, who ran it last and how long ago, whether
+/// that account's prompt cache is warm or why not, the model of the copy the chosen account
+/// would resume), and the lines below it: that the index does not have it, and that the warm
+/// account is not the one recommended, and why. Its id is the user's own, said back on their
+/// terminal; none of this is sent.
+pub fn session_rows(
+    session: &Session,
+    entries: &[Entry],
+    candidates: &[Candidate],
+    chosen: Option<usize>,
+    config: &Config,
+    now: Timestamp,
+) -> Vec<(&'static str, String)> {
+    let resume = &session.resume;
+    let warm = session.warm(config, now);
+    let warm_candidate = candidates.iter().position(|c| c.affine);
+    let who = match &session.last {
+        None => {
+            "not launched through remuda: no account's prompt cache is known to be warm".to_string()
+        }
+        Some(last) => {
+            let renamed = entries
+                .iter()
+                .any(|e| e.account.qualified() == last.account && !last.is(&e.account));
+            let why = match (warm, warm_candidate) {
+                (Some(_), Some(_)) => "prompt cache warm: preferred".to_string(),
+                (Some(_), None) if renamed => {
+                    "registered now with another home: another login, whose cache does not hold \
+                     it"
+                    .to_string()
+                }
+                (Some(_), None) => "no longer registered".to_string(),
+                (None, _) if config.affinity_minutes == 0 => {
+                    "affinity off: [pick] affinity_minutes = 0".to_string()
+                }
+                (None, _) => format!(
+                    "more than {} minutes ago: its prompt cache has likely expired",
+                    config.affinity_minutes
+                ),
+            };
+            format!(
+                "{} ran it {} ({why})",
+                last.account,
+                ago(last.active_at, now)
+            )
+        }
+    };
+    let model = match chosen {
+        Some(c) => session.model_for(&entries[candidates[c].entry].account.qualified()),
+        None => session.model(),
+    };
+    let mut rows = vec![(
+        "session",
+        format!(
+            "{} {}: {who}; model {}",
+            resume.kind.name(),
+            resume.id,
+            model.unwrap_or("unknown")
+        ),
+    )];
+    if session.seen_by.is_none() {
+        rows.push((
+            "",
+            "not in the session index: every account is offered, whether or not it can see \
+             the session (`remuda sessions` indexes it)"
+                .to_string(),
+        ));
+    }
+    if let (Some(w), Some(last)) = (warm_candidate, &session.last)
+        && chosen.is_none_or(|c| candidates[c].entry != candidates[w].entry)
+    {
+        // Feasible, the warm account is the rules' first: only Jev chooses another.
+        let but = match (&candidates[w].why_not, chosen) {
+            (Some(why), _) => why.clone(),
+            (None, Some(c)) => format!(
+                "jev chose {}",
+                entries[candidates[c].entry].account.qualified()
+            ),
+            (None, None) => "nothing was chosen".to_string(),
+        };
+        rows.push((
+            "",
+            format!(
+                "{} ran this session {}, but {but}; resuming as another account rewrites its \
+                 prompt cache",
+                last.account,
+                ago(last.active_at, now)
+            ),
+        ));
+    }
+    rows
+}
+
+/// [`session_rows`] as lines of the text report.
+pub fn format_session(rows: &[(&str, String)]) -> String {
+    rows.iter()
+        .map(|(k, v)| format!("{k:<10}  {v}\n"))
+        .collect()
+}
+
+/// The plain-text report of `remuda pick` (R23): `args` are the user's, after `--`, and
+/// `session` the session they resume or fork.
 pub fn format_text(
     entries: &[Entry],
     candidates: &[Candidate],
     decision: &Decision,
     config: &Config,
     now: Timestamp,
+    args: &[String],
+    session: Option<&Session>,
 ) -> String {
     let c = &candidates[decision.chosen];
     let entry = &entries[c.entry];
+    let model = match (session, &c.model) {
+        (_, Some(model)) => model.clone(),
+        (Some(session), None) => format!(
+            "the session's ({})",
+            session
+                .model_for(&entry.account.qualified())
+                .unwrap_or("unknown")
+        ),
+        (None, None) => "agent default".to_string(),
+    };
     let mut rows: Vec<(&str, String)> = vec![
         ("account", entry.account.qualified()),
-        (
-            "model",
-            c.model
-                .clone()
-                .unwrap_or_else(|| "agent default".to_string()),
-        ),
+        ("model", model),
         ("effort", effort_text(decision)),
         ("decided by", decided_text(decision, candidates, entries)),
     ];
@@ -1106,6 +1618,16 @@ pub fn format_text(
                 "would choose {}",
                 pair_label(&entries[candidates[rules].entry], &candidates[rules])
             ),
+        ));
+    }
+    if let Some(session) = session {
+        rows.extend(session_rows(
+            session,
+            entries,
+            candidates,
+            Some(decision.chosen),
+            config,
+            now,
         ));
     }
     rows.push((
@@ -1143,7 +1665,7 @@ pub fn format_text(
     }
     rows.push((
         "command",
-        command(entry, c, decision.effort.as_deref()).join(" "),
+        shell_line(&command(entry, c, decision.effort.as_deref(), args)),
     ));
     let mut out: String = rows
         .iter()
@@ -1153,14 +1675,35 @@ pub fn format_text(
     out
 }
 
-/// `claude:max / claude-opus-5-5, effort high; decided by jev (confidence 0.90)`.
-pub fn summary(entries: &[Entry], candidates: &[Candidate], decision: &Decision) -> String {
+/// `claude:max / claude-opus-5-5, effort high; decided by jev (confidence 0.90)`; resuming,
+/// `; resume <id> (its prompt cache is warm)`, or who ran it last.
+pub fn summary(
+    entries: &[Entry],
+    candidates: &[Candidate],
+    decision: &Decision,
+    session: Option<&Session>,
+    now: Timestamp,
+) -> String {
     let c = &candidates[decision.chosen];
     let effort = decision.effort.as_deref().unwrap_or("agent default");
+    let resuming = session.map(|session| {
+        let resume = &session.resume;
+        let warmth = match &session.last {
+            _ if c.affine => " (its prompt cache is warm)".to_string(),
+            Some(last) => format!(
+                " (last ran as {} {})",
+                last.account,
+                ago(last.active_at, now)
+            ),
+            None => String::new(),
+        };
+        format!("; {} {}{warmth}", resume.kind.name(), resume.id)
+    });
     format!(
-        "{}, effort {effort}; decided by {}",
+        "{}, effort {effort}; decided by {}{}",
         pair_label(&entries[c.entry], c),
-        decided_text(decision, candidates, entries)
+        decided_text(decision, candidates, entries),
+        resuming.unwrap_or_default()
     )
 }
 
@@ -1232,14 +1775,32 @@ pub fn format_not_feasible(entries: &[Entry], candidates: &[Candidate]) -> Strin
     out
 }
 
-/// The `--json` report (R23); `decision` `None` when nothing is feasible.
+/// The `--json` report (R23); `decision` `None` when nothing is feasible. `args` are the
+/// user's, after `--`; `session` is `null` without a session resumed or forked.
 pub fn to_json(
     entries: &[Entry],
     candidates: &[Candidate],
     decision: Option<&Decision>,
     config: &Config,
+    args: &[String],
+    session: Option<&Session>,
+    now: Timestamp,
 ) -> Value {
     let ts = |t: Option<Timestamp>| t.map(|t| t.to_string());
+    let session = session.map(|s| {
+        json!({
+            "id": s.resume.id,
+            "kind": s.resume.kind.name(),
+            "last_account": s.last.as_ref().map(|l| l.account.clone()),
+            "last_active_at": ts(s.last.as_ref().map(|l| l.active_at)),
+            "age_seconds": s.age(now),
+            "affine": candidates.iter().any(|c| c.affine),
+            "model": decision
+                .map(|d| entries[candidates[d.chosen].entry].account.qualified())
+                .map_or(s.model(), |account| s.model_for(&account)),
+            "indexed": s.seen_by.is_some(),
+        })
+    });
     let list: Vec<Value> = candidates
         .iter()
         .enumerate()
@@ -1266,6 +1827,7 @@ pub fn to_json(
                     "reset_passed": w.reset_passed(),
                 })).collect::<Vec<_>>(),
                 "rules_rank": c.rules_rank,
+                "affine": c.affine,
                 "jev_probability": decision
                     .and_then(|d| d.jev.as_ref())
                     .and_then(|j| j.probabilities.get(&i).copied()),
@@ -1276,7 +1838,7 @@ pub fn to_json(
         return json!({
             "account": null, "provider": null, "model": null, "effort": null,
             "effort_by": null, "decided_by": null, "reason": null, "jev": null, "command": [],
-            "candidates": list,
+            "session": session, "candidates": list,
         });
     };
     let c = &candidates[d.chosen];
@@ -1296,7 +1858,8 @@ pub fn to_json(
             "effort_error": j.effort_error,
             "error": j.error,
         })),
-        "command": command(entry, c, d.effort.as_deref()),
+        "command": command(entry, c, d.effort.as_deref(), args),
+        "session": session,
         "candidates": list,
     })
 }
@@ -1320,7 +1883,7 @@ mod tests {
     fn parses_the_pick_table() {
         let config = parse(&format!(
             "{ACCOUNTS}[pick]\nexclude = [\"work\"]\nprefer = [\"max\", \"claude:max\"]\n\
-             min_headroom = 25\nstale_after = 30\nnotes = \"\"\"\n  Keep max for refactors.\n\"\"\"\n\n\
+             min_headroom = 25\nstale_after = 30\naffinity_minutes = 0\nnotes = \"\"\"\n  Keep max for refactors.\n\"\"\"\n\n\
              [pick.claude]\nmodels = [\"claude-opus-5-5\", \"fable\"]\n\
              efforts = [\"high\", \"max\"]\ndefault_effort = \"high\"\n"
         ))
@@ -1328,6 +1891,7 @@ mod tests {
         assert_eq!(config.exclude, ["codex:work"]);
         assert_eq!(config.prefer, ["claude:max"]);
         assert_eq!((config.min_headroom, config.stale_after), (25, 30));
+        assert_eq!(config.affinity_minutes, 0);
         assert_eq!(config.notes, "Keep max for refactors.");
         assert_eq!(config.claude.models, ["claude-opus-5-5", "fable"]);
         assert_eq!(config.claude.default_effort.as_deref(), Some("high"));
@@ -1335,6 +1899,7 @@ mod tests {
         // Without `[pick]`: the defaults, not zeros.
         let none = parse(ACCOUNTS).unwrap();
         assert_eq!((none.min_headroom, none.stale_after), (10, 120));
+        assert_eq!(none.affinity_minutes, 60);
         assert_eq!(none, Config::default());
     }
 
@@ -1347,6 +1912,7 @@ mod tests {
             agents,
             live: live.then_some(Duration::from_secs(90)),
             provider: None,
+            seen_by: None,
         };
         let (mut entries, _) = gather(std::slice::from_ref(account), &Config::default(), &sources);
         (entries.remove(0), agents.ran())
@@ -1506,6 +2072,7 @@ mod tests {
             agents: &agents,
             live: Some(Duration::from_secs(90)),
             provider: None,
+            seen_by: None,
         };
         let (entries, now) = gather(std::slice::from_ref(&work), &Config::default(), &sources);
         assert_eq!(
@@ -1575,6 +2142,18 @@ mod tests {
             (
                 "[pick]\nstale_after = 0\n".to_string(),
                 "positive integer (minutes)",
+            ),
+            (
+                "[pick]\naffinity_minutes = 1441\n".to_string(),
+                "[pick]: `affinity_minutes` must be an integer from 0 to 1440 (minutes)",
+            ),
+            (
+                "[pick]\naffinity_minutes = -1\n".to_string(),
+                "integer from 0 to 1440",
+            ),
+            (
+                "[pick]\naffinity_minutes = \"60\"\n".to_string(),
+                "integer from 0 to 1440",
             ),
             (
                 format!("[pick]\nnotes = \"{long}\"\n"),
@@ -1699,7 +2278,7 @@ mod tests {
         ];
         let entries = [entry(Provider::Claude, "max", 5, &rows)];
         let config = with_models(&["claude-opus-5-5", "claude-fable-5-1"], &[]);
-        let c = candidates(&entries, &config, ts(NOW));
+        let c = candidates(&entries, &config, ts(NOW), None);
         assert_eq!(c.len(), 2);
         assert_eq!(
             c[0].headroom,
@@ -1726,7 +2305,7 @@ mod tests {
         let entries = [entry(Provider::Claude, "max", 600, &rows)];
         let config = Config::default();
         assert!(entries[0].stale(&config));
-        let c = candidates(&entries, &config, now);
+        let c = candidates(&entries, &config, now, None);
         assert!(!c[0].feasible(), "the week is known, and exhausted");
         assert_eq!(
             c[0].why_not.as_deref(),
@@ -1743,7 +2322,7 @@ mod tests {
             row("Week (all models)", 50.0, Some("2026-09-28T09:00:00Z")),
         ];
         let entries = [entry(Provider::Claude, "max", 600, &rows)];
-        let c = candidates(&entries, &config, now);
+        let c = candidates(&entries, &config, now, None);
         assert!(c[0].feasible());
         assert_eq!(c[0].headroom, Some(50.0));
         assert_eq!(
@@ -1770,7 +2349,7 @@ mod tests {
         let entries = [entry(Provider::Claude, "old", 4 * 24 * 60, &rows)];
         let mut config = with_models(&["claude-opus-5-5"], &[]);
         config.min_headroom = 100;
-        let c = candidates(&entries, &config, now);
+        let c = candidates(&entries, &config, now, None);
         assert!(c[0].feasible(), "{:?}", c[0].why_not);
         assert_eq!((c[0].headroom, &c[0].binding), (None, &None));
         assert_eq!(
@@ -1780,7 +2359,7 @@ mod tests {
         assert_eq!(c[0].rules_rank, Some(1));
 
         let decision = decide(&c, &entries, &config, Asked::Skipped(Reason::NoKey)).unwrap();
-        let text = format_text(&entries, &c, &decision, &config, now);
+        let text = format_text(&entries, &c, &decision, &config, now, &[], None);
         for line in [
             "limit       unknown\n",
             "unknown     Session, Week (all models): reset since cached (--live asks the agent)\n",
@@ -1788,7 +2367,7 @@ mod tests {
         ] {
             assert!(text.contains(line), "{line:?} in:\n{text}");
         }
-        let v = to_json(&entries, &c, Some(&decision), &config);
+        let v = to_json(&entries, &c, Some(&decision), &config, &[], None, now);
         let pair = &v["candidates"][0];
         assert_eq!(pair["feasible"], true);
         assert_eq!(pair["reset_passed"], true);
@@ -1833,7 +2412,7 @@ mod tests {
             },
         ];
         let config = Config::default();
-        let c = candidates(&entries, &config, now);
+        let c = candidates(&entries, &config, now, None);
         assert!(c.iter().all(Candidate::feasible));
         assert_eq!(
             order(&entries, &c),
@@ -1849,7 +2428,7 @@ mod tests {
         assert_eq!(c[1].headroom, Some(71.0));
         assert_eq!(c[2].headroom, Some(15.0));
         // The report never names an instant in the past.
-        let v = to_json(&entries, &c, None, &config);
+        let v = to_json(&entries, &c, None, &config, &[], None, now);
         let passed: Vec<(&Value, &Value, &Value)> = v["candidates"]
             .as_array()
             .unwrap()
@@ -1887,14 +2466,14 @@ mod tests {
             usage: Some(Snapshot::live(&rows, now).at(now)),
             ..entry(Provider::Claude, "max", 0, &[])
         }];
-        let c = candidates(&entries, &Config::default(), now);
+        let c = candidates(&entries, &Config::default(), now, None);
         assert!(!c[0].feasible());
         assert_eq!(
             c[0].why_not.as_deref(),
             Some("Week (all models): 95% used, below the 10% left required")
         );
         assert!(c[0].reset_passed.is_empty());
-        let v = to_json(&entries, &c, None, &Config::default());
+        let v = to_json(&entries, &c, None, &Config::default(), &[], None, now);
         assert_eq!(v["candidates"][0]["reset_passed"], false);
         assert_eq!(v["candidates"][0]["resets_at"], Value::Null);
         assert_eq!(v["candidates"][0]["headroom"], 5.0);
@@ -1910,7 +2489,7 @@ mod tests {
             row("Week (Sonnet)", 40.0, Some("2026-09-30T10:00:00Z")),
         ];
         let entries = [entry(Provider::Claude, "max", 600, &rows)];
-        let c = candidates(&entries, &Config::default(), now);
+        let c = candidates(&entries, &Config::default(), now, None);
         assert!(
             c[0].reset_passed.is_empty(),
             "it does not apply to the pair"
@@ -1919,7 +2498,7 @@ mod tests {
             used_text(&c[0].default_model_windows[0], now),
             "Week (Fable) usage unknown (reset since cached)"
         );
-        let v = to_json(&entries, &c, None, &Config::default());
+        let v = to_json(&entries, &c, None, &Config::default(), &[], None, now);
         assert_eq!(
             v["candidates"][0]["default_model_windows"],
             json!([
@@ -1977,7 +2556,7 @@ mod tests {
         // 60-69% left: the fresh b, f (sooner reset) and a, then the stale d despite its sooner
         // reset; c, of a lower band, after.
         assert_eq!(
-            order(&entries, &candidates(&entries, &config, now))[..6],
+            order(&entries, &candidates(&entries, &config, now, None))[..6],
             [
                 "claude:b / claude-opus-5-5",
                 "claude:f / claude-opus-5-5",
@@ -1988,7 +2567,7 @@ mod tests {
             ]
         );
         config.prefer = vec!["claude:f".into()];
-        let c = candidates(&entries, &config, now);
+        let c = candidates(&entries, &config, now, None);
         let all = order(&entries, &c);
         assert_eq!(
             all[..2],
@@ -2033,7 +2612,7 @@ mod tests {
             (band(100.0), band(99.0), band(90.0), band(89.9)),
             (9, 9, 9, 8)
         );
-        let c = candidates(&entries, &Config::default(), now);
+        let c = candidates(&entries, &Config::default(), now, None);
         assert_eq!(
             order(&entries, &c),
             ["claude:default / default", "claude:max / default"]
@@ -2049,7 +2628,7 @@ mod tests {
             row("Week (Fable)", 100.0, Some("2026-09-30T10:00:00Z")),
         ];
         let entries = [entry(Provider::Claude, "max", 5, &rows)];
-        let c = candidates(&entries, &Config::default(), ts(NOW));
+        let c = candidates(&entries, &Config::default(), ts(NOW), None);
         assert_eq!(c.len(), 1);
         assert!(c[0].feasible());
         assert_eq!(c[0].headroom, Some(50.0));
@@ -2065,7 +2644,7 @@ mod tests {
         );
         // With models, the pair of another family carries none.
         let config = with_models(&["claude-opus-5-5"], &[]);
-        let c = candidates(&entries, &config, ts(NOW));
+        let c = candidates(&entries, &config, ts(NOW), None);
         assert!(c[0].default_model_windows.is_empty());
     }
 
@@ -2078,7 +2657,7 @@ mod tests {
         let mut config = with_models(&["claude-opus-5-5", "claude-sonnet-5"], &[]);
         config.claude.efforts = vec!["medium".into(), "high".into(), "max".into()];
         config.claude.default_effort = Some("high".into());
-        let c = candidates(&entries, &config, ts(NOW));
+        let c = candidates(&entries, &config, ts(NOW), None);
         (entries, c, config)
     }
 
@@ -2162,7 +2741,7 @@ mod tests {
             blocked: Some("excluded ([pick] exclude)".into()),
             ..entry(Provider::Claude, "max", 5, &[])
         }];
-        let c = candidates(&entries, &Config::default(), ts(NOW));
+        let c = candidates(&entries, &Config::default(), ts(NOW), None);
         assert!(
             decide(
                 &c,
@@ -2179,7 +2758,9 @@ mod tests {
         args.iter().map(|a| a.to_string()).collect()
     }
 
-    /// R23: injected options go before the user's; one the user set is not injected.
+    /// R23: injected options go before the user's; one the user set is not injected. A named
+    /// session to resume or fork gets nothing injected (R23 Resuming); arguments that neither
+    /// start a session nor name one are refused.
     #[test]
     fn run_args_inject_before_the_users_and_respect_them() {
         let (args, notices) = run_args(
@@ -2206,15 +2787,34 @@ mod tests {
         );
         let (args, _) = run_args(Provider::Claude, None, None, &[]).unwrap();
         assert!(args.is_empty());
-        assert!(
-            run_args(
-                Provider::Claude,
-                Some("m"),
-                None,
-                &strings(&["--resume", "x"])
-            )
-            .is_err()
-        );
+        for resume in [
+            &["--resume", "x"][..],
+            &["-r", "x", "-p", "go on"],
+            &["--resume=x"],
+            &["--resume", "x", "--fork-session"],
+        ] {
+            let (args, notices) =
+                run_args(Provider::Claude, Some("m"), Some("high"), &strings(resume)).unwrap();
+            assert_eq!(args, resume, "nothing is injected into a resume");
+            assert!(notices.is_empty());
+        }
+        for refused in [
+            &["-c"][..],
+            &["--resume"],
+            &["--continue"],
+            &["--session-id", "x"],
+            &["--resume", "x", "-c"],
+            &["--resume", "x", "--session-id", "y"],
+            &["--resume", "x", "--fork-session", "--session-id", "y"],
+            &["agents"],
+        ] {
+            let err = run_args(Provider::Claude, None, None, &strings(refused)).unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("`pick --run` starts a new session; these arguments do not"),
+                "{refused:?}: {err}"
+            );
+        }
         assert!(run_args(Provider::Claude, Some("update"), None, &[]).is_err());
 
         let (args, _) =
@@ -2235,16 +2835,318 @@ mod tests {
         }
         let (args, _) = run_args(Provider::Codex, Some("g"), None, &strings(&["-mx"])).unwrap();
         assert_eq!(args, ["-mx"]);
-        assert!(
-            run_args(
-                Provider::Codex,
-                Some("g"),
-                None,
-                &strings(&["resume", "id"])
-            )
-            .is_err()
+        for resume in [&["resume", "id"][..], &["fork", "id", "go on"]] {
+            let (args, _) =
+                run_args(Provider::Codex, Some("g"), Some("high"), &strings(resume)).unwrap();
+            assert_eq!(args, resume, "no -m, -c or -C");
+        }
+        for refused in [
+            &["fork"][..],
+            &["resume", "--last"],
+            &["resume", "id", "--last"],
+        ] {
+            let err = run_args(Provider::Codex, Some("g"), None, &strings(refused)).unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("`pick --run` starts a new session; `codex "),
+                "{refused:?}: {err}"
+            );
+        }
+    }
+
+    /// R23 (Resuming): which arguments name a session, and whose.
+    #[test]
+    fn session_args_accept_only_a_named_session() {
+        let id = "766560c5-0000-4000-8000-000000000000";
+        let named = |args: &[&str]| {
+            session_args(&strings(args))
+                .unwrap()
+                .map(|r| (r.provider, r.kind, r.id))
+        };
+        let claude = |kind| Some((Provider::Claude, kind, id.to_string()));
+        let codex = |kind| Some((Provider::Codex, kind, id.to_string()));
+        assert_eq!(named(&["--resume", id]), claude(SessionKind::Resume));
+        assert_eq!(
+            named(&["-r", id, "-p", "go on"]),
+            claude(SessionKind::Resume)
         );
-        assert!(run_args(Provider::Codex, Some("g"), None, &strings(&["fork"])).is_err());
+        assert_eq!(
+            named(&[&format!("--resume={id}")]),
+            claude(SessionKind::Resume)
+        );
+        assert_eq!(
+            named(&["--resume", id, "--fork-session"]),
+            claude(SessionKind::Fork)
+        );
+        assert_eq!(named(&["resume", id]), codex(SessionKind::Resume));
+        assert_eq!(named(&["fork", id, "go on"]), codex(SessionKind::Fork));
+        // A new session, or arguments `run_args` refuses: none named.
+        for args in [
+            &[][..],
+            &["-p", "hi"],
+            &["-c"],
+            &["--resume"],
+            &["--session-id", id],
+            &["--resume", id, "-c"],
+            &["--resume", id, "--resume", "other"],
+            &["--resume", id, "--session-id", "other"],
+            &["--resume", id, "--fork-session", "--session-id", "other"],
+            &["resume", "--last"],
+            &["fork"],
+        ] {
+            assert_eq!(named(args), None, "{args:?}");
+        }
+        let err = session_args(&strings(&["resume", "a", "--resume", id])).unwrap_err();
+        assert!(err.to_string().ends_with("ambiguous"), "{err}");
+    }
+
+    /// A session resumed with `claude:<last>` its last account, active `age_min` minutes
+    /// before [`NOW`].
+    fn resuming(last: &str, age_min: i64, model: Option<&str>) -> Session {
+        let active_at = ts(NOW) - jiff::SignedDuration::from_mins(age_min);
+        Session {
+            resume: Resume {
+                provider: Provider::Claude,
+                kind: SessionKind::Resume,
+                id: "766560c5-0000-4000-8000-000000000000".into(),
+            },
+            last: Some(LastRun {
+                account: format!("claude:{last}"),
+                home: format!("/h/{last}"),
+                launched_at: active_at,
+                active_at,
+            }),
+            // One store holds it, which both accounts share.
+            seen_by: model.map(|model| {
+                ["claude:max", "claude:team"]
+                    .into_iter()
+                    .map(|a| (a.to_string(), Some(model.to_string())))
+                    .collect()
+            }),
+        }
+    }
+
+    /// R23 (Resuming): the account that ran the session within `affinity_minutes` ranks first
+    /// among the feasible pairs, whatever its headroom; each account is one pair without a
+    /// model, whatever `models` says.
+    #[test]
+    fn affinity_ranks_the_warm_account_first() {
+        let week = |pct: f64| [row("Week (all models)", pct, Some("2026-09-30T00:00:00Z"))];
+        let entries = vec![
+            entry(Provider::Claude, "max", 5, &week(20.0)),
+            entry(Provider::Claude, "team", 5, &week(70.0)),
+        ];
+        let config = with_models(&["claude-opus-5-5", "claude-sonnet-5"], &[]).for_resume();
+        let session = resuming("team", 30, None);
+        let c = candidates(&entries, &config, ts(NOW), Some(&session));
+        assert_eq!(
+            order(&entries, &c),
+            ["claude:team / default", "claude:max / default"]
+        );
+        assert_eq!(c.len(), 2);
+        assert_eq!(
+            c.iter().map(|c| c.affine).collect::<Vec<_>>(),
+            [false, true]
+        );
+        // Without the session, headroom decides.
+        let c = candidates(&entries, &config, ts(NOW), None);
+        assert_eq!(
+            order(&entries, &c),
+            ["claude:max / default", "claude:team / default"]
+        );
+        assert!(c.iter().all(|c| !c.affine));
+        // Right at the limit it is warm; a minute past, nothing is preferred.
+        let mut config = config;
+        config.affinity_minutes = 30;
+        let c = candidates(&entries, &config, ts(NOW), Some(&session));
+        assert_eq!(order(&entries, &c)[0], "claude:team / default");
+        config.affinity_minutes = 29;
+        let c = candidates(&entries, &config, ts(NOW), Some(&session));
+        assert_eq!(order(&entries, &c)[0], "claude:max / default");
+        assert!(c.iter().all(|c| !c.affine));
+        // 0: affinity off, however recent.
+        config.affinity_minutes = 0;
+        let c = candidates(&entries, &config, ts(NOW), Some(&resuming("team", 0, None)));
+        assert_eq!(order(&entries, &c)[0], "claude:max / default");
+        // Never launched through remuda: nothing to prefer.
+        let mut unknown = resuming("team", 0, None);
+        unknown.last = None;
+        let c = candidates(&entries, &Config::default(), ts(NOW), Some(&unknown));
+        assert_eq!(order(&entries, &c)[0], "claude:max / default");
+    }
+
+    /// R23 (Resuming): affinity orders, it never admits. A warm account short of headroom, or
+    /// blocked, stays infeasible, and the report says resuming elsewhere rewrites its cache.
+    #[test]
+    fn an_infeasible_warm_account_stays_infeasible() {
+        let week = |pct: f64| [row("Week (all models)", pct, Some("2026-09-30T00:00:00Z"))];
+        let entries = vec![
+            entry(Provider::Claude, "max", 5, &week(20.0)),
+            entry(Provider::Claude, "team", 5, &week(95.0)),
+        ];
+        let config = Config::default().for_resume();
+        let session = resuming("team", 12, Some("claude-opus-5-5"));
+        let c = candidates(&entries, &config, ts(NOW), Some(&session));
+        assert!(c[1].affine);
+        assert!(!c[1].feasible());
+        assert_eq!(c[1].rules_rank, None);
+        assert_eq!(ranked(&c), [0]);
+        let d = decide(&c, &entries, &config, Asked::Skipped(Reason::NoKey)).unwrap();
+        assert_eq!((d.chosen, d.effort.as_deref()), (0, None));
+        let text = format_text(&entries, &c, &d, &config, ts(NOW), &[], Some(&session));
+        assert!(
+            text.contains(
+                "session     resume 766560c5-0000-4000-8000-000000000000: claude:team ran it 12m \
+                 ago (prompt cache warm: preferred); model claude-opus-5-5\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "claude:team ran this session 12m ago, but Week (all models): 95% used, below \
+                 the 10% left required, resets in 2d14h; resuming as another account rewrites \
+                 its prompt cache"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("model       the session's (claude-opus-5-5)\n"),
+            "{text}"
+        );
+        // Blocked as a whole: the same.
+        let blocked = vec![
+            entries[0].clone(),
+            Entry {
+                blocked: Some("excluded ([pick] exclude)".into()),
+                ..entries[1].clone()
+            },
+        ];
+        let c = candidates(&blocked, &config, ts(NOW), Some(&session));
+        assert!(c[1].affine && !c[1].feasible());
+        assert_eq!(ranked(&c), [0]);
+        let d = decide(&c, &blocked, &config, Asked::Skipped(Reason::NoKey)).unwrap();
+        let v = to_json(
+            &blocked,
+            &c,
+            Some(&d),
+            &config,
+            &[],
+            Some(&session),
+            ts(NOW),
+        );
+        assert_eq!(v["session"]["affine"], true);
+        assert_eq!(v["session"]["last_account"], "claude:team");
+        assert_eq!(v["session"]["age_seconds"], 720);
+        assert_eq!(v["candidates"][1]["affine"], true);
+        assert_eq!(v["candidates"][1]["feasible"], false);
+        assert_eq!(v["account"], "claude:max");
+    }
+
+    /// R23 (Resuming): the windows of the session's model apply when it is known; unknown, the
+    /// per-model windows are shown, not counted, as for the agent's default.
+    #[test]
+    fn a_known_session_model_counts_its_windows() {
+        let rows = [
+            row("Week (all models)", 30.0, Some("2026-09-30T10:00:00Z")),
+            row("Week (Fable)", 95.0, Some("2026-09-30T10:00:00Z")),
+        ];
+        let entries = [entry(Provider::Claude, "max", 5, &rows)];
+        let config = with_models(&["claude-opus-5-5"], &[]).for_resume();
+        let fable = resuming("max", 500, Some("claude-fable-5-1"));
+        let c = candidates(&entries, &config, ts(NOW), Some(&fable));
+        assert_eq!(c[0].model, None);
+        assert!(
+            !c[0].feasible(),
+            "the Fable week counts: {:?}",
+            c[0].why_not
+        );
+        assert!(c[0].default_model_windows.is_empty());
+        let opus = resuming("max", 500, Some("claude-opus-5-5"));
+        let c = candidates(&entries, &config, ts(NOW), Some(&opus));
+        assert_eq!(c[0].headroom, Some(70.0));
+        let unknown = resuming("max", 500, None);
+        let c = candidates(&entries, &config, ts(NOW), Some(&unknown));
+        assert_eq!(c[0].headroom, Some(70.0));
+        assert_eq!(c[0].default_model_windows.len(), 1);
+    }
+
+    /// R23 (Output): the command shown replays as the very words, whatever the user's
+    /// arguments hold: spaces, quotes, an empty word, shell syntax.
+    #[test]
+    fn the_command_shown_is_quoted_for_the_shell() {
+        let words = strings(&[
+            "remuda",
+            "run",
+            "claude:max",
+            "--model",
+            "claude-opus-5-5",
+            "-p",
+            "Please print $(printf CHANGED) with spaces",
+            "",
+            "it's \"quoted\" `x` \\ $HOME *",
+            "a\nb",
+        ]);
+        let line = shell_line(&words);
+        assert!(
+            line.starts_with("remuda run claude:max --model claude-opus-5-5 -p 'Please print"),
+            "{line}"
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\0' {line}"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{line}");
+        let back: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .split_terminator('\0')
+            .map(str::to_string)
+            .collect();
+        assert_eq!(back, words, "{line}");
+    }
+
+    /// R23 (Resuming): of several copies of a session in one store, the one written to last;
+    /// of equal times, the one in the launch's directory; else none is known.
+    #[test]
+    fn copy_in_takes_the_latest_then_the_launch_directory() {
+        let tail = |ts: Option<&str>, cwd: &str, model: &str| SessionTail {
+            ts_last: ts.map(str::to_string),
+            cwd_last: Some(cwd.to_string()),
+            model: Some(model.to_string()),
+        };
+        let model = |tails: Vec<SessionTail>, cwd: Option<&str>| {
+            copy_in(tails, cwd).map(|t| t.model.unwrap())
+        };
+        let old = tail(Some("2026-10-08T07:00:00Z"), "/w", "old");
+        let new = tail(Some("2026-10-08T09:59:00Z"), "/w", "new");
+        let none = tail(None, "/w", "untimed");
+        // Whatever their order: the latest.
+        assert_eq!(
+            model(vec![old.clone(), new.clone(), none.clone()], Some("/w")).as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            model(vec![new.clone(), old.clone()], Some("/w")).as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            model(vec![none.clone(), old.clone()], None).as_deref(),
+            Some("old")
+        );
+        // A tie: the one in the launch's directory, else none.
+        let here = tail(Some("2026-10-08T09:59:00Z"), "/here", "here");
+        assert_eq!(
+            model(vec![new.clone(), here.clone()], Some("/here")).as_deref(),
+            Some("here")
+        );
+        assert_eq!(
+            model(vec![new.clone(), here.clone()], Some("/elsewhere")),
+            None
+        );
+        assert_eq!(model(vec![new.clone(), here.clone()], None), None);
+        assert_eq!(model(vec![new.clone(), new.clone()], Some("/w")), None);
+        assert_eq!(model(vec![none.clone(), none.clone()], Some("/x")), None);
+        assert_eq!(model(Vec::new(), Some("/w")), None);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use jiff::Timestamp;
 use serde::Deserialize;
 
 use crate::Env;
@@ -167,10 +168,134 @@ pub fn collect(
     attribution
 }
 
+/// A launch that ran a session, as the launch log has it (R6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launched {
+    /// `provider:name`.
+    pub account: String,
+    /// The home string it was launched with, as logged (R2).
+    pub home: String,
+    pub ts: Timestamp,
+    /// The session this launch ran: the session itself, or for a fork the one it made (unknown
+    /// for codex, which chooses the id).
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+}
+
+/// The latest launch of `provider` that ran session `id` (R23): one whose `session_id` is `id`,
+/// or that forked it (`fork_of`), since a fork reads the whole session it copies. Latest by
+/// `ts`, and of equal times the later line; a line whose `ts` cannot be read tells no time, and
+/// one without a `home` no login, and they are skipped. A missing or unreadable log has none.
+pub fn last_launch(path: &Path, provider: Provider, id: &str) -> Option<Launched> {
+    #[derive(Deserialize)]
+    struct Launch {
+        ts: Option<String>,
+        account: Option<String>,
+        home: Option<String>,
+        cwd: Option<String>,
+        session_id: Option<String>,
+        fork_of: Option<String>,
+    }
+    let prefix = format!("{provider}:");
+    let mut last: Option<Launched> = None;
+    for_each_line(path, |line| {
+        let Ok(launch) = serde_json::from_slice::<Launch>(line) else {
+            return;
+        };
+        let runs =
+            launch.session_id.as_deref() == Some(id) || launch.fork_of.as_deref() == Some(id);
+        let (Some(account), Some(home), Some(ts)) = (launch.account, launch.home, launch.ts) else {
+            return;
+        };
+        let Ok(ts) = ts.parse::<Timestamp>() else {
+            return;
+        };
+        if !runs || !account.starts_with(&prefix) {
+            return;
+        }
+        if last.as_ref().is_none_or(|l| ts >= l.ts) {
+            last = Some(Launched {
+                account,
+                home,
+                ts,
+                session_id: launch.session_id,
+                cwd: launch.cwd,
+            });
+        }
+    });
+    last
+}
+
 /// Calls `f` for each complete line of `path`; a missing or unreadable file has none.
 fn for_each_line(path: &Path, mut f: impl FnMut(&[u8])) {
     let Ok(bytes) = fs::read(path) else { return };
     for line in complete_lines(&bytes, false).lines {
         f(line);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R23 (Resuming): the latest launch that ran the session, a fork of it included; another
+    /// provider's launches, other sessions and lines without a readable time do not count.
+    #[test]
+    fn last_launch_counts_forks_and_takes_the_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("launches.jsonl");
+        let id = "766560c5-0000-4000-8000-000000000000";
+        let lines = [
+            format!(
+                r#"{{"ts":"2026-10-08T10:00:00Z","account":"claude:max","home":"/homes/max","cwd":"/a","session_id":"{id}"}}"#
+            ),
+            // A fork of it, later: the fork's account read the whole session.
+            format!(
+                r#"{{"ts":"2026-10-08T10:30:00Z","account":"claude:team","home":"/homes/team","cwd":"/b","session_id":"f0","fork_of":"{id}"}}"#
+            ),
+            // Later still, but another session, another provider, or no time.
+            r#"{"ts":"2026-10-08T11:00:00Z","account":"claude:max","home":"/homes/max","session_id":"other"}"#
+                .to_string(),
+            format!(
+                r#"{{"ts":"2026-10-08T11:00:00Z","account":"codex:work","home":"/homes/work","session_id":"{id}"}}"#
+            ),
+            // No home: no login to tell, later though it is.
+            format!(r#"{{"ts":"2026-10-08T12:00:00Z","account":"claude:max","session_id":"{id}"}}"#),
+            format!(r#"{{"ts":"yesterday","account":"claude:max","home":"/homes/max","session_id":"{id}"}}"#),
+            "not json".to_string(),
+        ];
+        fs::write(&log, lines.join("\n") + "\n").unwrap();
+        let last = last_launch(&log, Provider::Claude, id).unwrap();
+        assert_eq!(
+            last,
+            Launched {
+                account: "claude:team".into(),
+                home: "/homes/team".into(),
+                ts: "2026-10-08T10:30:00Z".parse().unwrap(),
+                session_id: Some("f0".into()),
+                cwd: Some("/b".into()),
+            }
+        );
+        assert_eq!(
+            last_launch(&log, Provider::Codex, id).map(|l| l.account),
+            Some("codex:work".into())
+        );
+        assert_eq!(last_launch(&log, Provider::Claude, "nothing"), None);
+        assert_eq!(
+            last_launch(&dir.path().join("missing"), Provider::Claude, id),
+            None
+        );
+        // Of equal times, the later line.
+        let tie = [
+            format!(r#"{{"ts":"2026-10-08T10:00:00Z","account":"claude:a","home":"/homes/a","session_id":"{id}"}}"#),
+            format!(r#"{{"ts":"2026-10-08T10:00:00Z","account":"claude:b","home":"/homes/b","session_id":"{id}"}}"#),
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&log, tie).unwrap();
+        assert_eq!(
+            last_launch(&log, Provider::Claude, id).unwrap().account,
+            "claude:b"
+        );
     }
 }

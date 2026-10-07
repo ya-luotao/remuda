@@ -253,6 +253,28 @@ pub(crate) fn feed_tail(tail: &mut Tail, lines: &[&[u8]]) {
     }
 }
 
+/// The model a `turn_context` record names (R23); `None` for any other record.
+pub(crate) fn turn_context_model(line: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct TurnContext {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        payload: Option<WithModel>,
+    }
+    #[derive(Deserialize)]
+    struct WithModel {
+        model: Option<String>,
+    }
+    if !contains(line, b"turn_context") {
+        return None;
+    }
+    let record: TurnContext = serde_json::from_slice(line).ok()?;
+    if record.kind.as_deref() != Some("turn_context") {
+        return None;
+    }
+    non_empty(record.payload?.model)
+}
+
 /// The session id in a rollout's file name, `rollout-<time>-<id>.jsonl` (the id is the last 36
 /// characters of the stem); `None` for any other name.
 pub fn rollout_id(file_name: &str) -> Option<&str> {
