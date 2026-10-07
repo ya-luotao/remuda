@@ -22,7 +22,10 @@ future one); 2026-10-07 lane 3 (`LiveUsage::Untold` separated from `Unrecognized
 **Read time-dependent data at the time of the data, not at the time the command started.** A live
 query may take as long as its timeout; a reset that falls in between has happened.
 *Evidence:* 2026-10-06 lane 7, two majors (feasibility and `resets_at` computed from the start
-time; wrong across a reset). *Seen:* 1 day (promoted with the entry above: R23 "The instant").
+time; wrong across a reset); 2026-10-08 lane C (`remuda usage` evaluated cached readings at the
+command's start, then `usage --wait` took the clock before reading the cache: a reset in between
+was recorded as current). *Seen:* 2 days (promoted with the entry above: R23 "The instant"; R10
+now says the time is taken after the read).
 
 **Merge duplicates whole, never field by field.** Two records of one request are two views of one
 allocation; taking each column's maximum builds a usage nobody ever had.
@@ -66,21 +69,39 @@ aborted remuda and left the terminal in raw mode.
 
 ## Files, locks, processes
 
-**A lock guards the resource, not the path it was reached by.** Two valid entries to one registry
-(a symlinked `config.toml`) must take the same lock.
-*Evidence:* 2026-10-06 lane 1 (locking the entry directory lost an account under two entries).
-*Seen:* 1 day.
+**A lock guards the resource, not the path it was reached by; resolve the path once and never go
+through the name again.** Two valid entries to one registry (a symlinked `config.toml`) must take
+the same lock; after the lock is taken, every read and write goes through the resolved target (or
+the locked directory's descriptor), or a link retargeted meanwhile redirects the write.
+*Evidence:* 2026-10-06 lane 1 (locking the entry directory lost an account under two entries);
+2026-10-08 lane C round 1 (two `$REMUDA_HOME`s whose history files linked to one file took two
+locks and lost a point) and round 2 (the link retargeted between validation and the write
+redirected the compaction). *Seen:* 2 days.
 
 **Check the permission the operation needs, not a neighbouring one.** Readable is not writable;
 readable is not searchable.
 *Evidence:* 2026-10-06 lane 1 (directory readability made a precondition for a write into a
-private `state/`); lane 6 (a directory readable but not searchable silently emptied the cache).
-*Seen:* 1 day.
+private `state/`); lane 6 (a directory readable but not searchable silently emptied the cache);
+2026-10-08 lane C (compaction wrote through a 0644 target the append path had refused; a target
+deleted mid-write was recreated with the registry's default mode). *Seen:* 2 days.
 
 **A child started between a signal and its registration belongs to nobody.** Register the start
 before the fork, or make the last start under way finish the signal's work.
 *Evidence:* 2026-10-06 lane 8 (`probe.rs` / `interrupt.rs`: Ctrl-C during parallel starts left an
 agent running). *Seen:* 1 day.
+
+**A fix narrows a lookup: keep the selection rule inside the narrowed set, and re-run the
+finding's neighbours.** Two fixes in a row each introduced the next round's finding.
+*Evidence:* 2026-10-08 lane A (restricting transcripts to the account's store replaced "the latest
+copy" with "the first path"); lane C (refusing a retargeted link introduced recreating a deleted
+target with the wrong mode). *Seen:* 1 day.
+
+**Validate before every early return, and fix the sibling path too.** An argument check placed
+after a "nothing feasible" return is skipped exactly when it matters; an ordering bug in one path
+usually exists in its twin.
+*Evidence:* 2026-10-08 lane A (GitHub review: `pick -- --resume` with every account exhausted said
+"nothing to recommend"); lane C (the clock-before-read order fixed in `usage` was still in
+`usage --wait`, found by the critic one round later). *Seen:* 1 day.
 
 ## The agents' commands
 
@@ -100,7 +121,19 @@ logged as `claude:max`; the probe measured the wrong account). *Seen:* 1 day.
 **Gate every follow-up fix and every semantic merge with the critic before pushing.** The test
 suite passing is not the gate.
 *Evidence:* 2026-10-06 fleet (four regressions caught by the local critic after the whole suite
-had passed); 2026-10-07 lane 2 (critic round 3 on the price-date follow-up). *Seen:* 2 days.
+had passed); 2026-10-07 lane 2 (critic round 3 on the price-date follow-up); 2026-10-08 (the
+critic's merge reviews passed, its follow-up reviews found the sibling-path bug above).
+*Seen:* 3 days → promote: CONTRIBUTING "Pull requests" should name the review gate.
+
+**Word a review request as a code review, not as an attack.** The codex critic produced nothing,
+twice, for prompts that said "bypass the privacy check" and "retargeting"; the same request in
+ordinary terms ("file-mode check", "concurrent-writer reproducer") went through.
+*Evidence:* 2026-10-08 lane C rounds 2 and 3. *Seen:* 1 day.
+
+**Archive lane records without their build output.** Critic evidence directories carry Cargo
+target directories of several GB each; copy them with `target`, `build`, `mutation-build`,
+`baseline-target` and `mutation-target` excluded.
+*Evidence:* 2026-10-08 (an 8.1 GB copy of one lane's `.lane/`, 123 MB after pruning). *Seen:* 1 day.
 
 **Every fix carries a test that is red with the fix reverted.** Compile failures do not count.
 *Evidence:* the lane briefs of 2026-10-06 and 2026-10-07; the revert evidence in each lane's
@@ -111,4 +144,5 @@ the revert rule explicitly when seen once more.
 only; new findings block only within a named blocker set (R2 / R13 / R21 violations, data loss,
 a SPEC contradiction, a red suite).
 *Evidence:* 2026-10-06 (four rounds on two lanes before the rule); 2026-10-07 (three rounds,
-converged). *Seen:* 2 days.
+converged); 2026-10-08 (lane C took eight rounds, each later round one finding in the blocker
+set, so the rule held). *Seen:* 3 days → promote into CONTRIBUTING with the entry above.
