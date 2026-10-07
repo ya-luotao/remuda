@@ -5,7 +5,8 @@ holds, the evidence (which review found what, with the date), and on how many di
 has come up. It is reread after every merged batch of work; an entry seen on three or more days
 is promoted into [SPEC.md](SPEC.md) or [CONTRIBUTING.md](CONTRIBUTING.md) and marked so here.
 Review records live under `docs/` in the maintainer's checkout (`docs/review-2026-10-02.md`,
-`docs/arch-2026-10-06/`, `docs/study-2026-10-07/`), git-excluded; the dates below point at them.
+`docs/arch-2026-10-06/`, `docs/study-2026-10-07/`, `docs/study-2026-10-08/`), git-excluded; the
+dates below point at them.
 
 ## Data and time
 
@@ -123,7 +124,7 @@ suite passing is not the gate.
 *Evidence:* 2026-10-06 fleet (four regressions caught by the local critic after the whole suite
 had passed); 2026-10-07 lane 2 (critic round 3 on the price-date follow-up); 2026-10-08 (the
 critic's merge reviews passed, its follow-up reviews found the sibling-path bug above).
-*Seen:* 3 days → promote: CONTRIBUTING "Pull requests" should name the review gate.
+*Seen:* 3 days → promoted: CONTRIBUTING "Review gate" (2026-10-08).
 
 **Word a review request as a code review, not as an attack.** The codex critic produced nothing,
 twice, for prompts that said "bypass the privacy check" and "retargeting"; the same request in
@@ -145,4 +146,4 @@ only; new findings block only within a named blocker set (R2 / R13 / R21 violati
 a SPEC contradiction, a red suite).
 *Evidence:* 2026-10-06 (four rounds on two lanes before the rule); 2026-10-07 (three rounds,
 converged); 2026-10-08 (lane C took eight rounds, each later round one finding in the blocker
-set, so the rule held). *Seen:* 3 days → promote into CONTRIBUTING with the entry above.
+set, so the rule held). *Seen:* 3 days → promoted: CONTRIBUTING "Review gate" (2026-10-08).

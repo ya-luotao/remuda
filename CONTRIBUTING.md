@@ -98,7 +98,34 @@ supported Rust version.
   `Fixed`, `Security`). Internal refactors and test-only changes do not need an entry.
 - Do not change dependencies unless the change requires it; explain any new dependency in the
   description.
-- Pull requests are merged once CI passes and a maintainer has approved them.
+- Pull requests are merged once CI passes, the review below has approved the final diff, and a
+  maintainer has approved them.
+
+### Review gate
+
+The test suite passing is not the gate; a review of the diff is.
+
+- Every change is reviewed by someone other than its author (a maintainer, or an adversarial
+  reviewer such as a Codex session on the branch) before it is pushed for merge. The review reads
+  the diff against `main`, checks it against the SPEC entries it cites, and tries to break it:
+  the write boundary (R13), the home path invariant (R2), private mode (R21), concurrent writers,
+  a reset or a deadline passing while a command runs.
+- Every follow-up fix after a review, and every merge of `main` into the branch that resolves
+  more than an adjacent-line conflict, goes through the same review before it is pushed. Each
+  review round so far has found what the previous round's fix introduced.
+- Reviews converge by rule. The first two rounds are open. From the third round on, a round
+  re-checks the previous round's fixes and the regressions they could have caused; a new finding
+  blocks only when it is one of: a violation of R2, R13 or R21; data loss or corruption; behavior
+  that contradicts SPEC.md; a red test suite. Everything else is recorded in the pull request as a
+  non-blocking follow-up, and the round can approve with it open.
+
+### Merging
+
+- Merge the commit that was reviewed: `gh pr merge --match-head-commit <sha>` (or the equivalent
+  check), so that a push after the review cannot land unreviewed.
+- A CI run that was cancelled or skipped is not a pass; rerun it.
+- Each commit has one goal (see the commit message rules above): a follow-up fix is its own
+  commit, and a merge of `main` is its own.
 
 ## Releases
 
