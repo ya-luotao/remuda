@@ -730,6 +730,200 @@ fn codex_events_before_the_first_turn_take_its_model() {
     assert_eq!(of(&table.overall, "gpt-test-c"), toks(50, 40, 0, 9, 0));
 }
 
+/// A real `token_count` event of codex 0.160.0 (gpt-6-astra, 2026-10-07): `[input, cached,
+/// cache write, output, reasoning]` of the session's total and of the latest request.
+const REAL_TOTAL: [u64; 5] = [5_728_399, 5_586_560, 0, 19_533, 4_590];
+const REAL_LAST: [u64; 5] = [137_139, 136_704, 0, 529, 90];
+
+/// `usage` with `write` more tokens written to the cache: they are part of the prompt, so
+/// `input_tokens` (and `total_tokens`) grow by as many.
+fn written(usage: [u64; 5], write: u64) -> [u64; 5] {
+    let [input, cached, w, output, reasoning] = usage;
+    [input + write, cached, w + write, output, reasoning]
+}
+
+/// R20: codex's `cache_write_input_tokens` is part of `input_tokens`, like
+/// `cached_input_tokens`: it is counted as cache write and taken out of the input, so the total
+/// stays `input_tokens` + `output_tokens`; it is priced at the model's cache-write price. A
+/// rollout without it (before codex 0.160) counts as before.
+#[test]
+fn codex_cache_write_is_part_of_input() {
+    let rollout = |id: &str, model: &str, total: Value, last: Value| {
+        [
+            cx::meta(id, "/w/proj", json!("cli"), 0, &cx::ts(0)),
+            cx::model_turn(model, &cx::ts(1)),
+            cx::usage_event(total, last, &cx::ts(2)),
+        ]
+        .concat()
+    };
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    // The real event, and the same request with 2,000 tokens written to the cache.
+    cx::write_rollout(
+        &work,
+        R1,
+        &rollout(
+            R1,
+            "gpt-6-astra",
+            cx::usage_with_write(REAL_TOTAL),
+            cx::usage_with_write(REAL_LAST),
+        ),
+    );
+    cx::write_rollout(
+        &work,
+        R2,
+        &rollout(
+            R2,
+            "gpt-5.6-sol",
+            cx::usage_with_write(written(REAL_TOTAL, 2_000)),
+            cx::usage_with_write(written(REAL_LAST, 2_000)),
+        ),
+    );
+    let table = f.all();
+    let row = |model: &str| table.overall.iter().find(|r| r.model == model).unwrap();
+    let real = row("gpt-6-astra");
+    assert_eq!(real.tokens, toks6(435, 136_704, 0, 0, 529, 90));
+    assert_eq!(real.tokens.total(), 137_139 + 529);
+    // USD per million tokens: input 10, cached 1, output 50.
+    assert_eq!(
+        real.cost,
+        Cost {
+            pico_usd: 435 * 10_000_000 + 136_704 * 1_000_000 + 529 * 50_000_000,
+            unpriced_tokens: 0,
+        }
+    );
+    let write = row("gpt-5.6-sol");
+    assert_eq!(write.tokens, toks6(435, 136_704, 2_000, 0, 529, 90));
+    assert_eq!(write.tokens.total(), 139_139 + 529);
+    // Input 4, cached 0.40, cache write 5 (1.25 times input), output 20.
+    assert_eq!(
+        write.cost,
+        Cost {
+            pico_usd: 435 * 4_000_000 + 136_704 * 400_000 + 2_000 * 5_000_000 + 529 * 20_000_000,
+            unpriced_tokens: 0,
+        }
+    );
+
+    // Without the field, as codex wrote it before.
+    let unrecorded = |u: [u64; 5]| {
+        let mut v = cx::usage_with_write(u);
+        v.as_object_mut()
+            .unwrap()
+            .remove("cache_write_input_tokens");
+        v
+    };
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    cx::write_rollout(
+        &work,
+        R1,
+        &rollout(R1, "gpt-5.4", unrecorded(REAL_TOTAL), unrecorded(REAL_LAST)),
+    );
+    let table = f.all();
+    assert_eq!(
+        table.overall,
+        [ModelRow {
+            provider: Provider::Codex,
+            model: "gpt-5.4".into(),
+            tokens: toks6(435, 136_704, 0, 0, 529, 90),
+            cost: Cost {
+                pico_usd: 435 * 2_500_000 + 136_704 * 250_000 + 529 * 15_000_000,
+                unpriced_tokens: 0,
+            },
+        }]
+    );
+}
+
+/// R20: requests with the same five cumulative counts but a different cache write (the first
+/// requests of two unrelated rollouts, counted once: a known limitation) count as the usage of
+/// the copy that counts, whole: input from one and cache write from the other would be more
+/// tokens than either request had, and could cross the long-context threshold neither did.
+/// Within a rollout, the first usage of a total stays.
+#[test]
+fn codex_requests_with_one_total_keep_one_usage() {
+    // `[input, cached, cache write, output, reasoning]` in the first request of a rollout in
+    // store `a` at minute 2 and in store `b` at minute 5.
+    let collide = |first: [u64; 5], second: [u64; 5]| {
+        let mut f = Fixture::new();
+        for (store, id, usage, minute) in [("a", R1, first, 2), ("b", R2, second, 5)] {
+            let home = f.codex(store);
+            let text = [
+                cx::meta(id, "/w/proj", json!("cli"), 0, &cx::ts(0)),
+                cx::model_turn("gpt-5.6-sol", &cx::ts(1)),
+                cx::usage_event(
+                    cx::usage_with_write(usage),
+                    cx::usage_with_write(usage),
+                    &cx::ts(minute),
+                ),
+            ]
+            .concat();
+            cx::write_rollout(&home, id, &text);
+        }
+        let table = f.all();
+        assert_eq!(model_names(&table.overall), ["gpt-5.6-sol"]);
+        let row = table.overall[0].clone();
+        (row.tokens, row.cost)
+    };
+    let priced = |pico_usd| Cost {
+        pico_usd,
+        unpriced_tokens: 0,
+    };
+
+    // The earlier copy counts, with its own split.
+    let (tokens, _) = collide([100, 40, 60, 10, 0], [100, 40, 0, 10, 0]);
+    assert_eq!(tokens, toks6(0, 40, 60, 0, 10, 0));
+    assert_eq!(tokens.total(), 110);
+    let (tokens, _) = collide([100, 40, 0, 10, 0], [100, 40, 60, 10, 0]);
+    assert_eq!(tokens, toks6(60, 40, 0, 0, 10, 0));
+    assert_eq!(tokens.total(), 110);
+
+    // 200K input tokens each: neither is a long-context request (input 4, cached 0.40, cache
+    // write 5, output 20 USD per million tokens).
+    let (tokens, cost) = collide(
+        [200_000, 40_000, 0, 1_000, 0],
+        [200_000, 40_000, 160_000, 1_000, 0],
+    );
+    assert_eq!(tokens, toks6(160_000, 40_000, 0, 0, 1_000, 0));
+    assert_eq!(
+        cost,
+        priced(160_000 * 4_000_000 + 40_000 * 400_000 + 1_000 * 20_000_000)
+    );
+    let (tokens, cost) = collide(
+        [200_000, 40_000, 160_000, 1_000, 0],
+        [200_000, 40_000, 0, 1_000, 0],
+    );
+    assert_eq!(tokens, toks6(0, 40_000, 160_000, 0, 1_000, 0));
+    assert_eq!(
+        cost,
+        priced(40_000 * 400_000 + 160_000 * 5_000_000 + 1_000 * 20_000_000)
+    );
+
+    // In one rollout, a total seen again (not right after itself) keeps its first usage.
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let event = |total: [u64; 5], last: [u64; 5], minute| {
+        cx::usage_event(
+            cx::usage_with_write(total),
+            cx::usage_with_write(last),
+            &cx::ts(minute),
+        )
+    };
+    let text = [
+        cx::meta(R1, "/w/proj", json!("cli"), 0, &cx::ts(0)),
+        cx::model_turn("gpt-5.6-sol", &cx::ts(1)),
+        event([100, 40, 60, 10, 0], [100, 40, 60, 10, 0], 2),
+        event([150, 80, 60, 15, 0], [50, 40, 0, 5, 0], 3),
+        event([100, 40, 0, 10, 0], [100, 40, 0, 10, 0], 4),
+    ]
+    .concat();
+    cx::write_rollout(&work, R1, &text);
+    let table = f.all();
+    assert_eq!(
+        of(&table.overall, "gpt-5.6-sol"),
+        toks6(10, 80, 60, 0, 15, 0)
+    );
+}
+
 /// R20, R17: a rollout of a store several codex homes share counts for those accounts
 /// together.
 #[test]
@@ -1002,13 +1196,21 @@ fn cache_round_trips_and_a_schema_mismatch_rebuilds() {
             .as_array()
             .unwrap()[..]
     );
-    // A cache of schema 1 (a single cache write) is rebuilt.
-    assert_eq!(SCHEMA_VERSION, 2);
+    // A cache of schema 1 (a single cache write) or 2 (codex's cache write not read: its rows
+    // would keep it in the input) is rebuilt.
     let old = f.root.join("old-stats.json");
-    fs::write(&old, "{\"schema_version\":1,\"files\":{}}").unwrap();
-    let loaded = Cache::load(&old);
-    assert!(loaded.files.is_empty());
-    assert_eq!(loaded.schema_version, 2);
+    for version in [1, 2] {
+        let mut older = v.clone();
+        older["schema_version"] = json!(version);
+        fs::write(&old, older.to_string()).unwrap();
+        let loaded = Cache::load(&old);
+        assert!(
+            loaded.files.is_empty(),
+            "a cache of schema {version} is not rebuilt"
+        );
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
+    }
+    assert_eq!(SCHEMA_VERSION, 3);
 
     let mut other = v.clone();
     other["schema_version"] = json!(SCHEMA_VERSION + 1);

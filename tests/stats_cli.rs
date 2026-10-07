@@ -359,7 +359,7 @@ fn stats_invalid_prices_fail_naming_the_config() {
 
 /// R20: codex rollouts (fixtures of `tests/stats.rs`) in `$HOME/.codex`: repeats, compaction
 /// estimates, fork replays and inherited totals skipped, archived rollouts counted, events
-/// before the first turn under its model; cache write is `-`.
+/// before the first turn under its model; codex records cache write, here 0.
 #[test]
 fn stats_codex() {
     let sb = Sandbox::new();
@@ -431,14 +431,46 @@ fn stats_codex() {
     assert_eq!(labels(&out), ["claude:default", "codex:default", "overall"]);
     assert_eq!(block(&out, "claude:default"), ["no tokens"]);
     let codex_rows = [
-        "gpt-test-a 120 230 - 35 11 385 -",
-        "gpt-test-b 90 180 - 25 3 295 -",
-        "gpt-test-d 100 100 - 20 8 220 -",
-        "gpt-test-c 50 40 - 9 0 99 -",
-        "total 360 550 - 89 22 999 -",
+        "gpt-test-a 120 230 0 35 11 385 -",
+        "gpt-test-b 90 180 0 25 3 295 -",
+        "gpt-test-d 100 100 0 20 8 220 -",
+        "gpt-test-c 50 40 0 9 0 99 -",
+        "total 360 550 0 89 22 999 -",
     ];
     assert_eq!(block(&out, "codex:default"), codex_rows);
     assert_eq!(block(&out, "overall"), codex_rows);
+}
+
+/// R20: codex's `cache_write_input_tokens`, part of `input_tokens`, is shown as cache write and
+/// priced at the cache-write price; the total is unchanged. The request of a real codex 0.160.0
+/// event, with 2,000 tokens written to the cache (and so 2,000 more input tokens).
+#[test]
+fn stats_codex_cache_write() {
+    let sb = Sandbox::new();
+    let codex = sb.home().join(".codex");
+    cx::write_rollout(
+        &codex,
+        R1,
+        &[
+            cx::meta(R1, "/w/proj", json!("cli"), 0, &cx::ts(0)),
+            cx::model_turn("gpt-5.6-sol", &cx::ts(1)),
+            cx::usage_event(
+                cx::usage_with_write([5_730_399, 5_586_560, 2_000, 19_533, 4_590]),
+                cx::usage_with_write([139_139, 136_704, 2_000, 529, 90]),
+                &cx::ts(2),
+            ),
+        ]
+        .concat(),
+    );
+    let out = stats(&sb, &[]);
+    // $0.0770016: 435 × 4 + 136,704 × 0.40 + 2,000 × 5 + 529 × 20, per million.
+    assert_eq!(
+        block(&out, "codex:default"),
+        [
+            "gpt-5.6-sol 435 137K 2K 529 90 140K $0.08",
+            "total 435 137K 2K 529 90 140K $0.08",
+        ]
+    );
 }
 
 /// R20: with an account, only the sections that include it, and no overall section.

@@ -211,7 +211,7 @@ separate caches, because they need different parts of each file.
   codex rollouts (+ archived) ┤ stats::sources
                               ▼
                         stats::refresh ──────────────────► stats.json   (one row per request,
-                              │                                          whole files; schema 2)
+                              │                                          whole files; schema 3)
                               ▼
                         stats::report(period, prices)  ◄── pricing (built-in + [prices])
                               │

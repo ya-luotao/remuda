@@ -10,6 +10,13 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Changed
 
+- Codex statistics read `cache_write_input_tokens`, which codex 0.160 records (SPEC R20): the
+  tokens written to the cache are part of `input_tokens`, so they are now counted as cache write
+  instead of input, and priced at the cache-write price, 1.25 times the input price on
+  `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-sol` and `gpt-6-astra`, the input price on the others.
+  Totals are unchanged. Codex rows show their cache write (`0` until codex records one) instead
+  of `-`. A `[prices]` table for a codex model prices the cache write with `cache_write_5m`. The
+  statistics cache is rebuilt once.
 - On a file system without locks, or where the directory that holds the registry file
   (`$REMUDA_HOME`, or where a symlinked `config.toml` points) cannot be opened for reading,
   `remuda add`, `setup` and `remove` now refuse and change nothing, instead of writing
