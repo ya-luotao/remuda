@@ -97,6 +97,8 @@ switching to a different, logged-out account.
   prefer = ["claude:personal"]  # the rules' last tie-break
   min_headroom = 10         # percent left required on every window that applies
   stale_after = 120         # minutes after which cached usage is stale
+  affinity_minutes = 60     # minutes the account that ran a session stays preferred for
+                            # resuming it (R23); 0: never
   notes = "Keep claude:personal for long refactors."   # sent to Jev (R23)
 
   [pick.claude]             # also [pick.codex]
@@ -147,8 +149,8 @@ switching to a different, logged-out account.
   `output`, or has a price that is not a number from 0 to 1,000,000, a `[pick]` with a key other
   than those above, an `exclude` or `prefer` entry that does not resolve as in R1, a
   `min_headroom` that is not an integer from 0 to 100, a `stale_after` that is not a positive
-  integer, `notes` longer than 4000 characters, a model not matching `[A-Za-z0-9._:-]+` or
-  starting with `-`, an effort not matching `[a-z]+`, a duplicate model or effort, a claude model
+  integer, an `affinity_minutes` that is not an integer from 0 to 1440, `notes` longer than
+  4000 characters, a model not matching `[A-Za-z0-9._:-]+` or starting with `-`, an effort not matching `[a-z]+`, a duplicate model or effort, a claude model
   or effort that is a claude subcommand, or a `default_effort` not among `efforts`, and similar
   problems are all reported as errors naming the file; remuda neither guesses nor skips. A bare
   name in `[pick]` resolves as in R1, so it becomes an error once another provider has an account
@@ -356,7 +358,8 @@ remuda help [<command>]                            help for remuda or a command
   above: any subcommand name, `--help` / `-h`, or `--version` / `-v` means "not a session". New
   sessions, resumes, continues, forks, and `-p` runs are sessions.
 - Launch log `state/launches.jsonl`: one line per launch, containing time, account, home, cwd,
-  args, and session ID (or unknown). `args` are the user's arguments as the agent got them,
+  args, and session ID (or unknown). Besides attribution (R9), `pick` reads it to find the
+  account that last ran a session it is asked to resume (R23, **Resuming**). `args` are the user's arguments as the agent got them,
   without what remuda injected: a prompt given on the command line is in the log, which is why
   the log is readable by the user alone (R3).
 - Launching from within a claude session. A claude session gives the processes of its tools and
@@ -1803,11 +1806,17 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
 what is feasible and rank it; with a key, TypeSafe's Jev model chooses among the feasible options.
 It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4) or, with
 `--live`, R10's live queries, and writes nothing except, with `--run`, the launch log (R6): the
-usage it reads is not recorded in the usage history (R24).
+usage it reads is not recorded in the usage history (R24). Given a session to resume or fork, it
+also reads the launch log and the session index (R8) to prefer the account whose prompt cache
+holds it (**Resuming**, below).
 
 - **Candidates.** Each account R1 lists (`default` included) with each model of its provider's
-  `models`, or with the agent's default (nothing injected) when there are none. Not feasible, each
-  with its reason: excluded; not of `--provider`; claude with neither `oauthAccount` in its
+  `models`, or with the agent's default (nothing injected) when there are none; resuming or
+  forking a session, each account once, with the session's model (**Resuming**). Not feasible,
+  each with its reason: excluded; not of `--provider`, or not of the provider whose session is
+  resumed; resuming a session the session index has, an account whose store (R8) does not hold
+  it (`cannot see this session (its store is not this account's)`: it could not resume it);
+  claude with neither `oauthAccount` in its
   `.claude.json` nor a usage cache; codex without `codex` on PATH, or whose `codex login status`
   says it is not logged in (a status that cannot be read is noted, not blocking); or a window
   that applies, of known usage, with less than `min_headroom` percent left (default 10). With
@@ -1849,14 +1858,15 @@ usage it reads is not recorded in the usage history (R24).
   remuda never queries live on its own, not before `--run` either (a live query lets the agent
   reach its provider and write in its home): where the recommended pair has a window that has
   reset since, the output names it and, for cached usage, says that `--live` asks the agent.
-- **Rules.** Feasible pairs rank by: known headroom before unknown; the model's position in
+- **Rules.** Feasible pairs rank by: resuming a session, the account whose prompt cache is warm
+  (**Resuming**) first; known headroom before unknown; the model's position in
   `models`; headroom in 10-point bands, higher first (90% left and more is one band); fresh before
   stale; the binding window's reset, sooner first; `prefer` order; registry order. Headroom
   known from stale usage is still known: such a pair ranks before every pair of unknown
   headroom, so usage whose resets have all passed never outranks usage that says something.
   Pairs of unknown headroom, without usage data or past every reset, rank among themselves by
   the same rules (a pair without usage data is not stale). The rules' effort is
-  `default_effort`, or none.
+  `default_effort`, or none (none when resuming).
 - **When Jev is asked.** Only with `TYPESAFE_API_KEY` in remuda's environment, without
   `--offline`, with `notes`, and with a choice to make (two feasible pairs, or a provider with two
   or more `efforts` and a feasible pair). Otherwise the rules decide, and the reason is `offline`,
@@ -1898,13 +1908,18 @@ usage it reads is not recorded in the usage history (R24).
   why, with Jev's confidence; the rules' choice when Jev's differs; the binding window and its
   reset (`unknown` when no window that applies is known); the windows that have reset since,
   with the hint to `--live` when the usage is cached; the data's age; the exclusions; the
-  `remuda run <account> <options>` command; and every pair that is not feasible,
+  `remuda run <account> <options> <args>` command, `<args>` being those after `--`, each word
+  quoted for a POSIX shell where it needs it (so that the line, run by a shell, gives the agent
+  the same words; `--json` has them as an array); resuming,
+  the session's facts (**Resuming**); and every pair that is not feasible,
   with its reason. `--json` prints `account`, `provider`, `model`, `effort`, `decided_by` (`jev`,
   `jev_account`, `rules`), `reason`, `effort_by` (`jev`, `rules`; null without an effort), `jev`
   (`model`, `confidence`, `effort_confidence`, `effort_error`, `error`; null when not asked),
-  `command`, and `candidates` (`account`, `model`, `feasible`, `why_not`, `headroom`, `binding`,
-  `resets_at`, `reset_passed`, `default_model_windows`, `source`, `fetched_at`, `age_seconds`,
-  `stale`, `rules_rank`, `jev_probability`). `headroom` and `binding` are null when the headroom
+  `command`, `session` (null without a session resumed or forked, nothing feasible included;
+  else `id`, `kind` (`resume`, `fork`), `last_account`, `last_active_at`, `age_seconds`,
+  `affine`, `model`, `indexed`), and `candidates` (`account`, `model`, `feasible`, `why_not`,
+  `headroom`, `binding`, `resets_at`, `reset_passed`, `default_model_windows`, `source`,
+  `fetched_at`, `age_seconds`, `stale`, `rules_rank`, `affine`, `jev_probability`). `headroom` and `binding` are null when the headroom
   is unknown; `resets_at` is the binding window's reset, null unless it is ahead: never an
   instant in the past; `reset_passed` is true when a window that applies has reset since.
   Each of `default_model_windows` has `label`, `percent`, `resets_at`, and `reset_passed`, with
@@ -1918,9 +1933,89 @@ usage it reads is not recorded in the usage history (R24).
   `-c`/`--config model_reasoning_effort=…`) is not injected, and remuda says so on stderr. So
   does it when a window of the launched pair has reset since (with the hint to `--live` when
   the usage is cached); it launches all the same.
-  Arguments that do not start a new session (R6's classification for claude; `resume` or `fork`
-  first for codex) are refused before anything is sent. `--json` and `--print-request` do not
-  combine with `--run`.
+  Arguments that resume or fork a named session (**Resuming**) are launched as given, nothing
+  injected, exactly as `remuda run <account> <args>`: the same directory (R6), the same log
+  record, codex's `resume <id>` without a `-C` of remuda's; like `run`, `pick --run` does not
+  check that the session is running elsewhere (R16's check is the TUI's). Other arguments that
+  do not start a new session (R6's classification for claude; `resume` or `fork` without an id,
+  or with `--last`, first for codex) are refused before anything is sent, with `--run` or
+  without (the command shown is one remuda would launch), and when no pair is feasible as
+  well as when one is. With a feasible pair they are checked for the providers of the feasible
+  pairs, as the launch would read them; with none, for each provider with an account that
+  nothing permanent blocks (not excluded, of `--provider` or of the session's provider, logged
+  in, `codex` on PATH, able to see the session resumed), before saying that nothing is
+  feasible. Arguments after `--` need no `--run`;
+  without it they are only shown in the command. `--json` and `--print-request` do not combine
+  with `--run`.
+- **Resuming.** Prompt caches are per account (verified on claude 2.1.292: a session begun as
+  one account and resumed as another read only the prefix the second had cached itself and
+  wrote the rest of the conversation again, 9,817 tokens; resumed as the first again, it read
+  what the first had written; every write was the 1-hour ephemeral cache). Resuming or forking
+  a session as another account than the one that ran it lately writes the whole conversation
+  into the new account's cache: it takes longer and spends that account's limits. So `pick`
+  prefers the account that ran it, among the feasible pairs only: **affinity orders, it never
+  makes a pair feasible**.
+  - The arguments after `--` name the session: for claude, exactly one `--resume <id>`
+    (`-r <id>`, `--resume=<id>`) with no other resume, continue, or `--session-id` option, alone
+    or with `--fork-session` for a fork (R6's classification; where R6 forks the first of
+    several resumes, `pick` refuses them, as it refuses every other form); for codex,
+    `resume <id>` or `fork <id>` first (R17). Only that provider's accounts are candidates (a conflicting
+    `--provider` is an error, and arguments that name a session for both readings are refused
+    as ambiguous). Each account is one candidate, with nothing injected: neither `models` nor
+    `efforts` nor `default_effort` applies, and Jev is not asked an effort.
+  - The account that ran it last: of the launch log's records (R6) whose `session_id` is the id
+    or whose `fork_of` is (a fork reads the whole session it copies, into its account's cache),
+    the latest, with the home it was launched with. That account is the one registered under
+    that name **with that home string, byte for byte** (R2): an account registered again under
+    the name with another home is another login, whose cache never held the session; it is not
+    warm, and the output says so. Its last activity is the later of that launch and the last
+    record of what the launch ran (the session itself, or for a fork the session it made; a
+    codex fork's is unknown), read at the end of **that account's own copy**: the transcript the
+    session index (R8) has in the account's store. Stores that are not shared each hold their
+    own copy of a session; another account's copy, however recent, is that account's activity.
+    One store may hold several copies (one per project directory): the session goes on in the
+    one written to last (by its last record's time); of copies written to last at the same
+    time, the one whose last record is in the launch's directory; when that does not single
+    one out, neither its time nor its model is known. A copy is read only when its file is
+    there and is named by that session, and its last record counts only when it is in the
+    launch's directory. A last record elsewhere was written by a later run the log does not
+    have, maybe another account's: when it cannot be told, remuda takes the account's cache for
+    cold rather than credit it with someone else's activity. Without such a record the launch's time
+    counts. A session remuda never launched has no last account, and nothing is preferred;
+    `history.jsonl` (R9) tells no time and is not used.
+  - Its prompt cache is warm, and the account is preferred, when that last activity is at
+    most `affinity_minutes` (R3; default 60, 0: never) before the instant. 60 follows the
+    1-hour cache writes above; codex's cache lifetime is **[unverified]**, and the same value
+    is used.
+  - The session's model, for each account, is that of the copy it would resume, the one in its
+    own store, chosen as above: the last assistant record of that transcript (claude) or its
+    last `turn_context` (codex), found through the session index; unknown otherwise. The
+    windows of that model apply (**Windows**); unknown, the pair is as `default`'s: its
+    per-model windows are shown, never counted. The model is the transcript's text, unchecked: it is matched
+    against the windows locally and shown on the user's terminal, and never sent to Jev. Nor
+    is a window's label, which may name it (the agent's quota name for the session's model):
+    resuming or forking, the request names each window by its kind only (`session window`,
+    `weekly window`, codex's `<N>h window` / `<N>d window`, else `window`; a per-model one `… of
+    the session's model`, or `… of one model` when the session's model is unknown), with what
+    it holds and when it resets. The text report and `--json` keep the labels; a request that
+    resumes nothing is as before.
+  - Which accounts can see it: those whose store holds the transcript the index has. A session
+    the index does not have holds no account back, and the output says so.
+  - Nothing is read but the launch log, `state/index.json`, and the end of the session's
+    transcripts: no store is scanned, no request is made.
+  - The output names the session's kind and id, the account that ran it last and how long
+    ago, whether its cache is warm (or why not: too long ago, affinity off, no longer
+    registered, registered again with another home, never launched through remuda), and the
+    model of the copy the recommended account would resume (with nothing recommended, the
+    model every copy has, if they agree); when the warm account is not the one recommended, it
+    says why (its reason for not being feasible, or Jev's choice) and that resuming as another
+    account rewrites its prompt cache. These facts are in the text report whether or not a
+    pair is feasible, and, with `--run`, on stderr before the launch. The request to Jev says,
+    in one sentence, which account ran the session to be resumed and how long ago, by its
+    alias (an account no longer registered with that home is named as such), and whether its
+    cache is warm, has likely expired, or is not considered (`affinity_minutes = 0`); the warm
+    account's option says so too, also when its usage is unknown (`no usage data`). The
+    session's id, title, directory, and model are never sent.
 - **`--wait`.** With nothing feasible, remuda does not stop: it tries again until a pair is
   feasible, then goes on as without `--wait` (the text, `--json`, or `--run`'s launch). With a
   feasible pair it changes nothing. Each attempt is the whole gathering, at an instant of its
@@ -1937,8 +2032,8 @@ usage it reads is not recorded in the usage history (R24).
     minutes) after it. Asleep, remuda reads the clock again at least every `NAP` (60 s), so a
     computer that slept does not put the attempt off.
   - Nothing to wait for. When every pair that is not feasible is so for a reason that time does
-    not change (excluded, not of `--provider`, not logged in, `codex` not on PATH), or there is
-    no account: at once, the reasons as without `--wait`, `nothing to wait for: …` naming them
+    not change (excluded, not of `--provider` or of the provider whose session is resumed, not
+    logged in, `codex` not on PATH, unable to see the session resumed), or there is no account: at once, the reasons as without `--wait`, `nothing to wait for: …` naming them
     on stderr, exit 1.
   - `--max-wait S`. No attempt starts later than S seconds after remuda started. When the next
     would, remuda gives up at once instead of sleeping out time in which it would check
@@ -1955,11 +2050,15 @@ usage it reads is not recorded in the usage history (R24).
     wait, is printed. `--json` prints once, at the
     end. Ctrl-C, Ctrl-\, a hangup, or SIGTERM ends remuda by that signal, whether it sleeps or
     an attempt is under way: a query under way, or being started, is told first (R4), and
-    none is left running. `--print-request` does not combine with `--wait`. With `--run`: when
-    a pair is feasible, the arguments are checked as without `--wait`; when remuda is about to
-    wait, they are checked then, for each provider with an account that nothing permanent
-    blocks (not excluded, of `--provider`, logged in, `codex` on PATH), and refused before the
-    wait instead of after it.
+    none is left running. `--print-request` does not combine with `--wait`. The arguments after
+    `--` are checked at each attempt as without `--wait` (**`--run`**): when a pair is feasible,
+    for the feasible pairs' providers; when remuda is about to wait, for each provider with an
+    account that nothing permanent blocks, so they are refused before the wait instead of after
+    it.
+  - Resuming (**Resuming**), the session's facts (the launch log, the session index, the ends
+    of its copies) are read once, before the first attempt; whether the account that ran it is
+    warm is judged at each attempt's instant, so a long wait can let its cache go cold.
+
 
 ## R24. Usage history
 

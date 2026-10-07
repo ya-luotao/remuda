@@ -10,6 +10,21 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Added
 
+- `remuda pick` recommends the account to resume or fork a session as: `remuda pick -- --resume
+  <id>` (claude, also with `--fork-session`) or `-- resume <id>` / `-- fork <id>` (codex). Prompt
+  caches are per account, so the account that ran the session within `[pick] affinity_minutes`
+  (new, default 60; 0 turns it off) ranks first among the feasible ones, from the launch log and
+  the end of its own copy of the session's transcript; it never makes an account feasible, and
+  an account registered again under that name with another home is not it. Accounts whose
+  store does not hold the session are not feasible. Nothing is injected: the model of the copy
+  each account would resume is the one whose windows are counted. The text output has a
+  `session` line, also when nothing is feasible and, with `--run`, on stderr; `--json` has a
+  `session` object and `affine` on each candidate; Jev is told which account (by alias) ran the
+  session and how long ago, never its id, title, directory or model, and reads the usage
+  windows by their kind only (`weekly window of the session's model`), since a window's label
+  may name that model. Of several copies of the session in one store, the one written to last
+  counts. `pick --run` launches a resume exactly as `remuda run <account> --resume <id>` (SPEC
+  R23, R3).
 - `remuda pick --wait [--max-wait <SECONDS>]`: when nothing is feasible, wait until something is,
   checking again 30 seconds after the earliest reset of a window that blocks (at least a minute
   apart, every 5 minutes when no reset is known), then print or launch as usual (SPEC R23). It
@@ -41,6 +56,10 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Changed
 
+- `remuda pick -- <args>` no longer needs `--run`: without it, the arguments go into the
+  `command` shown, each word quoted for the shell where it needs it. Arguments that neither start
+  a new session nor name one to resume (`-c`, `--resume` without an id) are refused with or
+  without `--run`, also before `--wait` waits (SPEC R23).
 - Claude's live usage query (`remuda usage --live`, `u` in the TUI, `remuda pick --live`) no
   longer runs the account's hooks or starts its MCP servers: it is
   `claude -p /usage --no-session-persistence --setting-sources "" --strict-mcp-config` (SPEC R10).
