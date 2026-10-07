@@ -121,6 +121,11 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Fixed
 
+- `remuda usage` reads each account's cached usage against the time it was read, not the time
+  the command started, and `remuda usage --wait` each of its cached attempts likewise (SPEC R10):
+  a window whose reset fell in between shows `reset since cached` instead of its old percentage
+  and a note about a reset already past, is not waited on, and is not recorded in the usage
+  history (R24).
 - SIGTERM sent to remuda (by `kill` or a supervisor) is passed on to the agent commands it is
   running, as Ctrl-C is, before remuda ends by it (SPEC R4): a live usage query
   (`remuda usage --live`, `remuda pick --live`, and their `--wait`) no longer outlives remuda.

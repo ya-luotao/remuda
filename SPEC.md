@@ -666,9 +666,13 @@ appeared in no `history.jsonl`.
   time, or the time a live query answered (not the time it was started: a query may take as long
   as its timeout; nor the time the answer is first shown: in the TUI it may wait behind a
   foreground agent). Every place that shows or uses it (`remuda usage`, the table and the
-  timeline, `remuda pick`) reads it against the current time in the same way; a command that
-  waits for an agent takes the current time after the wait (`remuda usage --live` when each
-  answer arrives, `remuda pick` as R23 says):
+  timeline, `remuda pick`) reads it against the current time in the same way, taken once the
+  usage has been read, not when the command started; a command that waits for an agent takes
+  the current time after the wait (`remuda usage` when it has read each account's cache, and
+  `remuda usage --wait` likewise at each of its attempts; `remuda usage --live` when each answer
+  arrives, `remuda pick` as R23 says). So a reset that falls while `remuda usage` runs, before an
+  account's cache is read, has reset since for that account: its old percentage is not shown,
+  noted, recorded (R24), or waited on:
   - Reset wording is read as the next such time after it was said, not after now.
   - A window whose reset fell after its usage was recorded and is not after now has **reset
     since**: the percentage recorded is obsolete, and what the window holds now is unknown until
@@ -1974,10 +1978,11 @@ nothing (R23), and `remuda list` reads no usage.
   `live`. Times are RFC 3339. A window is identified by `account`, `label`, and `model`.
 - **What is recorded.** `remuda usage` records what it reads, cached or with `--live`; with
   `--wait` (R10), every reading it takes, the one printed at the end included, once the wait is
-  over and that reading is printed; `remuda usage --history` records nothing. The TUI records the cached usage it reads for the
-  Accounts view and each answer of `u` (R16). Not recorded: a reading whose time is unknown (a
-  cache without `fetchedAtMs`); a window that has reset since it was read (`reset since cached`,
-  R10), whose percentage is unknown; a live query that failed, or whose answer told no usage or
+  over and that reading is printed; `remuda usage --history` records nothing. The TUI records
+  the cached usage it reads for the Accounts view and each answer of `u` (R16). Not recorded: a
+  reading whose time is unknown (a cache without `fetchedAtMs`); a window that has reset since
+  it was read (`reset since cached`, R10, as of the time the cache was read, not when the
+  command started), whose percentage is unknown; a live query that failed, or whose answer told no usage or
   was not recognized (R10); a point older than the 45 days kept. A point already in the history,
   of the same window with the same `ts`, `percent`, and `resets_at`, is not recorded again, so
   a cache read between two live answers adds nothing.

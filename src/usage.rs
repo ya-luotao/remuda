@@ -411,25 +411,35 @@ fn cached_claude(account: &Account, env: &Env) -> Result<CachedUsage, String> {
     parse_cached(&text)
 }
 
-/// `remuda usage` block for one account from its cached usage (R10).
-pub fn cached_report(account: &Account, env: &Env, tz: &TimeZone, now: Timestamp) -> String {
-    cached_attempt(account, env, tz, now).0
+/// `remuda usage` block for one account from its cached usage (R10), read as of `clock` once
+/// the cache has been read ([`cached_attempt`]).
+pub fn cached_report(
+    account: &Account,
+    env: &Env,
+    tz: &TimeZone,
+    clock: impl Fn() -> Timestamp,
+) -> String {
+    cached_attempt(account, env, tz, clock).0
 }
 
 /// [`cached_report`], and the reading it shows (`None` without cached usage): for
-/// `usage --wait` (R10), which reads it for windows that are used up, and for the usage
-/// history (R24), which records it.
+/// `remuda usage`, for `usage --wait` (R10), which reads it for windows that are used up, and
+/// for the usage history (R24), which records it. The cache is read first and `clock` asked
+/// after that: usage is read against the time it was read at (R10), so a reset that falls while
+/// the cache is read (or while the command ran before) has passed since.
 pub fn cached_attempt(
     account: &Account,
     env: &Env,
     tz: &TimeZone,
-    now: Timestamp,
+    clock: impl Fn() -> Timestamp,
 ) -> (String, Option<Reading>) {
-    cached_text(account, &cached_usage(account, env), tz, now)
+    let cached = cached_usage(account, env);
+    cached_text(account, &cached, tz, clock())
 }
 
-/// [`cached_attempt`] of the cached usage `cached` already read.
-pub fn cached_text(
+/// [`cached_attempt`] of the cached usage `cached` already read, as of `now`: a time taken
+/// after it was read.
+fn cached_text(
     account: &Account,
     cached: &Result<CachedUsage, String>,
     tz: &TimeZone,
@@ -1552,6 +1562,51 @@ mod tests {
         assert_eq!(
             normalized(&aged),
             ["Session - reset since asked (Sep 23 23:00)"]
+        );
+    }
+
+    /// R10, R24: cached usage is read against a time taken after the cache was read, never
+    /// before: here asking the clock changes the cache, and what is shown is what was there
+    /// before it was asked. So a reset that falls while the cache is read has passed since.
+    #[test]
+    fn cached_usage_takes_the_time_after_reading_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("max");
+        fs::create_dir(&home).unwrap();
+        let cache = |percent: u32| {
+            format!(
+                r#"{{"cachedUsageUtilization": {{"fetchedAtMs": {}, "utilization": {{"limits": [
+                  {{"kind": "session", "percent": {percent},
+                    "resets_at": "2026-10-08T11:00:00Z"}}]}}}}}}"#,
+                ts("2026-10-08T10:00:00Z").as_millisecond()
+            )
+        };
+        fs::write(home.join(".claude.json"), cache(34)).unwrap();
+        let max = Account {
+            home: crate::registry::Home::Path(home.display().to_string()),
+            ..claude_account("max")
+        };
+        let env = Env::new();
+        let asked = std::cell::Cell::new(0);
+        let clock = || {
+            asked.set(asked.get() + 1);
+            fs::write(home.join(".claude.json"), cache(99)).unwrap();
+            ts("2026-10-08T10:30:00Z")
+        };
+        let (text, reading) = cached_attempt(&max, &env, &TimeZone::UTC, clock);
+        assert_eq!(asked.get(), 1);
+        assert!(text.contains("Session  34%"), "{text}");
+        assert_eq!(reading.unwrap().windows[0].used(), Some(34.0));
+        // Read at a time after its reset: reset since, whatever the command's start was.
+        fs::write(home.join(".claude.json"), cache(34)).unwrap();
+        let after = || ts("2026-10-08T11:00:30Z");
+        let (text, reading) = cached_attempt(&max, &env, &TimeZone::UTC, after);
+        assert!(text.contains("reset since cached (Oct 8 11:00)"), "{text}");
+        assert_eq!(reading.unwrap().windows[0].used(), None);
+        assert_eq!(
+            cached_report(&max, &env, &TimeZone::UTC, after),
+            text,
+            "the report is the attempt's text"
         );
     }
 
