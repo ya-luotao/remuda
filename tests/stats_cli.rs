@@ -301,7 +301,7 @@ fn stats_by_account_and_model() {
         [
             "Not priced: claude-advisor-test, claude-haiku-test, claude-test \
              (add [prices.\"<model>\"] to config.toml)",
-            "Cost ≈ API list price (prices as of 2026-09-24): an estimate, not a bill.",
+            "Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.",
             "",
         ]
     );

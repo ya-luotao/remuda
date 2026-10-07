@@ -16,7 +16,8 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-6-sol` and `gpt-6-astra`, the input price on the others.
   Totals are unchanged. Codex rows show their cache write (`0` until codex records one) instead
   of `-`. A `[prices]` table for a codex model prices the cache write with `cache_write_5m`. The
-  statistics cache is rebuilt once.
+  statistics cache is rebuilt once. Every built-in price was checked against the providers'
+  pricing pages again; the prices are now as of 2026-10-07 (none changed).
 - On a file system without locks, or where the directory that holds the registry file
   (`$REMUDA_HOME`, or where a symlinked `config.toml` points) cannot be opened for reading,
   `remuda add`, `setup` and `remove` now refuse and change nothing, instead of writing

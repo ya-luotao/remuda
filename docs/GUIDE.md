@@ -253,7 +253,7 @@ models = ["gpt-6-astra"]
 ## Cost estimates
 
 The statistics price each request at the provider's public API list price, built into remuda (as
-of 2026-09-24). Claude's 5-minute and 1-hour cache writes are priced separately, as are fast mode
+of 2026-10-07). Claude's 5-minute and 1-hour cache writes are priced separately, as are fast mode
 (twice the price on the models that offer it) and US-only inference (1.1 times the price on the
 models from 4.6 on), as the transcripts record them. Codex's cache writes are priced at 1.25
 times the input price from GPT-5.6 on, and at the input price before. A Codex request with more
@@ -322,7 +322,7 @@ Accounts with `share = false` and the source itself are not checked.
 - **Token statistics** are counted from the agents' own transcripts. Each request counts once,
   even when a message is written in several records, a session is forked, or a store is shared
   by several accounts. Each request is also priced at the provider's public API list
-  price (built in, as of 2026-09-24), which estimates what the usage would cost on the API; for
+  price (built in, as of 2026-10-07), which estimates what the usage would cost on the API; for
   subscription logins it is not a bill. No agent is run and nothing is fetched.
 - **Recommendations** (`remuda pick`) read the same usage and `[pick]`; the only request remuda
   makes itself goes to TypeSafe, and only with a key and notes (see

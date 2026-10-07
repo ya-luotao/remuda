@@ -1304,7 +1304,7 @@ stays reserved so that the entries after it keep theirs.
 
 Token counts per account and model, read from the agents' own transcripts, for a period, and their
 estimated cost: what the requests would cost at the providers' public API list prices (prices as
-of 2026-09-24). Most accounts are subscription logins, so the cost is an estimate for comparison
+of 2026-10-07). Most accounts are subscription logins, so the cost is an estimate for comparison
 (≈ API list price), not a bill. Computing them runs no agent command and makes no network request:
 the prices are built into remuda and can be overridden in `config.toml` (R3).
 
@@ -1409,8 +1409,8 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   | `claude-haiku-4-5` | 1 | 1.25 | 2 | 0.10 | 5 |
   | `claude-3-5-haiku` | 0.80 | 1 | 1.60 | 0.08 | 4 |
 
-  Codex, USD per million tokens (the cache-write prices as of 2026-10-07: 1.25 times the input
-  price from GPT-5.6 on; before, a cache write has no price of its own and costs the input price):
+  Codex, USD per million tokens (a cache write costs 1.25 times the input price from GPT-5.6 on;
+  before, it has no price of its own and costs the input price):
 
   | Model | Input | Cached input | Cache write | Output | Long context |
   | --- | ---: | ---: | ---: | ---: | :---: |

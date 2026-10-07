@@ -12,7 +12,7 @@ use crate::provider::Provider;
 use crate::stats::Tokens;
 
 /// When the built-in prices were read from the providers' pricing pages.
-pub const PRICES_AS_OF: &str = "2026-09-24";
+pub const PRICES_AS_OF: &str = "2026-10-07";
 
 /// The keys of a `[prices."<model>"]` table.
 pub const OVERRIDE_KEYS: [&str; 5] = [

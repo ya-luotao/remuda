@@ -1873,7 +1873,7 @@ overall
   gpt-test      1.5K         200            0      30         12   1.7K        -
   total         1.5K        1.2M          160     120         12   1.2M  $12.34+
 
-Cost ≈ API list price (prices as of 2026-09-24): an estimate, not a bill.
+Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.
 Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
 "
         );
@@ -1889,7 +1889,7 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
                 "MODEL          INPUT  CACHE READ  CACHE WRITE  OUTPUT  REASONING  TOTAL    COST",
                 "claude:max",
                 "claude:default + claude:max",
-                "Cost ≈ API list price (prices as of 2026-09-24): an estimate, not a bill.",
+                "Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.",
             ]
         );
         let all = Table {
@@ -1904,7 +1904,7 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
             "Tokens · all time\n\n\
              MODEL  INPUT  CACHE READ  CACHE WRITE  OUTPUT  REASONING  TOTAL  COST\n\
              overall\n  no tokens\n\n\
-             Cost ≈ API list price (prices as of 2026-09-24): an estimate, not a bill.\n"
+             Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.\n"
         );
     }
 
