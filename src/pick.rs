@@ -21,7 +21,7 @@ use crate::provider::{Provider, codex};
 use crate::registry::{Account, Registry};
 use crate::transcript::{self, SessionTail};
 use crate::usage::{self, CachedUsage, LiveUsage, Reading, Snapshot, Source, UsageRow, Window};
-use crate::{Env, attribution, probe};
+use crate::{Env, attribution, probe, wait};
 
 /// Percent left required on every window that applies, unless `[pick] min_headroom` says (R23).
 pub const DEFAULT_MIN_HEADROOM: u32 = 10;
@@ -843,6 +843,35 @@ pub fn ranked(candidates: &[Candidate]) -> Vec<usize> {
         .collect();
     order.sort_by_key(|&i| candidates[i].rules_rank);
     order
+}
+
+/// `--wait` (R23): when to try again after an attempt whose candidates, read at `now`, found
+/// nothing feasible. A pair infeasible by a usage window waits on that window (its binding
+/// one) to reset; one whose account is blocked (excluded, another provider, not logged in,
+/// `codex` not on PATH) waits on nothing time changes. With no pair of the first kind:
+/// [`wait::Wait::Never`], the blocked accounts' reasons.
+pub fn next_attempt(candidates: &[Candidate], entries: &[Entry], now: Timestamp) -> wait::Wait {
+    let blocking = candidates.iter().filter_map(|c| {
+        let entry = &entries[c.entry];
+        let window = c.binding.as_ref()?;
+        (c.why_not.is_some() && entry.blocked.is_none()).then_some((&entry.account, window))
+    });
+    wait::schedule(blocking, now).unwrap_or_else(|| {
+        let reasons: Vec<String> = entries
+            .iter()
+            .filter_map(|e| {
+                Some(format!(
+                    "{} {}",
+                    e.account.qualified(),
+                    e.blocked.as_deref()?
+                ))
+            })
+            .collect();
+        wait::Wait::Never(match reasons.is_empty() {
+            true => "no account is listed".to_string(),
+            false => reasons.join("; "),
+        })
+    })
 }
 
 /// `1h20m`, `2d3h`, `4d`, `45m` from `now` until `at` (0 when past).
@@ -3181,5 +3210,176 @@ mod tests {
         assert_eq!(format_in(at(2 * 86_400 + 3 * 3600 + 59), now), "2d3h");
         assert_eq!(format_in(at(4 * 86_400), now), "4d");
         assert_eq!(format_in(at(-5), now), "0m");
+    }
+
+    /// R23 `--wait`: a pair infeasible by a usage window waits on its binding window: the
+    /// earliest such reset over every pair, plus the margin; a blocked account does not count.
+    #[test]
+    fn next_attempt_waits_for_the_earliest_reset_plus_a_margin() {
+        let now = ts(NOW);
+        let mut excluded = entry(Provider::Claude, "work", 5, &[]);
+        excluded.blocked = Some("excluded ([pick] exclude)".into());
+        let entries = [
+            entry(
+                Provider::Claude,
+                "max",
+                5,
+                &[row(
+                    "Week (all models)",
+                    100.0,
+                    Some("2026-09-29T10:00:00Z"),
+                )],
+            ),
+            entry(
+                Provider::Claude,
+                "team",
+                5,
+                &[
+                    row("Session", 95.0, Some("2026-09-27T11:12:00Z")),
+                    row("Week (all models)", 40.0, Some("2026-09-28T10:00:00Z")),
+                ],
+            ),
+            excluded,
+        ];
+        let c = candidates(&entries, &Config::default(), now, None);
+        assert!(ranked(&c).is_empty());
+        match next_attempt(&c, &entries, now) {
+            wait::Wait::At { at, on } => {
+                assert_eq!(at, ts("2026-09-27T11:12:30Z"));
+                assert_eq!(on.account, "claude:team");
+                assert_eq!(on.window.label, "Session");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// R23 `--wait`: right after a reset that freed nothing (another window still blocks,
+    /// its reset just ahead), the next attempt is still a minute away: no spinning.
+    #[test]
+    fn next_attempt_waits_at_least_a_minute() {
+        let now = ts(NOW);
+        let entries = [entry(
+            Provider::Claude,
+            "max",
+            5,
+            &[
+                // Reset since it was cached: unknown, frees nothing by itself.
+                row("Session", 100.0, Some("2026-09-27T09:59:50Z")),
+                row("Week (all models)", 100.0, Some("2026-09-27T10:00:01Z")),
+            ],
+        )];
+        let c = candidates(&entries, &Config::default(), now, None);
+        assert!(!c[0].feasible());
+        let wait = next_attempt(&c, &entries, now);
+        assert_eq!(wait.next(), Some(ts("2026-09-27T10:01:00Z")));
+    }
+
+    /// R23 `--wait`: a blocking window with no reset ahead known is tried again in five
+    /// minutes.
+    #[test]
+    fn next_attempt_without_a_known_reset_retries_in_five_minutes() {
+        let now = ts(NOW);
+        let entries = [entry(
+            Provider::Claude,
+            "max",
+            5,
+            &[row("Week (all models)", 97.0, None)],
+        )];
+        let c = candidates(&entries, &Config::default(), now, None);
+        let wait = next_attempt(&c, &entries, now);
+        assert!(matches!(wait, wait::Wait::Unknown { .. }), "{wait:?}");
+        assert_eq!(wait.next(), Some(ts("2026-09-27T10:05:00Z")));
+    }
+
+    /// R23 `--wait`: what time does not change (excluded, another provider, not logged in,
+    /// no `codex`) is nothing to wait for; one pair blocked by a window is enough to wait.
+    #[test]
+    fn next_attempt_never_waits_on_what_time_does_not_change() {
+        let now = ts(NOW);
+        let blocked = |provider, name: &str, why: &str| {
+            let mut e = entry(provider, name, 5, &[]);
+            e.usage = None;
+            e.blocked = Some(why.into());
+            e
+        };
+        let mut entries = vec![
+            blocked(Provider::Claude, "work", "excluded ([pick] exclude)"),
+            blocked(Provider::Codex, "cx", "`codex` not found on PATH"),
+        ];
+        let c = candidates(&entries, &Config::default(), now, None);
+        assert_eq!(
+            next_attempt(&c, &entries, now),
+            wait::Wait::Never(
+                "claude:work excluded ([pick] exclude); codex:cx `codex` not found on PATH".into()
+            )
+        );
+        assert_eq!(
+            next_attempt(&[], &[], now),
+            wait::Wait::Never("no account is listed".into())
+        );
+        entries.push(entry(
+            Provider::Claude,
+            "max",
+            5,
+            &[row("Session", 100.0, Some("2026-09-27T12:00:00Z"))],
+        ));
+        let c = candidates(&entries, &Config::default(), now, None);
+        assert_eq!(
+            next_attempt(&c, &entries, now).next(),
+            Some(ts("2026-09-27T12:00:30Z"))
+        );
+    }
+
+    /// R23 `--wait` without `--live`: each attempt reads the same cache at a later instant.
+    /// Once the blocking window's reset has passed it is unknown, and the pair feasible of
+    /// unknown headroom: the wait ends at the reset plus the margin, the window named as reset
+    /// since cached, with the hint to `--live`. Waiting never makes remuda query live.
+    #[test]
+    fn a_cached_wait_ends_right_after_the_reset_of_unknown_headroom() {
+        struct Quiet;
+        impl wait::Status for Quiet {
+            fn show(&mut self, _: &wait::Wait, _: Timestamp) {}
+            fn clear(&mut self) {}
+        }
+        let cached = CachedUsage {
+            fetched_at: Some(ts(NOW) - jiff::SignedDuration::from_mins(5)),
+            rows: vec![row(
+                "Week (all models)",
+                100.0,
+                Some("2026-09-27T12:00:00Z"),
+            )],
+        };
+        let clock = std::cell::Cell::new(ts(NOW));
+        let mut attempts = Vec::new();
+        let ((entries, c), ended) = wait::until(
+            || {
+                let now = clock.get();
+                attempts.push(now);
+                let entries = vec![Entry {
+                    account: account(Provider::Claude, "max"),
+                    blocked: None,
+                    usage: Some(Snapshot::cached(&cached).at(now)),
+                    notes: Vec::new(),
+                }];
+                let c = candidates(&entries, &Config::default(), now, None);
+                let wait = ranked(&c)
+                    .is_empty()
+                    .then(|| next_attempt(&c, &entries, now));
+                Ok::<_, std::convert::Infallible>(((entries, c), wait))
+            },
+            None,
+            || clock.get(),
+            |d| clock.set(clock.get().checked_add(d).unwrap()),
+            &mut Quiet,
+        )
+        .unwrap();
+        assert_eq!(ended, wait::Ended::Ready);
+        assert_eq!(attempts, [ts(NOW), ts("2026-09-27T12:00:30Z")]);
+        assert!(c[0].feasible());
+        assert_eq!(c[0].headroom, None);
+        assert_eq!(
+            live_hint(&entries[0], &c[0]).as_deref(),
+            Some("Week (all models): reset since cached (--live asks the agent)")
+        );
     }
 }

@@ -32,6 +32,7 @@ mod tracking;
 pub mod transcript;
 pub mod tui;
 pub mod usage;
+pub mod wait;
 
 use std::collections::BTreeMap;
 

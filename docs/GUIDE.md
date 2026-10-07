@@ -258,8 +258,8 @@ models = ["gpt-6-astra"]
   would: claude gets `--model` and `--effort`, codex `-m` and `-c model_reasoning_effort=`,
   before your arguments; an option your arguments already set is left alone. Without `--run`,
   the arguments after `--` only go into the `command` shown, quoted for the shell so that it
-  can be copied and run as is. Arguments that neither start a new
-  session nor name one (`-c`, `--resume` without an id, `codex resume --last`) are refused.
+  can be copied and run as is. Arguments that neither start a new session nor name one (`-c`,
+  `--resume` without an id, `codex resume --last`) are refused.
 - **Resuming.** `remuda pick -- --resume <id>` (claude; also `--resume <id> --fork-session`) or
   `remuda pick -- resume <id>` (codex; also `fork <id>`) recommends the account to resume that
   session as. Prompt caches are per account: resuming as another account than the one that ran
@@ -269,8 +269,8 @@ models = ["gpt-6-astra"]
   among the feasible ones; it is never made feasible by it. The account is the one launched
   with that very home: a name registered again with another home is another login, and is not
   preferred. Where accounts do not share their sessions, each account's model and activity are
-  those of the copy in its own store. An account whose sessions are not shared with
-  the session's store cannot resume it and is not offered (once `remuda sessions` or the TUI has
+  those of the copy in its own store. An account whose sessions are not shared with the
+  session's store cannot resume it and is not offered (once `remuda sessions` or the TUI has
   indexed the session). Nothing is injected: the session keeps its own model, whose limits are
   the ones counted. The output says who ran the session and how long ago, and, when that
   account cannot be recommended, why, and what resuming elsewhere costs:
@@ -288,6 +288,20 @@ models = ["gpt-6-astra"]
   stderr who ran the session and, when that account is not the one launched, why; like `run`,
   it does not check whether the session is running elsewhere. Jev is told which account (by
   alias) ran the session and how long ago; never its id, title, directory or model.
+- **Waiting.** `remuda pick --wait` does not give up when nothing is feasible: it checks again
+  30 seconds after the earliest reset of a window that blocks (at least a minute apart; every 5
+  minutes when no reset is known), and then prints, or with `--run` launches, as usual. Each
+  check reads the cache again; it queries the agents only with `--live`. Without `--live`, a
+  window whose reset has passed is of unknown usage, so `pick --wait` returns right after the
+  reset and says that `--live` would ask. When nothing that blocks passes with time (excluded,
+  logged out), there is nothing to wait for: it exits 1 at once. `--max-wait <SECONDS>` gives up
+  (exit 1) as soon as the next check would come later: with a reset three hours away,
+  `--max-wait 3600` exits at once, since nothing can change before then. On a terminal one
+  status line says what it waits for; Ctrl-C (or SIGTERM) stops it, live queries under way
+  included. With `-- --resume <id>` it waits for the accounts that can resume the session, and
+  still prefers the one that ran it if its cache is warm when something frees up. `remuda usage
+  --wait <account>` does the same for one account: it returns once none of its windows is below
+  `[pick] min_headroom`.
 
 ## Cost estimates
 
@@ -334,6 +348,12 @@ With `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` set, claude's `/usage` asks for 
 only repeats a reading taken within the hour, if there is one. Remuda's live usage query removes
 the variable for that one command, so `remuda usage --live` and `u` get a new reading; sessions
 you launch keep it, and the Accounts view says so.
+
+The live usage query is remuda's probe, not one of your sessions: it runs
+`claude -p /usage --no-session-persistence --setting-sources "" --strict-mcp-config`, which loads
+none of the account's settings files and starts none of its MCP servers. Your hooks (a
+`SessionStart` or `SessionEnd` command, say) do not run for it, and the `env` of your settings
+files does not apply to it.
 
 For each member of `[share.claude]` it also checks the links of the home, and says which link
 to make:

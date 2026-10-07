@@ -1068,8 +1068,8 @@ fn live_usage_first() {
     let out = pick(&sb, false, &["--live"]);
     assert!(
         out.stdout.contains(
-            "live query failed (`claude -p /usage --no-session-persistence` \
-                             exited with status 1"
+            "live query failed (`claude -p /usage --no-session-persistence \
+             --setting-sources \"\" --strict-mcp-config` exited with status 1"
         ),
         "{}",
         out.stdout
@@ -2418,4 +2418,451 @@ fn per_model_windows_without_models_are_shown_not_counted() {
             .contains("(per-model; applies only if the agent's default model is in this family)"),
         "{body:#}"
     );
+}
+
+// --- wait --------------------------------------------------------------------------------
+
+/// `--json` without what moves with the clock: each candidate's `age_seconds`.
+fn json_without_age(stdout: &str) -> Value {
+    let mut v: Value = serde_json::from_str(stdout).unwrap();
+    for c in v["candidates"].as_array_mut().unwrap() {
+        c.as_object_mut().unwrap().remove("age_seconds");
+    }
+    v
+}
+
+/// R23 `--wait`: with a feasible pair it changes nothing: the same report, text or `--json`,
+/// right away, and nothing more is run.
+#[test]
+fn wait_changes_nothing_when_a_pair_is_feasible() {
+    let (sb, _, _) = two_accounts(MODELS);
+    let plain = pick(&sb, false, &["--json"]);
+    let waited = pick(&sb, false, &["--json", "--wait", "--max-wait", "0"]);
+    assert_eq!((plain.code, waited.code), (Some(0), Some(0)));
+    assert_eq!(
+        json_without_age(&waited.stdout),
+        json_without_age(&plain.stdout)
+    );
+    assert_eq!(waited.stderr, plain.stderr);
+    let plain = pick(&sb, false, &[]);
+    let waited = pick(&sb, false, &["--wait"]);
+    assert_eq!(waited.code, Some(0));
+    assert_eq!(without_clock(&waited.stdout), without_clock(&plain.stdout));
+    assert_eq!(waited.stderr, plain.stderr);
+    assert!(sb.invocations().is_empty(), "--wait never queries live");
+}
+
+/// R23 `--wait`: when what keeps every pair from being feasible does not pass with time
+/// (excluded, not logged in, another provider), there is nothing to wait for: exit 1 at once,
+/// the reasons as without `--wait`, and why on stderr.
+#[test]
+fn wait_with_nothing_to_wait_for_exits_at_once() {
+    let sb = Sandbox::new();
+    let max = sb.make_claude_home("h/max");
+    let fresh = sb.make_claude_home("h/fresh");
+    sb.write_claude_json(
+        Some(&max),
+        &claude_json("max@example.com", 60, &[limit("weekly_all", 10.0, DAY)]),
+    );
+    configure(
+        &sb,
+        &[("claude", "max", &max), ("claude", "fresh", &fresh)],
+        "[pick]\nexclude = [\"claude:max\"]\n",
+    );
+    let start = std::time::Instant::now();
+    let plain = pick(&sb, false, &[]);
+    let out = pick(&sb, false, &["--wait"]);
+    assert!(start.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(out.code, Some(1));
+    assert_eq!(out.stdout, plain.stdout);
+    let logged_out = "not logged in (no oauthAccount in .claude.json, no usage cache)";
+    assert_eq!(
+        out.stderr,
+        format!(
+            "{}remuda: nothing to wait for: claude:default {logged_out}; claude:max excluded \
+             ([pick] exclude); claude:fresh {logged_out}\n",
+            plain.stderr
+        )
+    );
+    // Not of `--provider`, and no codex account at all.
+    let out = pick(&sb, false, &["--wait", "--provider", "codex", "--json"]);
+    assert_eq!(out.code, Some(1));
+    assert_eq!(
+        serde_json::from_str::<Value>(&out.stdout).unwrap()["account"],
+        Value::Null
+    );
+    assert!(
+        out.stderr
+            .contains("nothing to wait for: claude:default not a codex account"),
+        "{}",
+        out.stderr
+    );
+}
+
+/// `max`, whose week is used up until an hour from now; `default` is logged out.
+fn used_up_for_an_hour() -> (Sandbox, PathBuf) {
+    let sb = Sandbox::new();
+    let max = sb.make_claude_home("h/max");
+    sb.write_claude_json(
+        Some(&max),
+        &claude_json("max@example.com", 60, &[limit("weekly_all", 100.0, 3600)]),
+    );
+    configure(&sb, &[("claude", "max", &max)], "");
+    (sb, max)
+}
+
+/// R23 `--max-wait`: when the next check (the reset an hour away, plus the margin) would come
+/// after the deadline, remuda gives up at once: the reasons as without `--wait`, exit 1, and
+/// when the next check would have been. `--max-wait 0` is one look.
+#[test]
+fn max_wait_gives_up_when_the_next_check_is_later() {
+    let (sb, _) = used_up_for_an_hour();
+    let plain = pick(&sb, false, &[]);
+    assert_eq!(plain.code, Some(1));
+    let next = jiff::Timestamp::from_second(now() + 3600 + 30)
+        .unwrap()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .strftime("%b %-d %H:%M")
+        .to_string();
+    for max_wait in ["0", "1", "60"] {
+        let start = std::time::Instant::now();
+        let out = pick(&sb, false, &["--wait", "--max-wait", max_wait]);
+        assert!(start.elapsed() < std::time::Duration::from_secs(30));
+        assert_eq!(out.code, Some(1), "{max_wait}");
+        assert_eq!(out.stdout, plain.stdout);
+        assert!(
+            why_not(&out, "claude:max / default")
+                .starts_with("Week (all models): 100% used, below the 10% left required"),
+            "{}",
+            out.stdout
+        );
+        let gave_up = out
+            .stderr
+            .strip_prefix(&plain.stderr)
+            .unwrap_or_else(|| panic!("{max_wait}: {}", out.stderr));
+        // The minute may turn between the two clocks.
+        assert!(
+            gave_up.starts_with("remuda: gave up waiting: the next check (")
+                && gave_up.ends_with(") would come after --max-wait\n"),
+            "{gave_up}"
+        );
+        assert!(
+            gave_up.contains(&next) || max_wait != "0",
+            "{gave_up} (expected about {next})"
+        );
+    }
+    let out = pick(&sb, false, &["--wait", "--max-wait", "1", "--json"]);
+    assert_eq!(out.code, Some(1));
+    let v: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(v["account"], Value::Null);
+    assert!(sb.invocations().is_empty(), "--wait never queries live");
+}
+
+/// R23 `--wait`: it does not combine with `--print-request`, and `--max-wait` needs it.
+#[test]
+fn wait_options_that_do_not_combine() {
+    let (sb, _) = used_up_for_an_hour();
+    for args in [
+        &["--wait", "--print-request"][..],
+        &["--max-wait", "5"],
+        &["--wait", "--max-wait", "-1"],
+        &["--wait", "--max-wait", "never"],
+    ] {
+        let out = pick(&sb, false, args);
+        assert_eq!(out.code, Some(2), "{args:?}: {}", out.stderr);
+    }
+}
+
+/// R23 `--wait`: arguments that neither start a new session nor name one to resume are
+/// refused before the wait, not hours later, with `--run` or without (the command shown is one
+/// remuda would launch). A resume that names its session is not refused (R23 Resuming): see
+/// `wait_resumes_a_named_session`.
+#[test]
+fn wait_refuses_an_unnamed_session_before_waiting() {
+    let (sb, _) = used_up_for_an_hour();
+    for run in [&["--run"][..], &[]] {
+        for refused in [&["-c"][..], &["--resume"]] {
+            let args = [&["--wait", "--max-wait", "600"][..], run, &["--"], refused].concat();
+            let start = std::time::Instant::now();
+            let out = pick(&sb, false, &args);
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(30),
+                "{args:?}"
+            );
+            assert_eq!(out.code, Some(1), "{args:?}: {}", out.stderr);
+            assert!(
+                out.stderr.contains("`pick --run` starts a new session"),
+                "{args:?}: {}",
+                out.stderr
+            );
+            assert!(!out.stderr.contains("gave up"), "{args:?}: {}", out.stderr);
+        }
+    }
+    assert!(sb.invocations().is_empty());
+}
+
+/// R23 `--wait` with Resuming: a named session is waited for like any recommendation, among
+/// the accounts that can resume it. Nothing to wait for when no account can see it (that time
+/// does not change); giving up, the text still tells the session's facts; and once something is
+/// feasible, the warm account is preferred as without `--wait`.
+#[test]
+fn wait_resumes_a_named_session() {
+    // Both accounts used up for an hour; team ran the session a few minutes ago.
+    let (sb, shared) = shared_store(&format!("{NOTES}{MODELS}"), 300, false);
+    for account in ["claude:max", "claude:team"] {
+        let home = PathBuf::from(home_of(&sb, account));
+        sb.write_claude_json(
+            Some(&home),
+            &claude_json("x@example.com", 60, &[limit("weekly_all", 100.0, 3600)]),
+        );
+    }
+    sb.remuda().arg("sessions").assert().success();
+    log_launch(&sb, "claude:team", 600, "/w/proj", SESSION, None);
+    let start = std::time::Instant::now();
+    let out = pick(
+        &sb,
+        false,
+        &[
+            "--wait",
+            "--max-wait",
+            "0",
+            "--run",
+            "--",
+            "--resume",
+            SESSION,
+        ],
+    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(out.code, Some(1), "{}{}", out.stdout, out.stderr);
+    assert!(out.stderr.contains("gave up waiting"), "{}", out.stderr);
+    assert!(
+        !out.stderr.contains("starts a new session"),
+        "a named session is not refused: {}",
+        out.stderr
+    );
+    let session = field(&out, "session");
+    assert!(
+        session.starts_with(&format!("resume {SESSION}: claude:team ran it "))
+            && session.contains("(prompt cache warm: preferred)"),
+        "{}",
+        out.stdout
+    );
+    assert!(launched(&sb).is_empty());
+
+    // The session is in no store an account has: nothing to wait for, at once.
+    std::fs::remove_file(shared.join("-w-proj").join(format!("{SESSION}.jsonl"))).unwrap();
+    let elsewhere = sb.root().join("elsewhere-projects");
+    write_transcript(&elsewhere, SESSION, "/w/proj", 300, "claude-opus-5-5");
+    let index = sb.remuda_home().join("state").join("index.json");
+    let text = std::fs::read_to_string(&index).unwrap();
+    let real = std::fs::canonicalize(&shared).unwrap();
+    let moved = text.replace(
+        real.to_str().unwrap(),
+        std::fs::canonicalize(&elsewhere).unwrap().to_str().unwrap(),
+    );
+    assert_ne!(moved, text);
+    std::fs::write(&index, moved).unwrap();
+    let start = std::time::Instant::now();
+    let out = pick(
+        &sb,
+        false,
+        &["--wait", "--max-wait", "600", "--", "--resume", SESSION],
+    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(30));
+    assert_eq!(out.code, Some(1), "{}{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains("nothing to wait for: ")
+            && out
+                .stderr
+                .contains("claude:max cannot see this session (its store is not this account's)"),
+        "{}",
+        out.stderr
+    );
+
+    // Feasible: `--wait` changes nothing, the warm account first.
+    let (sb, _) = shared_store(&format!("{NOTES}{MODELS}"), 300, true);
+    log_launch(&sb, "claude:team", 600, "/w/proj", SESSION, None);
+    let out = pick(&sb, false, &["--wait", "--", "--resume", SESSION]);
+    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
+    assert_eq!(field(&out, "account"), "claude:team");
+}
+
+/// R23 `--wait --run` (lane review round 1): the arguments are checked for the providers a
+/// pair may come from, as `--run` checks them. Claude is excluded (`max`) or logged out
+/// (`default`), so `-c` is codex's option here, not claude's `--continue`: with a feasible codex
+/// pair `--wait` launches exactly as without it, and when the codex pair has to wait, it waits
+/// (here it gives up at once, `--max-wait 0`) instead of refusing the arguments.
+#[test]
+fn wait_run_checks_only_the_providers_that_can_launch() {
+    let sb = Sandbox::new();
+    sb.install_codex();
+    let work = sb.make_codex_home("c/work");
+    sb.set_codex_login(Some(&work), "Logged in using ChatGPT");
+    let max = sb.make_claude_home("h/max");
+    sb.write_claude_json(
+        Some(&max),
+        &claude_json("max@example.com", 60, &[limit("weekly_all", 10.0, DAY)]),
+    );
+    configure(
+        &sb,
+        &[("claude", "max", &max), ("codex", "work", &work)],
+        "[pick]\nexclude = [\"claude:max\"]\n",
+    );
+    let effort = ["--", "-c", "model_reasoning_effort=high"];
+    let launches = || -> Vec<Vec<String>> {
+        sb.codex_invocations()
+            .into_iter()
+            .map(|i| i.args)
+            .filter(|args| args.first().map(String::as_str) == Some("-c"))
+            .collect()
+    };
+    for wait in [&[][..], &["--wait"]] {
+        let args = [&["--offline", "--run"][..], wait, &effort].concat();
+        let out = pick(&sb, false, &args);
+        assert_eq!(out.code, Some(0), "{args:?}: {}{}", out.stdout, out.stderr);
+    }
+    assert_eq!(launches(), [["-c", "model_reasoning_effort=high"]; 2]);
+
+    // The codex pair now waits for its week, used up live until an hour from now.
+    let resets = now() + 3600;
+    sb.set_codex_account(
+        Some(&work),
+        r#"{"account": {"type": "chatgpt", "email": "cx@example.com", "planType": "pro"}}"#,
+    );
+    sb.set_codex_rate_limits(
+        Some(&work),
+        &format!(
+            r#"{{"rateLimits": {{"limitId": "codex", "primary":
+                {{"usedPercent": 100, "windowDurationMins": 10080, "resetsAt": {resets}}}}}}}"#
+        ),
+    );
+    let args = [
+        &["--offline", "--live", "--wait", "--max-wait", "0", "--run"][..],
+        &effort,
+    ]
+    .concat();
+    let out = pick(&sb, false, &args);
+    assert_eq!(out.code, Some(1), "{}{}", out.stdout, out.stderr);
+    assert!(out.stderr.contains("gave up waiting"), "{}", out.stderr);
+    assert!(
+        !out.stderr.contains("starts a new session"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(launches().len(), 2, "nothing more was launched");
+}
+
+/// `remuda pick <args>` left waiting until `ready`, then sent `signal`: how it ended, and
+/// whether anything it started outlived it. remuda is given the writing end of a pipe, which
+/// every process it starts inherits: the reading end sees the end of the pipe once the last of
+/// them is gone.
+fn signalled_while_waiting(
+    sb: &Sandbox,
+    args: &[&str],
+    ready: impl Fn() -> bool,
+    signal: libc::c_int,
+) -> (std::process::ExitStatus, bool) {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    let (mut alive, held) = std::io::pipe().unwrap();
+    let held_fd = held.as_raw_fd();
+    let mut cmd = sb.remuda_process();
+    cmd.arg("pick")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: the closure only calls `signal` and `fcntl`, both async-signal-safe. Whatever
+    // started the tests may have left SIGINT ignored, which remuda would then leave alone too;
+    // the pipe's writing end, closed on exec elsewhere, stays open in remuda.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            if libc::fcntl(held_fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut remuda = cmd.spawn().unwrap();
+    drop(held);
+    let until = Instant::now() + Duration::from_secs(60);
+    while !ready() {
+        if Instant::now() >= until {
+            let _ = remuda.kill();
+            panic!("remuda never got to wait");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Past the attempt, into the sleep: an attempt takes far less than this, also under load,
+    // and a signal during one ends remuda all the same.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(remuda.try_wait().unwrap().is_none(), "remuda did not wait");
+    // SAFETY: kill(2) takes no pointers.
+    assert_eq!(unsafe { libc::kill(remuda.id() as libc::pid_t, signal) }, 0);
+    let until = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match remuda.try_wait().unwrap() {
+            Some(status) => break status,
+            None if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+            None => {
+                let _ = remuda.kill();
+                panic!("remuda slept through signal {signal}");
+            }
+        }
+    };
+    let (tx, ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = alive.read(&mut [0]);
+        let _ = tx.send(());
+    });
+    let outlived = ended.recv_timeout(Duration::from_secs(10)).is_err();
+    (status, outlived)
+}
+
+/// R23 `--wait`: Ctrl-C (or SIGTERM) while remuda waits ends it by that signal, at once. With
+/// cached usage no handler was ever installed: the signal's default action.
+#[test]
+fn a_signal_ends_a_waiting_pick() {
+    use std::os::unix::process::ExitStatusExt;
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let (sb, _) = used_up_for_an_hour();
+        let (status, outlived) = signalled_while_waiting(&sb, &["--wait"], || true, signal);
+        assert_eq!(status.signal(), Some(signal), "{status:?}");
+        assert!(!outlived, "something remuda started outlived it");
+    }
+}
+
+/// R23 `--wait --live`, R4: a live attempt installs remuda's signal handler (its queries run in
+/// process groups of their own), and it is never replaced. The sleep that follows still ends
+/// by Ctrl-C at once, and no query is left running.
+#[test]
+fn an_interrupt_ends_a_live_wait_after_its_queries() {
+    use std::os::unix::process::ExitStatusExt;
+    let (sb, max) = used_up_for_an_hour();
+    let resets = jiff::Timestamp::from_second(now() + 3600)
+        .unwrap()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .strftime("%b %-d at %-I:%M%P (UTC)")
+        .to_string();
+    sb.set_live_usage(
+        Some(&max),
+        &format!(
+            "Current session: 5% used \u{b7} resets {resets}\n\
+             Current week (all models): 100% used \u{b7} resets {resets}\n"
+        ),
+    );
+    // Each claude account's query has answered: `default` (no fixture, fails) and `max`.
+    let queried = || {
+        std::fs::read(sb.claude_out())
+            .map(|bytes| common::parse_invocations(&bytes).len() >= 2)
+            .unwrap_or(false)
+    };
+    let (status, outlived) =
+        signalled_while_waiting(&sb, &["--wait", "--live"], queried, libc::SIGINT);
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+    assert!(!outlived, "a query outlived remuda");
+    let invs = sb.invocations();
+    assert_eq!(invs.len(), 2, "one attempt, then the wait: {invs:?}");
 }
