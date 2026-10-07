@@ -10,13 +10,23 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Added
 
+- `remuda pick --wait [--max-wait <SECONDS>]`: when nothing is feasible, wait until something is,
+  checking again 30 seconds after the earliest reset of a window that blocks (at least a minute
+  apart, every 5 minutes when no reset is known), then print or launch as usual (SPEC R23). It
+  never queries live by itself: without `--live` it reads the cache again, and returns right
+  after the reset, of unknown headroom. Exits 1 at once when nothing that blocks passes with
+  time, and when the next check would come after `--max-wait` (or `--max-wait` ran out while
+  the computer slept). A status line on a terminal says
+  what it waits for.
+- `remuda usage --wait <account> [--max-wait <SECONDS>]`: wait until none of the account's
+  windows has less than `[pick] min_headroom` percent left, then print its usage (SPEC R10).
 - The Accounts view warns when `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN` is set (it
   overrides every account's `/login`, like `ANTHROPIC_API_KEY`), when `ANTHROPIC_BASE_URL` is set
   (every account's requests go to that endpoint), and when
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (SPEC R11). The values are never shown.
-- Usage history (SPEC R24): every usage reading of `remuda usage` (cached or `--live`) and of the
-  TUI's Accounts view (its cached usage and `u`) is recorded in `state/usage-history.jsonl`, a
-  line per window, at the time the agent took it; the same reading is recorded once, and points
+- Usage history (SPEC R24): every usage reading of `remuda usage` (cached or `--live`, and each
+  one `--wait` takes, the one it prints included) and of the TUI's Accounts view (its cached
+  usage and `u`) is recorded in `state/usage-history.jsonl`, a line per window, at the time the agent took it; the same reading is recorded once, and points
   older than 45 days are dropped. `remuda pick` records nothing. Concurrent writers lose no point,
   also through two `$REMUDA_HOME`s whose histories are symlinks to one file; nothing is written
   to a history that is a symlink to a file others can read.
@@ -31,6 +41,11 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Changed
 
+- Claude's live usage query (`remuda usage --live`, `u` in the TUI, `remuda pick --live`) no
+  longer runs the account's hooks or starts its MCP servers: it is
+  `claude -p /usage --no-session-persistence --setting-sources "" --strict-mcp-config` (SPEC R10).
+  A `SessionStart` or `SessionEnd` hook in your settings no longer fires for remuda's query, and
+  the `env` of your settings files no longer applies to it. The query is also quicker.
 - Codex statistics read `cache_write_input_tokens`, which codex 0.160 records (SPEC R20): the
   tokens written to the cache are part of `input_tokens`, so they are now counted as cache write
   instead of input, and priced at the cache-write price, 1.25 times the input price on
@@ -106,6 +121,9 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Fixed
 
+- SIGTERM sent to remuda (by `kill` or a supervisor) is passed on to the agent commands it is
+  running, as Ctrl-C is, before remuda ends by it (SPEC R4): a live usage query
+  (`remuda usage --live`, `remuda pick --live`, and their `--wait`) no longer outlives remuda.
 - Claude's live reset times written `Oct 9, 2:59pm (UTC)` or with a year (`Jan 2, 2027 at 3pm
   (UTC)`, `Jan 2, 2027, 3pm (UTC)`) are now read as instants (SPEC R10); they were wording
   remuda could not read, so the timeline drew the cached reset of the same limit in their

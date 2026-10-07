@@ -107,7 +107,7 @@ The exceptions, all for a type or a small helper:
 | `provider::app_server` | JSON-RPC client for `codex app-server` (`account/read`, `account/rateLimits/read`) | R4, R10 |
 | `probe` | Run a short command in its own process group with captured output and a timeout, taking its output once it exited and terminating the group when it times out; JSON-RPC over stdio on the same core, its group terminated on every way out; run many in parallel; run `curl` with its configuration on stdin | R4, R10, R23 |
 | `account_command` | Run an agent's command for an account: pick the provider's program, set or remove the home variable (and remove the variables a caller names), run it, and word the failure (`Runner`, `OnPath`); the shape of a parse that may be partial (`Parsed`) | R2, R4, R10, R10a |
-| `interrupt` | The terminal's signals, owned in one place: sat out while a foreground child has the terminal, passed on to the process groups of running commands and of commands being started, before remuda ends by them; a place for each of at most 1024 commands at a time, which one more waits for | R4, R6 |
+| `interrupt` | The terminal's signals and SIGTERM, owned in one place: Ctrl-C and Ctrl-\ sat out while a foreground child has the terminal, passed on to the process groups of running commands and of commands being started, before remuda ends by them; a place for each of at most 1024 commands at a time, which one more waits for | R4, R6 |
 | `launch` | Classify arguments, inject `--session-id`, set or unset the home variable, the launch record, `exec` and foreground runs | R2, R6, R16, R17 |
 | `share` | Shared configuration injected at launch, the fallback for what a home does not link: `plan` (reads only; a `Plan` carries the relation of every shared item) and `apply` (item links, rule copies, settings file: what they are; `owned` writes them) | R18 |
 | `home_items` | The items of a claude home, once: the catalog (each item's name, whether `setup` links it and on what condition, whether the launch's `--add-dir` carries it, when the source's counts as one to share, what breaks when it is another account's) and how a member's home relates to the source's right now (`Source::relate`, `linked_elsewhere`, `membership`) | R11, R12, R18 |
@@ -125,7 +125,8 @@ The exceptions, all for a type or a small helper:
 | `stats` | Token counting, deduplication across copies, periods, sections, chart buckets, text table; its sources, how they are listed, its cache | R20 |
 | `pricing` | Built-in prices and `[prices]` overrides; the cost of one request in picodollars | R20 |
 | `account_config` | What an account's sessions load and where each item comes from, on top of `share::plan` | R22 |
-| `pick` | `[pick]`; candidates, which windows apply to a model, and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options | R3, R23 |
+| `pick` | `[pick]`; candidates, which windows apply to a model, and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options; when `--wait` tries again (`next_attempt`) | R3, R23 |
+| `wait` | `--wait`: when to try again from the windows that block and their resets (`schedule`, its named constants), the loop of attempts with an injected clock and sleep (`until`), the status line | R10, R23 |
 | `jev` | The request to Jev (aliased state, Choice and Score questions), `curl` transport, response parsing | R23 |
 | `privacy` | `Marked`, a message in the pieces it was put together from (remuda's words, a path, text from elsewhere); account-name aliases, whole-word aliasing of names in free text, and aliasing of every `provider:name` in the `pick` notes | R21, R23 |
 | `text` | Terminal text measured in display columns | – |

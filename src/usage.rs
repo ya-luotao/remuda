@@ -413,31 +413,70 @@ fn cached_claude(account: &Account, env: &Env) -> Result<CachedUsage, String> {
 
 /// `remuda usage` block for one account from its cached usage (R10).
 pub fn cached_report(account: &Account, env: &Env, tz: &TimeZone, now: Timestamp) -> String {
+    cached_attempt(account, env, tz, now).0
+}
+
+/// [`cached_report`], and the reading it shows (`None` without cached usage): for
+/// `usage --wait` (R10), which reads it for windows that are used up, and for the usage
+/// history (R24), which records it.
+pub fn cached_attempt(
+    account: &Account,
+    env: &Env,
+    tz: &TimeZone,
+    now: Timestamp,
+) -> (String, Option<Reading>) {
     cached_text(account, &cached_usage(account, env), tz, now)
 }
 
-/// [`cached_report`] of the cached usage `cached` already read.
+/// [`cached_attempt`] of the cached usage `cached` already read.
 pub fn cached_text(
     account: &Account,
     cached: &Result<CachedUsage, String>,
     tz: &TimeZone,
     now: Timestamp,
-) -> String {
+) -> (String, Option<Reading>) {
     let name = account.qualified();
     match cached {
-        Err(notice) => format!("{name}  no cached usage ({notice})\n"),
+        Err(notice) => (format!("{name}  no cached usage ({notice})\n"), None),
         Ok(cached) => {
             let reading = Snapshot::cached(cached).at(now);
             let when = match (reading.age_text(), reading.fetched_at) {
                 (Some(age), Some(at)) => format!("cached {age} ({})", format_time(at, tz)),
                 _ => "cached (time unknown)".to_string(),
             };
-            format!("{name}  {when}\n{}", format_rows(&reading, tz, now))
+            let text = format!("{name}  {when}\n{}", format_rows(&reading, tz, now));
+            (text, Some(reading))
         }
     }
 }
 
-pub const LIVE_USAGE_ARGS: &[&str] = &["-p", "/usage", "--no-session-persistence"];
+/// The windows of `reading` that are used up for `usage --wait` (R10): of known usage, with
+/// less than `min_headroom` percent left (`[pick] min_headroom`, R3). A window that has reset
+/// since its usage was recorded is unknown, never used up.
+pub fn exhausted(reading: &Reading, min_headroom: u32) -> Vec<&Window> {
+    reading
+        .windows
+        .iter()
+        .filter(|w| w.left().is_some_and(|left| left < f64::from(min_headroom)))
+        .collect()
+}
+
+/// Claude's live usage query (R10): `/usage` in print mode, which calls no model, leaving no
+/// transcript (`--no-session-persistence`). It is remuda's probe, not the user's session, so it
+/// loads none of the account's settings files (`--setting-sources` with an empty list: no
+/// hooks run, no plugin is enabled, the files' `env` is not applied) and none of its MCP
+/// servers (`--strict-mcp-config` without `--mcp-config`). The empty list is an argument of its
+/// own: claude reads `--setting-sources=` as a flag without its value. Verified on 2.1.292
+/// (R10's Basis); not `--bare`, with which `/usage` prints the session's cost instead of the
+/// limits.
+pub const LIVE_USAGE_ARGS: &[&str] = &[
+    "-p",
+    "/usage",
+    "--no-session-persistence",
+    "--setting-sources",
+    "",
+    "--strict-mcp-config",
+];
 
 /// Set, it makes claude's `/usage` send no request and only repeat a reading another run took
 /// within the hour, or print no usage line at all (R10, verified on 2.1.292).
@@ -517,7 +556,7 @@ pub fn live_usage(
     }
 }
 
-/// Runs `claude -p /usage --no-session-persistence` for `account` (R10), without
+/// Runs `claude` with [`LIVE_USAGE_ARGS`] for `account` (R10), without
 /// [`NONESSENTIAL_TRAFFIC_VAR`]: never through `launch::prepare`, so no `--session-id` is
 /// injected and nothing is logged. An answer with a usage line that cannot be read is not
 /// recognized as a whole: its other lines are not the account's usage.
@@ -621,24 +660,40 @@ pub fn live_report(
     clock: fn() -> Timestamp,
     timeout: Duration,
 ) -> (String, bool) {
+    let (text, ok, _) = live_attempt(account, agents, tz, clock, timeout);
+    (text, ok)
+}
+
+/// [`live_report`], and the reading it shows (`None` when the answer gave no usage rows): for
+/// `usage --wait --live` (R10) and for the usage history (R24). The answer is read when it
+/// arrived, by `clock` after the query.
+pub fn live_attempt(
+    account: &Account,
+    agents: &dyn Runner,
+    tz: &TimeZone,
+    clock: fn() -> Timestamp,
+    timeout: Duration,
+) -> (String, bool, Option<Reading>) {
     let result = live_usage(account, agents, timeout);
     live_text(account, &result, tz, clock())
 }
 
-/// [`live_report`] of the answer `result`, read at `answered_at`: when it arrived.
+/// [`live_attempt`] of the answer `result`, read at `answered_at`: when it arrived.
 pub fn live_text(
     account: &Account,
     result: &Result<LiveResult, String>,
     tz: &TimeZone,
     answered_at: Timestamp,
-) -> (String, bool) {
+) -> (String, bool, Option<Reading>) {
     let name = account.qualified();
     match result {
-        Err(e) => (format!("{name}  error: {e}\n"), false),
+        Err(e) => (format!("{name}  error: {e}\n"), false, None),
         Ok(LiveResult { usage, identity }) => {
             let who = identity.as_ref().map(who_and_plan).unwrap_or_default();
             match usage {
-                LiveUsage::Untold(untold) => (format!("{name}  live: {}\n", untold.reason()), true),
+                LiveUsage::Untold(untold) => {
+                    (format!("{name}  live: {}\n", untold.reason()), true, None)
+                }
                 LiveUsage::Unrecognized(stdout) => {
                     let raw: String = stdout
                         .lines()
@@ -647,6 +702,7 @@ pub fn live_text(
                     (
                         format!("{name}  live (output not recognized; shown as is){who}\n{raw}"),
                         true,
+                        None,
                     )
                 }
                 LiveUsage::Rows(rows) => {
@@ -657,6 +713,7 @@ pub fn live_text(
                             format_rows(&reading, tz, answered_at)
                         ),
                         true,
+                        Some(reading),
                     )
                 }
             }
@@ -1107,7 +1164,8 @@ mod tests {
         }
     }
 
-    const USAGE: &str = "claude:max -p /usage --no-session-persistence";
+    const USAGE: &str =
+        "claude:max -p /usage --no-session-persistence --setting-sources \"\" --strict-mcp-config";
     const T: Duration = Duration::from_secs(90);
 
     /// R10: `claude -p /usage` answers rows; a failure says the command and why; a claude that
@@ -1124,13 +1182,13 @@ mod tests {
         let agents = Scripted::new().on(USAGE, Outcome::TimedOut);
         assert_eq!(
             live_usage(&max, &agents, T),
-            Err("`claude -p /usage --no-session-persistence` timed out after 90s".to_string())
+            Err("`claude -p /usage --no-session-persistence --setting-sources \"\" --strict-mcp-config` timed out after 90s".to_string())
         );
         let agents = Scripted::new().on(USAGE, Scripted::exited(1, "", "Not logged in\n"));
         assert_eq!(
             live_usage(&max, &agents, T),
             Err(
-                "`claude -p /usage --no-session-persistence` exited with status 1: Not logged in"
+                "`claude -p /usage --no-session-persistence --setting-sources \"\" --strict-mcp-config` exited with status 1: Not logged in"
                     .to_string()
             )
         );
@@ -1553,5 +1611,37 @@ mod tests {
                 "Week (Fable) 90% !!"
             ]
         );
+    }
+
+    /// R10 `usage --wait`: a window is used up with less than `min_headroom` percent left, of
+    /// known usage only: one that has reset since it was cached never is.
+    #[test]
+    fn used_up_windows_are_known_and_below_min_headroom() {
+        let at = |s: &str| s.parse::<Timestamp>().unwrap();
+        let now = at("2026-10-08T10:00:00Z");
+        let row = |label: &str, percent: f64, resets: &str| UsageRow {
+            label: label.into(),
+            percent,
+            severity: None,
+            resets: Some(Resets::At(at(resets))),
+        };
+        let cached = CachedUsage {
+            fetched_at: Some(at("2026-10-08T08:00:00Z")),
+            rows: vec![
+                row("Session", 100.0, "2026-10-08T09:00:00Z"),
+                row("Week (all models)", 90.0, "2026-10-09T09:00:00Z"),
+                row("Week (Fable)", 95.5, "2026-10-09T09:00:00Z"),
+            ],
+        };
+        let reading = Snapshot::cached(&cached).at(now);
+        let labels = |min| -> Vec<String> {
+            exhausted(&reading, min)
+                .iter()
+                .map(|w| w.label.clone())
+                .collect()
+        };
+        assert_eq!(labels(10), ["Week (Fable)"]);
+        assert_eq!(labels(11), ["Week (all models)", "Week (Fable)"]);
+        assert!(labels(0).is_empty());
     }
 }

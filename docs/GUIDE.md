@@ -257,6 +257,17 @@ models = ["gpt-6-astra"]
   would: claude gets `--model` and `--effort`, codex `-m` and `-c model_reasoning_effort=`,
   before your arguments; an option your arguments already set is left alone. Arguments that
   resume or fork a session are refused.
+- **Waiting.** `remuda pick --wait` does not give up when nothing is feasible: it checks again
+  30 seconds after the earliest reset of a window that blocks (at least a minute apart; every 5
+  minutes when no reset is known), and then prints, or with `--run` launches, as usual. Each
+  check reads the cache again; it queries the agents only with `--live`. Without `--live`, a
+  window whose reset has passed is of unknown usage, so `pick --wait` returns right after the
+  reset and says that `--live` would ask. When nothing that blocks passes with time (excluded,
+  logged out), there is nothing to wait for: it exits 1 at once. `--max-wait <SECONDS>` gives up
+  (exit 1) as soon as the next check would come later: with a reset three hours away,
+  `--max-wait 3600` exits at once, since nothing can change before then. On a terminal one status line says what
+  it waits for; Ctrl-C (or SIGTERM) stops it, live queries under way included. `remuda usage --wait <account>` does the same for one account: it returns once none of its
+  windows is below `[pick] min_headroom`.
 
 ## Cost estimates
 
@@ -304,6 +315,12 @@ only repeats a reading taken within the hour, if there is one. Remuda's live usa
 the variable for that one command, so `remuda usage --live` and `u` get a new reading; sessions
 you launch keep it, and the Accounts view says so.
 
+The live usage query is remuda's probe, not one of your sessions: it runs
+`claude -p /usage --no-session-persistence --setting-sources "" --strict-mcp-config`, which loads
+none of the account's settings files and starts none of its MCP servers. Your hooks (a
+`SessionStart` or `SessionEnd` command, say) do not run for it, and the `env` of your settings
+files does not apply to it.
+
 For each member of `[share.claude]` it also checks the links of the home, and says which link
 to make:
 
@@ -331,7 +348,7 @@ Accounts with `share = false` and the source itself are not checked.
   `.claude.json`, the rate limits in Codex rollouts), or, with `remuda usage --live` or `u` in the
   TUI, from asking the agent itself (`claude -p /usage`, `codex app-server`).
 - **Usage history** is what remuda itself kept of those readings: each reading of `remuda usage`
-  and of the TUI's Accounts view (cached or live) is recorded in `state/usage-history.jsonl`, at
+  (also each one `--wait` takes) and of the TUI's Accounts view (cached or live) is recorded in `state/usage-history.jsonl`, at
   the time the agent took it, for 45 days. `remuda pick` records nothing. `remuda usage
   --history` shows it per window, with the pace of the current window: `used 71% with 48% of the
   window elapsed: ahead of an even pace; at this pace 100% by Oct 8 20:00` says the window runs

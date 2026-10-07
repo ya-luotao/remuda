@@ -65,7 +65,7 @@ impl dyn Runner + '_ {
         unset: &[&str],
         timeout: Duration,
     ) -> Result<Output, Failure> {
-        let command = format!("{} {}", account.provider.program(), args.join(" "));
+        let command = format!("{} {}", account.provider.program(), spelled(args));
         if !self.has(account.provider) {
             let why = Why::Missing(account.provider);
             return Err(Failure { command, why });
@@ -167,8 +167,18 @@ impl Output {
     }
 }
 
+/// `args` as words for a message: separated by spaces, an empty one as `""` (R10's live query
+/// passes `--setting-sources ""`), so that none goes missing between two spaces.
+fn spelled(args: &[&str]) -> String {
+    let words: Vec<&str> = args
+        .iter()
+        .map(|a| if a.is_empty() { "\"\"" } else { a })
+        .collect();
+    words.join(" ")
+}
+
 /// Why a command gave nothing to read. Displayed as a whole clause:
-/// `` `claude -p /usage --no-session-persistence` exited with status 1: <stderr's first line> ``,
+/// `` `claude auth status --json` exited with status 1: <stderr's first line> ``,
 /// or `` `codex` not found on PATH ``.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
@@ -398,7 +408,7 @@ impl Runner for Scripted {
         unset: &[&str],
         _timeout: Duration,
     ) -> Outcome {
-        let command = format!("{} {}", account.qualified(), args.join(" "));
+        let command = format!("{} {}", account.qualified(), spelled(args));
         let outcome = self.outcomes.iter().find(|(c, _)| *c == command);
         self.ran.lock().unwrap().push(command.clone());
         let vars = unset.iter().map(|var| var.to_string()).collect();
