@@ -350,9 +350,25 @@ remuda help [<command>]                            help for remuda or a command
   args, and session ID (or unknown). `args` are the user's arguments as the agent got them,
   without what remuda injected: a prompt given on the command line is in the log, which is why
   the log is readable by the user alone (R3).
-- **[unverified]**: whether variables inherited when launching from within a claude session, such
-  as `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, and `CLAUDE_CODE_MESSAGING_*`, affect the child claude;
-  if they do, define a list of variables to strip.
+- Launching from within a claude session. A claude session gives the processes of its tools and
+  hooks `CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ID`,
+  `CLAUDE_CODE_SESSION_ATTENDED`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_MESSAGING_SOCKET`,
+  `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_CODE_BRIDGE_SESSION_ID`, `CLAUDE_CODE_EXECPATH`,
+  `CLAUDE_PID`, and `CLAUDE_EFFORT`, and a remuda started there passes them on, like the rest of
+  its environment. Basis (verified on 2.1.292, each variable alone and all of them together, in a
+  temporary home against a local stand-in for the API): none of them keeps the child from
+  starting or puts it in another session (its ID is the injected `--session-id`, else a new one,
+  never the inherited `CLAUDE_CODE_SESSION_ID`), and none changes a `-p` run. One changes an
+  interactive session: with `CLAUDE_CODE_CHILD_SESSION` inherited, claude writes no transcript and
+  no prompt history for it, and says "Transcript saving is off — inherited
+  CLAUDE_CODE_CHILD_SESSION marker"; the launch log has its ID, the index never will. remuda
+  strips none of them: that marker is claude's own finding that it runs nested, which remuda
+  cannot tell from a terminal that inherited it by mistake, and claude documents the override,
+  `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`, which is the user's to set (with it, the session
+  above was saved). The commands remuda runs for an account (R7, R10, R10a) keep them too.
+- **[unverified]**: an inherited `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN`
+  of a session that is still running; only a socket path that does not exist was tried, and claude
+  documents that each session exports its own.
 
 ## R7. Running sessions
 
@@ -512,7 +528,12 @@ appeared in no `history.jsonl`.
      - Claude: `claude -p /usage --no-session-persistence`. Basis (verified on 2.1.280): `/usage`
        is a local command that supports non-interactive use and does not call the model (0
        tokens, no cost); with `--no-session-persistence` it leaves no transcript. It takes
-       anywhere from 2 to 20 seconds (it scans the local session history).
+       anywhere from 2 to 20 seconds (it scans the local session history). The query runs
+       without `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, removed from the environment it
+       inherits: with that set, `/usage` sends no request and prints only a reading that another
+       run took within the hour, or no `Current` line at all (verified on 2.1.292), and the user
+       asked for a live reading. Only this query goes without it: launches (R6) and the other
+       commands run for an account keep it, and R11 says so.
      - Codex: one `codex app-server` (R4) per account, which is sent both
        `account/rateLimits/read` with `{"excludeResetCreditDetails": true}` and `account/read`
        with `{"refreshToken": false}`, and answers both (about a second or two). The rate limits
@@ -612,7 +633,24 @@ appeared in no `history.jsonl`.
 
 ## R11. Checks in the accounts view
 
-- `ANTHROPIC_API_KEY` is set: warning (it overrides `/login` for every account).
+- Variables of the environment that change what claude does for every account, one warning each,
+  in this order, never with the value (the tokens are secrets); remuda counts an empty value as
+  not set:
+  - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`: it overrides `/login`
+    for every account.
+  - `ANTHROPIC_BASE_URL`: every account's requests go to that endpoint instead of Anthropic's.
+  - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: claude's `/usage` then repeats an old reading at
+    most; remuda removes it for its own live query (R10), but claude launched as any account
+    keeps it.
+
+  Basis: claude's authentication precedence (code.claude.com/docs/en/iam) puts
+  `ANTHROPIC_AUTH_TOKEN` (sent as `Authorization: Bearer`), `ANTHROPIC_API_KEY`, and
+  `CLAUDE_CODE_OAUTH_TOKEN` before the credentials of `/login`, and a `/login` run while
+  `CLAUDE_CODE_OAUTH_TOKEN` is set lasts only that session; `ANTHROPIC_BASE_URL` overrides "the API
+  endpoint to route requests through a proxy or gateway" (code.claude.com/docs/en/env-vars).
+  Verified on 2.1.292 in a home that is not logged in: either token alone makes
+  `claude auth status --json` answer `"loggedIn": true, "authMethod": "oauth_token"`, and the
+  request goes out with it as the bearer token, to the `ANTHROPIC_BASE_URL` given.
 - The home contains symlinks whose targets do not exist.
 - `projects` is shared by several accounts and one of the participating accounts does not set
   `cleanupPeriodDays`: warning (the default 30-day cleanup deletes everyone's sessions in the
