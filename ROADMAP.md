@@ -163,6 +163,7 @@ in 0.2.0.
 Resolved:
 
 - Stale cached usage is addressed by on-demand live queries via
-  `claude -p /usage --no-session-persistence` (R10).
+  `claude -p /usage --no-session-persistence --setting-sources "" --strict-mcp-config` (R10),
+  which run none of the account's hooks or MCP servers.
 - Codex `default` home semantics and keyring isolation: `CODEX_HOME=~/.codex` equals leaving it
   unset, and the keyring key hashes the normalized path (R4, verified on 0.155.1).

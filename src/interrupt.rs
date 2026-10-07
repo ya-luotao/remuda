@@ -1,10 +1,10 @@
-//! The terminal's signals (Ctrl-C, Ctrl-\, a hangup): the one owner of what remuda does with
-//! them (SPEC R4, R6).
+//! The signals that end remuda (Ctrl-C, Ctrl-\, a hangup, SIGTERM): the one owner of what
+//! remuda does with them (SPEC R4, R6).
 //!
 //! Two modules care. A foreground child ([`crate::launch`]) has the terminal, so remuda sits
 //! Ctrl-C and Ctrl-\ out while it runs ([`hold`]). A captured command ([`crate::probe`]) leads
-//! its own process group, so the terminal's signals no longer reach it: remuda passes them on
-//! before it ends by them ([`starting`]). Both go through one handler, installed once and never
+//! its own process group, so the terminal's signals no longer reach it: remuda passes them on,
+//! and a SIGTERM it gets, before it ends by them ([`starting`]). Both go through one handler, installed once and never
 //! replaced, so that neither can mistake what the other did for what remuda inherited.
 //!
 //! A command is remuda's to tell from the moment its start begins, not from the moment its
@@ -22,8 +22,9 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// What a terminal sends its foreground process group, each ending a process by default:
-/// Ctrl-C, Ctrl-\ and a hangup.
-const SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP];
+/// Ctrl-C, Ctrl-\ and a hangup; and SIGTERM, which `kill` or a supervisor sends remuda alone.
+/// The commands remuda runs in groups of their own get none of them by themselves.
+const SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGTERM];
 
 /// How many commands remuda runs at a time, each in a watched process group. Nothing else
 /// bounds them: there is one per account at once (`list`, `usage --live`, `pick`, the TUI's
@@ -72,9 +73,10 @@ impl<const N: usize> State<N> {
     }
 
     /// Whether `signal` does nothing now: Ctrl-C or Ctrl-\ while a foreground child has the
-    /// terminal. A hangup is never sat out.
+    /// terminal, which gets them too. A hangup and SIGTERM are never sat out: the child does
+    /// not get SIGTERM from the terminal, and remuda ends by it as it would without a handler.
     fn sat_out(&self, signal: libc::c_int) -> bool {
-        signal != libc::SIGHUP && self.held.load(Ordering::SeqCst) > 0
+        matches!(signal, libc::SIGINT | libc::SIGQUIT) && self.held.load(Ordering::SeqCst) > 0
     }
 
     /// The handler's part: unless `signal` is sat out, remuda is ending by it from now on, and
@@ -476,7 +478,7 @@ mod tests {
     }
 
     /// R6: with a foreground child, Ctrl-C and Ctrl-\ are sat out, and remuda is not ending:
-    /// commands still start. A hangup never is sat out.
+    /// commands still start. A hangup and SIGTERM never are sat out.
     #[test]
     fn interrupts_are_sat_out_while_held() {
         let state = State::<4>::new();
@@ -489,6 +491,7 @@ mod tests {
         assert!(state.start());
         assert_eq!(state.start_over(), None);
         assert!(!state.sat_out(libc::SIGHUP));
+        assert!(!state.sat_out(libc::SIGTERM));
         assert!(state.signalled(libc::SIGHUP));
         assert_eq!(state.ending.load(Ordering::SeqCst), libc::SIGHUP);
         // The guard is what holds: for as long as it lives.
