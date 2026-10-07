@@ -12,7 +12,7 @@ use crate::provider::Provider;
 use crate::stats::Tokens;
 
 /// When the built-in prices were read from the providers' pricing pages.
-pub const PRICES_AS_OF: &str = "2026-09-24";
+pub const PRICES_AS_OF: &str = "2026-10-07";
 
 /// The keys of a `[prices."<model>"]` table.
 pub const OVERRIDE_KEYS: [&str; 5] = [
@@ -23,7 +23,8 @@ pub const OVERRIDE_KEYS: [&str; 5] = [
     "cache_write_1h",
 ];
 
-/// A codex request with more input tokens than this (cached included) is a long-context one.
+/// A codex request with more input tokens than this (cached and cache write included) is a
+/// long-context one.
 pub const LONG_CONTEXT_TOKENS: u64 = 272_000;
 
 /// The largest price `[prices]` accepts, USD per million tokens.
@@ -36,14 +37,16 @@ pub struct Rate {
     pub output: u64,
     /// Claude's cache read; codex's cached input.
     pub cache_read: Option<u64>,
+    /// Claude's 5-minute cache write; codex's cache write.
     pub cache_write_5m: Option<u64>,
     pub cache_write_1h: Option<u64>,
     /// Fast mode doubles every price.
     pub fast_mode: bool,
     /// US-only inference multiplies every price by 1.1.
     pub us_premium: bool,
-    /// A request with more than [`LONG_CONTEXT_TOKENS`] input tokens (cached included) is
-    /// priced at twice the input and cache prices and 1.5 times the output price, whole.
+    /// A request with more than [`LONG_CONTEXT_TOKENS`] input tokens (cached and cache write
+    /// included) is priced at twice the input and cache prices and 1.5 times the output price,
+    /// whole.
     pub long_context: bool,
 }
 
@@ -54,7 +57,11 @@ impl Rate {
     /// price follows from the counts where the rate has `long_context`.
     pub fn cost(&self, tokens: &Tokens, fast: bool, us: bool) -> Option<u128> {
         let long = self.long_context
-            && tokens.input.saturating_add(tokens.cache_read) > LONG_CONTEXT_TOKENS;
+            && tokens
+                .input
+                .saturating_add(tokens.cache_read)
+                .saturating_add(tokens.cache_write())
+                > LONG_CONTEXT_TOKENS;
         // The multiplier of the input and cache prices, and of the output price, as
         // (numerator, denominator).
         let (inputs, output) = match long {
@@ -315,24 +322,26 @@ const CLAUDE: &[(&str, [u64; 5], bool, bool)] = &[
     ),
 ];
 
-/// Codex: id, [input, cached input, output] in thousandths of a USD per million tokens, and
-/// whether the long-context price applies (R20). A codex model not listed is not priced.
-const CODEX: &[(&str, [u64; 3], bool)] = &[
-    ("gpt-5.6-sol", [4_000, 400, 20_000], true),
-    ("gpt-6-astra", [10_000, 1_000, 50_000], true),
-    ("gpt-6-sol", [2_000, 200, 10_000], true),
-    ("gpt-5.6-terra", [2_000, 200, 12_000], true),
-    ("gpt-5.5", [5_000, 500, 30_000], true),
-    ("gpt-5.4", [2_500, 250, 15_000], true),
-    ("gpt-5.3-codex", [1_750, 175, 14_000], false),
-    ("gpt-5.2-codex", [1_750, 175, 14_000], false),
-    ("gpt-5.2", [1_750, 175, 14_000], false),
-    ("gpt-5.1-codex-max", [1_250, 125, 10_000], false),
-    ("gpt-5.1-codex", [1_250, 125, 10_000], false),
-    ("gpt-5.1-codex-mini", [250, 25, 2_000], false),
-    ("gpt-5-codex", [1_250, 125, 10_000], false),
-    ("gpt-5", [1_250, 125, 10_000], false),
-    ("o4-mini", [1_100, 275, 4_400], false),
+/// Codex: id, [input, cached input, cache write, output] in thousandths of a USD per million
+/// tokens, and whether the long-context price applies (R20). A cache write costs 1.25 times the
+/// input price from GPT-5.6 on, and the input price before. A codex model not listed is not
+/// priced.
+const CODEX: &[(&str, [u64; 4], bool)] = &[
+    ("gpt-5.6-sol", [4_000, 400, 5_000, 20_000], true),
+    ("gpt-6-astra", [10_000, 1_000, 12_500, 50_000], true),
+    ("gpt-6-sol", [2_000, 200, 2_500, 10_000], true),
+    ("gpt-5.6-terra", [2_000, 200, 2_500, 12_000], true),
+    ("gpt-5.5", [5_000, 500, 5_000, 30_000], true),
+    ("gpt-5.4", [2_500, 250, 2_500, 15_000], true),
+    ("gpt-5.3-codex", [1_750, 175, 1_750, 14_000], false),
+    ("gpt-5.2-codex", [1_750, 175, 1_750, 14_000], false),
+    ("gpt-5.2", [1_750, 175, 1_750, 14_000], false),
+    ("gpt-5.1-codex-max", [1_250, 125, 1_250, 10_000], false),
+    ("gpt-5.1-codex", [1_250, 125, 1_250, 10_000], false),
+    ("gpt-5.1-codex-mini", [250, 25, 250, 2_000], false),
+    ("gpt-5-codex", [1_250, 125, 1_250, 10_000], false),
+    ("gpt-5", [1_250, 125, 1_250, 10_000], false),
+    ("o4-mini", [1_100, 275, 1_100, 4_400], false),
 ];
 
 /// The built-in rate of `provider`'s model `id` (without its date), found exactly.
@@ -352,11 +361,12 @@ fn built_in(provider: Provider, id: &str) -> Option<Rate> {
             },
         ),
         Provider::Codex => CODEX.iter().find(|row| row.0 == id).map(
-            |&(_, [input, cached, output], long_context)| Rate {
+            |&(_, [input, cached, write, output], long_context)| Rate {
                 input: pico(input),
                 output: pico(output),
                 cache_read: Some(pico(cached)),
-                cache_write_5m: None,
+                // Codex records its cache write without a lifetime, as 5-minute.
+                cache_write_5m: Some(pico(write)),
                 cache_write_1h: None,
                 fast_mode: false,
                 us_premium: false,
@@ -480,7 +490,7 @@ mod tests {
     }
 
     /// R20: codex prices input without cached, cached input, and output (reasoning included);
-    /// it records no cache write.
+    /// an override that leaves out `cache_write_5m` does not price a cache write.
     #[test]
     fn codex_prices_input_cached_and_output() {
         let prices =
@@ -496,9 +506,45 @@ mod tests {
         assert_eq!(builtin.cost(&t, true, true), Some(11_375_000_000_000));
     }
 
-    /// R20: a codex request with more than 272K input tokens, cached included, is priced at
-    /// twice the input and cached prices and 1.5 times the output price, on the models that
-    /// have a long-context price; exactly, since every such price is even.
+    /// R20: codex's cache write (`cache_write_input_tokens`) costs 1.25 times the input price
+    /// from GPT-5.6 on, and the input price before; an override prices it by `cache_write_5m`.
+    #[test]
+    fn codex_cache_write_at_its_price() {
+        let write = tokens(0, 0, 2_000, 0, 0);
+        for (model, usd) in [
+            ("gpt-6-astra", 12_500_000),
+            ("gpt-6-sol", 2_500_000),
+            ("gpt-5.6-sol", 5_000_000),
+            ("gpt-5.6-terra", 2_500_000),
+            ("gpt-5.5", 5_000_000),
+            ("gpt-5.4", 2_500_000),
+            ("gpt-5.3-codex", 1_750_000),
+            ("o4-mini", 1_100_000),
+        ] {
+            let rate = rate(Provider::Codex, model);
+            assert_eq!(
+                rate.cost(&write, false, false),
+                Some(2_000 * usd),
+                "{model}"
+            );
+        }
+        for &(model, [input, _, write, _], _) in CODEX {
+            let ratio = match ["gpt-5.6-", "gpt-6-"].iter().any(|p| model.starts_with(p)) {
+                true => (5, 4),
+                false => (1, 1),
+            };
+            assert_eq!(write * ratio.1, input * ratio.0, "{model}");
+        }
+        let prices =
+            parse("[prices.\"gpt-test\"]\ninput = 1\noutput = 2\ncache_write_5m = 1.5\n").unwrap();
+        let gpt = prices.rate(Provider::Codex, "gpt-test").unwrap();
+        assert_eq!(gpt.cost(&write, false, false), Some(2_000 * 1_500_000));
+    }
+
+    /// R20: a codex request with more than 272K input tokens, cached and cache write included,
+    /// is priced at twice the input, cached and cache-write prices and 1.5 times the output
+    /// price, on the models that have a long-context price; exactly, since every such price is
+    /// even.
     #[test]
     fn codex_long_context_reprices_the_whole_request() {
         let gpt = rate(Provider::Codex, "gpt-5.4");
@@ -513,9 +559,20 @@ mod tests {
             gpt.cost(&over, false, false),
             Some(200_001 * 5_000_000 + 72_000 * 500_000 + 1_000 * 22_500_000)
         );
-        // Cached input alone crosses it too.
+        // Cached input alone crosses it too, and so does the cache write, part of the input.
         let cached = tokens(0, 272_001, 0, 0, 0);
         assert_eq!(gpt.cost(&cached, false, false), Some(272_001 * 500_000));
+        let written = tokens(1, 200_000, 72_000, 0, 0);
+        assert_eq!(
+            gpt.cost(&written, false, false),
+            Some(5_000_000 + 200_000 * 500_000 + 72_000 * 5_000_000)
+        );
+        // At twice the cache-write price: gpt-6-astra's 12.50 is 25.
+        let astra = rate(Provider::Codex, "gpt-6-astra");
+        assert_eq!(
+            astra.cost(&tokens(0, 0, 272_001, 0, 0), false, false),
+            Some(272_001 * 25_000_000)
+        );
 
         let plain = rate(Provider::Codex, "gpt-5.3-codex");
         assert!(!plain.long_context);

@@ -189,11 +189,23 @@ pub fn usage(u: [u64; 4]) -> Value {
 
 /// A `token_count` event with `info`: the cumulative `total` and the latest request's `last`.
 pub fn tokens(total: [u64; 4], last: [u64; 4], ts: &str) -> String {
+    usage_event(usage(total), usage(last), ts)
+}
+
+/// Codex 0.160.0's usage `[input (cached and cache write included), cached, cache write,
+/// output, reasoning]`.
+pub fn usage_with_write(u: [u64; 5]) -> Value {
+    json!({"input_tokens": u[0], "cached_input_tokens": u[1], "cache_write_input_tokens": u[2],
+           "output_tokens": u[3], "reasoning_output_tokens": u[4], "total_tokens": u[0] + u[3]})
+}
+
+/// A `token_count` event with `info` of the usages as given.
+pub fn usage_event(total: Value, last: Value, ts: &str) -> String {
     record(
         "event_msg",
         ts,
         json!({"type": "token_count",
-               "info": {"total_token_usage": usage(total), "last_token_usage": usage(last),
+               "info": {"total_token_usage": total, "last_token_usage": last,
                         "model_context_window": 258400},
                "rate_limits": null}),
     )
