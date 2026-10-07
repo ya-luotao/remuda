@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::launch;
+use crate::launch::{self, EnvChange};
 use crate::probe::{self, Outcome};
 use crate::provider::{Provider, app_server};
 use crate::registry::Account;
@@ -25,9 +25,15 @@ pub trait Runner: Sync {
     /// Whether `provider`'s agent is there to run. The other two are asked only when it is.
     fn has(&self, provider: Provider) -> bool;
 
-    /// `<agent> args...` in `account`'s environment, stdin closed, output captured, at most
-    /// `timeout`.
-    fn captured(&self, account: &Account, args: &[&str], timeout: Duration) -> Outcome;
+    /// `<agent> args...` in `account`'s environment without the variables named in `unset`,
+    /// stdin closed, output captured, at most `timeout`.
+    fn captured(
+        &self,
+        account: &Account,
+        args: &[&str],
+        unset: &[&str],
+        timeout: Duration,
+    ) -> Outcome;
 
     /// One `codex app-server` run in `account`'s environment, as [`app_server::call`]: each
     /// request's result or error, or why it could not answer them all.
@@ -47,12 +53,24 @@ impl dyn Runner + '_ {
         args: &[&str],
         timeout: Duration,
     ) -> Result<Output, Failure> {
+        self.run_without(account, args, &[], timeout)
+    }
+
+    /// [`run`](Self::run) with the variables named in `unset` removed from the agent's
+    /// environment, for a command that an inherited setting would keep from answering.
+    fn run_without(
+        &self,
+        account: &Account,
+        args: &[&str],
+        unset: &[&str],
+        timeout: Duration,
+    ) -> Result<Output, Failure> {
         let command = format!("{} {}", account.provider.program(), args.join(" "));
         if !self.has(account.provider) {
             let why = Why::Missing(account.provider);
             return Err(Failure { command, why });
         }
-        match self.captured(account, args, timeout) {
+        match self.captured(account, args, unset, timeout) {
             Outcome::Exited {
                 code: Some(code),
                 stdout,
@@ -78,7 +96,19 @@ impl dyn Runner + '_ {
         args: &[&str],
         timeout: Duration,
     ) -> Result<Output, Failure> {
-        let output = self.run(account, args, timeout)?;
+        self.run_ok_without(account, args, &[], timeout)
+    }
+
+    /// [`run_ok`](Self::run_ok), with the variables named in `unset` removed from the agent's
+    /// environment.
+    pub fn run_ok_without(
+        &self,
+        account: &Account,
+        args: &[&str],
+        unset: &[&str],
+        timeout: Duration,
+    ) -> Result<Output, Failure> {
+        let output = self.run_without(account, args, unset, timeout)?;
         if output.code == 0 {
             Ok(output)
         } else {
@@ -198,7 +228,8 @@ fn missing(provider: Provider) -> String {
 }
 
 /// The agents found on `PATH` (`None`: not there), run through [`probe`]. The home variable is
-/// set to the account's home, or removed for `default`, by [`launch::env_change`] alone (R2).
+/// set to the account's home, or removed for `default`, by [`launch::env_change`] alone (R2);
+/// the variables a caller names are removed after it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OnPath<'a> {
     pub claude: Option<&'a Path>,
@@ -219,10 +250,18 @@ impl Runner for OnPath<'_> {
         self.program(provider).is_some()
     }
 
-    fn captured(&self, account: &Account, args: &[&str], timeout: Duration) -> Outcome {
+    fn captured(
+        &self,
+        account: &Account,
+        args: &[&str],
+        unset: &[&str],
+        timeout: Duration,
+    ) -> Outcome {
         match self.program(account.provider) {
             Some(program) => {
-                probe::run_captured(program, args, &launch::env_change(account), timeout)
+                let mut changes = vec![launch::env_change(account)];
+                changes.extend(unset.iter().map(|var| EnvChange::Remove(var.to_string())));
+                probe::run_captured_with(program, args, &changes, timeout)
             }
             None => Outcome::SpawnFailed(missing(account.provider)),
         }
@@ -286,6 +325,7 @@ pub(crate) struct Scripted {
     outcomes: Vec<(String, Outcome)>,
     answers: Vec<(String, Answers)>,
     ran: std::sync::Mutex<Vec<String>>,
+    unset: std::sync::Mutex<Vec<(String, Vec<String>)>>,
 }
 
 #[cfg(test)]
@@ -296,6 +336,7 @@ impl Scripted {
             outcomes: Vec::new(),
             answers: Vec::new(),
             ran: std::sync::Mutex::new(Vec::new()),
+            unset: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -324,6 +365,16 @@ impl Scripted {
         self.ran.lock().unwrap().clone()
     }
 
+    /// The variables each run of `command` was to go without, in order of the runs.
+    pub(crate) fn unset_for(&self, command: &str) -> Vec<Vec<String>> {
+        let unset = self.unset.lock().unwrap();
+        unset
+            .iter()
+            .filter(|(c, _)| c == command)
+            .map(|(_, vars)| vars.clone())
+            .collect()
+    }
+
     /// An [`Outcome`] that exited with `code`.
     pub(crate) fn exited(code: i32, stdout: &str, stderr: &str) -> Outcome {
         Outcome::Exited {
@@ -340,10 +391,18 @@ impl Runner for Scripted {
         !self.without.contains(&provider)
     }
 
-    fn captured(&self, account: &Account, args: &[&str], _timeout: Duration) -> Outcome {
+    fn captured(
+        &self,
+        account: &Account,
+        args: &[&str],
+        unset: &[&str],
+        _timeout: Duration,
+    ) -> Outcome {
         let command = format!("{} {}", account.qualified(), args.join(" "));
         let outcome = self.outcomes.iter().find(|(c, _)| *c == command);
         self.ran.lock().unwrap().push(command.clone());
+        let vars = unset.iter().map(|var| var.to_string()).collect();
+        self.unset.lock().unwrap().push((command.clone(), vars));
         match outcome {
             Some((_, outcome)) => outcome.clone(),
             None => panic!("no script for {command:?}"),
@@ -554,6 +613,35 @@ mod tests {
                 .to_string(),
             "`codex login status` exited with status 1: codex login status [/c/work/../work]"
         );
+    }
+
+    /// R10: a variable the caller names is not in the agent's environment, whatever remuda
+    /// inherited; the home variable is still the account's. (`CARGO_MANIFEST_DIR` stands for an
+    /// inherited variable: cargo sets it for the tests it runs.)
+    #[test]
+    fn on_path_removes_the_variables_the_caller_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_program = script(
+            dir.path(),
+            "claude",
+            "printf '[%s] [%s]' \"${CLAUDE_CONFIG_DIR-unset}\" \"${CARGO_MANIFEST_DIR-unset}\"",
+        );
+        let agents = OnPath {
+            claude: Some(&claude_program),
+            codex: None,
+        };
+        let runner: &dyn Runner = &agents;
+        let inherited = env!("CARGO_MANIFEST_DIR");
+        let output = runner.run_ok(&claude("max"), &["x"], T).unwrap();
+        assert_eq!(
+            output.stdout,
+            format!("[/h/max/] [{inherited}]"),
+            "the test runs through `cargo test`, which sets CARGO_MANIFEST_DIR"
+        );
+        let output = runner
+            .run_ok_without(&claude("max"), &["x"], &["CARGO_MANIFEST_DIR"], T)
+            .unwrap();
+        assert_eq!(output.stdout, "[/h/max/] [unset]");
     }
 
     #[test]

@@ -14,6 +14,14 @@ cancels. Confirmations accept `y`; any other key except `Ctrl-P` cancels. In the
 opened by `remuda run` without an account, `Enter` launches the selected account and `Esc` or `q`
 exits without launching anything.
 
+A terminal started from inside a Claude session (by its Bash tool, for example a background
+launcher or a `screen` session) may carry `CLAUDE_CODE_CHILD_SESSION=1`. Claude then saves no
+transcript and no prompt history for an interactive session started there, and says
+"Transcript saving is off" at the bottom of the screen; Remuda passes the variable on like the
+rest of the environment, so such a session never appears in the session list and cannot be
+resumed. Set `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` in that terminal if it is your own. `-p`
+runs are saved either way.
+
 Resuming a Claude session that is still running elsewhere is refused, because two processes
 writing the same session would overwrite each other. Codex has no source of running sessions, so
 resuming a Codex session in place always asks for confirmation. A fork only reads the original
@@ -283,10 +291,17 @@ search.
 ## Account checks
 
 The Accounts view warns about conditions that silently break multi-account setups: an
-`ANTHROPIC_API_KEY` that overrides every login, dangling symlinks, missing or logged-out homes, a
-shared `projects` store without `cleanupPeriodDays`, and problems with the shared configuration:
-a missing source home, a plugin whose install is gone, instruction items that would load twice,
-and rules limited to `paths` that are not applied where the rules are injected.
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN` that overrides every
+login, an `ANTHROPIC_BASE_URL` that sends every account's requests elsewhere, dangling symlinks,
+missing or logged-out homes, a shared `projects` store without `cleanupPeriodDays`, and problems
+with the shared configuration: a missing source home, a plugin whose install is gone, instruction
+items that would load twice, and rules limited to `paths` that are not applied where the rules
+are injected. The values of those variables are never shown.
+
+With `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` set, claude's `/usage` asks for nothing new and
+only repeats a reading taken within the hour, if there is one. Remuda's live usage query removes
+the variable for that one command, so `remuda usage --live` and `u` get a new reading; sessions
+you launch keep it, and the Accounts view says so.
 
 For each member of `[share.claude]` it also checks the links of the home, and says which link
 to make:

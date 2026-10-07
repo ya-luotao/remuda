@@ -251,6 +251,50 @@ fn live_usage_runs_claude_per_account_with_its_env() {
     );
 }
 
+/// R10: with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` set, claude's `/usage` asks for no new
+/// reading (the fake answers as claude 2.1.292 then does, without a `Current` line). The live
+/// query runs without it and gets the account's rows; the other commands run for an account
+/// (`auth status`) and launches keep it (R6).
+#[test]
+fn live_usage_runs_without_disable_nonessential_traffic() {
+    const VAR: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+    let Setup { sb, max, .. } = setup();
+    sb.set_live_usage(Some(&max), LIVE_SAMPLE);
+    let out = stdout_of(
+        sb.remuda()
+            .env(VAR, "1")
+            .args(["usage", "max", "--live"])
+            .assert()
+            .success(),
+    );
+    let b = blocks(&out);
+    assert_eq!(b[0].0, "claude:max live", "{out}");
+    assert_eq!(b[0].1.len(), 3, "{out}");
+    assert!(b[0].1[0].starts_with("Session 9%"), "{out}");
+    let invs = sb.invocations_with(Some(&max));
+    assert_eq!(invs.len(), 1);
+    assert_eq!(invs[0].args, ["-p", "/usage", "--no-session-persistence"]);
+    assert_eq!(invs[0].nonessential_traffic, None);
+
+    sb.set_auth(
+        Some(&max),
+        r#"{"loggedIn": true, "authMethod": "claude.ai"}"#,
+    );
+    sb.remuda().env(VAR, "1").arg("list").assert().success();
+    sb.remuda()
+        .env(VAR, "1")
+        .args(["run", "max", "-p", "hi"])
+        .assert()
+        .success();
+    let invs = sb.invocations_with(Some(&max));
+    assert_eq!(invs.len(), 3);
+    assert_eq!(invs[1].args, ["auth", "status", "--json"]);
+    assert_eq!(invs[2].args[..2], ["-p", "hi"]);
+    for inv in &invs[1..] {
+        assert_eq!(inv.nonessential_traffic.as_deref(), Some("1"), "{inv:?}");
+    }
+}
+
 #[test]
 fn live_usage_prints_unparseable_output_raw() {
     let Setup { sb, max, .. } = setup();

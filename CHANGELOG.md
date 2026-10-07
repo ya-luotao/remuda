@@ -8,7 +8,19 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ## [Unreleased]
 
+### Added
+
+- The Accounts view warns when `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN` is set (it
+  overrides every account's `/login`, like `ANTHROPIC_API_KEY`), when `ANTHROPIC_BASE_URL` is set
+  (every account's requests go to that endpoint), and when
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set (SPEC R11). The values are never shown.
+
 ### Changed
+
+- Claude's live usage query (`remuda usage --live`, `u` in the TUI, `remuda pick --live`) runs
+  without `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` (SPEC R10). With it set, `claude -p /usage`
+  asks for no new reading and printed either an old one or no usage line at all, which remuda
+  showed as output it did not recognize. Launches and the other commands keep the variable.
 
 - On a file system without locks, or where the directory that holds the registry file
   (`$REMUDA_HOME`, or where a symlinked `config.toml` points) cannot be opened for reading,
