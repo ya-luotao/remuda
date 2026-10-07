@@ -238,7 +238,11 @@ the UI, not reported as an error:
     every group still running, then ends by it as it would have. Commands are started in
     parallel, and a signal may come while some are being started: remuda then starts nothing
     more, passes the signal on to each of those as soon as it runs, and ends by the signal
-    when the last of them has been told. A signal remuda was started ignoring stays ignored.
+    when the last of them has been told. SIGTERM, which reaches remuda alone (`kill`, a
+    supervisor), is passed on and ends remuda the same way; a timeout is remuda's to enforce,
+    and a group it did not tell would outlive it. Only Ctrl-C and Ctrl-\ are sat out while a
+    child remuda runs in the foreground has the terminal (which gets them too); a hangup and
+    SIGTERM never are. A signal remuda was started ignoring stays ignored.
   - A process that reads the terminal there, or changes its modes, would be stopped (SIGTTIN,
     SIGTTOU) until its timeout. The command is started ignoring both: the read fails at once
     (EIO) and the change goes through, as it would in the foreground.
@@ -251,7 +255,9 @@ the UI, not reported as an error:
 remuda                                             open the TUI
 remuda run [<account>] [args]                      launch the agent under an account (R6); without
                                                    an account, open the TUI picker (R16)
-remuda usage [<account>] [--live] [--timeout S]    per-account usage as plain text (R10)
+remuda usage [<account>] [--live] [--timeout S]    per-account usage as plain text (R10); with
+       [--wait [--max-wait S]]                     --wait, one account's once none of its
+                                                   windows is used up
 remuda list [--timeout S]                          accounts, login identity, home (R10a)
 remuda sessions [--limit N]                        recent sessions: time, account attribution,
                                                    title, cwd (R8, R9)
@@ -265,8 +271,8 @@ remuda setup [--provider P] <name> [--email E]     create a new home, link it to
 remuda remove <account>                            unregister an account; its home is left in
                                                    place (R14a)
 remuda pick [--provider P] [--live] [--timeout S]  recommend the account, model and effort to
-       [--offline] [--json | --print-request]      launch now; with --run, launch it (R23)
-       [--run [-- <args>]]
+       [--offline] [--json | --print-request]      launch now; with --run, launch it; with
+       [--wait [--max-wait S]] [--run [-- <args>]] --wait, once a pair is feasible (R23)
 remuda help [<command>]                            help for remuda or a command
 ```
 
@@ -278,7 +284,8 @@ remuda help [<command>]                            help for remuda or a command
   the agent too, the help of `run` itself is `remuda help run`.
 - `--provider` is `claude` (the default) or `codex`; for `pick`, a filter without default.
   `--timeout` is in seconds, per query: `usage --live` and `pick --live` default to 90, `list` to
-  15.
+  15. `--max-wait` is in seconds too, 0 included, and needs `--wait`; without it there is no
+  limit.
 
 ## R6. Launch (`run` and launches from the TUI)
 
@@ -525,15 +532,32 @@ appeared in no `history.jsonl`.
      queries with that account's credentials. Accounts are queried in parallel; the default
      timeout is 90 seconds. In the TUI the registry is read first, and only the accounts it
      still lists are queried (R16).
-     - Claude: `claude -p /usage --no-session-persistence`. Basis (verified on 2.1.280): `/usage`
-       is a local command that supports non-interactive use and does not call the model (0
-       tokens, no cost); with `--no-session-persistence` it leaves no transcript. It takes
-       anywhere from 2 to 20 seconds (it scans the local session history). The query runs
-       without `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, removed from the environment it
-       inherits: with that set, `/usage` sends no request and prints only a reading that another
-       run took within the hour, or no `Current` line at all (verified on 2.1.292), and the user
-       asked for a live reading. Only this query goes without it: launches (R6) and the other
-       commands run for an account keep it, and R11 says so.
+     - Claude: `claude -p /usage --no-session-persistence --setting-sources "" --strict-mcp-config`,
+       the empty list of setting sources an argument of its own. Basis (verified on 2.1.280):
+       `/usage` is a local command that supports non-interactive use and does not call the model
+       (0 tokens, no cost); with `--no-session-persistence` it leaves no transcript. It takes
+       anywhere from 2 to 20 seconds (it scans the local session history).
+       The query is remuda's probe, not the user's session, and repeated by `--wait` (R23): it
+       loads none of the account's settings files, so none of their hooks run, no plugin is
+       enabled and their `env` is not applied (managed policy settings still are), and it starts
+       none of the account's MCP servers. Basis (verified on 2.1.292, 2026-10-08): in a home with
+       SessionStart and SessionEnd hooks and MCP servers of its own (in `.claude.json`, and in a
+       `.mcp.json` of the working directory), `--setting-sources ""` alone kept every hook and
+       server from running; `--strict-mcp-config` alone kept the servers from starting, not the
+       hooks; `--tools ""` changed nothing, and is not passed; `/usage` took 0.8 s against
+       2.8–3.7 s. On a logged-in home (a read-only run on a real profile), the answer with both
+       was the billing sentence and the three `Current` lines, as without them, in 7.2 s, and
+       claude's debug log showed no hook run and no MCP server started, where the run without
+       them showed the user's SessionStart and SessionEnd hooks and a plugin's MCP server
+       starting. claude reads `--setting-sources=` as the flag without its value (and takes the
+       next argument for it). `--bare` would skip hooks too, but `/usage` then prints the
+       session's cost summary instead of the limits (2.1.292, 2026-10-07): not usable.
+       The query runs without `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, removed from the
+       environment it inherits: with that set, `/usage` sends no request and prints only a
+       reading that another run took within the hour, or no `Current` line at all (verified on
+       2.1.292; with the arguments above too, 2026-10-08: it repeated the reading taken a moment
+       before), and the user asked for a live reading. Only this query goes without it: launches
+       (R6) and the other commands run for an account keep it, and R11 says so.
      - Codex: one `codex app-server` (R4) per account, which is sent both
        `account/rateLimits/read` with `{"excludeResetCreditDetails": true}` and `account/read`
        with `{"refreshToken": false}`, and answers both (about a second or two). The rate limits
@@ -606,6 +630,21 @@ appeared in no `history.jsonl`.
   or reset time is not shown.
 - `remuda usage [--live]` prints the same information as plain text for direct use from the shell;
   a codex account's live header also shows its email and plan.
+- **`remuda usage --wait <account>`** waits until the account has no window used up, then
+  prints its usage as `remuda usage <account>` does, exit 0. A window is used up when its usage
+  is known and less than `[pick] min_headroom` percent is left (R3: `usage --wait` reads `[pick]`
+  for it); a window that has reset since its usage was recorded is unknown, never used up. Each
+  attempt reads what `remuda usage <account>` reads, the cache or with `--live` a live query:
+  `--wait` never queries live by itself. Attempts follow R23's `--wait`: the earliest reset of a
+  window used up plus `RESET_MARGIN`, at least `MIN_INTERVAL` after the attempt, `UNKNOWN_RETRY`
+  without a reset ahead. So without `--live` the wait ends once the cached window's reset has
+  passed, and the output says `reset since cached`. With nothing to read (no cached usage, a live
+  answer that told none or was not recognized) nothing is used up either: done. A live query
+  that failed is nothing to wait for: its report, `nothing to wait for` on stderr, exit 1.
+  `--max-wait S`: when the next check would come later than S seconds after remuda started,
+  remuda gives up at once with the last reading, `gave up waiting` and the time of that check
+  on stderr, exit 1. The status line and signals are as in R23. Without an account it is a
+  usage error (exit 2) that names `remuda pick --wait`.
 - The live sources provide no severity: 75% is marked as a warning and 90% as critical. Claude's
   live reset times are localized text; the timeline makes a best effort to parse them into instants
   and otherwise (wording it cannot read, or no reset told) uses the cached reset time of the same
@@ -1865,3 +1904,42 @@ It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4)
   Arguments that do not start a new session (R6's classification for claude; `resume` or `fork`
   first for codex) are refused before anything is sent. `--json` and `--print-request` do not
   combine with `--run`.
+- **`--wait`.** With nothing feasible, remuda does not stop: it tries again until a pair is
+  feasible, then goes on as without `--wait` (the text, `--json`, or `--run`'s launch). With a
+  feasible pair it changes nothing. Each attempt is the whole gathering, at an instant of its
+  own: the cache is read again (an agent may have refreshed it), and with `--live` every account
+  is queried again. `--wait` never implies `--live`: remuda still never queries live on its own.
+  So without `--live`, once the reset of the window that blocked has passed, that cached window
+  has reset since, is of unknown usage and blocks nothing: `pick --wait` returns right after
+  the reset, of unknown headroom, naming the window with the hint to `--live`.
+  - When. A pair that is not feasible by a window (its binding window, below `min_headroom`)
+    waits for that window's reset. The next attempt is at the earliest such reset ahead plus
+    `RESET_MARGIN` (30 s), and never sooner than `MIN_INTERVAL` (60 s) after the attempt's
+    instant: a reset that passed and freed no pair (another window still below) does not make
+    remuda try again at once. Without a known reset ahead for any of them, `UNKNOWN_RETRY` (5
+    minutes) after it. Asleep, remuda reads the clock again at least every `NAP` (60 s), so a
+    computer that slept does not put the attempt off.
+  - Nothing to wait for. When every pair that is not feasible is so for a reason that time does
+    not change (excluded, not of `--provider`, not logged in, `codex` not on PATH), or there is
+    no account: at once, the reasons as without `--wait`, `nothing to wait for: …` naming them
+    on stderr, exit 1.
+  - `--max-wait S`. No attempt starts later than S seconds after remuda started. When the next
+    would, remuda gives up at once instead of sleeping out time in which it would check
+    nothing: the reasons as without `--wait`, when that next check would have been on stderr,
+    exit 1. The clock is read again on waking, before each attempt: a sleep that ended after
+    the deadline (a computer that slept, a clock set forward) starts none either; the wait ends
+    with the last attempt's reasons, and stderr says that `--max-wait` ran out before the check
+    that was due could be made. An attempt under way is not cut short:
+    with `--live`, a query may run on for its `--timeout`.
+  - While it waits, only when stderr is a terminal, one line there, rewritten in place: the
+    account and window it waits on, the time to its reset, the next check, and that Ctrl-C
+    stops it (`remuda: waiting: claude:max Week (Fable) 100% used, resets in 1h12m; next check
+    Oct 8 21:40 (Ctrl-C stops)`); it is cleared before the result, or an error that ends the
+    wait, is printed. `--json` prints once, at the
+    end. Ctrl-C, Ctrl-\, a hangup, or SIGTERM ends remuda by that signal, whether it sleeps or
+    an attempt is under way: a query under way, or being started, is told first (R4), and
+    none is left running. `--print-request` does not combine with `--wait`. With `--run`: when
+    a pair is feasible, the arguments are checked as without `--wait`; when remuda is about to
+    wait, they are checked then, for each provider with an account that nothing permanent
+    blocks (not excluded, of `--provider`, logged in, `codex` on PATH), and refused before the
+    wait instead of after it.
