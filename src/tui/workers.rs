@@ -4,8 +4,8 @@
 //! ([`super::accounts::Listing::read`]).
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -66,6 +66,7 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                 // Every account's usage is sent before any is recorded: a history lock waited
                 // for holds up no row (R24).
                 let mut points = Vec::new();
+                let mut pending = None;
                 for account in listed(&deps, &tx, accounts) {
                     let result = usage::cached_usage(&account, &deps.env);
                     if let Ok(cached) = &result {
@@ -74,9 +75,15 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                             &Snapshot::cached(cached).at((deps.clock)()),
                         ));
                     }
+                    // Counted before it is shown: leaving the TUI waits for it (R24).
+                    if !points.is_empty() && pending.is_none() {
+                        pending = Some(Pending::begin());
+                    }
                     let _ = tx.send(Event::CachedUsage { account, result });
                 }
-                record_usage(&deps, points);
+                if let Some(pending) = pending {
+                    record_usage(&deps, points, pending);
+                }
             });
         }
         Effect::LiveUsage(accounts) => {
@@ -98,12 +105,15 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                             ),
                             _ => Vec::new(),
                         };
+                        let pending = (!points.is_empty()).then(Pending::begin);
                         let _ = tx.send(Event::LiveUsage {
                             account,
                             result,
                             answered_at,
                         });
-                        record_usage(&deps, points);
+                        if let Some(pending) = pending {
+                            record_usage(&deps, points, pending);
+                        }
                     });
                 }
             });
@@ -255,7 +265,7 @@ fn answer(
 /// batch of cached usage; a live answer in the thread of its own account), so a lock waited
 /// for holds up nothing on screen; the TUI never compacts the history, and what keeps it from
 /// being written is not told.
-fn record_usage(deps: &Deps, points: Vec<history::Point>) {
+fn record_usage(deps: &Deps, points: Vec<history::Point>, _pending: Pending) {
     let _ = history::record(
         &deps.state_dir,
         points,
@@ -263,6 +273,44 @@ fn record_usage(deps: &Deps, points: Vec<history::Point>) {
         false,
         &owned::Flock,
     );
+}
+
+/// How long leaving the TUI waits for the recordings of readings it has shown (R16, R24): the
+/// history is a by-product, and a lock another remuda holds must not keep the TUI from ending.
+pub const RECORD_DRAIN: Duration = Duration::from_secs(2);
+
+/// The recordings of usage readings under way: from before the reading is shown until its
+/// points are written (or could not be). Process-wide: one TUI runs in a process.
+static RECORDING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// One recording under way ([`RECORDING`]), until dropped.
+struct Pending;
+
+impl Pending {
+    fn begin() -> Pending {
+        *RECORDING.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Pending
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        *RECORDING.0.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        RECORDING.1.notify_all();
+    }
+}
+
+/// Waits, at most `within`, for the recordings of usage readings under way to end, so that
+/// leaving the TUI does not lose a reading it has shown (R24). `false`: some were still under
+/// way (waiting for a lock another remuda holds, say), and are left: the history is a
+/// by-product.
+pub fn finish_recording(within: Duration) -> bool {
+    let count = RECORDING.0.lock().unwrap_or_else(|e| e.into_inner());
+    let (count, _) = RECORDING
+        .1
+        .wait_timeout_while(count, within, |n| *n > 0)
+        .unwrap_or_else(|e| e.into_inner());
+    *count == 0
 }
 
 /// The accounts of `asked` (the app's rows when it asked) that the registry still lists, home
@@ -1488,11 +1536,93 @@ mod tests {
         assert_eq!(lines.lines().count(), 2, "{lines}");
     }
 
+    /// The tests that hold the history's lock or wait for the recordings under way, one at a
+    /// time: [`finish_recording`] waits for every recording of the process.
+    fn recording_alone() -> std::sync::MutexGuard<'static, ()> {
+        static ALONE: Mutex<()> = Mutex::new(());
+        ALONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// [`deps`] with a usage cache in `max`'s home (a session at 34%), and the account.
+    fn with_a_cache(dir: &std::path::Path) -> (Arc<Deps>, Account) {
+        let deps = deps(dir);
+        let max = max(&deps);
+        fs::write(
+            dir.join("max/.claude.json"),
+            r#"{"cachedUsageUtilization": {"fetchedAtMs": 1790247600000,
+              "utilization": {"limits": [{"kind": "session", "percent": 34}]}}}"#,
+        )
+        .unwrap();
+        (deps, max)
+    }
+
+    /// The cached usage of `max`, once it has been sent (and so shown): its recording may still
+    /// be under way.
+    fn shown(deps: &Arc<Deps>, max: &Account) -> mpsc::Receiver<Event> {
+        let (tx, rx) = mpsc::channel();
+        spawn(Effect::CachedUsage(vec![max.clone()]), deps, &tx);
+        drop(tx);
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                Event::CachedUsage { .. } => return rx,
+                _ => continue,
+            }
+        }
+    }
+
+    /// R24, R16: leaving the TUI waits for the recording of a reading it has shown, so that the
+    /// reading is not lost: here the history's lock is held by another remuda for a moment.
+    #[test]
+    fn leaving_waits_for_a_reading_shown_to_be_recorded() {
+        let _alone = recording_alone();
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, max) = with_a_cache(dir.path());
+        let path = owned::usage_history(&deps.state_dir);
+        let held = owned::lock_state_file(&path, &owned::Flock).unwrap();
+        let _rx = shown(&deps, &max);
+        let other = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        assert!(
+            finish_recording(RECORD_DRAIN),
+            "the recording did not end in time"
+        );
+        let labels: Vec<String> = recorded(&deps).into_iter().map(|p| p.label).collect();
+        assert_eq!(labels, ["Session"], "recorded once leaving is done waiting");
+        other.join().unwrap();
+    }
+
+    /// R24, R16: leaving the TUI waits a while at most: a recording still held up by a lock
+    /// another remuda keeps is left after [`RECORD_DRAIN`], unwritten, and the TUI ends.
+    #[test]
+    fn leaving_does_not_wait_long_for_a_recording_held_up() {
+        let _alone = recording_alone();
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, max) = with_a_cache(dir.path());
+        let path = owned::usage_history(&deps.state_dir);
+        let held = owned::lock_state_file(&path, &owned::Flock).unwrap();
+        let rx = shown(&deps, &max);
+        let started = Instant::now();
+        assert!(!finish_recording(RECORD_DRAIN));
+        let waited = started.elapsed();
+        assert!(
+            waited >= RECORD_DRAIN - Duration::from_millis(50),
+            "{waited:?}"
+        );
+        assert!(waited < RECORD_DRAIN + Duration::from_secs(1), "{waited:?}");
+        assert!(!path.exists(), "nothing written while the lock is held");
+        // Let the worker end before the next test waits for recordings.
+        drop(held);
+        let _: Vec<Event> = rx.iter().collect();
+    }
+
     /// R24, R16: while another remuda holds the history's lock (a `remuda usage` compacting,
     /// or one suspended), every account's cached usage and live answer still reaches the
     /// screen; they are recorded once the lock is free.
     #[test]
     fn a_history_lock_holds_up_no_usage() {
+        let _alone = recording_alone();
         let dir = tempfile::tempdir().unwrap();
         let other = Account {
             provider: CLAUDE,

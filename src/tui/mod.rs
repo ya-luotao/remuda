@@ -310,8 +310,15 @@ fn event_loop(
             }
             for effect in effects {
                 match effect {
-                    Effect::Quit => return Ok(None),
-                    Effect::Pick(account) => return Ok(Some(account)),
+                    // Leaving: the readings shown are recorded first, a while at most (R24).
+                    Effect::Quit => {
+                        workers::finish_recording(workers::RECORD_DRAIN);
+                        return Ok(None);
+                    }
+                    Effect::Pick(account) => {
+                        workers::finish_recording(workers::RECORD_DRAIN);
+                        return Ok(Some(account));
+                    }
                     Effect::Launch(request) => {
                         let (request, what) = for_screen(&app, request);
                         let mut event = launch_in_foreground(terminal, &deps, request, &tx)?;

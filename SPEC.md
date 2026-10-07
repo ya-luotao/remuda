@@ -973,8 +973,11 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
 - **Usage readings are recorded** (R24): the cached usage the Accounts view reads (when it
   starts, on a refresh, for an account the registry adds) and every answer of `u`'s live
   queries, as `remuda usage` records them, once they are shown: the cached usage of every
-  account read at once first. The TUI never compacts the history and does not show it, so
-  private mode (R21) has nothing of it to hide.
+  account read at once first. Leaving the TUI (quitting, or choosing the account of
+  `remuda run`) waits for the recordings of the readings it has shown, at most `RECORD_DRAIN`
+  (2 seconds): what is still under way then (held up by a lock another remuda holds) is not
+  recorded, and the TUI ends all the same. The TUI never compacts the history and does not show
+  it, so private mode (R21) has nothing of it to hide.
 - **Preview** (`p` or Space in History / Live): expands or collapses the preview (R8); `Enter`
   resumes or attaches, as above.
 
@@ -2119,7 +2122,8 @@ nothing (R23), and `remuda list` reads no usage.
   point), and a `state/` that cannot be created, written, or locked records nothing; `remuda
   usage` and the TUI say nothing of it and go on. The TUI records a batch once all of it is on
   the screen: a lock another remuda holds (one compacting, or one suspended) holds up no
-  account's usage.
+  account's usage. Leaving the TUI waits for such recordings at most 2 seconds (R16), so a
+  reading shown just before is not lost, and a lock held elsewhere delays the end no longer.
 - **Window length.** The pace needs a window's length, which remuda reads from its label (R10):
   `Session` is 5 hours and `Week …` 7 days (claude's `session`, `weekly_all`, and
   `weekly_scoped` limits, its older `five_hour` and `seven_day` fields, its live `Current session`

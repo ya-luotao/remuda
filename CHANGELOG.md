@@ -42,7 +42,8 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 - Usage history (SPEC R24): every usage reading of `remuda usage` (cached or `--live`, and each
   one `--wait` takes, the one it prints included) and of the TUI's Accounts view (its cached
   usage and `u`) is recorded in `state/usage-history.jsonl`, a line per window, at the time the agent took it; the same reading is recorded once, and points
-  older than 45 days are dropped. `remuda pick` records nothing. Concurrent writers lose no point,
+  older than 45 days are dropped. `remuda pick` records nothing. Leaving the TUI waits up to 2
+  seconds for the readings it has shown to be recorded. Concurrent writers lose no point,
   also through two `$REMUDA_HOME`s whose histories are symlinks to one file; nothing is written
   to a history that is a symlink to a file others can read.
   On a file system without locks, or with a `state/` remuda cannot write, nothing is recorded and
