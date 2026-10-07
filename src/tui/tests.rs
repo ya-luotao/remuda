@@ -20,7 +20,7 @@ use crate::live::{Control, LiveSession, Source};
 use crate::registry::{Account, CLAUDE, CODEX, Home};
 use crate::stats::{self, Cost, ModelRow, Period, Report, Section, Table, Tokens};
 use crate::transcript::{Message, Role};
-use crate::usage::{CachedUsage, LiveResult, LiveUsage, Resets, UsageRow};
+use crate::usage::{CachedUsage, LiveResult, LiveUsage, Resets, Untold, UsageRow};
 
 const NOW: &str = "2026-09-24T12:00:00Z";
 
@@ -593,6 +593,35 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
     );
     assert!(!app.accounts[2].work.live.is_running());
     assert!(app.accounts[2].rows().is_empty());
+}
+
+/// R10, R21: an answer that tells no usage is the live query's reason, in remuda's words, and
+/// private mode keeps the reason as it is.
+#[test]
+fn a_live_answer_that_tells_no_usage_is_its_reason() {
+    let mut app = app();
+    for (untold, reason) in [
+        (Untold::Unavailable, "no usage limits told for now"),
+        (
+            Untold::NotSubscribed,
+            "not logged in to a Claude subscription, or using an API key",
+        ),
+    ] {
+        keys(&mut app, &[Key::Char('u')]);
+        update(
+            &mut app,
+            Event::LiveUsage {
+                account: account("max"),
+                answered_at: ts(NOW),
+                result: Ok(LiveUsage::Untold(untold).into()),
+            },
+        );
+        assert_eq!(app.accounts[1].live, Some(Err(reason.to_string())));
+        app.private = true;
+        let copy = super::privacy::redacted(&app);
+        assert_eq!(copy.accounts[1].live, Some(Err(reason.to_string())));
+        app.private = false;
+    }
 }
 
 /// Results name their account: when the list changes during a query, a late result lands on

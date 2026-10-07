@@ -296,6 +296,85 @@ fn live_usage_read_in_part_is_shown_as_is() {
     assert!(!out.contains("  Session  "), "{out}");
 }
 
+/// R10: claude 2.1.292's answer when it could not get the account's limits: how the account is
+/// billed, and no usage line. Its reason is said in one line, not the text claude printed.
+#[test]
+fn live_usage_that_tells_no_limits_says_why() {
+    let Setup { sb, max, .. } = setup();
+    sb.set_live_usage(
+        Some(&max),
+        "You are currently using your subscription to power your Claude Code usage\n\n\
+         What's contributing to your limits usage?\n\
+         Approximate, based on local sessions on this machine \u{2014} does not include other \
+         devices or claude.ai. Behaviors are independent characteristics, not a breakdown.\n\n\
+         Last 24h \u{b7} 3915 requests \u{b7} 29 sessions\n",
+    );
+    let out = stdout_of(
+        sb.remuda()
+            .args(["usage", "max", "--live"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(out, "claude:max  live: no usage limits told for now\n");
+}
+
+/// R10: what claude 2.1.292 printed for `/usage` in an empty `CLAUDE_CONFIG_DIR` (exit 0): the
+/// session's cost, which is what it prints for an account not on a Claude subscription.
+#[test]
+fn live_usage_of_an_account_not_logged_in_says_so() {
+    let Setup { sb, max, .. } = setup();
+    sb.set_live_usage(
+        Some(&max),
+        "Total cost:            $0.0000\n\
+         Total duration (API):  0s\n\
+         Total duration (wall): 0s\n\
+         Total code changes:    0 lines added, 0 lines removed\n\
+         Usage:                 0 input, 0 output, 0 cache read, 0 cache write\n",
+    );
+    let out = stdout_of(
+        sb.remuda()
+            .args(["usage", "max", "--live"])
+            .assert()
+            .success(),
+    );
+    assert_eq!(
+        out,
+        "claude:max  live: not logged in to a Claude subscription, or using an API key\n"
+    );
+}
+
+/// R10: reset wording with a time out of range (here in the wordings with a comma and with a
+/// year) is wording remuda cannot read: the percentage is shown with claude's wording, and the
+/// command goes on to the end.
+#[test]
+fn live_usage_with_a_reset_time_out_of_range_is_shown_as_said() {
+    let Setup { sb, max, .. } = setup();
+    sb.set_live_usage(
+        Some(&max),
+        "Current session: 40% used \u{b7} resets Oct 9, 2:60pm (UTC)\n\
+         Current week (all models): 50% used \u{b7} resets Jan 2, 2027 at 3:99pm (UTC)\n\
+         Current week (Fable): 60% used \u{b7} resets Jan 2, 2027, 3:-1pm (UTC)\n",
+    );
+    let out = stdout_of(
+        sb.remuda()
+            .args(["usage", "max", "--live"])
+            .assert()
+            .success()
+            .stderr(""),
+    );
+    let b = blocks(&out);
+    assert_eq!(b.len(), 1, "{out}");
+    assert_eq!(b[0].0, "claude:max live");
+    assert_eq!(
+        b[0].1,
+        [
+            "Session 40% resets Oct 9, 2:60pm (UTC)",
+            "Week (all models) 50% resets Jan 2, 2027 at 3:99pm (UTC)",
+            "Week (Fable) 60% resets Jan 2, 2027, 3:-1pm (UTC)",
+        ]
+    );
+}
+
 /// A cached `limits` entry that cannot be read spoils the cache (R10, review #14): the limits
 /// that can be read are not shown as the account's usage.
 #[test]

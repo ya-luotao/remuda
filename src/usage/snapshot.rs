@@ -245,8 +245,9 @@ fn window_model(label: &str) -> Option<String> {
 }
 
 /// When a limit resets, as an instant: [`Resets::At`] as is; claude's wording
-/// (`Sep 24 at 3:19am (Asia/Shanghai)`, `3am (UTC)`) parsed best-effort, as the next such
-/// time around `now`. `None` when the wording is not recognized.
+/// (`Sep 24 at 3:19am (Asia/Shanghai)`, `Oct 9, 2:59pm (UTC)`, `Jan 2, 2027 at 3pm (UTC)`,
+/// `3am (UTC)`) parsed best-effort, as the next such time around `now` unless it names its
+/// year. `None` when the wording is not recognized.
 fn reset_instant(resets: &Resets, now: Timestamp) -> Option<Timestamp> {
     match resets {
         Resets::At(ts) => Some(*ts),
@@ -257,7 +258,9 @@ fn reset_instant(resets: &Resets, now: Timestamp) -> Option<Timestamp> {
 fn parse_reset_text(text: &str, now: Timestamp) -> Option<Timestamp> {
     let (rest, zone) = text.trim().strip_suffix(')')?.rsplit_once(" (")?;
     let zone = TimeZone::get(zone).ok()?;
-    let (date, time) = match rest.split_once(" at ") {
+    // Claude writes the date and the time as its runtime's `en-US` format puts them together:
+    // `Sep 24 at 3:19am`, or `Sep 24, 3:19am`; `, <year>` after the day in another year.
+    let (date, time) = match rest.split_once(" at ").or_else(|| rest.rsplit_once(", ")) {
         Some((date, time)) => (Some(date.trim()), time.trim()),
         None => (None, rest.trim()),
     };
@@ -271,7 +274,8 @@ fn parse_reset_text(text: &str, now: Timestamp) -> Option<Timestamp> {
         Some((h, m)) => (h.parse::<i8>().ok()?, m.parse::<i8>().ok()?),
         None => (clock.parse::<i8>().ok()?, 0),
     };
-    if !(1..=12).contains(&hour) {
+    // `Date::at` panics on a time out of range: wording that names one is not recognized.
+    if !(1..=12).contains(&hour) || !(0..=59).contains(&minute) {
         return None;
     }
     let hour = hour % 12 + if pm { 12 } else { 0 };
@@ -294,6 +298,16 @@ fn parse_reset_text(text: &str, now: Timestamp) -> Option<Timestamp> {
             }
         }
         Some(date) => {
+            let (date, year) = match date.split_once(", ") {
+                Some((date, year)) => {
+                    let year = year.trim();
+                    if year.len() != 4 || !year.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    (date, Some(year.parse::<i16>().ok()?))
+                }
+                None => (date, None),
+            };
             let (month, day) = date.split_once(' ')?;
             const MONTHS: [&str; 12] = [
                 "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
@@ -301,6 +315,9 @@ fn parse_reset_text(text: &str, now: Timestamp) -> Option<Timestamp> {
             let month = month.get(..3)?.to_ascii_lowercase();
             let month = MONTHS.iter().position(|m| *m == month)? as i8 + 1;
             let day: i8 = day.trim().parse().ok()?;
+            if let Some(year) = year {
+                return at(jiff::civil::Date::new(year, month, day).ok()?);
+            }
             // The nearest year that does not put the reset more than a day in the past.
             let year = today.year();
             let this = at(jiff::civil::Date::new(year, month, day).ok()?)?;
@@ -389,6 +406,69 @@ mod tests {
         }
         let at = ts("2026-09-25T05:00:00Z");
         assert_eq!(reset_instant(&Resets::At(at), now), Some(at));
+    }
+
+    /// R10: the other ways claude writes a reset: a comma between the date and the time (as
+    /// its runtime's `en-US` format may put them), the year after the day (a reset in another
+    /// year), `AM` / `PM` in capitals. A named year is that year's, even in the past.
+    #[test]
+    fn reset_text_in_its_other_wordings() {
+        let now = ts("2026-09-23T18:00:00Z"); // Sep 24 02:00 in Shanghai
+        let parse = |t: &str| reset_instant(&Resets::Text(t.into()), now);
+        assert_eq!(
+            parse("Oct 9, 2:59pm (UTC)"),
+            Some(ts("2026-10-09T14:59:00Z"))
+        );
+        assert_eq!(
+            parse("Sep 24, 3:19am (Asia/Shanghai)"),
+            Some(ts("2026-09-23T19:19:00Z"))
+        );
+        assert_eq!(parse("Oct 9, 3pm (UTC)"), Some(ts("2026-10-09T15:00:00Z")));
+        assert_eq!(
+            parse("Jan 2, 2027 at 3:04pm (UTC)"),
+            Some(ts("2027-01-02T15:04:00Z"))
+        );
+        assert_eq!(
+            parse("Jan 2, 2027, 3:04pm (UTC)"),
+            Some(ts("2027-01-02T15:04:00Z"))
+        );
+        assert_eq!(
+            parse("Jan 2, 2027 at 3pm (Asia/Shanghai)"),
+            Some(ts("2027-01-02T07:00:00Z"))
+        );
+        // A year in the past is read as said, not moved ahead.
+        assert_eq!(
+            parse("Jan 2, 2025, 3pm (UTC)"),
+            Some(ts("2025-01-02T15:00:00Z"))
+        );
+        assert_eq!(
+            parse("Sep 29 at 11:59AM (Asia/Shanghai)"),
+            Some(ts("2026-09-29T03:59:00Z"))
+        );
+        assert_eq!(
+            parse("Oct 9, 2:59PM (UTC)"),
+            Some(ts("2026-10-09T14:59:00Z"))
+        );
+        assert_eq!(parse("7PM (UTC)"), Some(ts("2026-09-23T19:00:00Z")));
+        for junk in [
+            "Oct 9 2:59pm (UTC)",
+            "Oct 9,2:59pm (UTC)",
+            "Oct 9, 2:59pm",
+            "Oct 9, 14:59 (UTC)",
+            "Jan 2, 27 at 3pm (UTC)",
+            "Jan 2, 20x7, 3pm (UTC)",
+            "Jan 2, 2027 (UTC)",
+            "Feb 30, 2027, 3pm (UTC)",
+            "9 Oct, 2:59pm (UTC)",
+            // A minute out of range is not recognized, rather than a panic.
+            "Oct 9, 2:60pm (UTC)",
+            "Jan 2, 2027 at 3:99pm (UTC)",
+            "Jan 2, 2027, 3:-1pm (UTC)",
+            "Sep 24 at 3:60am (UTC)",
+            "7:60pm (UTC)",
+        ] {
+            assert_eq!(parse(junk), None, "{junk:?}");
+        }
     }
 
     /// R10, R23: a window whose reset fell after the usage was recorded is of unknown usage,

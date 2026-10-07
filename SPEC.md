@@ -519,10 +519,31 @@ appeared in no `history.jsonl`.
        are the usage; `account/read` also gives the account's email and plan (R10a).
 - Claude's live source produces only human-readable text (`--output-format json` merely places the
   same text in `result`). remuda parses only the lines that start with `Current session` or
-  `Current week`. If there is none, or one of them cannot be parsed, it displays the text as-is
-  and never crashes: an answer read only in part is not used, because the line left out may be
-  the limit that is used up. This format is not a public interface and may change between
-  versions.
+  `Current week`, never crashes, and reads the answer as one of three kinds:
+  - **Usage**: such lines, each of them parsed.
+  - **No usage told**: not one such line, and the answer says why (verified on 2.1.292). A line
+    that starts with how the account is billed, `You are currently using your subscription to
+    power your Claude Code usage` or `You are currently using your overages to power your Claude
+    Code usage`, means that claude could not get the account's limits just now: it prints the
+    sentence alone then (with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, for an account whose
+    limits it has not fetched within the hour; when its usage endpoint does not answer). The
+    reason is `no usage limits told for now`. A first line that starts with `Total cost:` is the
+    session's cost, which claude prints instead of limits for an account that is not on a Claude
+    subscription: in an empty `CLAUDE_CONFIG_DIR` (not logged in) `/usage` exits with status 0,
+    prints that summary, and writes nothing to stderr. The reason is `not logged in to a Claude
+    subscription, or using an API key`: claude prints the same for an API key, so remuda does
+    not take it for a login that must be made again. The reason is shown in one line instead of
+    the text (`remuda usage --live`: `live: <reason>`; the TUI: as the live query's reason;
+    `remuda pick`: R23).
+  - **Not recognized**: anything else, including an answer with a line that starts like a usage
+    line and cannot be parsed, whatever else it says. The text is displayed as is: an answer
+    read only in part is not used, because the line left out may be the limit that is used up.
+
+  This format is not a public interface and may change between versions. Texts that other tools
+  take for a refused sign-in (`OAuth session expired and could not be refreshed`, `OAuth token
+  revoked`) are not looked for: in 2.1.292 they are errors of requests to the model, which
+  `/usage` does not make. A `/usage` that exits with a status other than 0 is a failed query,
+  told with the first line of its stderr.
 - **Codex, cached** (verified on 0.155.1 against 1456 real rollouts): each model turn appends
   `{"timestamp", "type": "event_msg", "payload": {"type": "token_count", "rate_limits": {…}}}`.
   `rate_limits` (may be null) holds `limit_id`, `limit_name`, and the windows `primary` and
@@ -567,7 +588,12 @@ appeared in no `history.jsonl`.
 - The live sources provide no severity: 75% is marked as a warning and 90% as critical. Claude's
   live reset times are localized text; the timeline makes a best effort to parse them into instants
   and otherwise (wording it cannot read, or no reset told) uses the cached reset time of the same
-  limit, if that is still ahead. A reset that was read is never replaced by the cached one,
+  limit, if that is still ahead. The wordings read: `Sep 24 at 3:19am (Asia/Shanghai)`;
+  `Oct 9, 2:59pm (UTC)` (claude formats the time with its runtime's `en-US` format, which joins
+  the date and the time with ` at ` or with `, `); the year after the day, which claude adds in
+  another year, `Jan 2, 2027 at 3pm (UTC)` or `Jan 2, 2027, 3pm (UTC)`, read as that year's; and
+  a time alone, `3am (UTC)`. `am` and `pm` are read in either case; the time zone in parentheses
+  is required. A reset that was read is never replaced by the cached one,
   whatever it comes to below. Codex reports instants.
 - **Usage is read at an instant.** A percentage is what an agent said at some time: the cache
   time, or the time a live query answered (not the time it was started: a query may take as long
@@ -1705,7 +1731,8 @@ It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4)
   is the age of all of an account's usage, a reset since is one window's. Usage that is not
   stale can hold a window that has reset since, and the windows of stale usage whose resets are
   ahead stay known, at the percentage recorded. `--live` queries every candidate account first
-  (R10; `--timeout` per query, default 90); a failed query falls back to the cache, with a note.
+  (R10; `--timeout` per query, default 90); a failed query falls back to the cache, with a note,
+  and so does an answer that tells no usage (R10), the note giving its reason.
   remuda never queries live on its own, not before `--run` either (a live query lets the agent
   reach its provider and write in its home): where the recommended pair has a window that has
   reset since, the output names it and, for cached usage, says that `--live` asks the agent.
