@@ -5,8 +5,8 @@ holds, the evidence (which review found what, with the date), and on how many di
 has come up. It is reread after every merged batch of work; an entry seen on three or more days
 is promoted into [SPEC.md](SPEC.md) or [CONTRIBUTING.md](CONTRIBUTING.md) and marked so here.
 Review records live under `docs/` in the maintainer's checkout (`docs/review-2026-10-02.md`,
-`docs/arch-2026-10-06/`, `docs/study-2026-10-07/`, `docs/study-2026-10-08/`), git-excluded; the
-dates below point at them.
+`docs/arch-2026-10-06/`, `docs/study-2026-10-07/`, `docs/study-2026-10-08/`,
+`docs/study-2026-10-08-batch3/`), git-excluded; the dates below point at them.
 
 ## Data and time
 
@@ -33,6 +33,15 @@ allocation; taking each column's maximum builds a usage nobody ever had.
 *Evidence:* 2026-10-07 lane 2 (codex `input` / `cache_write` split merged by per-field maxima:
 110 tokens became 170; a 201K request crossed the 272K long-context price step, $0.68 → $2.94).
 *Seen:* 1 day.
+
+**A tolerance is not exactness; compare ratios in whole numbers.** Two readings can be truly
+closer than any tolerance you pick, and a floating-point product rounds like a quotient does.
+Where a rule says "at the boundary counts", order, compare and band on integers (the percent to a
+fixed number of decimals, the seconds), with one relation for all three.
+*Evidence:* 2026-10-08 batch 3 lane A, rounds 2–4: a `1e-9` relative tolerance merged two paces
+1.8e-10 apart and changed the recommendation; `f64` cross-products put a pace exactly on the
+boundary 5e-10 below it; sorting by quotient and anchoring bands on the raw terms made the band
+depend on input order. *Seen:* 1 day.
 
 **A newly accepted input shape gets its range guards in the same change.** Accepting a wording is
 not the same as having validated its parts.
@@ -86,6 +95,15 @@ private `state/`); lane 6 (a directory readable but not searchable silently empt
 2026-10-08 lane C (compaction wrote through a 0644 target the append path had refused; a target
 deleted mid-write was recreated with the registry's default mode). *Seen:* 2 days.
 
+**A cache version names the computation, not only the shape.** When the rule that produced a
+cached value changes, a cache of the same shape holds wrong values and is reused as if right;
+bump the version. And what was *consumed* is not what was *parsed*: a read offset past blank or
+malformed lines says nothing about whether the first record was seen; persist the parse state the
+rule depends on.
+*Evidence:* 2026-10-08 batch 3 lane B, round 2 (the project rule changed, schema 4 kept: caches
+written by the previous code kept the fork parent's project; `scanned_offset > 0` taken as "first
+record read" misfiled a rollout that began with a blank line). *Seen:* 1 day.
+
 **A child started between a signal and its registration belongs to nobody.** Register the start
 before the fork, or make the last start under way finish the signal's work.
 *Evidence:* 2026-10-06 lane 8 (`probe.rs` / `interrupt.rs`: Ctrl-C during parallel starts left an
@@ -95,7 +113,9 @@ agent running). *Seen:* 1 day.
 finding's neighbours.** Two fixes in a row each introduced the next round's finding.
 *Evidence:* 2026-10-08 lane A (restricting transcripts to the account's store replaced "the latest
 copy" with "the first path"); lane C (refusing a retargeted link introduced recreating a deleted
-target with the wrong mode). *Seen:* 1 day.
+target with the wrong mode); 2026-10-08 batch 3 lane A (three fixes to one boundary comparison,
+each found wanting by the next round) and lane B (the session_meta fix left old caches and the
+offset heuristic behind). *Seen:* 1 day (two fleets).
 
 **Validate before every early return, and fix the sibling path too.** An argument check placed
 after a "nothing feasible" return is skipped exactly when it matters; an ordering bug in one path
@@ -137,9 +157,22 @@ target directories of several GB each; copy them with `target`, `build`, `mutati
 *Evidence:* 2026-10-08 (an 8.1 GB copy of one lane's `.lane/`, 123 MB after pruning). *Seen:* 1 day.
 
 **Every fix carries a test that is red with the fix reverted.** Compile failures do not count.
-*Evidence:* the lane briefs of 2026-10-06 and 2026-10-07; the revert evidence in each lane's
-report. *Seen:* 2 days → in CONTRIBUTING's spirit ("SPEC and tests in the same change"); promote
-the revert rule explicitly when seen once more.
+*Evidence:* the lane briefs of 2026-10-06, 2026-10-07 and 2026-10-08; the revert evidence in each
+lane's report (2026-10-08 batch 3: 33 reverted mutations across three lanes, each red at a runtime
+assertion). *Seen:* 3 days → promoted: CONTRIBUTING "Hermetic tests" (2026-10-08).
+
+**A first-round approve with no findings is not the end of review.** Both lanes approved in
+round 1 with zero findings got a P2 from the GitHub review, and the follow-up rounds on those
+fixes found three more problems between them. The follow-up review is where the method earned
+its keep this time.
+*Evidence:* 2026-10-08 batch 3 lanes A and B (round 1: 0 findings; then 1 GitHub P2 each; then
+lane A rounds 2–3 and lane B round 2 each CHANGES REQUESTED). *Seen:* 1 day.
+
+**A lane that adds a field to a shared struct updates the neighbours' test literals too, and
+says so.** The merge is then a clean one instead of a compile failure on main.
+*Evidence:* 2026-10-08 batch 3 lane C (`UsageRow.window_minutes`: one `None` line in `pick.rs`
+and `jev.rs` fixtures, noted in its questions file; lane A's branch merged main without touching
+them). *Seen:* 1 day.
 
 **Review loops need a convergence rule.** From round 3 on, re-check prior fixes and regressions
 only; new findings block only within a named blocker set (R2 / R13 / R21 violations, data loss,

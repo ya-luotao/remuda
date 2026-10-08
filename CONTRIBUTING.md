@@ -63,6 +63,8 @@ When adding tests:
 - Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jsonl` and `.claude.json` follow
   the real formats and must be scrubbed of personal data.
 - Reference the SPEC anchor the test covers.
+- A fix comes with a test that fails with the fix reverted, at a runtime assertion; a test that
+  only fails to compile without the fix does not count. Pull requests say which test that is.
 - Run the suite as a regular user, not as root: some tests rely on file permission bits that root
   bypasses.
 
