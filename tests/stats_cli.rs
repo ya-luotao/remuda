@@ -1,4 +1,5 @@
-//! R5, R20: `remuda stats [<account>] [--period today|7d|30d|all]`.
+//! R5, R20: `remuda stats [<account>] [--period today|7d|30d|all] [--by account|project |
+//! --csv]`.
 
 mod common;
 
@@ -868,4 +869,445 @@ fn stats_unknown_account_fails() {
         .assert()
         .code(1)
         .stderr(predicates::str::starts_with("remuda: "));
+}
+
+/// The fixtures of the golden outputs below: `claude_fixtures`, and a priced codex request.
+fn golden_fixtures(s: &Setup) {
+    claude_fixtures(s);
+    cx::write_rollout(
+        &s.sb.home().join(".codex"),
+        R1,
+        &[
+            cx::meta(R1, "/w/proj", json!("cli"), 0, &cx::ts(0)),
+            cx::model_turn("gpt-5.6-sol", &cx::ts(1)),
+            cx::usage_event(
+                cx::usage_with_write([5_730_399, 5_586_560, 2_000, 19_533, 4_590]),
+                cx::usage_with_write([139_139, 136_704, 2_000, 529, 90]),
+                &cx::ts(2),
+            ),
+        ]
+        .concat(),
+    );
+}
+
+/// R5, R20: `--by account` is the default, and its output is byte for byte what `remuda stats`
+/// printed before `--by` existed (captured from `main` at 1250015), with and without an
+/// account.
+#[test]
+fn stats_by_account_is_the_report_as_it_was() {
+    let s = setup();
+    golden_fixtures(&s);
+    let all = concat!(
+        "Tokens · all time\n",
+        "\n",
+        "MODEL                  INPUT  CACHE READ  CACHE WRITE  OUTPUT  REASONING  TOTAL    COST\n",
+        "claude:default\n",
+        "  claude-test              8         600          160      90          -    858       -\n",
+        "  claude-advisor-test    700           0            0      70          -    770       -\n",
+        "  claude-haiku-test       30           0            0       5          -     35       -\n",
+        "  total                  738         600          160     165          -   1.7K       -\n",
+        "\n",
+        "claude:max\n",
+        "  claude-test              7           0            0       7          -     14       -\n",
+        "  total                    7           0            0       7          -     14       -\n",
+        "\n",
+        "claude:team\n",
+        "  claude-test             11           0            0      11          -     22       -\n",
+        "  total                   11           0            0      11          -     22       -\n",
+        "\n",
+        "codex:default\n",
+        "  gpt-5.6-sol            435        137K           2K     529         90   140K   $0.08\n",
+        "  total                  435        137K           2K     529         90   140K   $0.08\n",
+        "\n",
+        "claude:default + claude:max\n",
+        "  claude-test              5           0            0       5          -     10       -\n",
+        "  total                    5           0            0       5          -     10       -\n",
+        "\n",
+        "unattributed\n",
+        "  claude-test              9           0            0       9          -     18       -\n",
+        "  total                    9           0            0       9          -     18       -\n",
+        "\n",
+        "overall\n",
+        "  gpt-5.6-sol            435        137K           2K     529         90   140K   $0.08\n",
+        "  claude-test             40         600          160     122          -    922       -\n",
+        "  claude-advisor-test    700           0            0      70          -    770       -\n",
+        "  claude-haiku-test       30           0            0       5          -     35       -\n",
+        "  total                 1.2K        137K         2.2K     726         90   141K  $0.08+\n",
+        "\n",
+        "Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.\n",
+        "Not priced: claude-advisor-test, claude-haiku-test, claude-test (add [prices.\"<model>\"] to config.toml)\n",
+    );
+    let max = concat!(
+        "Tokens · all time\n",
+        "\n",
+        "MODEL          INPUT  CACHE READ  CACHE WRITE  OUTPUT  REASONING  TOTAL  COST\n",
+        "claude:max\n",
+        "  claude-test      7           0            0       7          -     14     -\n",
+        "  total            7           0            0       7          -     14     -\n",
+        "\n",
+        "claude:default + claude:max\n",
+        "  claude-test      5           0            0       5          -     10     -\n",
+        "  total            5           0            0       5          -     10     -\n",
+        "\n",
+        "Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.\n",
+        "Not priced: claude-test (add [prices.\"<model>\"] to config.toml)\n",
+    );
+    assert_eq!(stats(&s.sb, &[]), all);
+    assert_eq!(stats(&s.sb, &["--by", "account"]), all);
+    assert_eq!(stats(&s.sb, &["max"]), max);
+    assert_eq!(stats(&s.sb, &["--by", "account", "claude:max"]), max);
+}
+
+/// `record` with `edit` applied to its JSON.
+fn edited(record: &str, edit: impl FnOnce(&mut serde_json::Map<String, Value>)) -> String {
+    let mut v: Value = serde_json::from_str(record).unwrap();
+    edit(v.as_object_mut().unwrap());
+    cl::line(v)
+}
+
+/// A `claude-test` message of `session` started in `cwd` (`None`: a record without one) at
+/// `cl::ts(minute)` (`None`: without a timestamp).
+fn in_dir(
+    session: &str,
+    id: &str,
+    model: &str,
+    tokens: u64,
+    cwd: Option<&str>,
+    minute: Option<u32>,
+) -> String {
+    let record = cl::assistant_usage(
+        session,
+        id,
+        model,
+        cl::usage(tokens, tokens, 0, 0),
+        &cl::ts(minute.unwrap_or(0)),
+    );
+    edited(&record, |m| {
+        match cwd {
+            Some(cwd) => m.insert("cwd".into(), json!(cwd)),
+            None => m.remove("cwd"),
+        };
+        if minute.is_none() {
+            m.remove("timestamp");
+        }
+    })
+}
+
+/// Sessions in several directories: S_A (default) started in `/w/alpha` and resumed in
+/// `/w/resumed`; S_B (max) in `/w/b, "q"`; S_M (default + max) in `/w/alpha`; S_T (team) in
+/// `/w/alpha/`; S_U (unattributed) records no directory, and one of its messages no time.
+/// `claude-test` costs $3,000.000001 per million input tokens and $15,000 per million output
+/// tokens: 3,000,000,001 and 15,000,000,000 picodollars a token. `claude-nope` has no price.
+fn project_fixtures(s: &Setup) {
+    let config = s.sb.read_config();
+    s.sb.write_config(&format!(
+        "{config}[prices.\"claude-test\"]\ninput = 3000.000001\noutput = 15000\n"
+    ));
+    let t = "claude-test";
+    write(
+        &s.native,
+        &format!("{S_A}.jsonl"),
+        &[
+            cl::user("hi", "/w/alpha", &cl::ts(1)),
+            in_dir(S_A, "msg_a1", t, 100, Some("/w/alpha"), Some(1)),
+            in_dir(S_A, "msg_a2", t, 1, Some("/w/resumed"), Some(3)),
+        ]
+        .concat(),
+    );
+    write(
+        &s.native,
+        &format!("{S_B}.jsonl"),
+        &in_dir(S_B, "msg_b1", t, 20, Some("/w/b, \"q\""), Some(2)),
+    );
+    write(
+        &s.native,
+        &format!("{S_M}.jsonl"),
+        &in_dir(S_M, "msg_m1", t, 5, Some("/w/alpha"), Some(4)),
+    );
+    write(
+        &s.native,
+        &format!("{S_U}.jsonl"),
+        &[
+            in_dir(S_U, "msg_u1", "claude-nope", 10, None, Some(5)),
+            in_dir(S_U, "msg_u2", "claude-nope", 1, None, None),
+        ]
+        .concat(),
+    );
+    write(
+        &s.team.join("projects"),
+        &format!("{S_T}.jsonl"),
+        &in_dir(S_T, "msg_t1", t, 11, Some("/w/alpha/"), Some(0)),
+    );
+    history(&s.sb.home().join(".claude/history.jsonl"), &[S_A, S_M]);
+    history(&s.max.join("history.jsonl"), &[S_B, S_M]);
+    history(&s.team.join("history.jsonl"), &[S_T]);
+}
+
+/// R5, R20 **Projects**: `--by project` gives a section per directory a session started in, as
+/// recorded (a trailing `/` is another project; a resumed session stays where it started),
+/// most tokens first, ties by directory with `(no directory)` last; then the same overall
+/// section as `--by account`.
+#[test]
+fn stats_by_project() {
+    let s = setup();
+    project_fixtures(&s);
+    let out = stats(&s.sb, &["--by", "project"]);
+    assert!(out.starts_with("Tokens · all time\n\nMODEL "), "{out}");
+    assert_eq!(
+        labels(&out),
+        [
+            "/w/alpha",
+            "/w/b, \"q\"",
+            "/w/alpha/",
+            "(no directory)",
+            "overall"
+        ]
+    );
+    // msg_a1 + msg_a2 + msg_m1: 1,908,000,000,106 picodollars.
+    assert_eq!(
+        block(&out, "/w/alpha"),
+        [
+            "claude-test 106 0 0 106 - 212 $1.91",
+            "total 106 0 0 106 - 212 $1.91"
+        ]
+    );
+    assert_eq!(
+        block(&out, "/w/alpha/"),
+        [
+            "claude-test 11 0 0 11 - 22 $0.20",
+            "total 11 0 0 11 - 22 $0.20"
+        ]
+    );
+    assert_eq!(
+        block(&out, "(no directory)"),
+        ["claude-nope 11 0 0 11 - 22 -", "total 11 0 0 11 - 22 -"]
+    );
+    let by_account = stats(&s.sb, &[]);
+    assert_eq!(block(&out, "overall"), block(&by_account, "overall"));
+    assert_eq!(
+        block(&out, "overall"),
+        [
+            "claude-test 137 0 0 137 - 274 $2.47",
+            "claude-nope 11 0 0 11 - 22 -",
+            "total 148 0 0 148 - 296 $2.47+"
+        ]
+    );
+    assert!(out.ends_with("Not priced: claude-nope (add [prices.\"<model>\"] to config.toml)\n"));
+}
+
+/// R20 **Projects**: with an account, the projects of the sessions attributed to it (alone or
+/// with others), and no overall section; none when it has no tokens in the period.
+#[test]
+fn stats_by_project_for_one_account() {
+    let s = setup();
+    project_fixtures(&s);
+    let out = stats(&s.sb, &["max", "--by", "project"]);
+    assert_eq!(labels(&out), ["/w/b, \"q\"", "/w/alpha"]);
+    assert_eq!(
+        block(&out, "/w/alpha"),
+        ["claude-test 5 0 0 5 - 10 $0.09", "total 5 0 0 5 - 10 $0.09"]
+    );
+    let out = stats(&s.sb, &["--by", "project", "--period", "today", "max"]);
+    assert_eq!(labels(&out), Vec::<&str>::new(), "{out}");
+}
+
+/// R5, R20 **CSV**: one line per request counted, by time (none last), with its accounts,
+/// session, project and exact cost (empty when not priced; claude records no reasoning);
+/// fields quoted as RFC 4180 has it. The costs add up to the text report's.
+#[test]
+fn stats_csv() {
+    let s = setup();
+    project_fixtures(&s);
+    let out = s.sb.remuda().args(["stats", "--csv"]).assert().success();
+    let out = out.get_output();
+    let csv = String::from_utf8(out.stdout.clone()).unwrap();
+    let expected = [
+        "timestamp,provider,accounts,session_id,project,model,input,cache_read,cache_write_5m,\
+         cache_write_1h,output,reasoning,fast,us_only,cost_usd"
+            .to_string(),
+        format!(
+            "2026-09-20T10:00:00Z,claude,claude:team,{S_T},/w/alpha/,claude-test,\
+             11,0,0,0,11,,false,false,0.198000000011"
+        ),
+        format!(
+            "2026-09-20T10:01:00Z,claude,claude:default,{S_A},/w/alpha,claude-test,\
+             100,0,0,0,100,,false,false,1.8000000001"
+        ),
+        format!(
+            "2026-09-20T10:02:00Z,claude,claude:max,{S_B},\"/w/b, \"\"q\"\"\",claude-test,\
+             20,0,0,0,20,,false,false,0.36000000002"
+        ),
+        format!(
+            "2026-09-20T10:03:00Z,claude,claude:default,{S_A},/w/alpha,claude-test,\
+             1,0,0,0,1,,false,false,0.018000000001"
+        ),
+        format!(
+            "2026-09-20T10:04:00Z,claude,claude:default + claude:max,{S_M},/w/alpha,\
+             claude-test,5,0,0,0,5,,false,false,0.090000000005"
+        ),
+        format!("2026-09-20T10:05:00Z,claude,,{S_U},,claude-nope,10,0,0,0,10,,false,false,"),
+        format!(",claude,,{S_U},,claude-nope,1,0,0,0,1,,false,false,"),
+    ]
+    .map(|l| l + "\n")
+    .concat();
+    assert_eq!(csv, expected);
+    // Progress goes to stderr, as for the text report; nothing else does.
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("Incomplete"),
+        "{:?}",
+        out.stderr
+    );
+
+    // The exact costs add up to the overall cost of the text report: 2,466,000,000,137
+    // picodollars, shown as $2.47.
+    let pico: u128 = csv
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.rsplit(',').next().filter(|c| !c.is_empty()))
+        .map(|c| {
+            let (whole, frac) = c.split_once('.').unwrap_or((c, ""));
+            whole.parse::<u128>().unwrap() * 1_000_000_000_000
+                + format!("{frac:0<12}").parse::<u128>().unwrap()
+        })
+        .sum();
+    assert_eq!(pico, 2_466_000_000_137);
+    assert_eq!(
+        block(&stats(&s.sb, &[]), "overall")[0],
+        "claude-test 137 0 0 137 - 274 $2.47"
+    );
+
+    // With an account and a period, like the text report.
+    let max = stats(&s.sb, &["--csv", "max"]);
+    let sessions: Vec<&str> = max
+        .lines()
+        .skip(1)
+        .map(|l| l.split(',').nth(3).unwrap())
+        .collect();
+    assert_eq!(sessions, [S_B, S_M]);
+    assert_eq!(
+        stats(&s.sb, &["--csv", "--period", "today"]),
+        format!("{}\n", expected.lines().next().unwrap())
+    );
+}
+
+/// R5: `--csv` lists requests, not sections: it goes with no `--by`.
+#[test]
+fn stats_csv_and_by_conflict() {
+    let s = setup();
+    for by in ["account", "project"] {
+        s.sb.remuda()
+            .args(["stats", "--csv", "--by", by])
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains("cannot be used with"));
+    }
+    s.sb.remuda()
+        .args(["stats", "--by", "team"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("expected account or project"));
+}
+
+/// R20 **CSV**: an incomplete report keeps stdout pure CSV: the `Incomplete:` line goes to
+/// stderr and the exit status is 1. The text report is unchanged: the line on stdout, exit 0.
+#[test]
+fn stats_csv_says_on_stderr_and_by_its_exit_status_that_it_is_incomplete() {
+    let s = setup();
+    project_fixtures(&s);
+    let complete = stats(&s.sb, &["--csv"]);
+    let store = s.native.canonicalize().unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = s.sb.remuda().args(["stats", "--csv"]).assert().code(1);
+    let by_project =
+        s.sb.remuda()
+            .args(["stats", "--by", "project"])
+            .assert()
+            .success();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = out.get_output();
+    assert_eq!(String::from_utf8(out.stdout.clone()).unwrap(), complete);
+    let stderr = String::from_utf8(out.stderr.clone()).unwrap();
+    let said = format!("Incomplete: cannot read {}: ", store.display());
+    assert!(stderr.starts_with(&said), "{stderr}");
+    assert!(
+        stderr.ends_with("; 4 transcripts below it are counted as last read\n"),
+        "{stderr}"
+    );
+    let text = String::from_utf8(by_project.get_output().stdout.clone()).unwrap();
+    assert!(text.lines().last().unwrap().starts_with(&said), "{text}");
+}
+
+/// R20 **Cache**: a cache of schema 3 has no project directories, and files it holds would be
+/// read on from their offsets, past the records that have one: it is rebuilt.
+#[test]
+fn a_cache_of_schema_3_is_rebuilt_for_the_projects() {
+    let s = setup();
+    claude_fixtures(&s);
+    let complete = stats(&s.sb, &["--by", "project"]);
+    assert_eq!(labels(&complete), ["/w/proj", "overall"]);
+    let cache = s.sb.remuda_home().join("state/stats.json");
+    let mut v: Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+    v["schema_version"] = json!(3);
+    for file in v["files"].as_object_mut().unwrap().values_mut() {
+        file.as_object_mut().unwrap().remove("cwd");
+    }
+    fs::write(&cache, v.to_string()).unwrap();
+    assert_eq!(stats(&s.sb, &["--by", "project"]), complete);
+    let v: Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+    assert_eq!(v["schema_version"], remuda::stats::SCHEMA_VERSION);
+}
+
+/// R20 **Cache**, **Projects** (critic review 2 of #26): a cache of schema 4, written before a
+/// subagent's rollout stopped taking its fork parent's `session_meta` for its project, holds
+/// that project for a file that has not changed, and would hand it on to a file read on from
+/// its offset. It is rebuilt: run as it is, then once the rollout grew, the CSV is what a
+/// whole read gives.
+#[test]
+fn a_cache_of_schema_4_with_the_parents_project_is_rebuilt() {
+    let sb = Sandbox::new();
+    let codex = sb.home().join(".codex");
+    let rollout = cx::write_rollout(
+        &codex,
+        R2,
+        &[
+            // The subagent's own session_meta, without a cwd, then its fork parent's.
+            edited(&cx::fork_meta(R2, R1, "/w/unused", &cx::ts(0)), |m| {
+                m["payload"].as_object_mut().unwrap().remove("cwd");
+            }),
+            cx::parent_meta(R1, "/w/parent", &cx::ts(0)),
+            cx::turn_context("/w/turn", &cx::ts(1)),
+            cx::model_turn("gpt-test", &cx::ts(1)),
+            cx::tokens([100, 50, 10, 4], [100, 50, 10, 4], &cx::ts(2)),
+        ]
+        .concat(),
+    );
+    let projects = |csv: &str| -> Vec<String> {
+        csv.lines()
+            .skip(1)
+            .map(|l| l.split(',').nth(4).unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(projects(&stats(&sb, &["--csv"])), ["/w/turn"]);
+
+    // As the previous reading rule left it.
+    let cache = sb.remuda_home().join("state/stats.json");
+    let mut v: Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+    v["schema_version"] = json!(4);
+    let files = v["files"].as_object_mut().unwrap();
+    assert_eq!(files.len(), 1);
+    for file in files.values_mut() {
+        file["cwd"] = json!("/w/parent");
+        file.as_object_mut().unwrap().remove("codex_head");
+    }
+    fs::write(&cache, v.to_string()).unwrap();
+    assert_eq!(projects(&stats(&sb, &["--csv"])), ["/w/turn"], "unchanged");
+
+    append(
+        &rollout,
+        &cx::tokens([250, 150, 30, 10], [150, 100, 20, 6], &cx::ts(3)),
+    );
+    let grown = stats(&sb, &["--csv"]);
+    assert_eq!(projects(&grown), ["/w/turn", "/w/turn"], "grown");
+    fs::remove_file(&cache).unwrap();
+    assert_eq!(stats(&sb, &["--csv"]), grown, "as read whole");
 }

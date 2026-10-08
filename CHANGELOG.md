@@ -10,6 +10,16 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Added
 
+- `remuda stats --by project`: sections by the directory each session started in (as the
+  transcript records it; `(no directory)` for sessions that record none), most tokens first,
+  then the usual `overall` section; with an account, the projects of its sessions.
+  `remuda stats --csv`: every request of the period as CSV, one line each, with its time,
+  provider, accounts, session, project, model, counts, fast / US-only flags and exact cost in
+  USD, for reconciling with a bill; when the report is incomplete, the `Incomplete:` lines go to
+  stderr and the exit status is 1. The statistics cache records each transcript's directory
+  (schema 5), so the first `remuda stats` after upgrading reads every transcript whole again
+  (SPEC R20, R5).
+
 - `remuda pick` recommends the account to resume or fork a session as: `remuda pick -- --resume
   <id>` (claude, also with `--fork-session`) or `-- resume <id>` / `-- fork <id>` (codex). Prompt
   caches are per account, so the account that ran the session within `[pick] affinity_minutes`

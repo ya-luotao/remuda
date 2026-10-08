@@ -541,6 +541,109 @@ fn a_shared_store_is_read_once() {
     );
 }
 
+/// The project sections of `f`'s cache for all time: (directory, total tokens), as listed.
+fn project_totals(f: &Fixture, account: Option<&str>) -> Vec<(Option<String>, u64)> {
+    let sources = f.sources();
+    let counted = stats::requests(&f.cache, &sources, &f.attribution, &f.accounts, &f.prices);
+    let table = stats::projects(&counted, Period::All, f.now, &f.tz, account);
+    table
+        .sections
+        .iter()
+        .map(|p| (p.dir.clone(), p.total().total()))
+        .collect()
+}
+
+/// R20: a request counts for the project of the copy that counts, as it counts for its
+/// accounts: a claude fork in another store, started in another directory and on a path that
+/// sorts first, holds copies of its parent's messages, which count in the parent's directory.
+#[test]
+fn a_request_counts_for_the_project_of_the_copy_that_counts() {
+    let mut f = Fixture::new();
+    // `<root>/a-team` sorts before `<root>/home`: the fork is visited first.
+    let team = f.root.join("a-team");
+    fs::create_dir_all(team.join("projects")).unwrap();
+    f.accounts.push(Account {
+        provider: Provider::Claude,
+        name: "team".into(),
+        home: Home::Path(team.display().to_string()),
+    });
+    let in_dir = |record: &str, cwd: &str| edited(record, |v| v["cwd"] = json!(cwd));
+    f.write(
+        &format!("{S_A}.jsonl"),
+        &msg_a1_records().map(|r| in_dir(&r, "/w/parent")).concat(),
+    );
+    let fork = [
+        msg_a1_records()
+            .map(|r| in_dir(&cl::forked(&r, S_A), "/w/fork"))
+            .concat(),
+        in_dir(
+            &cl::assistant_usage(
+                S_B,
+                "msg_b1",
+                "claude-test",
+                cl::usage(7, 7, 0, 0),
+                &cl::ts(5),
+            ),
+            "/w/fork",
+        ),
+    ]
+    .concat();
+    write_file(&team.join(format!("projects/-w-fork/{S_B}.jsonl")), &fork);
+    f.attribute(S_A, "claude:default");
+    f.attribute(S_B, "claude:team");
+    f.refresh();
+    let msg_a1 = toks(3, 300, 100, 40, 0).total();
+    assert_eq!(
+        project_totals(&f, None),
+        [
+            (Some("/w/parent".into()), msg_a1),
+            (Some("/w/fork".into()), 14)
+        ]
+    );
+    assert_eq!(
+        project_totals(&f, Some("claude:team")),
+        [(Some("/w/fork".into()), 14)]
+    );
+}
+
+/// R20: the same for codex: a fork's rollout replays its parent's requests with later
+/// timestamps; the parent's copies count, in the parent's directory, though the fork's
+/// rollout is visited first.
+#[test]
+fn a_codex_request_counts_for_the_project_of_the_copy_that_counts() {
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let other = f.root.join("a-other");
+    fs::create_dir_all(other.join("sessions")).unwrap();
+    f.accounts.push(Account {
+        provider: Provider::Codex,
+        name: "other".into(),
+        home: Home::Path(other.display().to_string()),
+    });
+    cx::write_rollout(&work, R1, &r1_records(cx::ts));
+    let replay: String = r1_records(|m| cx::ts(m + 10))
+        .lines()
+        .skip(1)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    cx::write_rollout(
+        &other,
+        R2,
+        &[
+            cx::fork_meta(R2, R1, "/w/fork", &cx::ts(20)),
+            replay,
+            cx::tokens([520, 330, 55, 13], [120, 80, 10, 1], &cx::ts(22)),
+        ]
+        .concat(),
+    );
+    f.refresh();
+    // R1: 100 + 10, 150 + 20, 150 + 15 (the compaction estimate is not counted).
+    assert_eq!(
+        project_totals(&f, None),
+        [(Some("/w/proj".into()), 445), (Some("/w/fork".into()), 130)]
+    );
+}
+
 /// Rollout R1: a repeated event, a compaction estimate, and a model switch; `ts(minute)` gives
 /// the timestamps.
 fn r1_records(ts: impl Fn(u32) -> String) -> String {
@@ -1185,6 +1288,7 @@ fn cache_round_trips_and_a_schema_mismatch_rebuilds() {
         .to_str()
         .unwrap()];
     assert_eq!(claude["session_id"], S_A);
+    assert_eq!(claude["cwd"], "/w/proj");
     assert_eq!(claude["models"], json!(["claude-test"]));
     // One row per request: [key, ts, model, flags, input, cache read, cache write 5m, cache
     // write 1h, output, reasoning].
@@ -1196,10 +1300,12 @@ fn cache_round_trips_and_a_schema_mismatch_rebuilds() {
             .as_array()
             .unwrap()[..]
     );
-    // A cache of schema 1 (a single cache write) or 2 (codex's cache write not read: its rows
-    // would keep it in the input) is rebuilt.
+    // A cache of schema 1 (a single cache write), 2 (codex's cache write not read: its rows
+    // would keep it in the input), 3 (no project directory: a file read on from its offset
+    // would never get one) or 4 (never released: codex's project by an earlier rule) is
+    // rebuilt.
     let old = f.root.join("old-stats.json");
-    for version in [1, 2] {
+    for version in [1, 2, 3, 4] {
         let mut older = v.clone();
         older["schema_version"] = json!(version);
         fs::write(&old, older.to_string()).unwrap();
@@ -1210,7 +1316,7 @@ fn cache_round_trips_and_a_schema_mismatch_rebuilds() {
         );
         assert_eq!(loaded.schema_version, SCHEMA_VERSION);
     }
-    assert_eq!(SCHEMA_VERSION, 3);
+    assert_eq!(SCHEMA_VERSION, 5);
 
     let mut other = v.clone();
     other["schema_version"] = json!(SCHEMA_VERSION + 1);
