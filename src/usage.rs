@@ -37,6 +37,10 @@ pub struct UsageRow {
     /// `normal`, `warning`, `critical`, ... as reported; `None` when unknown.
     pub severity: Option<String>,
     pub resets: Option<Resets>,
+    /// How long the window is, in minutes, as codex tells it (R10; its label rounds it to whole
+    /// hours). `None` for claude's rows: neither its cache nor `/usage` says, and the length is
+    /// not guessed from the label here (R24 reads it from the label when it needs one).
+    pub window_minutes: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,6 +106,7 @@ fn cached_windows(utilization: &Value) -> Parsed<UsageRow> {
                     percent,
                     severity: None,
                     resets: resets_at(window),
+                    window_minutes: None,
                 }),
         )
     }))
@@ -129,6 +134,7 @@ fn limit_row(limit: &Value) -> Option<UsageRow> {
             .and_then(Value::as_str)
             .map(str::to_string),
         resets: resets_at(limit),
+        window_minutes: None,
     })
 }
 
@@ -166,7 +172,8 @@ pub fn codex_label(minutes: i64, name: Option<&str>) -> String {
 
 /// Rows of one codex rate-limit snapshot (R10): a rollout's `rate_limits` (snake_case) or an
 /// app-server snapshot (camelCase), `name` `None` for the general limit. A window without a
-/// numeric percentage and a positive duration is dropped; rows go by window length.
+/// numeric percentage and a positive duration is dropped; rows go by window length, each with
+/// its minutes as told (the label rounds them).
 pub fn codex_rows(snapshot: &Value, name: Option<&str>) -> Vec<UsageRow> {
     let mut windows: Vec<(i64, UsageRow)> = ["primary", "secondary"]
         .into_iter()
@@ -185,6 +192,7 @@ pub fn codex_rows(snapshot: &Value, name: Option<&str>) -> Vec<UsageRow> {
                 percent,
                 severity: None,
                 resets,
+                window_minutes: u32::try_from(minutes).ok(),
             };
             Some((minutes, row))
         })
@@ -266,6 +274,7 @@ fn live_row(line: &str) -> Option<UsageRow> {
         percent,
         severity: None,
         resets,
+        window_minutes: None,
     })
 }
 
@@ -778,6 +787,7 @@ mod tests {
             percent,
             severity: severity.map(str::to_string),
             resets,
+            window_minutes: None,
         }
     }
 
@@ -936,7 +946,17 @@ mod tests {
         Some(Resets::At(Timestamp::from_second(s).unwrap()))
     }
 
-    /// R10: codex windows are labeled by their duration, never by their position.
+    /// `row` of a codex window `minutes` long, as codex told it (R10).
+    fn lasting(minutes: u32, row: UsageRow) -> UsageRow {
+        UsageRow {
+            window_minutes: Some(minutes),
+            ..row
+        }
+    }
+
+    /// R10: codex windows are labeled by their duration, never by their position; each row
+    /// keeps the minutes codex told (the label rounds them), in a rollout's snake_case and in
+    /// app-server's camelCase.
     #[test]
     fn codex_windows_are_labeled_by_duration() {
         let rows = |v: Value| codex_rows(&v, None);
@@ -947,14 +967,17 @@ mod tests {
             "credits": {"has_credits": false}, "plan_type": "pro"});
         assert_eq!(
             rows(pro),
-            [row("Week (all models)", 99.0, None, at_second(1790414559))]
+            [lasting(
+                10080,
+                row("Week (all models)", 99.0, None, at_second(1790414559))
+            )]
         );
         // A Plus plan: five hours and a week, in either position; shortest first.
         let plus = json!({"primary": window(10.0, 300, json!(1)),
                           "secondary": window(20.0, 10080, json!(2))});
         let expected = [
-            row("Session", 10.0, None, at_second(1)),
-            row("Week (all models)", 20.0, None, at_second(2)),
+            lasting(300, row("Session", 10.0, None, at_second(1))),
+            lasting(10080, row("Week (all models)", 20.0, None, at_second(2))),
         ];
         assert_eq!(rows(plus), expected);
         let swapped = json!({"primary": window(20.0, 10080, json!(2)),
@@ -966,8 +989,8 @@ mod tests {
         assert_eq!(
             rows(legacy),
             [
-                row("Session", 1.5, None, None),
-                row("Week (all models)", 2.0, None, None)
+                lasting(299, row("Session", 1.5, None, None)),
+                lasting(10079, row("Week (all models)", 2.0, None, None))
             ]
         );
         // app-server spells the same in camelCase.
@@ -981,9 +1004,21 @@ mod tests {
         assert_eq!(
             codex_rows(&spark, Some("GPT-5.3-Codex-Spark")),
             [
-                row("Session (GPT-5.3-Codex-Spark)", 5.0, None, at_second(1)),
-                row("Week (GPT-5.3-Codex-Spark)", 7.0, None, at_second(2)),
+                lasting(
+                    300,
+                    row("Session (GPT-5.3-Codex-Spark)", 5.0, None, at_second(1))
+                ),
+                lasting(
+                    10080,
+                    row("Week (GPT-5.3-Codex-Spark)", 7.0, None, at_second(2))
+                ),
             ]
+        );
+        // A window of 90 minutes is labeled `2h window`, and keeps its 90 minutes.
+        let short = json!({"primary": window(30.0, 90, json!(3))});
+        assert_eq!(
+            rows(short),
+            [lasting(90, row("2h window", 30.0, None, at_second(3)))]
         );
         // Other durations.
         for (minutes, name, label) in [
@@ -1362,7 +1397,7 @@ mod tests {
             json!({"rateLimits": {"primary": {"usedPercent": 4, "windowDurationMins": 300}}});
         let read =
             json!({"account": {"type": "chatgpt", "email": "c@example.com", "planType": "plus"}});
-        let session = vec![row("Session", 4.0, None, None)];
+        let session = vec![lasting(300, row("Session", 4.0, None, None))];
         let agents =
             Scripted::new().app_server_says("codex:work", Ok(vec![Ok(limits.clone()), Ok(read)]));
         let result = live_usage(&work, &agents, T).unwrap();
@@ -1679,6 +1714,7 @@ mod tests {
             percent,
             severity: None,
             resets: Some(Resets::At(at(resets))),
+            window_minutes: None,
         };
         let cached = CachedUsage {
             fetched_at: Some(at("2026-10-08T08:00:00Z")),

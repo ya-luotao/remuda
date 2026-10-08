@@ -105,6 +105,7 @@ fn row(label: &str, percent: f64, severity: Option<&str>, resets: Option<&str>) 
         percent,
         severity: severity.map(str::to_string),
         resets: resets.map(|r| Resets::At(ts(r))),
+        window_minutes: None,
     }
 }
 
@@ -622,6 +623,47 @@ fn a_live_answer_that_tells_no_usage_is_its_reason() {
         assert_eq!(copy.accounts[1].live, Some(Err(reason.to_string())));
         app.private = false;
     }
+}
+
+/// R21, R10: a window's length is not personal: private mode keeps the minutes codex told, of
+/// a cache and of a live answer, as they are.
+#[test]
+fn private_mode_keeps_the_window_lengths() {
+    let lasting = |minutes, row: UsageRow| UsageRow {
+        window_minutes: Some(minutes),
+        ..row
+    };
+    let mut app = app();
+    // The caches are asked for: an answer comes to a query under way.
+    assert!(app.start().contains(&Effect::CachedUsage(everyone())));
+    update(
+        &mut app,
+        Event::CachedUsage {
+            account: account("max"),
+            result: cached(vec![
+                lasting(90, row("2h window", 10.0, None, None)),
+                row("Session", 5.0, None, None),
+            ]),
+        },
+    );
+    keys(&mut app, &[Key::Char('u')]);
+    update(
+        &mut app,
+        Event::LiveUsage {
+            account: account("team"),
+            answered_at: ts(NOW),
+            result: Ok(
+                LiveUsage::Rows(vec![lasting(300, row("Session", 55.0, None, None))]).into(),
+            ),
+        },
+    );
+    app.private = true;
+    let copy = super::privacy::redacted(&app);
+    let minutes = |rows: &[UsageRow]| rows.iter().map(|r| r.window_minutes).collect::<Vec<_>>();
+    let cached = copy.accounts[1].cached.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(minutes(&cached.rows), [Some(90), None]);
+    let (live, _) = copy.accounts[2].live.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(minutes(live), [Some(300)]);
 }
 
 /// Results name their account: when the list changes during a query, a late result lands on
@@ -2722,12 +2764,14 @@ fn populated_accounts() -> App {
                     percent: 12.0,
                     severity: None,
                     resets: Some(Resets::Text("Sep 24 at 1pm (UTC)".into())),
+                    window_minutes: None,
                 },
                 UsageRow {
                     label: "Week (all models)".into(),
                     percent: 91.0,
                     severity: None,
                     resets: Some(Resets::Text("Sep 30 at 11:59am (UTC)".into())),
+                    window_minutes: None,
                 },
             ])
             .into()),
@@ -3007,12 +3051,14 @@ fn accounts_view_a_live_reset_behind_its_answer_is_not_replaced() {
                     percent: 60.0,
                     severity: None,
                     resets: Some(Resets::Text("Sep 24 at 11am (UTC)".into())),
+                    window_minutes: None,
                 },
                 UsageRow {
                     label: "Week (all models)".into(),
                     percent: 55.0,
                     severity: None,
                     resets: Some(Resets::Text("whenever".into())),
+                    window_minutes: None,
                 },
             ])
             .into()),
@@ -3061,12 +3107,14 @@ fn accounts_view_a_queued_live_answer_keeps_its_answer_time() {
                     percent: 60.0,
                     severity: None,
                     resets: Some(Resets::Text("Sep 24 at 12pm (UTC)".into())),
+                    window_minutes: None,
                 },
                 UsageRow {
                     label: "Week (all models)".into(),
                     percent: 40.0,
                     severity: None,
                     resets: Some(Resets::Text("Sep 24 at 12:01pm (UTC)".into())),
+                    window_minutes: None,
                 },
             ])
             .into()),

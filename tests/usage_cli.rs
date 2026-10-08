@@ -1637,3 +1637,127 @@ fn usage_wait_records_the_reading_it_prints() {
     }
     assert!(!sb.launch_log().exists());
 }
+
+/// R10, R24: a codex window is recorded with the minutes codex told (`window_minutes`), and
+/// `--history` paces it by them, not by its label: 40% used half an hour into a window of 90
+/// minutes (labeled `2h window`) is ahead of an even pace; two hours would be behind it.
+#[test]
+fn a_codex_window_is_paced_by_its_minutes() {
+    use common::rollouts::{token_count, write_rollout};
+    let sb = Sandbox::new();
+    let work = sb.make_codex_home("c/work");
+    sb.write_config(&format!(
+        "[[account]]\nprovider = \"codex\"\nname = \"work\"\nhome = \"{}\"\n",
+        work.display()
+    ));
+    let now = minute();
+    let (read, reset) = (plus(now, -30 * 60), plus(now, 30 * 60));
+    let limits = serde_json::json!({"limit_id": "codex", "limit_name": null,
+        "primary": {"used_percent": 40.0, "window_minutes": 90, "resets_at": reset.as_second()},
+        "secondary": null, "plan_type": "plus"});
+    write_rollout(
+        &work,
+        "019c1e08-e4f6-7d70-a129-38ec744a3f3c",
+        &token_count(limits, &read.to_string()),
+    );
+    let out = stdout_of(sb.remuda().args(["usage", "codex:work"]).assert().success());
+    assert!(out.contains("2h window"), "{out}");
+    assert_eq!(
+        history(&sb),
+        [
+            serde_json::json!({"ts": read.to_string(), "account": "codex:work",
+            "label": "2h window", "model": null, "percent": 40.0,
+            "resets_at": reset.to_string(), "source": "cached", "window_minutes": 90})
+        ]
+    );
+    let out = stdout_of(
+        sb.remuda()
+            .args(["usage", "--history", "codex:work"])
+            .assert()
+            .success()
+            .stderr(""),
+    );
+    assert_eq!(
+        out,
+        format!(
+            "codex:work\n  2h window\n    {}  40%  resets {}\n    \
+             used 40% with 33% of the window elapsed: ahead of an even pace; \
+             at this pace 100% by {} (resets {})\n",
+            utc(read),
+            utc(reset),
+            utc(plus(now, 15 * 60)),
+            utc(reset),
+        )
+    );
+    assert!(sb.codex_invocations().is_empty());
+}
+
+/// R10, R24: `usage --wait` takes a second attempt and records the first one's reading only.
+/// The session is used up and resets in about ten seconds: the first attempt waits, the next
+/// is `MIN_INTERVAL` (60 s) later, when the cached session has reset since: done, exit 0. The
+/// history holds the first attempt's points, once each: the second attempt's week is the same
+/// reading, its session (`reset since cached`) is not recorded. The wait is real, and the
+/// status line is there on a terminal (stderr is a pseudo-terminal here).
+#[test]
+fn usage_wait_records_the_attempt_before_a_reset_once() {
+    use std::os::fd::FromRawFd;
+    let Setup { sb, max, .. } = setup();
+    let fetched = now_ms() as i64 - 60_000;
+    let reset = jiff::Timestamp::from_millisecond(now_ms() as i64 + 10_000).unwrap();
+    let limits = format!(
+        r#"{{"limits": [
+            {{"kind": "session", "percent": 100, "resets_at": "{reset}"}},
+            {{"kind": "weekly_all", "percent": 20, "resets_at": "2099-09-23T15:39:59Z"}}]}}"#
+    );
+    sb.write_claude_json(Some(&max), &cache_at(fetched, &limits));
+    let (master, slave) = pty();
+    let mut cmd = sb.remuda_process();
+    // SAFETY: the descriptor `pty` opened; the command owns it from here, and closes it once
+    // it is dropped.
+    let terminal_end = unsafe { std::fs::File::from_raw_fd(slave) };
+    cmd.args(["usage", "max", "--wait"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(terminal_end);
+    let start = Instant::now();
+    let remuda = cmd.spawn().unwrap();
+    // Only remuda has the terminal's end now: reading ends when it is gone.
+    drop(cmd);
+    let terminal = std::thread::spawn(move || {
+        use std::io::Read;
+        // SAFETY: the descriptor `pty` opened; this file is its only owner.
+        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+        let mut shown = Vec::new();
+        let _ = master.read_to_end(&mut shown);
+        String::from_utf8_lossy(&shown).into_owned()
+    });
+    let out = remuda.wait_with_output().unwrap();
+    let took = start.elapsed();
+    let shown = terminal.join().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{stdout}{shown}");
+    assert!(
+        took >= Duration::from_secs(60),
+        "took {took:?}: no second attempt"
+    );
+    assert!(took < Duration::from_secs(90), "took {took:?}");
+    assert!(
+        shown.contains("remuda: waiting: claude:max Session 100% used"),
+        "{shown:?}"
+    );
+    assert!(stdout.contains("reset since cached"), "{stdout}");
+    let ts = jiff::Timestamp::from_millisecond(fetched)
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        history(&sb),
+        [
+            serde_json::json!({"ts": ts, "account": "claude:max", "label": "Session",
+                "model": null, "percent": 100.0, "resets_at": reset.to_string(),
+                "source": "cached"}),
+            serde_json::json!({"ts": ts, "account": "claude:max",
+                "label": "Week (all models)", "model": null, "percent": 20.0,
+                "resets_at": "2099-09-23T15:39:59Z", "source": "cached"}),
+        ]
+    );
+}

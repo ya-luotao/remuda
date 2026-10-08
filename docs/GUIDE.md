@@ -387,8 +387,10 @@ Accounts with `share = false` and the source itself are not checked.
   --history` shows it per window, with the pace of the current window: `used 71% with 48% of the
   window elapsed: ahead of an even pace; at this pace 100% by Oct 8 20:00` says the window runs
   out before its reset at that rate; `behind an even pace; at this pace 83% at reset` says 17%
-  would go unused. The window lengths come from the labels (`Session` 5 hours, `Week` 7 days,
-  codex's `<N>h window`), so a codex window is counted to the hour. `remuda usage` also adds
+  would go unused. A codex window is as long as codex says, to the minute (each of its points
+  records `window_minutes`); Claude's windows, and codex points recorded before remuda kept the
+  minutes, take their length from the label (`Session` 5 hours, `Week` 7 days, codex's `<N>h
+  window`, counted to the hour). `remuda usage` also adds
   `note: resets in 42 min with 71% left` under a window that resets within the hour with a
   quarter or more left.
 - **Identity** comes from `claude auth status --json` and `codex login status`. `remuda list`

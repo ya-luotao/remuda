@@ -90,6 +90,7 @@ impl<'a> Snapshot<'a> {
                         Some(Resets::Text(text)) => Some(text.clone()),
                         _ => None,
                     },
+                    window_minutes: row.window_minutes,
                     percent: row.percent,
                     reported: row.severity.clone(),
                     source: self.source,
@@ -184,6 +185,8 @@ pub struct Window {
     pub reset: Reset,
     /// Claude's own wording of the reset, for display.
     pub wording: Option<String>,
+    /// The window's length in minutes, as its row tells it ([`UsageRow::window_minutes`]).
+    pub window_minutes: Option<u32>,
     /// Percent used as recorded; obsolete once the reset has passed, so only [`Window::used`]
     /// tells it.
     percent: f64,
@@ -346,6 +349,7 @@ mod tests {
             percent,
             severity: None,
             resets,
+            window_minutes: None,
         }
     }
 

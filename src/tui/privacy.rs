@@ -1109,7 +1109,7 @@ fn identity_redacted(identity: &Identity) -> Identity {
     }
 }
 
-/// Usage is numbers, limit labels (model names) and reset times: all shown.
+/// Usage is numbers, limit labels (model names), reset times and window lengths: all shown.
 fn cached_usage(usage: &CachedUsage) -> CachedUsage {
     let CachedUsage { fetched_at, rows } = usage;
     CachedUsage {
@@ -1124,6 +1124,7 @@ fn usage_row(row: &UsageRow) -> UsageRow {
         percent,
         severity,
         resets,
+        window_minutes,
     } = row;
     UsageRow {
         label: label.clone(),
@@ -1133,6 +1134,7 @@ fn usage_row(row: &UsageRow) -> UsageRow {
             Resets::At(at) => Resets::At(*at),
             Resets::Text(text) => Resets::Text(text.clone()),
         }),
+        window_minutes: *window_minutes,
     }
 }
 

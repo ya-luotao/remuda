@@ -1364,7 +1364,8 @@ mod tests {
 
     /// R10, R24 (lane review 6): `usage --wait` reads each cached attempt against a time taken
     /// after the cache was read. Here the reading of the cache takes until after the session's
-    /// reset (`.claude.json` is a FIFO that is written only then): the session, at 100% when
+    /// reset (`.claude.json` is a FIFO, written only once remuda has opened it, and the clock
+    /// moves past the reset in between; no sleep orders the two): the session, at 100% when
     /// remuda started, has reset since, so nothing is used up and the wait is done (exit 0), and
     /// its old percentage is not recorded. Read against a time taken before the cache, it would
     /// still be at 100%: `--max-wait 0` would give up (exit 1) and record it.
@@ -1402,10 +1403,14 @@ mod tests {
             fetched.as_millisecond()
         );
         let writer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(500));
+            use std::io::Write;
+            // Opening a FIFO to write waits for a reader to open it: once this returns,
+            // `usage_wait` is reading the cache (it cannot reach the end before this end is
+            // closed), and any time it took before that was taken before the reset.
+            let mut cache_file = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
             // The time moves past the reset, then the cache is there to be read.
             WRITTEN.store(true, Ordering::SeqCst);
-            std::fs::write(&fifo, cache).unwrap();
+            cache_file.write_all(cache.as_bytes()).unwrap();
         });
         let ctx = Context {
             args: Vec::new(),
@@ -1762,6 +1767,7 @@ mod tests {
                 percent: 100.0,
                 severity: None,
                 resets: Some(usage::Resets::At("2026-10-08T11:12:00Z".parse().unwrap())),
+                window_minutes: None,
             }],
         };
         let reading = usage::Snapshot::cached(&cached).at(now);
