@@ -1919,9 +1919,10 @@ holds it (**Resuming**, below).
   It is given for every pair, whatever the strategy, from the windows that apply and are known
   (**Windows**, the headroom's): of each, the percent left over the hours from the instant to
   its reset, never fewer than 1 (a window that resets in a minute would outrank everything), or
-  over its whole length when its reset is unknown. A window's length is its label's (R24:
-  `Session` five hours, `Week …` seven days, codex's `<N>h window`); a window of unknown length
-  gives no pace, whatever its reset. The pair's pace is the least of its budget windows' (a
+  over its whole length when its reset is unknown. A window's length is the length codex tells,
+  to the minute, else read from the label (R24: `Session` five hours, `Week …` seven days,
+  codex's `<N>h window`, rounded to the hour); the same length decides whether it is a budget
+  window. A window of unknown length gives no pace, whatever its reset. The pair's pace is the least of its budget windows' (a
   day long or longer: what is left of them at their reset is lost). A budget window that has
   reset since is unknown, never a full one: it gives no pace but is a budget window all the
   same, so a pair whose budget windows have all reset since has no pace. Only a pair without a

@@ -888,8 +888,9 @@ pub fn candidates(
 }
 
 /// The pace of a pair whose windows that apply are `windows`, read at `now` (R23 Rules): of
-/// each window of known usage and known length, the percent left per hour until its reset (the
-/// window's whole length when its reset is unknown), never over less than [`MIN_PACE_SECONDS`].
+/// each window of known usage and known length ([`window_length`]: codex's minutes, else the
+/// label's), the percent left per hour until its reset (the window's whole length when its
+/// reset is unknown), never over less than [`MIN_PACE_SECONDS`].
 /// With a budget window ([`BUDGET_WINDOW`] or longer, whether its usage is known or not), the
 /// pair's is the least of its budget windows' known ones, and `None` when each has reset since:
 /// a budget whose usage is unknown is not a budget the pair lacks. Without one, the least of the
@@ -901,7 +902,7 @@ pub fn pace<'a>(windows: &[&'a Window], now: Timestamp) -> Option<(Pace, &'a Win
     let paces: Vec<(Option<Pace>, &Window, bool)> = windows
         .iter()
         .filter_map(|w| {
-            let length = usage::history::window_length(&w.label)?;
+            let length = window_length(w)?;
             let pace = w.left().and_then(|left| {
                 let seconds = match w.reset {
                     usage::Reset::Ahead(at) => at.as_second() - now.as_second(),
@@ -919,6 +920,19 @@ pub fn pace<'a>(windows: &[&'a Window], now: Timestamp) -> Option<(Pace, &'a Win
         .filter(|(_, _, b)| *b == budget)
         .filter_map(|(pace, w, _)| Some(((*pace)?, *w)))
         .min_by(|a, b| a.0.cmp_pace(b.0))
+}
+
+/// How long `w` is (R23 Rules): the minutes its row tells (codex's own, to the minute), else
+/// what its label says ([`usage::history::window_length`]: codex's labels round to the hour,
+/// claude's tell the kind). A told length of no minute, or longer than
+/// [`usage::history::MAX_WINDOW_MINUTES`], is unknown, as in the usage history (R24).
+fn window_length(w: &Window) -> Option<jiff::SignedDuration> {
+    match w.window_minutes {
+        Some(minutes) => (1..=usage::history::MAX_WINDOW_MINUTES)
+            .contains(&i64::from(minutes))
+            .then(|| jiff::SignedDuration::from_mins(i64::from(minutes))),
+        None => usage::history::window_length(&w.label),
+    }
 }
 
 /// The pace band of each of `order`'s candidates (R23 Rules), by candidate index: the pairs of
@@ -1667,7 +1681,7 @@ pub fn pace_text(c: &Candidate, now: Timestamp) -> String {
     let (Some(pace), Some(w)) = (c.pace.map(Pace::per_hour), &c.pace_window) else {
         return "unknown".to_string();
     };
-    let reset = match (w.resets_at(), usage::history::window_length(&w.label)) {
+    let reset = match (w.resets_at(), window_length(w)) {
         (Some(at), _) => format!("resets in {}", format_in(at, now)),
         (None, Some(length)) => format!(
             "reset unknown: over its whole length, {}",
@@ -3055,6 +3069,42 @@ mod tests {
         let session = row("Session", 50.0, Some("2026-09-27T15:00:00Z"));
         let (pace, window) = pace_of(Provider::Claude, &[mystery, session], &config);
         assert!(close(pace, 10.0), "{pace:?}");
+        assert_eq!(window.as_deref(), Some("Session"));
+    }
+
+    /// R23 Rules (pace), GitHub review of PR #27's merge: a codex window is as long as the
+    /// minutes it tells, not its label's rounded hours, for its pace and for whether it is a
+    /// budget window.
+    #[test]
+    fn a_codex_window_is_as_long_as_its_minutes() {
+        let config = Config::default();
+        let codex = |minutes: u32, used: f64, resets: Option<&str>| UsageRow {
+            window_minutes: Some(minutes),
+            ..row(
+                &crate::usage::codex_label(i64::from(minutes), None),
+                used,
+                resets,
+            )
+        };
+        // 90 minutes, labeled `2h window`, its reset unknown: 90% left over 90 minutes, 60%/h
+        // (over the label's two hours, 45%/h).
+        let ninety = codex(90, 10.0, None);
+        assert_eq!(ninety.label, "2h window");
+        let entries = [entry(Provider::Codex, "a", 5, &[ninety])];
+        let c = candidates(&entries, &config, ts(NOW), None);
+        assert_eq!(c[0].pace.map(|p| p.seconds), Some(5400));
+        assert!(close(c[0].pace, 60.0), "{:?}", c[0].pace);
+        assert_eq!(
+            pace_text(&c[0], ts(NOW)),
+            "60.00%/h on 2h window (reset unknown: over its whole length, 1h30m)"
+        );
+        // 1439 minutes, labeled `1d window`, is less than a day: no budget window, so the
+        // tighter of it (50% over 20h, 2.5%/h) and the five-hour one (8% over 4h, 2%/h).
+        let day = codex(1439, 50.0, Some("2026-09-28T06:00:00Z"));
+        assert_eq!(day.label, "1d window");
+        let five = codex(300, 92.0, Some("2026-09-27T14:00:00Z"));
+        let (pace, window) = pace_of(Provider::Codex, &[five, day], &config);
+        assert!(close(pace, 2.0), "{pace:?}");
         assert_eq!(window.as_deref(), Some("Session"));
     }
 
