@@ -309,16 +309,10 @@ fn event_loop(
                 });
             }
             for effect in effects {
+                if let Some(picked) = leaving(&effect, drain_recordings) {
+                    return Ok(picked);
+                }
                 match effect {
-                    // Leaving: the readings shown are recorded first, a while at most (R24).
-                    Effect::Quit => {
-                        workers::finish_recording(workers::RECORD_DRAIN);
-                        return Ok(None);
-                    }
-                    Effect::Pick(account) => {
-                        workers::finish_recording(workers::RECORD_DRAIN);
-                        return Ok(Some(account));
-                    }
                     Effect::Launch(request) => {
                         let (request, what) = for_screen(&app, request);
                         let mut event = launch_in_foreground(terminal, &deps, request, &tx)?;
@@ -351,6 +345,25 @@ fn event_loop(
         }
         terminal.draw(|f| render::render_with(&app, &mut snapshot, f))?;
     }
+}
+
+/// When `effect` ends the TUI (R16), what it ends with: no account for `Quit`, the one chosen
+/// for `Pick`, once `drain` is done (the event loop's is [`drain_recordings`]). `None`: `effect` does not
+/// end it, and nothing is drained.
+fn leaving(effect: &Effect, drain: impl FnOnce() -> bool) -> Option<Option<Account>> {
+    let picked = match effect {
+        Effect::Quit => None,
+        Effect::Pick(account) => Some(account.clone()),
+        _ => return None,
+    };
+    drain();
+    Some(picked)
+}
+
+/// The wait on the way out of the TUI (R24, R16): for the recordings of the readings shown,
+/// [`workers::RECORD_DRAIN`] at most. `false`: some were left.
+fn drain_recordings() -> bool {
+    workers::finish_recording(workers::RECORD_DRAIN)
 }
 
 /// `request` with the description remuda prints before the child scrubbed in private mode

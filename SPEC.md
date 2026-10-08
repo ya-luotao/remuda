@@ -618,7 +618,10 @@ appeared in no `history.jsonl`.
   `Week (all models)`, any other duration `<N>h window` (`<N>d window` for whole days). A
   per-model limit's name replaces `all models` in `Week (<name>)` and is appended to the others
   (`Session (<name>)`). A window without a numeric percentage and a positive duration is dropped.
-  Rows: the general limit first, then per-model limits, each by window length.
+  Rows: the general limit first, then per-model limits, each by window length. Each row also
+  keeps the window's length as codex told it, in minutes (`window_minutes`, `windowDurationMins`),
+  which the label rounds: R24 records it and paces the window by it. Claude's rows have no
+  length (neither its cache nor `/usage` tells one); R24 reads theirs from the label.
 - Codex credits, reset credits, spend control, and upsell data are not shown (R4).
 - A live query does **not** refresh the local cache (verified for claude: `fetchedAtMs` is
   unchanged after consecutive runs); the two sources are displayed separately.
@@ -2070,14 +2073,18 @@ usage of a window can be followed to its reset. Nothing else records usage: `rem
 nothing (R23), and `remuda list` reads no usage.
 
 - **The file.** `$REMUDA_HOME/state/usage-history.jsonl`, one JSON object per line, appended:
-  `{"ts", "account", "label", "model", "percent", "resets_at", "source"}`. `ts` is the time of
-  the reading as R10 has it: the cache time (claude's `fetchedAtMs`, the codex rollout record's
-  `timestamp`) or the time a live answer arrived; never the time remuda ran, so the same cache
-  read again is the same reading. `account` is `provider:name`; `label` the window's label
-  (R10); `model` the name in its parentheses, null for `all models` and for a window without
-  one; `percent` the percentage used; `resets_at` the reset when it was ahead at the reading,
-  else null (none told, wording not read, or already behind when recorded); `source` `cached` or
-  `live`. Times are RFC 3339. A window is identified by `account`, `label`, and `model`.
+  `{"ts", "account", "label", "model", "percent", "resets_at", "source", "window_minutes"}`.
+  `ts` is the time of the reading as R10 has it: the cache time (claude's `fetchedAtMs`, the
+  codex rollout record's `timestamp`) or the time a live answer arrived; never the time remuda
+  ran, so the same cache read again is the same reading. `account` is `provider:name`; `label`
+  the window's label (R10); `model` the name in its parentheses, null for `all models` and for a
+  window without one; `percent` the percentage used; `resets_at` the reset when it was ahead at
+  the reading, else null (none told, wording not read, or already behind when recorded); `source`
+  `cached` or `live`; `window_minutes` the window's length in minutes as codex told it (R10),
+  written only when it is known: a point of claude's has no such key, nor has one recorded before
+  remuda kept the length. It is read when it is a whole number from 1 to 4294967295; null or any
+  other value is no length, and the line is still a point (the key does not tell points apart).
+  Times are RFC 3339. A window is identified by `account`, `label`, and `model`.
 - **What is recorded.** `remuda usage` records what it reads, cached or with `--live`; with
   `--wait` (R10), every reading it takes, the one printed at the end included, once the wait is
   over and that reading is printed; `remuda usage --history` records nothing. The TUI records
@@ -2087,7 +2094,8 @@ nothing (R23), and `remuda list` reads no usage.
   command started), whose percentage is unknown; a live query that failed, or whose answer told no usage or
   was not recognized (R10); a point older than the 45 days kept. A point already in the history,
   of the same window with the same `ts`, `percent`, and `resets_at`, is not recorded again, so
-  a cache read between two live answers adds nothing.
+  a cache read between two live answers adds nothing; `window_minutes` is not compared (a point
+  recorded without it and the same reading with it are one point).
 - **Writing.** The points of one run of `remuda usage` (every account) or of one batch of the
   TUI (the cached usage of the accounts it reads at once, or one account's live answer) are one
   write. Every write takes an exclusive lock and holds it while it reads the history, leaves out
@@ -2124,7 +2132,9 @@ nothing (R23), and `remuda list` reads no usage.
   the screen: a lock another remuda holds (one compacting, or one suspended) holds up no
   account's usage. Leaving the TUI waits for such recordings at most 2 seconds (R16), so a
   reading shown just before is not lost, and a lock held elsewhere delays the end no longer.
-- **Window length.** The pace needs a window's length, which remuda reads from its label (R10):
+- **Window length.** The pace, and the grouping of a window's points by reset (below), need the
+  window's length. A point that tells `window_minutes` is as long as that says (at most ten
+  years; a longer one is of unknown length). A point without it is read by its label (R10):
   `Session` is 5 hours and `Week …` 7 days (claude's `session`, `weekly_all`, and
   `weekly_scoped` limits, its older `five_hour` and `seven_day` fields, its live `Current session`
   and `Current week` lines; codex's windows of 5 and 168 hours); codex's `<N>h window`, `<N>d
@@ -2132,8 +2142,10 @@ nothing (R23), and `remuda list` reads no usage.
   years long); a claude limit of unknown kind, labeled by
   its kind, is 5 hours for `five_hour` and 7 days for `seven_day…`. Others are of unknown length,
   and a window of unknown length gets no pace.
-  Codex's labels round its windows to whole hours (R10), so a codex window of 90 minutes counts
-  as 2 hours.
+  Codex's labels round its windows to whole hours (R10), so a codex window of 90 minutes recorded
+  without `window_minutes` counts as 2 hours. When a window's points disagree (the earlier ones
+  recorded without `window_minutes`), the length is the latest point's, for grouping them and for
+  the pace of the current one.
 - **`remuda usage --history [<account>] [--days N]`** prints, for each account (the one named,
   else every account R1 lists, in order), each window it has points for since `N` days ago
   (default 7, at most 3650), in the order first recorded: the label, then its points in time

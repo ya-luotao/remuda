@@ -231,6 +231,7 @@ mod tests {
                     percent: *percent,
                     severity: None,
                     resets: reset.map(|r| Resets::At(ts(r))),
+                    window_minutes: None,
                 })
                 .collect(),
         };

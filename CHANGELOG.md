@@ -138,6 +138,11 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   the TUI and `remuda pick` (which still falls back to the cache) say it so, in place of
   "output not recognized". An answer with a usage line that cannot be read is still shown as
   it is.
+- `remuda usage --history` paces a codex window by the minutes codex tells for it, no longer by
+  its label rounded to whole hours: a 90-minute window (`2h window`) is 90 minutes long, also
+  where its points are grouped into windows by reset. Each point of a codex window records the
+  minutes as `window_minutes`; claude's points and those recorded before have none, and are read
+  by their label as before (SPEC R10, R24).
 
 ### Fixed
 

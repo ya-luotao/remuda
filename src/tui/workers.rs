@@ -1428,6 +1428,7 @@ mod tests {
                         percent: 4.0,
                         severity: None,
                         resets: None,
+                        window_minutes: Some(300),
                     }]),
                     identity: Some(identity),
                 }),
@@ -1488,6 +1489,7 @@ mod tests {
             percent: 34.0,
             resets_at: Some("2026-09-24T15:00:00Z".parse().unwrap()),
             source: usage::Source::Cached,
+            window_minutes: None,
         };
         assert_eq!(recorded(&deps), std::slice::from_ref(&session));
         // Read again: the same reading, not recorded twice.
@@ -1530,6 +1532,7 @@ mod tests {
             percent: 4.0,
             resets_at: Some(jiff::Timestamp::from_second(1790262000).unwrap()),
             source: usage::Source::Live,
+            window_minutes: Some(300),
         };
         assert_eq!(recorded(&deps), [session, live]);
         let lines = fs::read_to_string(owned::usage_history(&deps.state_dir)).unwrap();
@@ -1591,6 +1594,89 @@ mod tests {
         let labels: Vec<String> = recorded(&deps).into_iter().map(|p| p.label).collect();
         assert_eq!(labels, ["Session"], "recorded once leaving is done waiting");
         other.join().unwrap();
+    }
+
+    /// R16, R24: the TUI's ways out, Quit (`q`) and Pick (`remuda run` choosing an account,
+    /// `j` `Enter`), drain before they give the TUI's end back: [`super::super::leaving`] runs
+    /// the drain once, and returns after it; an effect that does not end the TUI drains
+    /// nothing. What the event loop's drain waits for is
+    /// [`the_drain_on_the_way_out_waits_for_a_recording_under_way`]'s.
+    #[test]
+    fn quit_and_pick_drain_before_leaving() {
+        use std::cell::RefCell;
+
+        use crate::tui::app::{App, Key, Mode};
+        let dir = tempfile::tempdir().unwrap();
+        let deps = deps(dir.path());
+        let max = max(&deps);
+        for (mode, keys, want) in [
+            (Mode::Browse, &[Key::Char('q')][..], None),
+            (
+                Mode::PickForRun,
+                &[Key::Char('j'), Key::Enter],
+                Some(max.clone()),
+            ),
+        ] {
+            let (tx, _rx) = mpsc::channel();
+            let accounts = deps.listing.read(&tx).accounts;
+            let mut app = App::new(accounts, TimeZone::UTC, None, answered());
+            app.mode = mode;
+            app::update(&mut app, Event::Resize(80, 24));
+            let effects: Vec<Effect> = keys
+                .iter()
+                .flat_map(|k| app::update(&mut app, Event::Key(*k)))
+                .collect();
+            let [effect] = &effects[..] else {
+                panic!("{mode:?}: {effects:?}");
+            };
+            let done = RefCell::new(Vec::new());
+            let picked = super::super::leaving(effect, || {
+                done.borrow_mut().push("drained");
+                true
+            });
+            done.borrow_mut().push("left");
+            assert_eq!(*done.borrow(), ["drained", "left"], "{mode:?}");
+            assert_eq!(picked, Some(want), "{mode:?}");
+        }
+        // Not a way out: nothing is drained.
+        let drained = RefCell::new(false);
+        let effect = Effect::ReadAccounts;
+        let left = super::super::leaving(&effect, || {
+            *drained.borrow_mut() = true;
+            true
+        });
+        assert_eq!(left, None);
+        assert!(!*drained.borrow());
+    }
+
+    /// R24, R16: the event loop's drain on the way out waits for a reading shown whose
+    /// recording is under way: here another remuda holds the history's lock until the drain
+    /// has returned, so the recording cannot end first, whatever the scheduling. The drain
+    /// waits its [`RECORD_DRAIN`] in full and leaves the recording, which is written once the
+    /// lock is free.
+    #[test]
+    fn the_drain_on_the_way_out_waits_for_a_recording_under_way() {
+        let _alone = recording_alone();
+        let dir = tempfile::tempdir().unwrap();
+        let (deps, max) = with_a_cache(dir.path());
+        let path = owned::usage_history(&deps.state_dir);
+        let held = owned::lock_state_file(&path, &owned::Flock).unwrap();
+        let rx = shown(&deps, &max);
+        let started = Instant::now();
+        assert!(
+            !super::super::drain_recordings(),
+            "a recording under way was not waited for"
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= RECORD_DRAIN - Duration::from_millis(50),
+            "{waited:?}"
+        );
+        assert!(!path.exists(), "nothing written while the lock is held");
+        drop(held);
+        let _: Vec<Event> = rx.iter().collect();
+        let labels: Vec<String> = recorded(&deps).into_iter().map(|p| p.label).collect();
+        assert_eq!(labels, ["Session"]);
     }
 
     /// R24, R16: leaving the TUI waits a while at most: a recording still held up by a lock
