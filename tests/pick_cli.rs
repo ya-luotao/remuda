@@ -2581,11 +2581,15 @@ fn pick_records_no_usage_history() {
 
 // --- wait --------------------------------------------------------------------------------
 
-/// `--json` without what moves with the clock: each candidate's `age_seconds`.
+/// `--json` without what moves with the clock: each candidate's `age_seconds`, and its `pace`
+/// (percent left per hour until a reset, which grows as the reset nears: two runs a second apart
+/// differ).
 fn json_without_age(stdout: &str) -> Value {
     let mut v: Value = serde_json::from_str(stdout).unwrap();
     for c in v["candidates"].as_array_mut().unwrap() {
-        c.as_object_mut().unwrap().remove("age_seconds");
+        let c = c.as_object_mut().unwrap();
+        c.remove("age_seconds");
+        c.remove("pace");
     }
     v
 }

@@ -47,14 +47,62 @@ pub const MAX_OPTIONS: usize = 255;
 pub const NOT_SEEN: &str = "cannot see this session (its store is not this account's)";
 /// How long `codex login status` may take (R4: about 0.05 s), as for `remuda list`.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
-/// The fewest hours a pace divides by (R23): a window that resets in a minute would otherwise
-/// outrank everything.
-pub const MIN_PACE_HOURS: f64 = 1.0;
+/// The fewest seconds a pace spreads what is left over, an hour (R23): a window that resets in a
+/// minute would otherwise outrank everything.
+pub const MIN_PACE_SECONDS: i64 = 3600;
 /// A window this long or longer is a budget window, whose pace counts first (R23): what is left
 /// of it at its reset is lost, while a shorter window refills within the budget.
 pub const BUDGET_WINDOW: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
-/// A pace below this share of its band's top opens a new band (R23).
-pub const PACE_BAND: f64 = 0.9;
+/// A pace below this share of its band's top opens a new band (R23): nine tenths, as
+/// `(numerator, denominator)`, so that the boundary is compared in whole numbers
+/// ([`Pace::below_band_of`]).
+pub const PACE_BAND: (i128, i128) = (9, 10);
+/// The unit a pace's percent left is counted in: a millionth of a percent.
+const PACE_LEFT_UNIT: f64 = 1_000_000.0;
+
+/// A pair's pace (R23 Rules) as two whole numbers: the percent left in millionths of a percent
+/// (rounded to the nearest), and the seconds until the reset it is spread over, never fewer than
+/// [`MIN_PACE_SECONDS`]. Every comparison of paces, the order, equality and the bands, is
+/// made on these exactly, by cross products in `i128` ([`Pace::cmp_pace`],
+/// [`Pace::below_band_of`]): no rounding can turn one over. The quotient, [`Pace::per_hour`],
+/// is only shown (the text report, `--json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pace {
+    pub left_micro: i64,
+    pub seconds: i64,
+}
+
+impl Pace {
+    /// `left` percent spread over `seconds`, at least [`MIN_PACE_SECONDS`]. A percentage is at
+    /// most a few hundred and a time a few hundred billion seconds (jiff's range), so the cross
+    /// products below stay far inside `i128`.
+    pub fn new(left: f64, seconds: i64) -> Pace {
+        Pace {
+            left_micro: (left * PACE_LEFT_UNIT).round().clamp(0.0, 1e15) as i64,
+            seconds: seconds.max(MIN_PACE_SECONDS),
+        }
+    }
+
+    /// Percent left per hour until reset.
+    pub fn per_hour(self) -> f64 {
+        self.left_micro as f64 / PACE_LEFT_UNIT / (self.seconds as f64 / 3600.0)
+    }
+
+    /// This pace against `other`, exactly: `left / seconds` against `other.left /
+    /// other.seconds`, as `left × other.seconds` against `other.left × seconds`. Paces over
+    /// different seconds with the same quotient are equal.
+    pub fn cmp_pace(self, other: Pace) -> std::cmp::Ordering {
+        (i128::from(self.left_micro) * i128::from(other.seconds))
+            .cmp(&(i128::from(other.left_micro) * i128::from(self.seconds)))
+    }
+
+    /// Whether this pace is below [`PACE_BAND`] of `top`'s, exactly: `10 × left × top.seconds <
+    /// 9 × top.left × seconds`. One exactly on the boundary is not below: it is in the band.
+    fn below_band_of(self, top: Pace) -> bool {
+        PACE_BAND.1 * i128::from(self.left_micro) * i128::from(top.seconds)
+            < PACE_BAND.0 * i128::from(top.left_micro) * i128::from(self.seconds)
+    }
+}
 
 /// `[pick]` of `config.toml` (R3, R23).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -700,7 +748,7 @@ pub struct Candidate {
     pub binding: Option<Window>,
     /// Percent left per hour until reset on `pace_window` ([`pace`]); `None` when unknown. A
     /// way to rank, never to decide feasibility; given whatever the strategy.
-    pub pace: Option<f64>,
+    pub pace: Option<Pace>,
     /// The window that gives `pace`: not `binding`'s kind of fact (the least left), but the
     /// tightest budget window, else the tightest shorter one.
     pub pace_window: Option<Window>,
@@ -841,26 +889,26 @@ pub fn candidates(
 
 /// The pace of a pair whose windows that apply are `windows`, read at `now` (R23 Rules): of
 /// each window of known usage and known length, the percent left per hour until its reset (the
-/// window's whole length when its reset is unknown), never over fewer than [`MIN_PACE_HOURS`].
+/// window's whole length when its reset is unknown), never over less than [`MIN_PACE_SECONDS`].
 /// With a budget window ([`BUDGET_WINDOW`] or longer, whether its usage is known or not), the
 /// pair's is the least of its budget windows' known ones, and `None` when each has reset since:
 /// a budget whose usage is unknown is not a budget the pair lacks. Without one, the least of the
 /// shorter windows'; `None` without either. A window that has reset since is of unknown usage
 /// and gives no pace (not that of a full window); a window of unknown length is neither a budget
 /// window nor a short one. Of equal paces, the first window.
-pub fn pace<'a>(windows: &[&'a Window], now: Timestamp) -> Option<(f64, &'a Window)> {
+pub fn pace<'a>(windows: &[&'a Window], now: Timestamp) -> Option<(Pace, &'a Window)> {
     // Each window of known length: whether it is a budget window, and its pace when known.
-    let paces: Vec<(Option<f64>, &Window, bool)> = windows
+    let paces: Vec<(Option<Pace>, &Window, bool)> = windows
         .iter()
         .filter_map(|w| {
             let length = usage::history::window_length(&w.label)?;
             let pace = w.left().and_then(|left| {
                 let seconds = match w.reset {
-                    usage::Reset::Ahead(at) => (at.as_second() - now.as_second()) as f64,
-                    usage::Reset::Unknown => length.as_secs_f64(),
+                    usage::Reset::Ahead(at) => at.as_second() - now.as_second(),
+                    usage::Reset::Unknown => length.as_secs(),
                     usage::Reset::Passed(_) => return None,
                 };
-                Some(left / (seconds / 3600.0).max(MIN_PACE_HOURS))
+                Some(Pace::new(left, seconds))
             });
             Some((pace, *w, length >= BUDGET_WINDOW))
         })
@@ -869,26 +917,28 @@ pub fn pace<'a>(windows: &[&'a Window], now: Timestamp) -> Option<(f64, &'a Wind
     paces
         .iter()
         .filter(|(_, _, b)| *b == budget)
-        .filter_map(|(pace, w, _)| Some((pace.as_ref().copied()?, *w)))
-        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .filter_map(|(pace, w, _)| Some(((*pace)?, *w)))
+        .min_by(|a, b| a.0.cmp_pace(b.0))
 }
 
 /// The pace band of each of `order`'s candidates (R23 Rules), by candidate index: the pairs of
 /// known pace, highest first; the first opens band 0, whose top is its pace, and each pair whose
-/// pace is below [`PACE_BAND`] of the current band's top opens the next band, topped by its own.
-/// Equal paces share a band, so the bands do not depend on the order ties come in. Pairs of
+/// pace is below [`PACE_BAND`] of the current band's top ([`Pace::below_band_of`]) opens the
+/// next band, topped by its own; one on the boundary stays. The order and the boundary are the
+/// same exact relation ([`Pace::cmp_pace`]), so equal paces, over the same seconds or not, are
+/// interchangeable as a band's top: the bands do not depend on the order ties come in. Pairs of
 /// unknown pace have none.
 fn pace_bands(candidates: &[Candidate], order: &[usize]) -> BTreeMap<usize, usize> {
-    let mut known: Vec<(f64, usize)> = order
+    let mut known: Vec<(Pace, usize)> = order
         .iter()
         .filter_map(|&i| Some((candidates[i].pace?, i)))
         .collect();
-    known.sort_by(|a, b| b.0.total_cmp(&a.0));
+    known.sort_by(|a, b| b.0.cmp_pace(a.0));
     let mut bands = BTreeMap::new();
-    let mut band: Option<(usize, f64)> = None;
+    let mut band: Option<(usize, Pace)> = None;
     for (pace, i) in known {
         let (n, top) = match band {
-            Some((n, top)) if pace >= PACE_BAND * top => (n, top),
+            Some((n, top)) if !pace.below_band_of(top) => (n, top),
             Some((n, _)) => (n + 1, pace),
             None => (0, pace),
         };
@@ -1614,7 +1664,7 @@ pub fn binding_text(w: &Window, now: Timestamp) -> String {
 /// The pace and the window that gives it: `1.25%/h on Week (all models) (resets in 2d3h)`;
 /// `0.42%/h on Week (all models) (reset unknown: over its whole length, 7d)`; `unknown`.
 pub fn pace_text(c: &Candidate, now: Timestamp) -> String {
-    let (Some(pace), Some(w)) = (c.pace, &c.pace_window) else {
+    let (Some(pace), Some(w)) = (c.pace.map(Pace::per_hour), &c.pace_window) else {
         return "unknown".to_string();
     };
     let reset = match (w.resets_at(), usage::history::window_length(&w.label)) {
@@ -2033,7 +2083,7 @@ pub fn to_json(
                 "headroom": c.headroom,
                 "binding": c.binding.as_ref().map(|w| w.label.clone()),
                 "resets_at": ts(c.binding.as_ref().and_then(Window::resets_at)),
-                "pace": c.pace,
+                "pace": c.pace.map(Pace::per_hour),
                 "pace_window": c.pace_window.as_ref().map(|w| w.label.clone()),
                 "reset_passed": !c.reset_passed.is_empty(),
                 "source": usage.map(|u| u.source.name()),
@@ -2906,7 +2956,7 @@ mod tests {
         provider: Provider,
         rows: &[UsageRow],
         config: &Config,
-    ) -> (Option<f64>, Option<String>) {
+    ) -> (Option<Pace>, Option<String>) {
         let entries = [entry(provider, "a", 5, rows)];
         let c = candidates(&entries, config, ts(NOW), None);
         (
@@ -2915,8 +2965,8 @@ mod tests {
         )
     }
 
-    fn close(got: Option<f64>, want: f64) -> bool {
-        got.is_some_and(|got| (got - want).abs() < 1e-9)
+    fn close(got: Option<Pace>, want: f64) -> bool {
+        got.is_some_and(|got| (got.per_hour() - want).abs() < 1e-9)
     }
 
     /// R23 Rules (pace): percent left per hour until reset, on the tightest window of a day or
@@ -3144,6 +3194,198 @@ mod tests {
                 "claude:c / default"
             ]
         );
+    }
+
+    /// Two accounts of `strategy = "pace"`, `prefer = ["claude:b"]`, each with one fresh week:
+    /// `(percent used, its reset)` for `a` and for `b`.
+    fn two_paces(a: (f64, &str), b: (f64, &str)) -> (Vec<Entry>, Vec<Candidate>) {
+        let week = |(used, resets): (f64, &str)| [row("Week (all models)", used, Some(resets))];
+        let entries = vec![
+            entry(Provider::Claude, "a", 5, &week(a)),
+            entry(Provider::Claude, "b", 5, &week(b)),
+        ];
+        let config = Config {
+            strategy: Strategy::Pace,
+            prefer: vec!["claude:b".into()],
+            ..Config::default()
+        };
+        let c = candidates(&entries, &config, ts(NOW), None);
+        (entries, c)
+    }
+
+    /// R23 Rules (pace), GitHub review of PR #27: a pace exactly 0.9 of its band's top is in the
+    /// band. 100% and 90% left of windows that both reset in 3601 s: the quotients, 99.97…%/h
+    /// and 89.97…%/h, put the second about 1.4e-14 under 0.9 × the first in floating point;
+    /// the terms compared without a division put it on the boundary. One band: `prefer`
+    /// decides.
+    #[test]
+    fn a_pace_on_the_band_boundary_is_in_the_band() {
+        let resets = "2026-09-27T11:00:01Z";
+        let (entries, c) = two_paces((0.0, resets), (10.0, resets));
+        let (a, b) = (c[0].pace.unwrap(), c[1].pace.unwrap());
+        assert_eq!((a.seconds, b.seconds), (3601, 3601));
+        assert!(
+            b.per_hour() < 0.9 * a.per_hour(),
+            "the case the review found: {} vs {}",
+            b.per_hour(),
+            0.9 * a.per_hour()
+        );
+        assert_eq!(
+            pace_bands(&c, &ranked(&c))
+                .into_values()
+                .collect::<Vec<_>>(),
+            [0, 0]
+        );
+        assert_eq!(
+            order(&entries, &c),
+            ["claude:b / default", "claude:a / default"]
+        );
+    }
+
+    /// R23 Rules (pace), critic round 2: a pace truly below 0.9 of its band's top opens a band,
+    /// however close. a: 99.99% left over 68743 s; b: 80% left over 61111 s. Exactly, b's pace
+    /// is 0.9 × a's × (1 − 1/5499440001): below, by 1.8e-10, which a relative tolerance of 1e-9
+    /// would have taken for the boundary. Two bands: a first, whatever `prefer` says.
+    #[test]
+    fn a_pace_just_below_the_band_boundary_opens_a_band() {
+        let (entries, c) = two_paces(
+            (0.01, "2026-09-28T05:05:43Z"),
+            (20.0, "2026-09-28T02:58:31Z"),
+        );
+        let (a, b) = (c[0].pace.unwrap(), c[1].pace.unwrap());
+        assert_eq!((a.seconds, b.seconds), (68743, 61111));
+        let ratio = b.per_hour() / (0.9 * a.per_hour());
+        assert!(
+            ratio < 1.0 && ratio > 1.0 - 1e-9,
+            "the critic's case: within 1e-9 under the boundary ({ratio})"
+        );
+        assert_eq!(
+            pace_bands(&c, &ranked(&c))
+                .into_values()
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(
+            order(&entries, &c),
+            ["claude:a / default", "claude:b / default"]
+        );
+    }
+
+    /// R23 Rules (pace), critic round 3: on the boundary over different seconds. a: 71.10% left
+    /// over 5670 s; b: 41.08% over 3640 s; `10 × 41.08 × 5670 = 9 × 71.10 × 3640 = 2329236`.
+    /// Multiplied in floating point the products differ by 5e-10 and b fell a band; in
+    /// millionths of a percent and whole seconds they are equal. One band: b, preferred and
+    /// resetting sooner, first.
+    #[test]
+    fn a_pace_on_the_boundary_over_other_seconds_is_in_the_band() {
+        let (entries, c) = two_paces(
+            (28.9, "2026-09-27T11:34:30Z"),
+            (58.92, "2026-09-27T11:00:40Z"),
+        );
+        let (a, b) = (c[0].pace.unwrap(), c[1].pace.unwrap());
+        assert_eq!(
+            (a, b),
+            (
+                Pace {
+                    left_micro: 71_100_000,
+                    seconds: 5670
+                },
+                Pace {
+                    left_micro: 41_080_000,
+                    seconds: 3640
+                }
+            )
+        );
+        let (a_left, b_left) = (100.0 - 28.9, 100.0 - 58.92);
+        assert!(
+            10.0 * b_left * 5670.0 < 9.0 * a_left * 3640.0,
+            "the critic's case: floating point puts b below"
+        );
+        assert_eq!(
+            pace_bands(&c, &ranked(&c))
+                .into_values()
+                .collect::<Vec<_>>(),
+            [0, 0]
+        );
+        assert_eq!(
+            order(&entries, &c),
+            ["claude:b / default", "claude:a / default"]
+        );
+    }
+
+    /// R23 Rules (pace), critic round 3: equal paces over different seconds are interchangeable
+    /// as a band's top. a: 34.60% left over 60480 s and b: 69.20% over 120960 s are the same
+    /// pace; c, 31.14% over 60480 s, is exactly 0.9 of it. In whatever order the candidates
+    /// come, one band, and the same ranking: c (preferred), then a (its reset sooner), then b.
+    #[test]
+    fn equal_paces_band_alike_in_any_order() {
+        let entries = [
+            entry(
+                Provider::Claude,
+                "a",
+                5,
+                &[row("Week (all models)", 65.4, Some("2026-09-28T02:48:00Z"))],
+            ),
+            entry(
+                Provider::Claude,
+                "b",
+                5,
+                &[row("Week (all models)", 30.8, Some("2026-09-28T19:36:00Z"))],
+            ),
+            entry(
+                Provider::Claude,
+                "c",
+                5,
+                &[row(
+                    "Week (all models)",
+                    68.86,
+                    Some("2026-09-28T02:48:00Z"),
+                )],
+            ),
+        ];
+        let config = Config {
+            strategy: Strategy::Pace,
+            prefer: vec!["claude:c".into()],
+            ..Config::default()
+        };
+        let c = candidates(&entries, &config, ts(NOW), None);
+        let (a, b) = (c[0].pace.unwrap(), c[1].pace.unwrap());
+        assert_eq!(a.cmp_pace(b), std::cmp::Ordering::Equal);
+        assert_ne!(a, b);
+        for perm in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            // The same candidates (each keeps its entry), in another order.
+            let mut shuffled: Vec<Candidate> = perm.iter().map(|&i| c[i].clone()).collect();
+            rank_rules(&mut shuffled, &entries, &config);
+            let bands: BTreeMap<String, usize> = pace_bands(&shuffled, &ranked(&shuffled))
+                .into_iter()
+                .map(|(i, band)| (entries[shuffled[i].entry].account.qualified(), band))
+                .collect();
+            assert_eq!(
+                bands.into_iter().collect::<Vec<_>>(),
+                [
+                    ("claude:a".to_string(), 0),
+                    ("claude:b".to_string(), 0),
+                    ("claude:c".to_string(), 0)
+                ],
+                "{perm:?}"
+            );
+            assert_eq!(
+                order(&entries, &shuffled),
+                [
+                    "claude:c / default",
+                    "claude:a / default",
+                    "claude:b / default"
+                ],
+                "{perm:?}"
+            );
+        }
     }
 
     /// R23 Rules: `strategy = "headroom"` ranks as the rules always have, and the pace is only

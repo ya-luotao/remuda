@@ -1891,7 +1891,11 @@ holds it (**Resuming**, below).
   every known pace, as unknown headroom does. The
   bands: the feasible pairs of known pace from the highest down, the first opening a band
   topped by its pace, and each pair whose pace is below 0.9 of the current band's top opening
-  the next, topped by its own; so paces within a tenth tie, and `prefer` breaks the tie. The
+  the next, topped by its own (one at exactly 0.9 of it is in the band); so paces within a tenth
+  tie, and `prefer` breaks the tie. Paces are ordered, compared, and banded exactly, on the
+  percent left to a millionth of a percent and the seconds until reset in whole seconds: two
+  paces equal so are equal whatever their reset times. The pace shown (`%/h`, and `pace` in
+  `--json`) is the quotient, for reading only. The
   pace only orders: feasibility, the binding window, and `--wait` are as above.
 - **When Jev is asked.** Only with `TYPESAFE_API_KEY` in remuda's environment, without
   `--offline`, with `notes`, and with a choice to make (two feasible pairs, or a provider with two
