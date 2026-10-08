@@ -1189,10 +1189,12 @@ fn json_report() {
             "model",
             "provider",
             "reason",
-            "session"
+            "session",
+            "strategy"
         ]
     );
     assert_eq!(v["session"], Value::Null);
+    assert_eq!(v["strategy"], "headroom");
     assert_eq!(v["account"], "claude:max");
     assert_eq!(v["provider"], "claude");
     assert_eq!(v["effort"], "high");
@@ -1231,6 +1233,8 @@ fn json_report() {
             "headroom",
             "jev_probability",
             "model",
+            "pace",
+            "pace_window",
             "reset_passed",
             "resets_at",
             "rules_rank",
@@ -1252,6 +1256,138 @@ fn json_report() {
     assert!((600..700).contains(&age), "{age}");
     assert_eq!(v["candidates"][0]["account"], "claude:default");
     assert_eq!(v["candidates"][0]["feasible"], false);
+    // Given whatever the strategy: 60% left over three days.
+    let pace = c["pace"].as_f64().unwrap();
+    assert!((pace - 60.0 / 72.0).abs() < 0.01, "{pace}");
+    assert_eq!(c["pace_window"], "Week (all models)");
+    assert_eq!(v["candidates"][0]["pace"], Value::Null);
+    assert_eq!(v["candidates"][0]["pace_window"], Value::Null);
+}
+
+/// The sentence the request's state has with `strategy = "pace"`, as `--print-request` prints
+/// it (JSON).
+const PACE_SENTENCE: &str = "rules' ranking strategy: pace (percent left per hour until reset, \
+                             on the tightest window of a day or longer, else of the shorter \
+                             ones; highest first, so that what a reset would waste is used \
+                             first).\\n";
+
+/// R3, R23 Rules and Output: `[pick] strategy = "pace"` ranks by the percent left per hour
+/// until reset, where the headroom ranks the other way; the text report has a `pace` line and
+/// says the strategy decided, `--json` has `strategy` (also with nothing feasible), and the
+/// request to Jev one sentence more. The default changes nothing.
+#[test]
+fn the_pace_strategy() {
+    let sb = Sandbox::new();
+    let max = sb.make_claude_home("h/max");
+    let team = sb.make_claude_home("h/team");
+    // max: 60% left over six days (0.42%/h); team: 30% left over a day (1.25%/h).
+    sb.write_claude_json(
+        Some(&max),
+        &claude_json(
+            "max@example.com",
+            600,
+            &[limit("weekly_all", 40.0, 6 * DAY)],
+        ),
+    );
+    sb.write_claude_json(
+        Some(&team),
+        &claude_json("team@example.com", 600, &[limit("weekly_all", 70.0, DAY)]),
+    );
+    let accounts = [
+        ("claude", "max", max.as_path()),
+        ("claude", "team", team.as_path()),
+    ];
+    configure(&sb, &accounts, "");
+    let headroom = pick(&sb, false, &[]);
+    assert_eq!(
+        headroom.code,
+        Some(0),
+        "{}{}",
+        headroom.stdout,
+        headroom.stderr
+    );
+    assert_eq!(field(&headroom, "account"), "claude:max");
+    assert!(
+        !headroom.stdout.lines().any(|l| l.starts_with("pace "))
+            && !headroom.stdout.contains("strategy"),
+        "{}",
+        headroom.stdout
+    );
+    let headroom_json: Value = serde_json::from_str(&pick(&sb, false, &["--json"]).stdout).unwrap();
+    assert_eq!(headroom_json["strategy"], "headroom");
+    let headroom_request = pick(&sb, false, &["--print-request"]).stdout;
+
+    configure(&sb, &accounts, "[pick]\nstrategy = \"pace\"\n");
+    let out = pick(&sb, false, &[]);
+    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
+    assert_eq!(field(&out, "account"), "claude:team");
+    assert_eq!(
+        field(&out, "decided by"),
+        "rules, strategy pace (no_key: TYPESAFE_API_KEY is not set)"
+    );
+    assert!(
+        field(&out, "pace").starts_with("1.25%/h on Week (all models) (resets in "),
+        "{}",
+        out.stdout
+    );
+    assert!(field(&out, "limit").starts_with("Week (all models) 30% left, resets in "));
+    let v: Value = serde_json::from_str(&pick(&sb, false, &["--json"]).stdout).unwrap();
+    assert_eq!(v["strategy"], "pace");
+    assert_eq!(v["account"], "claude:team");
+    let by_account = |v: &Value, account: &str| -> Value {
+        v["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["account"] == account)
+            .unwrap()
+            .clone()
+    };
+    let (t, m) = (by_account(&v, "claude:team"), by_account(&v, "claude:max"));
+    assert_eq!(
+        (t["rules_rank"].clone(), m["rules_rank"].clone()),
+        (json!(1), json!(2))
+    );
+    assert!((t["pace"].as_f64().unwrap() - 1.25).abs() < 0.01, "{t}");
+    assert!(
+        (m["pace"].as_f64().unwrap() - 60.0 / 144.0).abs() < 0.01,
+        "{m}"
+    );
+    // The same facts under either strategy, the rank aside.
+    for account in ["claude:team", "claude:max"] {
+        let (mut a, mut b) = (by_account(&v, account), by_account(&headroom_json, account));
+        for c in [&mut a, &mut b] {
+            let c = c.as_object_mut().unwrap();
+            for volatile in ["rules_rank", "age_seconds", "pace"] {
+                c.remove(volatile);
+            }
+        }
+        assert_eq!(a, b);
+    }
+    // One sentence more in the request, nothing else.
+    let request = pick(&sb, false, &["--print-request"]).stdout;
+    assert!(request.contains(PACE_SENTENCE), "{request}");
+    assert_eq!(
+        without_clock(&request.replacen(PACE_SENTENCE, "", 1)),
+        without_clock(&headroom_request)
+    );
+
+    // Nothing feasible: the strategy and the paces all the same.
+    configure(
+        &sb,
+        &accounts,
+        "[pick]\nstrategy = \"pace\"\nmin_headroom = 100\n",
+    );
+    let out = pick(&sb, false, &["--json"]);
+    assert_eq!(out.code, Some(1), "{}{}", out.stdout, out.stderr);
+    let v: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(
+        (v["strategy"].clone(), v["account"].clone()),
+        (json!("pace"), Value::Null)
+    );
+    let t = by_account(&v, "claude:team");
+    assert_eq!(t["feasible"], false);
+    assert_eq!(t["pace_window"], "Week (all models)");
 }
 
 /// `--run` launches the recommendation as `remuda run` does, the options before the user's.
@@ -2445,11 +2581,15 @@ fn pick_records_no_usage_history() {
 
 // --- wait --------------------------------------------------------------------------------
 
-/// `--json` without what moves with the clock: each candidate's `age_seconds`.
+/// `--json` without what moves with the clock: each candidate's `age_seconds`, and its `pace`
+/// (percent left per hour until a reset, which grows as the reset nears: two runs a second apart
+/// differ).
 fn json_without_age(stdout: &str) -> Value {
     let mut v: Value = serde_json::from_str(stdout).unwrap();
     for c in v["candidates"].as_array_mut().unwrap() {
-        c.as_object_mut().unwrap().remove("age_seconds");
+        let c = c.as_object_mut().unwrap();
+        c.remove("age_seconds");
+        c.remove("pace");
     }
     v
 }
@@ -2791,6 +2931,101 @@ fn wait_resumes_a_named_session() {
     let out = pick(&sb, false, &["--wait", "--", "--resume", SESSION]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert_eq!(field(&out, "account"), "claude:team");
+}
+
+/// R23 `--wait`, Resuming: whether the account that ran the session is warm is judged at each
+/// attempt's instant, so a wait can let its cache go cold. Both accounts' sessions are used up
+/// for 15 seconds; team ran the session 30 seconds ago, and `affinity_minutes = 1`. The first
+/// attempt finds nothing feasible (team still warm) and waits, at least `MIN_INTERVAL` (60 s);
+/// at the second, both sessions have reset since (unknown, feasible) and team's last activity
+/// is 90 seconds old: no longer preferred, max (registry order) is recommended. stderr is a
+/// terminal, so the wait shows its status line there.
+#[test]
+fn a_wait_lets_the_warm_account_go_cold() {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::time::{Duration, Instant};
+    let (sb, _) = shared_store("[pick]\naffinity_minutes = 1\n", 300, true);
+    for account in ["claude:max", "claude:team"] {
+        let home = PathBuf::from(home_of(&sb, account));
+        sb.write_claude_json(
+            Some(&home),
+            &claude_json("x@example.com", 60, &[limit("session", 100.0, 15)]),
+        );
+    }
+    // Later than the transcript's last record (300 s ago, in the same directory): the launch is
+    // team's last activity.
+    log_launch(&sb, "claude:team", 30, "/w/proj", SESSION, None);
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty(3) writes the two descriptors (the name, modes and size are not asked).
+    let made = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(made, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: the descriptors openpty opened; each file is the only owner of its own.
+    let (master, slave) = unsafe {
+        (
+            std::fs::File::from_raw_fd(master),
+            std::fs::File::from_raw_fd(slave),
+        )
+    };
+    let mut cmd = sb.remuda_process();
+    cmd.args([
+        "pick",
+        "--wait",
+        "--max-wait",
+        "85",
+        "--",
+        "--resume",
+        SESSION,
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(slave);
+    let start = Instant::now();
+    let remuda = cmd.spawn().unwrap();
+    // The terminal's other end stays open only in remuda: reading ends when it is gone.
+    drop(cmd);
+    let terminal = std::thread::spawn(move || {
+        let mut master = master;
+        let mut shown = Vec::new();
+        let _ = master.read_to_end(&mut shown);
+        String::from_utf8_lossy(&shown).into_owned()
+    });
+    let out = remuda.wait_with_output().unwrap();
+    let took = start.elapsed();
+    let stderr = terminal.join().unwrap();
+    let out = Out {
+        code: out.status.code(),
+        stdout: String::from_utf8(out.stdout).unwrap(),
+        stderr,
+    };
+    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
+    assert!(
+        took >= Duration::from_secs(60) && took < Duration::from_secs(90),
+        "two attempts, a minute apart: took {took:?}"
+    );
+    assert!(
+        out.stderr.contains("remuda: waiting: claude:") && out.stderr.contains("Session 100% used"),
+        "{:?}",
+        out.stderr
+    );
+    assert_eq!(field(&out, "account"), "claude:max", "{}", out.stdout);
+    let session = field(&out, "session");
+    assert!(
+        session.starts_with(&format!("resume {SESSION}: claude:team ran it 1m ago "))
+            && session.contains("(more than 1 minutes ago: its prompt cache has likely expired)"),
+        "{}",
+        out.stdout
+    );
+    assert_eq!(field(&out, "limit"), "unknown");
+    assert!(launched(&sb).is_empty());
 }
 
 /// R23 `--wait --run` (lane review round 1): the arguments are checked for the providers a

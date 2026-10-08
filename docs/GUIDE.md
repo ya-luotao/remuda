@@ -212,6 +212,7 @@ prefer = ["claude:max"]        # breaks the last ties
 min_headroom = 10              # percent left required on every window that applies
 stale_after = 120              # minutes after which cached usage is marked stale
 affinity_minutes = 60          # resuming a session: how long its last account stays preferred
+strategy = "headroom"          # how the rules rank: "headroom" (default) or "pace"
 notes = """
 Keep claude:max for long refactors. codex:work is the company's; weekdays only.
 """
@@ -236,6 +237,19 @@ models = ["gpt-6-astra"]
   window usable.
   Excluded and logged-out accounts are not feasible. The feasible pairs are ranked by model
   order, headroom (in 10-point bands), freshness, the sooner reset, `prefer`, and registry order.
+- **Pace, if you want it.** `strategy = "pace"` ranks by the percent left per hour until reset
+  instead of the headroom: how much an account has to use each hour for none of its limit to be
+  lost at the reset. It counts the weekly windows (a five-hour window only when an account has
+  nothing longer: what is left of it at its reset is no loss while the week holds the budget),
+  never divides by less than an hour, and treats paces within a tenth of each other as a tie
+  that `prefer` breaks. It is worth it when your accounts have weekly limits and you would
+  rather use up what is about to reset unused than keep the most room: an account at 30% left
+  that resets tomorrow goes before one at 60% left that resets in six days. A window that has
+  reset since its usage was cached has no pace, and an account whose weekly windows have all
+  reset since has none, whatever its five-hour window says; an account with no pace ranks after
+  those with one. Feasibility and `--wait` do not change, and the text report adds a `pace` line; `--json`
+  shows each pair's `pace` and `pace_window` under either strategy, so you can compare before
+  switching. The default stays `"headroom"`.
 - **Jev, when asked.** With `TYPESAFE_API_KEY` set and `notes` written, and something to choose
   (two options, or an effort to score), remuda sends one request to TypeSafe's Jev model through `curl` (the key on curl's standard
   input, never on its command line) and takes its choice when its confidence is at least 0.50,

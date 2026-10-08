@@ -247,6 +247,7 @@ cache_write_1h = 10
 [pick]                       # optional: what `remuda pick` may recommend
 exclude = ["codex:research"]
 affinity_minutes = 60        # resuming a session: how long its last account stays preferred
+strategy = "headroom"        # or "pace": rank by what a reset would waste first
 notes = "Keep claude:work for long refactors."   # sent to Jev, with account names aliased
 
 [pick.claude]

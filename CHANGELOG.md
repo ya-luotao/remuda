@@ -10,6 +10,15 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Added
 
+- `[pick] strategy = "pace"` (default `"headroom"`, unchanged): the rules rank the feasible pairs
+  by their pace, the percent left per hour until reset on the tightest weekly window (a
+  five-hour window only without a longer one; never over less than an hour; a window's whole
+  length when its reset is unknown), highest first, paces within a tenth tied for `prefer` to
+  break; a window that has reset since gives no pace, a pair whose weekly windows have all reset
+  since has none, and a pair of unknown pace ranks after the known ones. It orders only: feasibility and
+  `--wait` are as before. The text report shows a `pace` line under that strategy; `--json` has
+  a `strategy` field and each candidate's `pace` and `pace_window` under either; the request to
+  Jev says the strategy in one sentence (SPEC R23, R3).
 - `remuda stats --by project`: sections by the directory each session started in (as the
   transcript records it; `(no directory)` for sessions that record none), most tokens first,
   then the usual `overall` section; with an account, the projects of its sessions.
@@ -19,7 +28,6 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   stderr and the exit status is 1. The statistics cache records each transcript's directory
   (schema 5), so the first `remuda stats` after upgrading reads every transcript whole again
   (SPEC R20, R5).
-
 - `remuda pick` recommends the account to resume or fork a session as: `remuda pick -- --resume
   <id>` (claude, also with `--fork-session`) or `-- resume <id>` / `-- fork <id>` (codex). Prompt
   caches are per account, so the account that ran the session within `[pick] affinity_minutes`

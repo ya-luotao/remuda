@@ -336,7 +336,7 @@ pub fn window_length(label: &str) -> Option<SignedDuration> {
 
 /// The longest window a pace is given for: ten years. A label claiming more is of unknown
 /// length (R24), and so is a point telling more.
-const MAX_WINDOW_MINUTES: i64 = 10 * 366 * 24 * 60;
+pub const MAX_WINDOW_MINUTES: i64 = 10 * 366 * 24 * 60;
 
 /// How long the window of `series` (one key's points, in time order) is (R24): what its latest
 /// point tells (codex's minutes), else what its label says ([`window_length`]). Points recorded

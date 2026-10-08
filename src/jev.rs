@@ -288,9 +288,10 @@ fn neutral_window(w: &Window, known: bool) -> Window {
     neutral
 }
 
-/// The state Jev reads (R23): the local time, the rules already applied, each account with an
-/// option (aliased) and its usage, the models, the user's notes (qualified account names
-/// aliased, otherwise as written), and the task slot. No email, organization, plan, path,
+/// The state Jev reads (R23): the local time, the rules already applied (and, with `strategy =
+/// "pace"`, that they rank by pace), each account with an option (aliased) and its usage, the
+/// models, the user's notes (qualified account names aliased, otherwise as written), and the
+/// task slot. No email, organization, plan, path,
 /// working directory or session content: nothing of an entry's local notes is used. Resuming a
 /// session, one sentence on which account ran it lately, and its model in place of `models`.
 #[allow(clippy::too_many_arguments)]
@@ -319,6 +320,13 @@ pub fn state_text(
          unknown: not checked); excluded accounts are not listed.\n",
         config.min_headroom
     ));
+    if config.strategy == pick::Strategy::Pace {
+        out.push_str(
+            "rules' ranking strategy: pace (percent left per hour until reset, on the \
+             tightest window of a day or longer, else of the shorter ones; highest first, so \
+             that what a reset would waste is used first).\n",
+        );
+    }
     if let Some(session) = session {
         out.push_str(&format!(
             "resuming a session: {}\n",
@@ -1273,6 +1281,45 @@ mod tests {
             !body.contains("claude:max ") && !body.contains("codex:work"),
             "{body}"
         );
+    }
+
+    /// R23 (The request): with `strategy = "pace"`, the state says in one sentence, after the
+    /// rules, that they rank by pace; nothing else in the request changes. With the default
+    /// strategy the state does not name one.
+    #[test]
+    fn the_pace_strategy_is_one_sentence_of_the_state() {
+        let (entries, config, aliases) = fixture();
+        let now = ts(NOW);
+        let c = pick::candidates(&entries, &config, now, None);
+        let headroom = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC, None);
+        let config = Config {
+            strategy: pick::Strategy::Pace,
+            ..config
+        };
+        let c = pick::candidates(&entries, &config, now, None);
+        let pace = request(&entries, &c, &config, &aliases, now, &TimeZone::UTC, None);
+        let sentence = "rules' ranking strategy: pace (percent left per hour until reset, on the \
+                        tightest window of a day or longer, else of the shorter ones; highest \
+                        first, so that what a reset would waste is used first).\n";
+        let state = pace.body["state"].as_str().unwrap();
+        assert!(
+            state.contains(&format!("excluded accounts are not listed.\n{sentence}\n")),
+            "{state}"
+        );
+        assert_eq!(state.replacen(sentence, "", 1), headroom.body["state"]);
+        assert!(
+            !headroom.body["state"]
+                .as_str()
+                .unwrap()
+                .contains("strategy")
+        );
+        let without_state = |body: &Value| {
+            let mut body = body.clone();
+            body.as_object_mut().unwrap().remove("state");
+            body
+        };
+        assert_eq!(without_state(&pace.body), without_state(&headroom.body));
+        assert_eq!(pace.offered, headroom.offered);
     }
 
     /// R23: without `models`, the per-model windows go out as ones that may apply to the agent's

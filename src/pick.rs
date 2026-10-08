@@ -47,6 +47,62 @@ pub const MAX_OPTIONS: usize = 255;
 pub const NOT_SEEN: &str = "cannot see this session (its store is not this account's)";
 /// How long `codex login status` may take (R4: about 0.05 s), as for `remuda list`.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
+/// The fewest seconds a pace spreads what is left over, an hour (R23): a window that resets in a
+/// minute would otherwise outrank everything.
+pub const MIN_PACE_SECONDS: i64 = 3600;
+/// A window this long or longer is a budget window, whose pace counts first (R23): what is left
+/// of it at its reset is lost, while a shorter window refills within the budget.
+pub const BUDGET_WINDOW: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
+/// A pace below this share of its band's top opens a new band (R23): nine tenths, as
+/// `(numerator, denominator)`, so that the boundary is compared in whole numbers
+/// ([`Pace::below_band_of`]).
+pub const PACE_BAND: (i128, i128) = (9, 10);
+/// The unit a pace's percent left is counted in: a millionth of a percent.
+const PACE_LEFT_UNIT: f64 = 1_000_000.0;
+
+/// A pair's pace (R23 Rules) as two whole numbers: the percent left in millionths of a percent
+/// (rounded to the nearest), and the seconds until the reset it is spread over, never fewer than
+/// [`MIN_PACE_SECONDS`]. Every comparison of paces, the order, equality and the bands, is
+/// made on these exactly, by cross products in `i128` ([`Pace::cmp_pace`],
+/// [`Pace::below_band_of`]): no rounding can turn one over. The quotient, [`Pace::per_hour`],
+/// is only shown (the text report, `--json`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pace {
+    pub left_micro: i64,
+    pub seconds: i64,
+}
+
+impl Pace {
+    /// `left` percent spread over `seconds`, at least [`MIN_PACE_SECONDS`]. A percentage is at
+    /// most a few hundred and a time a few hundred billion seconds (jiff's range), so the cross
+    /// products below stay far inside `i128`.
+    pub fn new(left: f64, seconds: i64) -> Pace {
+        Pace {
+            left_micro: (left * PACE_LEFT_UNIT).round().clamp(0.0, 1e15) as i64,
+            seconds: seconds.max(MIN_PACE_SECONDS),
+        }
+    }
+
+    /// Percent left per hour until reset.
+    pub fn per_hour(self) -> f64 {
+        self.left_micro as f64 / PACE_LEFT_UNIT / (self.seconds as f64 / 3600.0)
+    }
+
+    /// This pace against `other`, exactly: `left / seconds` against `other.left /
+    /// other.seconds`, as `left × other.seconds` against `other.left × seconds`. Paces over
+    /// different seconds with the same quotient are equal.
+    pub fn cmp_pace(self, other: Pace) -> std::cmp::Ordering {
+        (i128::from(self.left_micro) * i128::from(other.seconds))
+            .cmp(&(i128::from(other.left_micro) * i128::from(self.seconds)))
+    }
+
+    /// Whether this pace is below [`PACE_BAND`] of `top`'s, exactly: `10 × left × top.seconds <
+    /// 9 × top.left × seconds`. One exactly on the boundary is not below: it is in the band.
+    fn below_band_of(self, top: Pace) -> bool {
+        PACE_BAND.1 * i128::from(self.left_micro) * i128::from(top.seconds)
+            < PACE_BAND.0 * i128::from(top.left_micro) * i128::from(self.seconds)
+    }
+}
 
 /// `[pick]` of `config.toml` (R3, R23).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +116,8 @@ pub struct Config {
     pub stale_after: u32,
     /// Minutes; 0: a session's last account is never preferred.
     pub affinity_minutes: u32,
+    /// How the rules rank the feasible pairs.
+    pub strategy: Strategy,
     /// Free text sent to Jev; empty: none.
     pub notes: String,
     pub claude: Choices,
@@ -74,6 +132,7 @@ impl Default for Config {
             min_headroom: DEFAULT_MIN_HEADROOM,
             stale_after: DEFAULT_STALE_AFTER,
             affinity_minutes: DEFAULT_AFFINITY_MINUTES,
+            strategy: Strategy::default(),
             notes: String::new(),
             claude: Choices::default(),
             codex: Choices::default(),
@@ -91,12 +150,33 @@ pub struct Choices {
     pub default_effort: Option<String>,
 }
 
-const KEYS: [&str; 8] = [
+/// `[pick] strategy`: how the rules rank the feasible pairs (R23 Rules).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Strategy {
+    /// By the least percent left, in 10-point bands.
+    #[default]
+    Headroom,
+    /// By the percent left per hour until the reset of the tightest budget window, in bands of
+    /// a tenth.
+    Pace,
+}
+
+impl Strategy {
+    pub fn name(self) -> &'static str {
+        match self {
+            Strategy::Headroom => "headroom",
+            Strategy::Pace => "pace",
+        }
+    }
+}
+
+const KEYS: [&str; 9] = [
     "exclude",
     "prefer",
     "min_headroom",
     "stale_after",
     "affinity_minutes",
+    "strategy",
     "notes",
     "claude",
     "codex",
@@ -151,6 +231,11 @@ impl Config {
                         "[pick]: `affinity_minutes` must be an integer from 0 to \
                          {MAX_AFFINITY_MINUTES} (minutes)"
                     ),
+                },
+                "strategy" => match value.as_str() {
+                    Some("headroom") => config.strategy = Strategy::Headroom,
+                    Some("pace") => config.strategy = Strategy::Pace,
+                    _ => bail!("[pick]: `strategy` must be \"headroom\" or \"pace\""),
                 },
                 "notes" => {
                     let Some(notes) = value.as_str() else {
@@ -661,6 +746,12 @@ pub struct Candidate {
     pub headroom: Option<f64>,
     /// The window that gives `headroom`.
     pub binding: Option<Window>,
+    /// Percent left per hour until reset on `pace_window` ([`pace`]); `None` when unknown. A
+    /// way to rank, never to decide feasibility; given whatever the strategy.
+    pub pace: Option<Pace>,
+    /// The window that gives `pace`: not `binding`'s kind of fact (the least left), but the
+    /// tightest budget window, else the tightest shorter one.
+    pub pace_window: Option<Window>,
     /// The windows that apply and have reset since their usage was recorded: of unknown
     /// usage, shown, never counted.
     pub reset_passed: Vec<Window>,
@@ -706,6 +797,8 @@ pub fn candidates(
                 why_not: Some(blocked.clone()),
                 headroom: None,
                 binding: None,
+                pace: None,
+                pace_window: None,
                 reset_passed: Vec::new(),
                 default_model_windows: Vec::new(),
                 rules_rank: None,
@@ -744,6 +837,7 @@ pub fn candidates(
             );
             let headroom = binding.map(|(_, left)| left);
             let binding = binding.map(|(w, _)| w.clone());
+            let pace = pace(&windows, now);
             let reset_passed: Vec<Window> = windows
                 .iter()
                 .filter(|w| w.reset_passed())
@@ -780,6 +874,8 @@ pub fn candidates(
                 why_not,
                 headroom,
                 binding,
+                pace: pace.map(|(pace, _)| pace),
+                pace_window: pace.map(|(_, w)| w.clone()),
                 reset_passed,
                 default_model_windows,
                 rules_rank: None,
@@ -791,17 +887,125 @@ pub fn candidates(
     out
 }
 
+/// The pace of a pair whose windows that apply are `windows`, read at `now` (R23 Rules): of
+/// each window of known usage and known length ([`window_length`]: codex's minutes, else the
+/// label's), the percent left per hour until its reset (the window's whole length when its
+/// reset is unknown), never over less than [`MIN_PACE_SECONDS`].
+/// With a budget window ([`BUDGET_WINDOW`] or longer, whether its usage is known or not), the
+/// pair's is the least of its budget windows' known ones, and `None` when each has reset since:
+/// a budget whose usage is unknown is not a budget the pair lacks. Without one, the least of the
+/// shorter windows'; `None` without either. A window that has reset since is of unknown usage
+/// and gives no pace (not that of a full window); a window of unknown length is neither a budget
+/// window nor a short one. Of equal paces, the first window.
+pub fn pace<'a>(windows: &[&'a Window], now: Timestamp) -> Option<(Pace, &'a Window)> {
+    // Each window of known length: whether it is a budget window, and its pace when known.
+    let paces: Vec<(Option<Pace>, &Window, bool)> = windows
+        .iter()
+        .filter_map(|w| {
+            let length = window_length(w)?;
+            let pace = w.left().and_then(|left| {
+                let seconds = match w.reset {
+                    usage::Reset::Ahead(at) => at.as_second() - now.as_second(),
+                    usage::Reset::Unknown => length.as_secs(),
+                    usage::Reset::Passed(_) => return None,
+                };
+                Some(Pace::new(left, seconds))
+            });
+            Some((pace, *w, length >= BUDGET_WINDOW))
+        })
+        .collect();
+    let budget = paces.iter().any(|(_, _, b)| *b);
+    paces
+        .iter()
+        .filter(|(_, _, b)| *b == budget)
+        .filter_map(|(pace, w, _)| Some(((*pace)?, *w)))
+        .min_by(|a, b| a.0.cmp_pace(b.0))
+}
+
+/// How long `w` is (R23 Rules): the minutes its row tells (codex's own, to the minute), else
+/// what its label says ([`usage::history::window_length`]: codex's labels round to the hour,
+/// claude's tell the kind). A told length of no minute, or longer than
+/// [`usage::history::MAX_WINDOW_MINUTES`], is unknown, as in the usage history (R24).
+fn window_length(w: &Window) -> Option<jiff::SignedDuration> {
+    match w.window_minutes {
+        Some(minutes) => (1..=usage::history::MAX_WINDOW_MINUTES)
+            .contains(&i64::from(minutes))
+            .then(|| jiff::SignedDuration::from_mins(i64::from(minutes))),
+        None => usage::history::window_length(&w.label),
+    }
+}
+
+/// The pace band of each of `order`'s candidates (R23 Rules), by candidate index: the pairs of
+/// known pace, highest first; the first opens band 0, whose top is its pace, and each pair whose
+/// pace is below [`PACE_BAND`] of the current band's top ([`Pace::below_band_of`]) opens the
+/// next band, topped by its own; one on the boundary stays. The order and the boundary are the
+/// same exact relation ([`Pace::cmp_pace`]), so equal paces, over the same seconds or not, are
+/// interchangeable as a band's top: the bands do not depend on the order ties come in. Pairs of
+/// unknown pace have none.
+fn pace_bands(candidates: &[Candidate], order: &[usize]) -> BTreeMap<usize, usize> {
+    let mut known: Vec<(Pace, usize)> = order
+        .iter()
+        .filter_map(|&i| Some((candidates[i].pace?, i)))
+        .collect();
+    known.sort_by(|a, b| b.0.cmp_pace(a.0));
+    let mut bands = BTreeMap::new();
+    let mut band: Option<(usize, Pace)> = None;
+    for (pace, i) in known {
+        let (n, top) = match band {
+            Some((n, top)) if !pace.below_band_of(top) => (n, top),
+            Some((n, _)) => (n + 1, pace),
+            None => (0, pace),
+        };
+        band = Some((n, top));
+        bands.insert(i, n);
+    }
+    bands
+}
+
 /// Numbers the feasible candidates by the rules (R23): resuming a session, the account whose
 /// prompt cache is warm first (among the feasible only: affinity orders, it never admits);
 /// then known headroom before unknown (stale
 /// data is still known; no usage data, or every window reset since, is not); then the model's
 /// position in `models`; the 10-point headroom band, higher first (90% left and more is one
 /// band); fresh before stale; the binding window's reset, sooner first; `prefer` order;
-/// registry order.
+/// registry order. With `strategy = "pace"`, the pace takes the headroom's three places: known
+/// pace before unknown, the pace band, highest first ([`pace_bands`]), and the reset of the
+/// window that gives the pace.
 pub fn rank_rules(candidates: &mut [Candidate], entries: &[Entry], config: &Config) {
     let mut order: Vec<usize> = (0..candidates.len())
         .filter(|&i| candidates[i].feasible())
         .collect();
+    let prefer = |c: &Candidate| {
+        let qualified = entries[c.entry].account.qualified();
+        config
+            .prefer
+            .iter()
+            .position(|p| *p == qualified)
+            .unwrap_or(config.prefer.len())
+    };
+    if config.strategy == Strategy::Pace {
+        let bands = pace_bands(candidates, &order);
+        order.sort_by_key(|&i| {
+            let c = &candidates[i];
+            (
+                !c.affine,
+                c.pace.is_none(),
+                c.model_rank,
+                bands.get(&i).copied().unwrap_or(usize::MAX),
+                entries[c.entry].stale(config),
+                c.pace_window
+                    .as_ref()
+                    .and_then(Window::resets_at)
+                    .map_or(i64::MAX, |t| t.as_second()),
+                prefer(c),
+                c.entry,
+            )
+        });
+        for (rank, i) in order.into_iter().enumerate() {
+            candidates[i].rules_rank = Some(rank + 1);
+        }
+        return;
+    }
     let key = |c: &Candidate| {
         let entry = &entries[c.entry];
         let qualified = entry.account.qualified();
@@ -957,6 +1161,8 @@ pub struct Decision {
     pub reason: Option<Reason>,
     /// `None` when Jev was not asked.
     pub jev: Option<JevReport>,
+    /// How the rules ranked the pairs.
+    pub strategy: Strategy,
 }
 
 /// Jev's answers, mapped onto the candidates.
@@ -1009,6 +1215,7 @@ pub fn decide(
                 decided_by: DecidedBy::Rules,
                 reason: Some(reason),
                 jev: None,
+                strategy: config.strategy,
             });
         }
         Asked::Failed(error) => {
@@ -1022,6 +1229,7 @@ pub fn decide(
                     error: Some(error),
                     ..JevReport::default()
                 }),
+                strategy: config.strategy,
             });
         }
         Asked::Answered(answers) => answers,
@@ -1104,6 +1312,7 @@ pub fn decide(
         decided_by,
         reason,
         jev: Some(report),
+        strategy: config.strategy,
     })
 }
 
@@ -1466,6 +1675,23 @@ pub fn binding_text(w: &Window, now: Timestamp) -> String {
     }
 }
 
+/// The pace and the window that gives it: `1.25%/h on Week (all models) (resets in 2d3h)`;
+/// `0.42%/h on Week (all models) (reset unknown: over its whole length, 7d)`; `unknown`.
+pub fn pace_text(c: &Candidate, now: Timestamp) -> String {
+    let (Some(pace), Some(w)) = (c.pace.map(Pace::per_hour), &c.pace_window) else {
+        return "unknown".to_string();
+    };
+    let reset = match (w.resets_at(), window_length(w)) {
+        (Some(at), _) => format!("resets in {}", format_in(at, now)),
+        (None, Some(length)) => format!(
+            "reset unknown: over its whole length, {}",
+            format_in(now + length, now)
+        ),
+        (None, None) => "reset unknown".to_string(),
+    };
+    format!("{pace:.2}%/h on {} ({reset})", w.label)
+}
+
 /// A window as used: `Week (Fable) 100% used, resets in 3d`; `Week (Fable) usage unknown (reset
 /// since cached)` when its reset has passed.
 pub fn used_text(w: &Window, now: Timestamp) -> String {
@@ -1686,6 +1912,9 @@ pub fn format_text(
     if let Some(hint) = live_hint(entry, c) {
         rows.push(("unknown", hint));
     }
+    if config.strategy == Strategy::Pace {
+        rows.push(("pace", pace_text(c, now)));
+    }
     for w in &c.default_model_windows {
         rows.push((
             "also",
@@ -1789,9 +2018,17 @@ fn decided_text(decision: &Decision, candidates: &[Candidate], entries: &[Entry]
                     format!("jev {}{top}", confidence.unwrap_or_default())
                 }
             };
-            format!("rules ({}: {why})", reason.name())
+            format!("{} ({}: {why})", rules_text(decision), reason.name())
         }
-        (DecidedBy::Rules, None) => "rules".to_string(),
+        (DecidedBy::Rules, None) => rules_text(decision),
+    }
+}
+
+/// `rules`, with the strategy when it is not the default: `rules, strategy pace`.
+fn rules_text(decision: &Decision) -> String {
+    match decision.strategy {
+        Strategy::Headroom => "rules".to_string(),
+        strategy => format!("rules, strategy {}", strategy.name()),
     }
 }
 
@@ -1860,6 +2097,8 @@ pub fn to_json(
                 "headroom": c.headroom,
                 "binding": c.binding.as_ref().map(|w| w.label.clone()),
                 "resets_at": ts(c.binding.as_ref().and_then(Window::resets_at)),
+                "pace": c.pace.map(Pace::per_hour),
+                "pace_window": c.pace_window.as_ref().map(|w| w.label.clone()),
                 "reset_passed": !c.reset_passed.is_empty(),
                 "source": usage.map(|u| u.source.name()),
                 "fetched_at": ts(usage.and_then(|u| u.fetched_at)),
@@ -1883,7 +2122,7 @@ pub fn to_json(
         return json!({
             "account": null, "provider": null, "model": null, "effort": null,
             "effort_by": null, "decided_by": null, "reason": null, "jev": null, "command": [],
-            "session": session, "candidates": list,
+            "session": session, "strategy": config.strategy.name(), "candidates": list,
         });
     };
     let c = &candidates[d.chosen];
@@ -1905,6 +2144,7 @@ pub fn to_json(
         })),
         "command": command(entry, c, d.effort.as_deref(), args),
         "session": session,
+        "strategy": config.strategy.name(),
         "candidates": list,
     })
 }
@@ -1928,7 +2168,7 @@ mod tests {
     fn parses_the_pick_table() {
         let config = parse(&format!(
             "{ACCOUNTS}[pick]\nexclude = [\"work\"]\nprefer = [\"max\", \"claude:max\"]\n\
-             min_headroom = 25\nstale_after = 30\naffinity_minutes = 0\nnotes = \"\"\"\n  Keep max for refactors.\n\"\"\"\n\n\
+             min_headroom = 25\nstale_after = 30\naffinity_minutes = 0\nstrategy = \"pace\"\nnotes = \"\"\"\n  Keep max for refactors.\n\"\"\"\n\n\
              [pick.claude]\nmodels = [\"claude-opus-5-5\", \"fable\"]\n\
              efforts = [\"high\", \"max\"]\ndefault_effort = \"high\"\n"
         ))
@@ -1937,6 +2177,7 @@ mod tests {
         assert_eq!(config.prefer, ["claude:max"]);
         assert_eq!((config.min_headroom, config.stale_after), (25, 30));
         assert_eq!(config.affinity_minutes, 0);
+        assert_eq!(config.strategy, Strategy::Pace);
         assert_eq!(config.notes, "Keep max for refactors.");
         assert_eq!(config.claude.models, ["claude-opus-5-5", "fable"]);
         assert_eq!(config.claude.default_effort.as_deref(), Some("high"));
@@ -2692,6 +2933,597 @@ mod tests {
         let config = with_models(&["claude-opus-5-5"], &[]);
         let c = candidates(&entries, &config, ts(NOW), None);
         assert!(c[0].default_model_windows.is_empty());
+    }
+
+    /// R3, R23: `[pick] strategy` is `"headroom"` (the default) or `"pace"`; resuming keeps it.
+    #[test]
+    fn parses_the_strategy() {
+        let pace = parse(&format!("{ACCOUNTS}[pick]\nstrategy = \"pace\"\n")).unwrap();
+        assert_eq!(pace.strategy, Strategy::Pace);
+        assert_eq!(pace.for_resume().strategy, Strategy::Pace);
+        let headroom = parse(&format!("{ACCOUNTS}[pick]\nstrategy = \"headroom\"\n")).unwrap();
+        assert_eq!(headroom, Config::default());
+        assert_eq!(Config::default().strategy, Strategy::Headroom);
+        for bad in ["\"Pace\"", "\"fast\"", "\"\"", "1", "[\"pace\"]"] {
+            let text = format!("[pick]\nstrategy = {bad}\n\n{ACCOUNTS}");
+            let err = format!("{:#}", parse(&text).unwrap_err());
+            assert!(
+                err.contains(r#"[pick]: `strategy` must be "headroom" or "pace""#),
+                "{bad} => {err}"
+            );
+        }
+        let err = format!(
+            "{:#}",
+            parse(&format!("[pick]\nstrategi = \"pace\"\n\n{ACCOUNTS}")).unwrap_err()
+        );
+        assert!(
+            err.contains(
+                "unknown key `strategi` (known: exclude, prefer, min_headroom, stale_after, \
+                 affinity_minutes, strategy, notes, claude, codex)"
+            ),
+            "{err}"
+        );
+    }
+
+    /// The pace of the one pair of an account of `provider` with `rows` cached five minutes
+    /// before [`NOW`], under `config`, and the window that gives it.
+    fn pace_of(
+        provider: Provider,
+        rows: &[UsageRow],
+        config: &Config,
+    ) -> (Option<Pace>, Option<String>) {
+        let entries = [entry(provider, "a", 5, rows)];
+        let c = candidates(&entries, config, ts(NOW), None);
+        (
+            c[0].pace,
+            c[0].pace_window.as_ref().map(|w| w.label.clone()),
+        )
+    }
+
+    fn close(got: Option<Pace>, want: f64) -> bool {
+        got.is_some_and(|got| (got.per_hour() - want).abs() < 1e-9)
+    }
+
+    /// R23 Rules (pace): percent left per hour until reset, on the tightest window of a day or
+    /// longer; a shorter window does not count beside one; never over less than an hour.
+    #[test]
+    fn pace_is_left_per_hour_on_the_tightest_budget_window() {
+        let config = with_models(&["claude-opus-5-5"], &[]);
+        // Session: 100% left over 2h is 50%/h, but the week is the budget: 60% over 60h.
+        let rows = [
+            row("Session", 0.0, Some("2026-09-27T12:00:00Z")),
+            row("Week (all models)", 40.0, Some("2026-09-29T22:00:00Z")),
+        ];
+        let (pace, window) = pace_of(Provider::Claude, &rows, &config);
+        assert!(close(pace, 1.0), "{pace:?}");
+        assert_eq!(window.as_deref(), Some("Week (all models)"));
+        // Two budget windows: the tighter, 30% over 60h; the per-model week counts for its family.
+        let rows = [
+            row("Session", 0.0, Some("2026-09-27T12:00:00Z")),
+            row("Week (all models)", 40.0, Some("2026-09-29T22:00:00Z")),
+            row("Week (Opus)", 70.0, Some("2026-09-29T22:00:00Z")),
+            row("Week (Fable)", 99.0, Some("2026-09-29T22:00:00Z")),
+        ];
+        let (pace, window) = pace_of(Provider::Claude, &rows, &config);
+        assert!(close(pace, 0.5), "{pace:?}");
+        assert_eq!(window.as_deref(), Some("Week (Opus)"));
+        // A week that resets in half an hour: 50% over at least an hour, not 100%/h.
+        let rows = [row("Week (all models)", 50.0, Some("2026-09-27T10:30:00Z"))];
+        let (pace, _) = pace_of(Provider::Claude, &rows, &config);
+        assert!(close(pace, 50.0), "{pace:?}");
+    }
+
+    /// R23 Rules (pace): a shorter window gives the pace only when no window of a day or
+    /// longer does.
+    #[test]
+    fn pace_falls_back_to_short_windows_only_without_a_long_one() {
+        let config = Config::default();
+        let five = row("5h window", 20.0, Some("2026-09-27T14:00:00Z"));
+        let week = row("7d window", 40.0, Some("2026-10-01T14:00:00Z"));
+        let (pace, window) = pace_of(Provider::Codex, &[five.clone(), week], &config);
+        assert!(close(pace, 0.6), "{pace:?}");
+        assert_eq!(window.as_deref(), Some("7d window"));
+        let (pace, window) = pace_of(Provider::Codex, &[five], &config);
+        assert!(close(pace, 20.0), "{pace:?}");
+        assert_eq!(window.as_deref(), Some("5h window"));
+        // Of two short windows, the tighter.
+        let rows = [
+            row("Session", 30.0, Some("2026-09-27T11:00:00Z")),
+            row("five_hour", 50.0, Some("2026-09-27T12:30:00Z")),
+        ];
+        let (pace, window) = pace_of(Provider::Claude, &rows, &config);
+        assert!(close(pace, 20.0), "{pace:?}");
+        assert_eq!(window.as_deref(), Some("five_hour"));
+    }
+
+    /// R23 Rules (pace): a window whose reset is unknown counts its whole length; a window of
+    /// unknown length gives no pace, and is not a budget window that would hide a short one.
+    #[test]
+    fn an_unknown_reset_counts_the_whole_window() {
+        let config = Config::default();
+        let rows = [row("Week (all models)", 16.0, None)];
+        let entries = [entry(Provider::Claude, "a", 5, &rows)];
+        let c = candidates(&entries, &config, ts(NOW), None);
+        assert!(close(c[0].pace, 0.5), "{:?}", c[0].pace);
+        assert_eq!(
+            pace_text(&c[0], ts(NOW)),
+            "0.50%/h on Week (all models) (reset unknown: over its whole length, 7d)"
+        );
+        // Claude's wording that cannot be read is a reset unknown as well.
+        let rows = [UsageRow {
+            resets: Some(Resets::Text("someday".into())),
+            ..row("Week (all models)", 16.0, None)
+        }];
+        let (pace, _) = pace_of(Provider::Claude, &rows, &config);
+        assert!(close(pace, 0.5), "{pace:?}");
+        // Of unknown length, with or without a reset: no pace, and not a budget window.
+        let mystery = row("Mystery", 0.0, Some("2026-09-29T10:00:00Z"));
+        assert_eq!(
+            pace_of(Provider::Claude, std::slice::from_ref(&mystery), &config),
+            (None, None)
+        );
+        assert_eq!(
+            pace_of(Provider::Claude, &[row("Mystery", 0.0, None)], &config),
+            (None, None)
+        );
+        let session = row("Session", 50.0, Some("2026-09-27T15:00:00Z"));
+        let (pace, window) = pace_of(Provider::Claude, &[mystery, session], &config);
+        assert!(close(pace, 10.0), "{pace:?}");
+        assert_eq!(window.as_deref(), Some("Session"));
+    }
+
+    /// R23 Rules (pace), GitHub review of PR #27's merge: a codex window is as long as the
+    /// minutes it tells, not its label's rounded hours, for its pace and for whether it is a
+    /// budget window.
+    #[test]
+    fn a_codex_window_is_as_long_as_its_minutes() {
+        let config = Config::default();
+        let codex = |minutes: u32, used: f64, resets: Option<&str>| UsageRow {
+            window_minutes: Some(minutes),
+            ..row(
+                &crate::usage::codex_label(i64::from(minutes), None),
+                used,
+                resets,
+            )
+        };
+        // 90 minutes, labeled `2h window`, its reset unknown: 90% left over 90 minutes, 60%/h
+        // (over the label's two hours, 45%/h).
+        let ninety = codex(90, 10.0, None);
+        assert_eq!(ninety.label, "2h window");
+        let entries = [entry(Provider::Codex, "a", 5, &[ninety])];
+        let c = candidates(&entries, &config, ts(NOW), None);
+        assert_eq!(c[0].pace.map(|p| p.seconds), Some(5400));
+        assert!(close(c[0].pace, 60.0), "{:?}", c[0].pace);
+        assert_eq!(
+            pace_text(&c[0], ts(NOW)),
+            "60.00%/h on 2h window (reset unknown: over its whole length, 1h30m)"
+        );
+        // 1439 minutes, labeled `1d window`, is less than a day: no budget window, so the
+        // tighter of it (50% over 20h, 2.5%/h) and the five-hour one (8% over 4h, 2%/h).
+        let day = codex(1439, 50.0, Some("2026-09-28T06:00:00Z"));
+        assert_eq!(day.label, "1d window");
+        let five = codex(300, 92.0, Some("2026-09-27T14:00:00Z"));
+        let (pace, window) = pace_of(Provider::Codex, &[five, day], &config);
+        assert!(close(pace, 2.0), "{pace:?}");
+        assert_eq!(window.as_deref(), Some("Session"));
+    }
+
+    /// R23 Rules (pace): a window that has reset since its usage was cached is of unknown
+    /// usage and gives no pace (an unknown is not a full window). It is still a budget window:
+    /// a pair whose budget windows have all reset since has no pace, rather than the pace of a
+    /// shorter window that holds no budget (`.lane/rulings.md` Q1); with another budget window
+    /// known, that one's.
+    #[test]
+    fn a_window_reset_since_gives_no_pace() {
+        let mut config = Config::default();
+        let week = row("Week (all models)", 0.0, Some("2026-09-27T09:00:00Z"));
+        let entries = [entry(
+            Provider::Claude,
+            "a",
+            600,
+            std::slice::from_ref(&week),
+        )];
+        let c = candidates(&entries, &config, ts(NOW), None);
+        assert!(c[0].reset_passed.len() == 1 && c[0].feasible());
+        assert_eq!((c[0].pace, c[0].pace_window.as_ref()), (None, None));
+        assert_eq!(pace_text(&c[0], ts(NOW)), "unknown");
+        // The session is known (50% over 2h, 25%/h), but the week holds the budget.
+        let session = row("Session", 50.0, Some("2026-09-27T12:00:00Z"));
+        let rows = [week.clone(), session.clone()];
+        let entries = [entry(Provider::Claude, "a", 600, &rows)];
+        let c = candidates(&entries, &config, ts(NOW), None);
+        assert_eq!((c[0].pace, c[0].pace_window.as_ref()), (None, None));
+        // Another budget window known: its pace (60% over 60h).
+        let rows = [
+            week.clone(),
+            session,
+            row("seven_day", 40.0, Some("2026-09-29T22:00:00Z")),
+        ];
+        let entries = [entry(Provider::Claude, "a", 600, &rows)];
+        let c = candidates(&entries, &config, ts(NOW), None);
+        assert!(close(c[0].pace, 1.0), "{:?}", c[0].pace);
+        assert_eq!(c[0].pace_window.as_ref().unwrap().label, "seven_day");
+        config.strategy = Strategy::Pace;
+        // A, its week past its reset, does not outrank B by its session's pace: it is unknown.
+        let entries = [
+            entry(
+                Provider::Claude,
+                "a",
+                5,
+                &[
+                    row("Week (all models)", 0.0, Some("2026-09-27T09:57:00Z")),
+                    row("Session", 50.0, Some("2026-09-27T12:00:00Z")),
+                ],
+            ),
+            entry(
+                Provider::Claude,
+                "b",
+                5,
+                &[row("Week (all models)", 20.0, Some("2026-09-29T10:00:00Z"))],
+            ),
+        ];
+        let c = candidates(&entries, &config, ts(NOW), None);
+        assert_eq!(c[0].pace, None);
+        assert_eq!(
+            order(&entries, &c),
+            ["claude:b / default", "claude:a / default"]
+        );
+        // Unknown ranks after known, however low the known pace: an unknown is not a zero.
+        let entries = [
+            entry(
+                Provider::Claude,
+                "past",
+                600,
+                &[row("Week (all models)", 0.0, Some("2026-09-27T09:00:00Z"))],
+            ),
+            Entry {
+                usage: None,
+                ..entry(Provider::Claude, "none", 0, &[])
+            },
+            entry(
+                Provider::Claude,
+                "low",
+                5,
+                &[row("Week (all models)", 89.0, Some("2026-10-03T10:00:00Z"))],
+            ),
+        ];
+        let c = candidates(&entries, &config, ts(NOW), None);
+        // Of the two unknown, the one without data before the stale one, as for the headroom.
+        assert_eq!(
+            order(&entries, &c),
+            [
+                "claude:low / default",
+                "claude:none / default",
+                "claude:past / default"
+            ]
+        );
+    }
+
+    /// R23 Rules (pace): pairs whose paces are within a tenth of their band's top share a band,
+    /// where `prefer` decides; the bands are cut from the highest pace down, so paces close in
+    /// a chain do not all merge.
+    #[test]
+    fn pace_bands_hold_within_a_tenth() {
+        // Over 100h: 1.0, 0.95, 0.91 | 0.85, 0.77 %/h.
+        let week = |used: f64| [row("Week (all models)", used, Some("2026-10-01T14:00:00Z"))];
+        let entries: Vec<Entry> = [("a", 0.0), ("b", 5.0), ("c", 9.0), ("d", 15.0), ("e", 23.0)]
+            .iter()
+            .map(|(name, used)| entry(Provider::Claude, name, 5, &week(*used)))
+            .collect();
+        let mut config = Config {
+            strategy: Strategy::Pace,
+            prefer: vec!["claude:e".into(), "claude:d".into(), "claude:c".into()],
+            ..Config::default()
+        };
+        let c = candidates(&entries, &config, ts(NOW), None);
+        let bands = pace_bands(&c, &ranked(&c));
+        let by_name: Vec<usize> = (0..5).map(|i| bands[&i]).collect();
+        assert_eq!(by_name, [0, 0, 0, 1, 1]);
+        assert_eq!(
+            order(&entries, &c),
+            [
+                "claude:c / default",
+                "claude:a / default",
+                "claude:b / default",
+                "claude:e / default",
+                "claude:d / default",
+            ]
+        );
+        // The same, whatever order the pairs come in.
+        let mut reversed = c.clone();
+        reversed.reverse();
+        let bands = pace_bands(&reversed, &ranked(&reversed));
+        assert_eq!(bands.values().filter(|b| **b == 0).count(), 3);
+        // Without `prefer`: the registry order within a band.
+        config.prefer.clear();
+        let c = candidates(&entries, &config, ts(NOW), None);
+        assert_eq!(
+            order(&entries, &c)[..3],
+            [
+                "claude:a / default",
+                "claude:b / default",
+                "claude:c / default"
+            ]
+        );
+    }
+
+    /// Two accounts of `strategy = "pace"`, `prefer = ["claude:b"]`, each with one fresh week:
+    /// `(percent used, its reset)` for `a` and for `b`.
+    fn two_paces(a: (f64, &str), b: (f64, &str)) -> (Vec<Entry>, Vec<Candidate>) {
+        let week = |(used, resets): (f64, &str)| [row("Week (all models)", used, Some(resets))];
+        let entries = vec![
+            entry(Provider::Claude, "a", 5, &week(a)),
+            entry(Provider::Claude, "b", 5, &week(b)),
+        ];
+        let config = Config {
+            strategy: Strategy::Pace,
+            prefer: vec!["claude:b".into()],
+            ..Config::default()
+        };
+        let c = candidates(&entries, &config, ts(NOW), None);
+        (entries, c)
+    }
+
+    /// R23 Rules (pace), GitHub review of PR #27: a pace exactly 0.9 of its band's top is in the
+    /// band. 100% and 90% left of windows that both reset in 3601 s: the quotients, 99.97…%/h
+    /// and 89.97…%/h, put the second about 1.4e-14 under 0.9 × the first in floating point;
+    /// the terms compared without a division put it on the boundary. One band: `prefer`
+    /// decides.
+    #[test]
+    fn a_pace_on_the_band_boundary_is_in_the_band() {
+        let resets = "2026-09-27T11:00:01Z";
+        let (entries, c) = two_paces((0.0, resets), (10.0, resets));
+        let (a, b) = (c[0].pace.unwrap(), c[1].pace.unwrap());
+        assert_eq!((a.seconds, b.seconds), (3601, 3601));
+        assert!(
+            b.per_hour() < 0.9 * a.per_hour(),
+            "the case the review found: {} vs {}",
+            b.per_hour(),
+            0.9 * a.per_hour()
+        );
+        assert_eq!(
+            pace_bands(&c, &ranked(&c))
+                .into_values()
+                .collect::<Vec<_>>(),
+            [0, 0]
+        );
+        assert_eq!(
+            order(&entries, &c),
+            ["claude:b / default", "claude:a / default"]
+        );
+    }
+
+    /// R23 Rules (pace), critic round 2: a pace truly below 0.9 of its band's top opens a band,
+    /// however close. a: 99.99% left over 68743 s; b: 80% left over 61111 s. Exactly, b's pace
+    /// is 0.9 × a's × (1 − 1/5499440001): below, by 1.8e-10, which a relative tolerance of 1e-9
+    /// would have taken for the boundary. Two bands: a first, whatever `prefer` says.
+    #[test]
+    fn a_pace_just_below_the_band_boundary_opens_a_band() {
+        let (entries, c) = two_paces(
+            (0.01, "2026-09-28T05:05:43Z"),
+            (20.0, "2026-09-28T02:58:31Z"),
+        );
+        let (a, b) = (c[0].pace.unwrap(), c[1].pace.unwrap());
+        assert_eq!((a.seconds, b.seconds), (68743, 61111));
+        let ratio = b.per_hour() / (0.9 * a.per_hour());
+        assert!(
+            ratio < 1.0 && ratio > 1.0 - 1e-9,
+            "the critic's case: within 1e-9 under the boundary ({ratio})"
+        );
+        assert_eq!(
+            pace_bands(&c, &ranked(&c))
+                .into_values()
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(
+            order(&entries, &c),
+            ["claude:a / default", "claude:b / default"]
+        );
+    }
+
+    /// R23 Rules (pace), critic round 3: on the boundary over different seconds. a: 71.10% left
+    /// over 5670 s; b: 41.08% over 3640 s; `10 × 41.08 × 5670 = 9 × 71.10 × 3640 = 2329236`.
+    /// Multiplied in floating point the products differ by 5e-10 and b fell a band; in
+    /// millionths of a percent and whole seconds they are equal. One band: b, preferred and
+    /// resetting sooner, first.
+    #[test]
+    fn a_pace_on_the_boundary_over_other_seconds_is_in_the_band() {
+        let (entries, c) = two_paces(
+            (28.9, "2026-09-27T11:34:30Z"),
+            (58.92, "2026-09-27T11:00:40Z"),
+        );
+        let (a, b) = (c[0].pace.unwrap(), c[1].pace.unwrap());
+        assert_eq!(
+            (a, b),
+            (
+                Pace {
+                    left_micro: 71_100_000,
+                    seconds: 5670
+                },
+                Pace {
+                    left_micro: 41_080_000,
+                    seconds: 3640
+                }
+            )
+        );
+        let (a_left, b_left) = (100.0 - 28.9, 100.0 - 58.92);
+        assert!(
+            10.0 * b_left * 5670.0 < 9.0 * a_left * 3640.0,
+            "the critic's case: floating point puts b below"
+        );
+        assert_eq!(
+            pace_bands(&c, &ranked(&c))
+                .into_values()
+                .collect::<Vec<_>>(),
+            [0, 0]
+        );
+        assert_eq!(
+            order(&entries, &c),
+            ["claude:b / default", "claude:a / default"]
+        );
+    }
+
+    /// R23 Rules (pace), critic round 3: equal paces over different seconds are interchangeable
+    /// as a band's top. a: 34.60% left over 60480 s and b: 69.20% over 120960 s are the same
+    /// pace; c, 31.14% over 60480 s, is exactly 0.9 of it. In whatever order the candidates
+    /// come, one band, and the same ranking: c (preferred), then a (its reset sooner), then b.
+    #[test]
+    fn equal_paces_band_alike_in_any_order() {
+        let entries = [
+            entry(
+                Provider::Claude,
+                "a",
+                5,
+                &[row("Week (all models)", 65.4, Some("2026-09-28T02:48:00Z"))],
+            ),
+            entry(
+                Provider::Claude,
+                "b",
+                5,
+                &[row("Week (all models)", 30.8, Some("2026-09-28T19:36:00Z"))],
+            ),
+            entry(
+                Provider::Claude,
+                "c",
+                5,
+                &[row(
+                    "Week (all models)",
+                    68.86,
+                    Some("2026-09-28T02:48:00Z"),
+                )],
+            ),
+        ];
+        let config = Config {
+            strategy: Strategy::Pace,
+            prefer: vec!["claude:c".into()],
+            ..Config::default()
+        };
+        let c = candidates(&entries, &config, ts(NOW), None);
+        let (a, b) = (c[0].pace.unwrap(), c[1].pace.unwrap());
+        assert_eq!(a.cmp_pace(b), std::cmp::Ordering::Equal);
+        assert_ne!(a, b);
+        for perm in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            // The same candidates (each keeps its entry), in another order.
+            let mut shuffled: Vec<Candidate> = perm.iter().map(|&i| c[i].clone()).collect();
+            rank_rules(&mut shuffled, &entries, &config);
+            let bands: BTreeMap<String, usize> = pace_bands(&shuffled, &ranked(&shuffled))
+                .into_iter()
+                .map(|(i, band)| (entries[shuffled[i].entry].account.qualified(), band))
+                .collect();
+            assert_eq!(
+                bands.into_iter().collect::<Vec<_>>(),
+                [
+                    ("claude:a".to_string(), 0),
+                    ("claude:b".to_string(), 0),
+                    ("claude:c".to_string(), 0)
+                ],
+                "{perm:?}"
+            );
+            assert_eq!(
+                order(&entries, &shuffled),
+                [
+                    "claude:c / default",
+                    "claude:a / default",
+                    "claude:b / default"
+                ],
+                "{perm:?}"
+            );
+        }
+    }
+
+    /// R23 Rules: `strategy = "headroom"` ranks as the rules always have, and the pace is only
+    /// shown; `"pace"` ranks by the pace, then by the sooner reset of the window that gives it.
+    #[test]
+    fn the_strategy_decides_only_the_ranking() {
+        let now = ts(NOW);
+        let entries = [
+            // 90% left over 160h: 0.5625%/h; headroom band 9.
+            entry(
+                Provider::Claude,
+                "x",
+                5,
+                &[row("Week (all models)", 10.0, Some("2026-10-04T02:00:00Z"))],
+            ),
+            // 40% left over 20h: 2%/h; headroom band 4.
+            entry(
+                Provider::Claude,
+                "y",
+                5,
+                &[row("Week (all models)", 60.0, Some("2026-09-28T06:00:00Z"))],
+            ),
+            // 50% left over 25h: 2%/h, as y, resetting later.
+            entry(
+                Provider::Claude,
+                "z",
+                5,
+                &[row("Week (all models)", 50.0, Some("2026-09-28T11:00:00Z"))],
+            ),
+            // 5% left: not feasible, whatever its pace (5%/h).
+            entry(
+                Provider::Claude,
+                "w",
+                5,
+                &[row("Week (all models)", 95.0, Some("2026-09-27T11:00:00Z"))],
+            ),
+        ];
+        let headroom = candidates(&entries, &Config::default(), now, None);
+        assert_eq!(
+            order(&entries, &headroom),
+            [
+                "claude:x / default",
+                "claude:z / default",
+                "claude:y / default"
+            ]
+        );
+        assert!(
+            close(headroom[0].pace, 0.5625),
+            "the pace is given all the same"
+        );
+        let config = Config {
+            strategy: Strategy::Pace,
+            ..Config::default()
+        };
+        let pace = candidates(&entries, &config, now, None);
+        assert_eq!(
+            order(&entries, &pace),
+            [
+                "claude:y / default",
+                "claude:z / default",
+                "claude:x / default"
+            ]
+        );
+        // Feasibility, the binding window and when `--wait` would try again are the same.
+        let without_rank = |c: &[Candidate]| -> Vec<Candidate> {
+            c.iter()
+                .map(|c| Candidate {
+                    rules_rank: None,
+                    ..c.clone()
+                })
+                .collect()
+        };
+        assert_eq!(without_rank(&pace), without_rank(&headroom));
+        assert!(!pace[3].feasible() && close(pace[3].pace, 5.0));
+        let blocked: Vec<Candidate> = pace.iter().filter(|c| !c.feasible()).cloned().collect();
+        assert_eq!(
+            next_attempt(&blocked, &entries, now),
+            next_attempt(
+                &headroom
+                    .iter()
+                    .filter(|c| !c.feasible())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                &entries,
+                now
+            )
+        );
     }
 
     fn two_accounts() -> (Vec<Entry>, Vec<Candidate>, Config) {
