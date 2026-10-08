@@ -23,9 +23,9 @@ use crate::transcript::{complete_lines, contains, read_at};
 use crate::{Env, owned};
 
 /// Bump whenever [`Row`], [`FileStats`] or the counting rules change: a mismatching cache is
-/// rebuilt (2: cache write by lifetime, fast / US flags; 3: codex's cache write; 4: the project
-/// directory).
-pub const SCHEMA_VERSION: u32 = 4;
+/// rebuilt (2: cache write by lifetime, fast / US flags; 3: codex's cache write; 5: the project
+/// directory; 4, never released, read codex's project by an earlier rule).
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Read size; an unfinished line is carried over to the next read.
 const CHUNK: u64 = 8 * 1024 * 1024;
@@ -165,6 +165,11 @@ pub struct FileStats {
     /// The project directory: the `cwd` of the first record that has one (claude: a record's
     /// own; codex: a `session_meta`'s or `turn_context`'s), as recorded (R20).
     pub cwd: Option<String>,
+    /// Codex: whether the rollout's first record (its first line that parses as one) was read,
+    /// the only `session_meta` that can give [`FileStats::cwd`]. Kept, as lines before it (blank
+    /// or not JSON) move [`FileStats::scanned_offset`] on without being a record.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub codex_head: bool,
     /// [`Source::path`] of the source it was listed under (for attribution).
     pub source: PathBuf,
     pub size: u64,
@@ -504,6 +509,7 @@ fn count(
             provider: source.kind.provider(),
             session_id: listed.session_id.clone(),
             cwd: None,
+            codex_head: false,
             source: source.path.clone(),
             size: 0,
             mtime_ns: 0,
@@ -711,20 +717,21 @@ struct ClaudeCwd {
 struct CodexCwd {
     #[serde(rename = "type")]
     kind: Option<String>,
-    payload: Option<ClaudeCwd>,
+    payload: Option<CodexCwdPayload>,
 }
 
-/// The project directory a line records, as recorded (R20): claude, a record's own `cwd`; codex,
-/// the `payload.cwd` of a `session_meta` or `turn_context`. Only those fields are deserialized.
-fn cwd(provider: Provider, line: &[u8]) -> Option<String> {
-    match provider {
-        Provider::Claude => serde_json::from_slice::<ClaudeCwd>(line).ok()?.cwd,
-        Provider::Codex => {
-            let record = serde_json::from_slice::<CodexCwd>(line).ok()?;
-            match record.kind.as_deref() {
-                Some("session_meta" | "turn_context") => record.payload?.cwd,
-                _ => None,
-            }
+/// A codex record's `payload`: its `cwd` read whatever its type, so that a first record whose
+/// `cwd` is not a string is still read as the first.
+#[derive(Deserialize)]
+struct CodexCwdPayload {
+    cwd: Option<serde_json::Value>,
+}
+
+impl CodexCwdPayload {
+    fn cwd(self) -> Option<String> {
+        match self.cwd? {
+            serde_json::Value::String(cwd) => Some(cwd),
+            _ => None,
         }
     }
 }
@@ -792,14 +799,44 @@ impl<'a> Counter<'a> {
 
     fn line(&mut self, line: &[u8]) {
         // Looked for in every line until found, ahead of the fast paths below, which skip the
-        // lines that carry it; parsed only from a line that mentions it.
-        if self.file.cwd.is_none() && contains(line, b"\"cwd\"") {
-            self.file.cwd = cwd(self.file.provider, line);
+        // lines that carry it; parsed only from a line that mentions it, or that may be a
+        // rollout's first record.
+        if self.file.cwd.is_none() {
+            match self.file.provider {
+                Provider::Claude if contains(line, b"\"cwd\"") => {
+                    self.file.cwd = serde_json::from_slice::<ClaudeCwd>(line)
+                        .ok()
+                        .and_then(|r| r.cwd);
+                }
+                Provider::Claude => {}
+                Provider::Codex => self.codex_cwd(line),
+            }
         }
         match self.file.provider {
             Provider::Claude => self.claude(line),
             Provider::Codex => self.codex(line),
         }
+    }
+
+    /// The project directory of a rollout (R20): the `payload.cwd` of its first record (its
+    /// first line that parses as one) if that is a `session_meta`, the session's own, else of
+    /// its first `turn_context` that has one. A later `session_meta` is a fork parent's (a
+    /// subagent's rollout has it after its own), and other records' `cwd` (an
+    /// `exec_command_begin`'s) is a command's. Only `type` and `payload.cwd` are deserialized.
+    fn codex_cwd(&mut self, line: &[u8]) {
+        if self.file.codex_head && !contains(line, b"\"cwd\"") {
+            return;
+        }
+        let Ok(record) = serde_json::from_slice::<CodexCwd>(line) else {
+            return;
+        };
+        let first = !std::mem::replace(&mut self.file.codex_head, true);
+        let cwd = match record.kind.as_deref() {
+            Some("session_meta") if first => record.payload.and_then(CodexCwdPayload::cwd),
+            Some("turn_context") => record.payload.and_then(CodexCwdPayload::cwd),
+            _ => None,
+        };
+        self.file.cwd = cwd;
     }
 
     /// An assistant record: its message's usage by `message.id`, and each advisor call in
@@ -2413,7 +2450,8 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
         assert_eq!(huge.total(), u64::MAX);
     }
 
-    /// Counts `text` as a whole file of `provider`, then on from that after `more` is appended.
+    /// Counts `text` as a whole file of `provider`, then on from that, as saved in the cache
+    /// and loaded again, after `more` is appended.
     fn counted(provider: Provider, text: &str, more: &str) -> (FileStats, FileStats) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.jsonl");
@@ -2439,8 +2477,11 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
         };
         fs::write(&path, text).unwrap();
         let whole = read(None);
+        let saved: FileStats =
+            serde_json::from_slice(&serde_json::to_vec(&whole).unwrap()).unwrap();
+        assert_eq!(saved, whole, "kept whole by the cache");
         fs::write(&path, [text, more].concat()).unwrap();
-        let grown = read(Some(&whole));
+        let grown = read(Some(&saved));
         (whole, grown)
     }
 
@@ -2533,6 +2574,75 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
         .concat();
         let (whole, _) = counted(Provider::Codex, &text, "");
         assert_eq!(whole.cwd.as_deref(), Some("/w/turn"));
+    }
+
+    /// R20 (GitHub review of #26): a subagent's rollout whose own `session_meta` has no `cwd`
+    /// (missing, `null` or not a string) takes its first `turn_context`'s, never the fork
+    /// parent's `session_meta` written after it, also when that is read in a later refresh.
+    #[test]
+    fn a_fork_parents_session_meta_never_gives_the_project() {
+        let record = |kind: &str, payload: &str| {
+            format!(
+                "{{\"timestamp\":\"2026-09-20T10:00:00Z\",\"type\":\"{kind}\",\"payload\":{payload}}}\n"
+            )
+        };
+        let parent = record("session_meta", "{\"id\":\"parent\",\"cwd\":\"/w/parent\"}");
+        let turn = record("turn_context", "{\"cwd\":\"/w/turn\",\"model\":\"m\"}");
+        for own in [
+            "{\"id\":\"r\"}",
+            "{\"id\":\"r\",\"cwd\":null}",
+            "{\"id\":\"r\",\"cwd\":7}",
+        ] {
+            let own = record("session_meta", own);
+            let (whole, _) = counted(
+                Provider::Codex,
+                &[own.as_str(), &parent, &turn].concat(),
+                "",
+            );
+            assert_eq!(whole.cwd.as_deref(), Some("/w/turn"), "{own}");
+
+            // The parent's in the part read on: the first record was read before.
+            let (whole, grown) = counted(Provider::Codex, &own, &[parent.as_str(), &turn].concat());
+            assert_eq!(whole.cwd, None, "{own}");
+            assert_eq!(grown.cwd.as_deref(), Some("/w/turn"), "{own}");
+        }
+    }
+
+    /// R20 (critic review 2 of #26): a rollout's first record is its first line that parses as
+    /// one, across refreshes too: read while the rollout held only blank or malformed lines, then
+    /// on once its own `session_meta` followed, it counts as read whole at once does.
+    #[test]
+    fn a_rollouts_first_record_is_found_after_a_refresh_of_lines_that_are_not_records() {
+        let record = |kind: &str, payload: &str| {
+            format!(
+                "{{\"timestamp\":\"2026-09-20T10:00:00Z\",\"type\":\"{kind}\",\"payload\":{payload}}}\n"
+            )
+        };
+        let rest = [
+            record("session_meta", "{\"id\":\"r\",\"cwd\":\"/w/own\"}"),
+            record("turn_context", "{\"cwd\":\"/w/turn\",\"model\":\"m\"}"),
+            record(
+                "event_msg",
+                "{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":5,\
+                 \"output_tokens\":1,\"total_tokens\":6},\"last_token_usage\":{\"input_tokens\":5,\
+                 \"output_tokens\":1,\"total_tokens\":6}}}",
+            ),
+        ]
+        .concat();
+        for prefix in ["\n", "{\"type\": not json\n"] {
+            let (before, grown) = counted(Provider::Codex, prefix, &rest);
+            assert!(
+                before.scanned_offset > 0 && !before.codex_head,
+                "{prefix:?}"
+            );
+            let (whole, _) = counted(Provider::Codex, &[prefix, &rest].concat(), "");
+            assert_eq!(whole.cwd.as_deref(), Some("/w/own"), "{prefix:?}");
+            let counted = |f: &FileStats| {
+                let f = f.clone();
+                (f.cwd, f.codex_head, f.scanned_offset, f.models, f.rows)
+            };
+            assert_eq!(counted(&grown), counted(&whole), "{prefix:?}");
+        }
     }
 
     /// R20: CSV fields are quoted as RFC 4180 has it, and costs are exact decimal dollars.

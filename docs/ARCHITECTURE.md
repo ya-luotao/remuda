@@ -214,7 +214,7 @@ separate caches, because they need different parts of each file.
                               ▼
                         stats::refresh ──────────────────► stats.json   (one row per request,
                               │                                          project dir per file,
-                              ▼                                          whole files; schema 4)
+                              ▼                                          whole files; schema 5)
                         stats::requests(prices)  ◄── pricing (built-in + [prices])
                               │  (each request once: the copy that counts, its accounts, cost)
                               ├─► stats::report(period) ─┬─► stats::format        `remuda stats`

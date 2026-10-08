@@ -1517,15 +1517,17 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   several accounts is counted once, for those accounts together (`max + team`); a claude session
   attributed to none is counted as unattributed. The sections therefore add up to the overall
   total.
-- **Projects.** A session's project is the directory it started in: the `cwd` of the first
-  record of its transcript that has one. Claude records it at the top level of a record; codex
-  in `payload.cwd` of `session_meta`, else of the first `turn_context` (other records, such as
-  a command's `exec_command_begin`, carry the command's directory and are not read for it). It
-  is the string as recorded, neither resolved nor normalized: two spellings of one directory
-  (a trailing `/`, a symlink) are two projects. A session resumed in another directory stays in
-  the one it started in (R8 shows and resumes the last one, `cwd_last`). A message counts for
-  the project of the transcript whose copy counts, the copy that also gives its accounts. A
-  transcript none of whose records has a `cwd` is in no project, shown as `(no directory)`.
+- **Projects.** A session's project is the directory it started in: the `cwd` of the first record of
+  its transcript that has one. Claude records it at the top level of a record; codex in
+  `payload.cwd` of the rollout's first record (its first line that parses as a record), its own
+  `session_meta`, else of the first `turn_context` (a later `session_meta` is a fork parent's,
+  written after a subagent's own, and other records, such as a command's `exec_command_begin`, carry
+  the command's directory; neither is read for it). It is the string as recorded, neither resolved
+  nor normalized: two spellings of one directory (a trailing `/`, a symlink) are two projects. A
+  session resumed in another directory stays in the one it started in (R8 shows and resumes the last
+  one, `cwd_last`). A message counts for the project of the transcript whose copy counts, the copy
+  that also gives its accounts. A transcript none of whose records gives a `cwd` is in no project,
+  shown as `(no directory)`.
 - **Periods**: today, the last 7 days, the last 30 days, all. A period starts at local midnight
   (the system time zone) of today, of 6 days before, or of 29 days before; a message is in it when
   its timestamp is not earlier than the start. All also includes messages without a timestamp.
@@ -1619,19 +1621,19 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   from a directory that is gone (a home's `sessions`, say, while its `archived_sessions` cannot
   be resolved) or whose account left the registry is no longer counted. A codex rollout kept
   this way is counted as unattributed while that lasts: the accounts of its home are not known.
-- **Cache**: `$REMUDA_HOME/state/stats.json`, with a schema version, rebuilt on a mismatch,
-  written atomically, deletable at any time (R3). For each transcript it holds what was counted
-  from it (a 64-bit FNV-1a hash of each request's key, its timestamp, model, counts with the
-  cache write by lifetime, and whether it used fast mode or US-only inference), its project
-  directory, how far the transcript was read, and, for codex, the last total and model. Beside the transcripts it
-  holds the real path each store and `archived_sessions` last resolved to (R8), which a cache
-  written before that was kept lacks and is read without. Transcripts are read like the
-  index (R8): an unchanged file is not read again, a grown one only from its last complete line,
-  any other one whole; only complete lines are parsed. Records of one message read in two
-  refreshes merge by their key. The first computation reads every transcript whole (measured:
-  20,895 files, 17.2 GB), and so does the first one after the schema version changes (version 2
-  added the cache lifetimes and pricing flags, version 3 codex's cache write, version 4 the
-  project directory: a transcript read on from where it was would never get one).
+- **Cache**: `$REMUDA_HOME/state/stats.json`, with a schema version, rebuilt on a mismatch, written
+  atomically, deletable at any time (R3). For each transcript it holds what was counted from it (a
+  64-bit FNV-1a hash of each request's key, its timestamp, model, counts with the cache write by
+  lifetime, and whether it used fast mode or US-only inference), its project directory, how far the
+  transcript was read, and, for codex, the last total and model and whether the first record was
+  read. Beside the transcripts it holds the real path each store and `archived_sessions` last
+  resolved to (R8), which a cache written before that was kept lacks and is read without.
+  Transcripts are read like the index (R8): an unchanged file is not read again, a grown one only
+  from its last complete line, any other one whole; only complete lines are parsed. Records of one
+  message read in two refreshes merge by their key. The first computation reads every transcript
+  whole (measured: 20,895 files, 17.2 GB), and so does the first one after the schema version
+  changes (version 2 added the cache lifetimes and pricing flags, version 3 codex's cache write,
+  version 5 the project directory: a transcript read on from where it was would never get one).
 - **Command**: `remuda stats [<account>] [--period today|7d|30d|all] [--by account|project]`
   prints one period (default `all`) with sections by account (the default) or by project, and
   a COST column, then a line saying the cost is ≈ API list price and the prices' date, and a

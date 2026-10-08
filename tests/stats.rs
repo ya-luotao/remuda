@@ -1301,10 +1301,11 @@ fn cache_round_trips_and_a_schema_mismatch_rebuilds() {
             .unwrap()[..]
     );
     // A cache of schema 1 (a single cache write), 2 (codex's cache write not read: its rows
-    // would keep it in the input) or 3 (no project directory: a file read on from its offset
-    // would never get one) is rebuilt.
+    // would keep it in the input), 3 (no project directory: a file read on from its offset
+    // would never get one) or 4 (never released: codex's project by an earlier rule) is
+    // rebuilt.
     let old = f.root.join("old-stats.json");
-    for version in [1, 2, 3] {
+    for version in [1, 2, 3, 4] {
         let mut older = v.clone();
         older["schema_version"] = json!(version);
         fs::write(&old, older.to_string()).unwrap();
@@ -1315,7 +1316,7 @@ fn cache_round_trips_and_a_schema_mismatch_rebuilds() {
         );
         assert_eq!(loaded.schema_version, SCHEMA_VERSION);
     }
-    assert_eq!(SCHEMA_VERSION, 4);
+    assert_eq!(SCHEMA_VERSION, 5);
 
     let mut other = v.clone();
     other["schema_version"] = json!(SCHEMA_VERSION + 1);

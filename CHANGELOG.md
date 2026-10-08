@@ -17,7 +17,7 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   provider, accounts, session, project, model, counts, fast / US-only flags and exact cost in
   USD, for reconciling with a bill; when the report is incomplete, the `Incomplete:` lines go to
   stderr and the exit status is 1. The statistics cache records each transcript's directory
-  (schema 4), so the first `remuda stats` after upgrading reads every transcript whole again
+  (schema 5), so the first `remuda stats` after upgrading reads every transcript whole again
   (SPEC R20, R5).
 
 - `remuda pick` recommends the account to resume or fork a session as: `remuda pick -- --resume

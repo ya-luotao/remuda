@@ -1254,5 +1254,60 @@ fn a_cache_of_schema_3_is_rebuilt_for_the_projects() {
     fs::write(&cache, v.to_string()).unwrap();
     assert_eq!(stats(&s.sb, &["--by", "project"]), complete);
     let v: Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
-    assert_eq!(v["schema_version"], 4);
+    assert_eq!(v["schema_version"], remuda::stats::SCHEMA_VERSION);
+}
+
+/// R20 **Cache**, **Projects** (critic review 2 of #26): a cache of schema 4, written before a
+/// subagent's rollout stopped taking its fork parent's `session_meta` for its project, holds
+/// that project for a file that has not changed, and would hand it on to a file read on from
+/// its offset. It is rebuilt: run as it is, then once the rollout grew, the CSV is what a
+/// whole read gives.
+#[test]
+fn a_cache_of_schema_4_with_the_parents_project_is_rebuilt() {
+    let sb = Sandbox::new();
+    let codex = sb.home().join(".codex");
+    let rollout = cx::write_rollout(
+        &codex,
+        R2,
+        &[
+            // The subagent's own session_meta, without a cwd, then its fork parent's.
+            edited(&cx::fork_meta(R2, R1, "/w/unused", &cx::ts(0)), |m| {
+                m["payload"].as_object_mut().unwrap().remove("cwd");
+            }),
+            cx::parent_meta(R1, "/w/parent", &cx::ts(0)),
+            cx::turn_context("/w/turn", &cx::ts(1)),
+            cx::model_turn("gpt-test", &cx::ts(1)),
+            cx::tokens([100, 50, 10, 4], [100, 50, 10, 4], &cx::ts(2)),
+        ]
+        .concat(),
+    );
+    let projects = |csv: &str| -> Vec<String> {
+        csv.lines()
+            .skip(1)
+            .map(|l| l.split(',').nth(4).unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(projects(&stats(&sb, &["--csv"])), ["/w/turn"]);
+
+    // As the previous reading rule left it.
+    let cache = sb.remuda_home().join("state/stats.json");
+    let mut v: Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+    v["schema_version"] = json!(4);
+    let files = v["files"].as_object_mut().unwrap();
+    assert_eq!(files.len(), 1);
+    for file in files.values_mut() {
+        file["cwd"] = json!("/w/parent");
+        file.as_object_mut().unwrap().remove("codex_head");
+    }
+    fs::write(&cache, v.to_string()).unwrap();
+    assert_eq!(projects(&stats(&sb, &["--csv"])), ["/w/turn"], "unchanged");
+
+    append(
+        &rollout,
+        &cx::tokens([250, 150, 30, 10], [150, 100, 20, 6], &cx::ts(3)),
+    );
+    let grown = stats(&sb, &["--csv"]);
+    assert_eq!(projects(&grown), ["/w/turn", "/w/turn"], "grown");
+    fs::remove_file(&cache).unwrap();
+    assert_eq!(stats(&sb, &["--csv"]), grown, "as read whole");
 }
