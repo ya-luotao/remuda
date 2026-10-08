@@ -99,6 +99,8 @@ switching to a different, logged-out account.
   stale_after = 120         # minutes after which cached usage is stale
   affinity_minutes = 60     # minutes the account that ran a session stays preferred for
                             # resuming it (R23); 0: never
+  strategy = "headroom"     # how the rules rank (R23): "headroom", or "pace" to use first
+                            # what a reset would waste
   notes = "Keep claude:personal for long refactors."   # sent to Jev (R23)
 
   [pick.claude]             # also [pick.codex]
@@ -149,8 +151,8 @@ switching to a different, logged-out account.
   `output`, or has a price that is not a number from 0 to 1,000,000, a `[pick]` with a key other
   than those above, an `exclude` or `prefer` entry that does not resolve as in R1, a
   `min_headroom` that is not an integer from 0 to 100, a `stale_after` that is not a positive
-  integer, an `affinity_minutes` that is not an integer from 0 to 1440, `notes` longer than
-  4000 characters, a model not matching `[A-Za-z0-9._:-]+` or starting with `-`, an effort not matching `[a-z]+`, a duplicate model or effort, a claude model
+  integer, an `affinity_minutes` that is not an integer from 0 to 1440, a `strategy` other
+  than `"headroom"` or `"pace"`, `notes` longer than 4000 characters, a model not matching `[A-Za-z0-9._:-]+` or starting with `-`, an effort not matching `[a-z]+`, a duplicate model or effort, a claude model
   or effort that is a claude subcommand, or a `default_effort` not among `efforts`, and similar
   problems are all reported as errors naming the file; remuda neither guesses nor skips. A bare
   name in `[pick]` resolves as in R1, so it becomes an error once another provider has an account
@@ -1870,6 +1872,27 @@ holds it (**Resuming**, below).
   Pairs of unknown headroom, without usage data or past every reset, rank among themselves by
   the same rules (a pair without usage data is not stale). The rules' effort is
   `default_effort`, or none (none when resuming).
+  That is `strategy = "headroom"`, the default (R3). With `strategy = "pace"`, the pace takes
+  the headroom's three places: known pace before unknown, the pace band, higher first, and the
+  reset of the window that gives the pace, sooner first; affinity, the model's position,
+  freshness, `prefer`, and registry order keep theirs. A pair's **pace** is the percent left
+  per hour until reset: how much has to be used each hour for nothing to be lost at the reset.
+  It is given for every pair, whatever the strategy, from the windows that apply and are known
+  (**Windows**, the headroom's): of each, the percent left over the hours from the instant to
+  its reset, never fewer than 1 (a window that resets in a minute would outrank everything), or
+  over its whole length when its reset is unknown. A window's length is its label's (R24:
+  `Session` five hours, `Week …` seven days, codex's `<N>h window`); a window of unknown length
+  gives no pace, whatever its reset. The pair's pace is the least of its budget windows' (a
+  day long or longer: what is left of them at their reset is lost). A budget window that has
+  reset since is unknown, never a full one: it gives no pace but is a budget window all the
+  same, so a pair whose budget windows have all reset since has no pace. Only a pair without a
+  budget window takes the least of its shorter windows' (what is left of a five-hour window at
+  its reset is no loss while a longer one holds the budget). A pair with no pace ranks after
+  every known pace, as unknown headroom does. The
+  bands: the feasible pairs of known pace from the highest down, the first opening a band
+  topped by its pace, and each pair whose pace is below 0.9 of the current band's top opening
+  the next, topped by its own; so paces within a tenth tie, and `prefer` breaks the tie. The
+  pace only orders: feasibility, the binding window, and `--wait` are as above.
 - **When Jev is asked.** Only with `TYPESAFE_API_KEY` in remuda's environment, without
   `--offline`, with `notes`, and with a choice to make (two feasible pairs, or a provider with two
   or more `efforts` and a feasible pair). Otherwise the rules decide, and the reason is `offline`,
@@ -1885,8 +1908,8 @@ holds it (**Resuming**, below).
     age, asked only when there are two or more; and
     `effort_<provider>`, a Score over `efforts`, for each provider with at least two and a
     feasible pair. The criteria are a JSON object, so their order carries no meaning.
-  - State: plain text with the local weekday and time (no time zone), the rules already applied,
-    each account with a feasible pair under its alias (`<provider>:account-<n>`, numbered per
+  - State: plain text with the local weekday and time (no time zone), the rules already applied
+    (and, with `strategy = "pace"`, one sentence saying that they rank by pace), each account with a feasible pair under its alias (`<provider>:account-<n>`, numbered per
     provider in registry order as in R21; `default` stays `default`), its usage (source, age,
     staleness, and each window that applies with its percentage and time to reset, or as
     `usage unknown (reset since cached)`), the models,
@@ -1908,8 +1931,10 @@ holds it (**Resuming**, below).
   JSON, or a `launch` answer that is missing or names an option not offered: the rules decide
   (`jev_error`), and the message holds at most 200 characters of the response and never the key.
 - **Output.** The account, model, and effort (and whether the effort is Jev's); what decided and
-  why, with Jev's confidence; the rules' choice when Jev's differs; the binding window and its
-  reset (`unknown` when no window that applies is known); the windows that have reset since,
+  why, with Jev's confidence (the rules, with `strategy = "pace"`, as `rules, strategy pace`);
+  the rules' choice when Jev's differs; the binding window and its
+  reset (`unknown` when no window that applies is known); with `strategy = "pace"`, the pace,
+  the window that gives it, and its reset (`unknown` when the pace is unknown); the windows that have reset since,
   with the hint to `--live` when the usage is cached; the data's age; the exclusions; the
   `remuda run <account> <options> <args>` command, `<args>` being those after `--`, each word
   quoted for a POSIX shell where it needs it (so that the line, run by a shell, gives the agent
@@ -1918,12 +1943,14 @@ holds it (**Resuming**, below).
   with its reason. `--json` prints `account`, `provider`, `model`, `effort`, `decided_by` (`jev`,
   `jev_account`, `rules`), `reason`, `effort_by` (`jev`, `rules`; null without an effort), `jev`
   (`model`, `confidence`, `effort_confidence`, `effort_error`, `error`; null when not asked),
-  `command`, `session` (null without a session resumed or forked, nothing feasible included;
+  `strategy` (`headroom`, `pace`; also with nothing feasible), `command`, `session` (null without a session resumed or forked, nothing feasible included;
   else `id`, `kind` (`resume`, `fork`), `last_account`, `last_active_at`, `age_seconds`,
   `affine`, `model`, `indexed`), and `candidates` (`account`, `model`, `feasible`, `why_not`,
-  `headroom`, `binding`, `resets_at`, `reset_passed`, `default_model_windows`, `source`,
-  `fetched_at`, `age_seconds`, `stale`, `rules_rank`, `affine`, `jev_probability`). `headroom` and `binding` are null when the headroom
-  is unknown; `resets_at` is the binding window's reset, null unless it is ahead: never an
+  `headroom`, `binding`, `resets_at`, `pace`, `pace_window`, `reset_passed`,
+  `default_model_windows`, `source`, `fetched_at`, `age_seconds`, `stale`, `rules_rank`,
+  `affine`, `jev_probability`). `headroom` and `binding` are null when the headroom
+  is unknown; `pace` (percent per hour) and `pace_window` (the label of the window that gives
+  it) are null when the pace is unknown, and are given whatever the strategy; `resets_at` is the binding window's reset, null unless it is ahead: never an
   instant in the past; `reset_passed` is true when a window that applies has reset since.
   Each of `default_model_windows` has `label`, `percent`, `resets_at`, and `reset_passed`, with
   `percent` and `resets_at` null when its reset has passed. `--print-request` prints the body a
