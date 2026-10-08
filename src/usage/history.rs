@@ -51,6 +51,10 @@ pub struct Point {
     /// The reset, when it was ahead at the reading.
     pub resets_at: Option<Timestamp>,
     pub source: Source,
+    /// The window's length in minutes, as codex told it (R10); `None` for claude's windows and
+    /// for the points recorded before remuda kept it. Not part of what makes two points the
+    /// same reading ([`Point::same`]).
+    pub window_minutes: Option<u32>,
 }
 
 impl Point {
@@ -76,9 +80,10 @@ impl Point {
         )
     }
 
-    /// The point as its line in the history, `\n` included.
+    /// The point as its line in the history, `\n` included; `window_minutes` only when it is
+    /// known.
     pub fn line(&self) -> String {
-        let value = json!({
+        let mut value = json!({
             "ts": self.ts.to_string(),
             "account": self.account,
             "label": self.label,
@@ -87,10 +92,16 @@ impl Point {
             "resets_at": self.resets_at.map(|t| t.to_string()),
             "source": self.source.name(),
         });
+        if let (Some(minutes), Some(map)) = (self.window_minutes, value.as_object_mut()) {
+            map.insert("window_minutes".to_string(), minutes.into());
+        }
         format!("{value}\n")
     }
 
-    /// A line of the history; `None` when it is not one (cut short, or not remuda's).
+    /// A line of the history; `None` when it is not one (cut short, or not remuda's). A line
+    /// whose `window_minutes` is missing, null, or anything but a whole number of minutes from
+    /// 1 to `u32::MAX` is a point of unknown length: the key tells no point apart, and a point is
+    /// not lost over it.
     pub fn parse(line: &str) -> Option<Point> {
         let v: Value = serde_json::from_str(line).ok()?;
         let text = |key: &str| v.get(key).and_then(Value::as_str);
@@ -102,6 +113,11 @@ impl Point {
             Value::Null => None,
             other => Some(other.as_str()?.to_string()),
         };
+        let window_minutes = v
+            .get("window_minutes")
+            .and_then(Value::as_u64)
+            .and_then(|m| u32::try_from(m).ok())
+            .filter(|m| *m > 0);
         Some(Point {
             ts: text("ts")?.parse().ok()?,
             account: text("account")?.to_string(),
@@ -114,6 +130,7 @@ impl Point {
                 "live" => Source::Live,
                 _ => return None,
             },
+            window_minutes,
         })
     }
 }
@@ -137,6 +154,7 @@ pub fn points(account: &str, reading: &Reading) -> Vec<Point> {
                 percent: w.used()?,
                 resets_at: w.resets_at(),
                 source: reading.source,
+                window_minutes: w.window_minutes,
             })
         })
         .collect()
@@ -287,8 +305,9 @@ pub fn load(path: &Path) -> Result<Option<Vec<Point>>> {
 /// `five_hour` and `seven_day` fields, its live `Current session` and `Current week` lines;
 /// codex's windows of 5 and 168 hours), codex's `<N>h window`, `<N>d window` and `<N>m
 /// window` as they say, and a claude limit of unknown kind labeled `five_hour` or
-/// `seven_day…` by that kind. Codex's labels give its windows' minutes rounded to whole hours,
-/// so that is the precision. `None`: unknown.
+/// `seven_day…` by that kind. Codex's labels give its windows' minutes rounded to whole hours:
+/// a point that tells its window's minutes is as long as they say instead ([`Point`]'s
+/// `window_minutes`), and the label is read for the points that do not. `None`: unknown.
 pub fn window_length(label: &str) -> Option<SignedDuration> {
     let base = match label.strip_suffix(')').and_then(|l| l.rsplit_once(" (")) {
         Some((base, _)) => base,
@@ -316,8 +335,22 @@ pub fn window_length(label: &str) -> Option<SignedDuration> {
 }
 
 /// The longest window a pace is given for: ten years. A label claiming more is of unknown
-/// length (R24).
+/// length (R24), and so is a point telling more.
 const MAX_WINDOW_MINUTES: i64 = 10 * 366 * 24 * 60;
+
+/// How long the window of `series` (one key's points, in time order) is (R24): what its latest
+/// point tells (codex's minutes), else what its label says ([`window_length`]). Points recorded
+/// before remuda kept the minutes tell none, so a key's points may disagree: the latest counts,
+/// for its windows and for the pace of the current one (whose latest point it is).
+fn series_length(series: &[&Point]) -> Option<SignedDuration> {
+    let latest = series.last()?;
+    match latest.window_minutes {
+        Some(minutes) => (1..=MAX_WINDOW_MINUTES)
+            .contains(&i64::from(minutes))
+            .then(|| SignedDuration::from_mins(i64::from(minutes))),
+        None => window_length(&latest.label),
+    }
+}
 
 /// One window of a key's points: a run of points in time order whose resets agree.
 struct Group<'a> {
@@ -450,7 +483,7 @@ pub fn report(
 /// One window key's section of [`report`]: `series` in time order.
 fn key_section(series: &[&Point], now: Timestamp, tz: &TimeZone) -> String {
     let label = &series[0].label;
-    let length = window_length(label);
+    let length = series_length(series);
     let slack = length.map_or(HOUR, |l| (l / 2).min(HOUR));
     let groups = windows(series, slack);
     let last = groups.len() - 1;
@@ -519,6 +552,7 @@ mod tests {
             percent,
             severity: None,
             resets: resets.map(|r| Resets::At(ts(r))),
+            window_minutes: None,
         }
     }
 
@@ -535,6 +569,7 @@ mod tests {
             percent,
             resets_at: resets.map(ts),
             source: Source::Cached,
+            window_minutes: None,
         }
     }
 
@@ -570,6 +605,7 @@ mod tests {
                     percent: 71.0,
                     resets_at: Some(ts("2026-10-09T12:59:00Z")),
                     source: Source::Cached,
+                    window_minutes: None,
                 },
                 Point {
                     ts: ts("2026-10-08T09:00:00Z"),
@@ -579,6 +615,7 @@ mod tests {
                     percent: 12.5,
                     resets_at: None,
                     source: Source::Cached,
+                    window_minutes: None,
                 },
             ],
             "the session reset at 11:00, after the cache and before now: not recorded"
@@ -610,10 +647,120 @@ mod tests {
                    "label": "Week (Fable)", "model": "Fable", "percent": 71.0,
                    "resets_at": "2026-10-09T12:59:00Z", "source": "live"})
         );
-        assert_eq!(Point::parse(&line), Some(p));
+        assert_eq!(Point::parse(&line), Some(p.clone()));
         for bad in ["", "{", "{\"ts\": \"x\"}", "[1]", "{\"ts\": 1}"] {
             assert_eq!(Point::parse(bad), None, "{bad}");
         }
+
+        // A codex window's minutes, when known, are one more key; read back as they were.
+        p.window_minutes = Some(90);
+        let line = p.line();
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["window_minutes"], json!(90));
+        assert_eq!(v.as_object().unwrap().len(), 8);
+        assert_eq!(Point::parse(&line), Some(p.clone()));
+        // Null, and anything but a whole number of minutes in range, reads as unknown: the line
+        // is still the point it was.
+        let with = |minutes: Value| {
+            let mut v = v.clone();
+            v["window_minutes"] = minutes;
+            Point::parse(&v.to_string())
+        };
+        assert_eq!(with(Value::Null).unwrap().window_minutes, None);
+        assert_eq!(
+            with(json!(u32::MAX)).unwrap().window_minutes,
+            Some(u32::MAX)
+        );
+        for bad in [
+            json!("90"),
+            json!(0),
+            json!(-5),
+            json!(1.5),
+            json!(u64::from(u32::MAX) + 1),
+        ] {
+            assert_eq!(
+                with(bad.clone()),
+                Some(Point {
+                    window_minutes: None,
+                    ..p.clone()
+                }),
+                "{bad}"
+            );
+        }
+    }
+
+    /// R24: the points of a codex reading tell its windows' minutes, those of claude's none;
+    /// lines written before remuda kept them (no `window_minutes`), and lines whose minutes
+    /// cannot be read, are read as points of unknown length, and are the same reading as a new point that tells them (the minutes
+    /// are not part of what makes two points one): not recorded twice. A compaction keeps each
+    /// line as it was, the minutes with it.
+    #[test]
+    fn window_minutes_are_recorded_and_old_lines_still_read() {
+        let mut codex_row = row("2h window", 40.0, Some("2026-10-08T12:30:00Z"));
+        codex_row.window_minutes = Some(90);
+        let cached = CachedUsage {
+            fetched_at: Some(ts("2026-10-08T11:30:00Z")),
+            rows: vec![codex_row, row("Session", 10.0, None)],
+        };
+        let got = points("codex:work", &Snapshot::cached(&cached).at(ts(NOW)));
+        let minutes: Vec<Option<u32>> = got.iter().map(|p| p.window_minutes).collect();
+        assert_eq!(minutes, [Some(90), None]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let path = owned::usage_history(&state);
+        fs::create_dir(&state).unwrap();
+        // A line as an earlier remuda wrote it: no `window_minutes` key at all.
+        let old_line = "{\"ts\":\"2026-10-08T11:30:00Z\",\"account\":\"codex:work\",\
+                        \"label\":\"2h window\",\"model\":null,\"percent\":40.0,\
+                        \"resets_at\":\"2026-10-08T12:30:00Z\",\"source\":\"cached\"}\n";
+        // One whose `window_minutes` cannot be read: a point all the same, of unknown length.
+        let odd_line = "{\"ts\":\"2026-10-08T11:35:00Z\",\"account\":\"codex:work\",\
+                        \"label\":\"2h window\",\"model\":null,\"percent\":45.0,\
+                        \"resets_at\":\"2026-10-08T12:30:00Z\",\"source\":\"cached\",\
+                        \"window_minutes\":\"90\"}\n";
+        let stale = point("codex:work", "2h window", "2026-08-01T00:00:00Z", 1.0, None);
+        fs::write(&path, stale.line() + old_line + odd_line).unwrap();
+        let odd = Point::parse(odd_line).unwrap();
+        assert_eq!(odd.window_minutes, None);
+        let old = Point::parse(old_line).unwrap();
+        assert_eq!(old.window_minutes, None);
+        assert_eq!(
+            Point {
+                window_minutes: Some(90),
+                ..old.clone()
+            },
+            got[0]
+        );
+        // The same reading, now with its minutes: already there.
+        let now = ts(NOW);
+        assert_eq!(
+            record(&state, vec![got[0].clone()], now, false, &Flock)
+                .unwrap()
+                .added,
+            0
+        );
+        // A new reading with its minutes, compacted in: the old lines kept as they were (the
+        // one with minutes that cannot be read too), the new one with its key.
+        let mut new = got[0].clone();
+        new.ts = ts("2026-10-08T11:45:00Z");
+        new.percent = 55.0;
+        let done = record(&state, vec![new.clone()], now, true, &Flock).unwrap();
+        assert_eq!(
+            done,
+            Recorded {
+                added: 1,
+                dropped: 1
+            }
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text, format!("{old_line}{odd_line}{}", new.line()));
+        assert!(
+            new.line().contains("\"window_minutes\":90"),
+            "{}",
+            new.line()
+        );
+        assert_eq!(lines(&path), [old, odd, new]);
     }
 
     /// R24: what is already recorded is not recorded again: the same cache read twice is one
@@ -1429,6 +1576,97 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// A codex point of the window `2h window` (codex's label for 90 minutes, R10), read at `at`,
+    /// telling `minutes`.
+    fn codex_point(at: &str, percent: f64, reset: &str, minutes: Option<u32>) -> Point {
+        Point {
+            window_minutes: minutes,
+            ..point("codex:work", "2h window", at, percent, Some(reset))
+        }
+    }
+
+    /// R24: a codex window is as long as its points say, not as its label rounds it: 40% used
+    /// half an hour into a window of 90 minutes is ahead of an even pace, where two hours would
+    /// be behind it. Of a key's points that disagree (some recorded before the minutes were
+    /// kept), the latest one's length counts; without minutes, the label's.
+    #[test]
+    fn a_codex_window_is_as_long_as_its_points_say() {
+        let pace_line = |points: &[Point]| {
+            let out = report_at(points, &["codex:work"], 7, &TimeZone::UTC);
+            out.lines().last().unwrap().trim().to_string()
+        };
+        let exact = "used 40% with 33% of the window elapsed: ahead of an even pace; \
+                     at this pace 100% by Oct 8 12:15 (resets Oct 8 12:30)";
+        let rounded = "used 40% with 50% of the window elapsed: behind an even pace; \
+                       at this pace 80% at reset";
+        let latest = |minutes| {
+            codex_point(
+                "2026-10-08T11:30:00Z",
+                40.0,
+                "2026-10-08T12:30:00Z",
+                minutes,
+            )
+        };
+        let earlier = |minutes| {
+            codex_point(
+                "2026-10-08T11:10:00Z",
+                20.0,
+                "2026-10-08T12:30:00Z",
+                minutes,
+            )
+        };
+        assert_eq!(pace_line(&[latest(Some(90))]), exact);
+        assert_eq!(pace_line(&[latest(None)]), rounded);
+        assert_eq!(pace_line(&[earlier(None), latest(Some(90))]), exact);
+        assert_eq!(pace_line(&[earlier(Some(90)), latest(None)]), rounded);
+        // At most ten years, as for a label; beyond it unknown, no pace (the label says no
+        // better).
+        for (minutes, paced) in [(5_270_400, true), (5_270_401, false), (u32::MAX, false)] {
+            let out = report_at(&[latest(Some(minutes))], &["codex:work"], 7, &TimeZone::UTC);
+            assert_eq!(out.contains("elapsed"), paced, "{minutes}: {out}");
+        }
+
+        // Its windows too: a reset 50 minutes from the one before is another window of 90
+        // minutes (further than half of it), the same one of two hours (within the hour).
+        let first = |minutes| {
+            codex_point(
+                "2026-10-08T10:00:00Z",
+                30.0,
+                "2026-10-08T11:30:00Z",
+                minutes,
+            )
+        };
+        let second = |minutes| {
+            codex_point(
+                "2026-10-08T11:00:00Z",
+                10.0,
+                "2026-10-08T12:20:00Z",
+                minutes,
+            )
+        };
+        let out = report_at(
+            &[first(Some(90)), second(Some(90))],
+            &["codex:work"],
+            7,
+            &TimeZone::UTC,
+        );
+        assert!(
+            out.contains("    window ended Oct 8 11:30: peaked 30%\n"),
+            "{out}"
+        );
+        let out = report_at(
+            &[first(None), second(None)],
+            &["codex:work"],
+            7,
+            &TimeZone::UTC,
+        );
+        assert!(!out.contains("window ended"), "{out}");
+        assert!(
+            out.contains("Oct 8 10:00  30%  resets Oct 8 11:30\n"),
+            "{out}"
+        );
     }
 
     /// R24: a window whose reset has passed is folded, the last one too; a point read after

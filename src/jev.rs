@@ -699,6 +699,7 @@ mod tests {
             percent,
             severity: None,
             resets: Some(Resets::At(ts(resets))),
+            window_minutes: None,
         }
     }
 

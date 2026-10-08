@@ -2488,6 +2488,7 @@ mod tests {
             percent,
             severity: None,
             resets: resets.map(|r| Resets::At(ts(r))),
+            window_minutes: None,
         }
     }
 

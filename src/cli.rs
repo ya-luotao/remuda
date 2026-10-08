@@ -17,7 +17,7 @@ use crate::index::{self, Index, RefreshStats};
 use crate::privacy::Aliases;
 use crate::provider::Provider;
 use crate::registry::{self, Account, Home, Registry};
-use crate::stats::{self, Period};
+use crate::stats::{self, By, Period};
 use crate::usage::history;
 use crate::{Env, owned, paths};
 use crate::{
@@ -86,13 +86,20 @@ enum Command {
         #[arg(long, value_name = "N", default_value = "30")]
         limit: usize,
     },
-    /// Tokens per account and model, from the transcripts (no agent is run)
+    /// Tokens per account (or project) and model, from the transcripts (no agent is run)
     Stats {
-        /// Only the sections that include this account (`name` or `provider:name`)
+        /// Only the sessions attributed to this account (`name` or `provider:name`)
         account: Option<String>,
         /// `today`, `7d`, `30d` or `all`; a period starts at local midnight
         #[arg(long, value_name = "PERIOD", default_value = "all", value_parser = parse_period)]
         period: Period,
+        /// Sections by `account`, or by `project`: the directory each session started in
+        #[arg(long, value_name = "SECTIONS", default_value = "account", value_parser = parse_by)]
+        by: By,
+        /// Print every request of the period as CSV instead, one line each (for reconciling
+        /// with a bill); exit 1 when the report is incomplete
+        #[arg(long, conflicts_with = "by")]
+        csv: bool,
     },
     /// Create a new home under $REMUDA_HOME/homes/<provider>/<name>, register it and log in;
     /// with [share.claude], a claude home is first linked to the source's
@@ -237,7 +244,12 @@ fn dispatch(cli: Cli, ctx: &Context) -> Result<ExitCode> {
             (false, false) => usage(&config, account, live, timeout, ctx),
         },
         Some(Command::Sessions { limit }) => sessions(&config, limit, ctx),
-        Some(Command::Stats { account, period }) => stats(&config, account, period, ctx),
+        Some(Command::Stats {
+            account,
+            period,
+            by,
+            csv,
+        }) => stats(&config, account, period, (!csv).then_some(by), ctx),
         Some(Command::Setup {
             provider,
             name,
@@ -1133,11 +1145,13 @@ fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
 
 /// `remuda stats`: the statistics cache (`state/stats.json`) brought up to date and saved when
 /// it changed (a failed save is a warning), attribution without live sessions, then one
-/// period's table, only the sections of `account` if given (R5, R20). Runs no agent.
+/// period's table with sections `by` accounts or projects, only of `account` if given, or with
+/// `by` `None`, its requests as CSV (R5, R20). Runs no agent.
 fn stats(
     config: &Path,
     account: Option<String>,
     period: Period,
+    by: Option<By>,
     ctx: &Context,
 ) -> Result<ExitCode> {
     let registry = Registry::load(config)?;
@@ -1163,21 +1177,44 @@ fn stats(
         );
     }
     let attribution = attribution::collect(&accounts, &ctx.env, &owned::launch_log(&state), &[]);
-    let report = stats::report(
-        &cache,
-        &sources,
-        &attribution,
-        &accounts,
-        &registry.prices,
-        ctx.now,
-        &ctx.tz,
-    );
-    print!(
-        "{}",
-        stats::format(report.table(period), filter.as_deref(), &ctx.tz)
-    );
+    let incomplete = unreadable_lines(&refreshed, "transcript", "counted as last read");
+    let filter = filter.as_deref();
+    let Some(by) = by else {
+        let counted = stats::requests(&cache, &sources, &attribution, &accounts, &registry.prices);
+        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+        stats::csv(&mut out, &counted, period, ctx.now, &ctx.tz, filter)?;
+        // A line of prose would break the CSV: the exit status says it is incomplete (R20).
+        for line in &incomplete {
+            eprintln!("Incomplete: {line}");
+        }
+        return Ok(match incomplete.is_empty() {
+            true => ExitCode::SUCCESS,
+            false => ExitCode::FAILURE,
+        });
+    };
+    let text = match by {
+        By::Account => {
+            let report = stats::report(
+                &cache,
+                &sources,
+                &attribution,
+                &accounts,
+                &registry.prices,
+                ctx.now,
+                &ctx.tz,
+            );
+            stats::format(report.table(period), filter, &ctx.tz)
+        }
+        By::Project => {
+            let counted =
+                stats::requests(&cache, &sources, &attribution, &accounts, &registry.prices);
+            let table = stats::projects(&counted, period, ctx.now, &ctx.tz, filter);
+            stats::format_projects(&table, &ctx.tz)
+        }
+    };
+    print!("{text}");
     // On stdout, with the report: one that is piped must not pass for a complete one (R20).
-    for line in unreadable_lines(&refreshed, "transcript", "counted as last read") {
+    for line in incomplete {
         println!("Incomplete: {line}");
     }
     Ok(ExitCode::SUCCESS)
@@ -1340,6 +1377,10 @@ fn parse_period(s: &str) -> std::result::Result<Period, String> {
     Period::parse(s).ok_or_else(|| format!("expected today, 7d, 30d or all, got {s:?}"))
 }
 
+fn parse_by(s: &str) -> std::result::Result<By, String> {
+    By::parse(s).ok_or_else(|| format!("expected account or project, got {s:?}"))
+}
+
 /// A positive, finite number of seconds.
 fn parse_timeout(s: &str) -> std::result::Result<Duration, String> {
     let secs: f64 = s.parse().map_err(|_| format!("not a number: {s:?}"))?;
@@ -1364,7 +1405,8 @@ mod tests {
 
     /// R10, R24 (lane review 6): `usage --wait` reads each cached attempt against a time taken
     /// after the cache was read. Here the reading of the cache takes until after the session's
-    /// reset (`.claude.json` is a FIFO that is written only then): the session, at 100% when
+    /// reset (`.claude.json` is a FIFO, written only once remuda has opened it, and the clock
+    /// moves past the reset in between; no sleep orders the two): the session, at 100% when
     /// remuda started, has reset since, so nothing is used up and the wait is done (exit 0), and
     /// its old percentage is not recorded. Read against a time taken before the cache, it would
     /// still be at 100%: `--max-wait 0` would give up (exit 1) and record it.
@@ -1402,10 +1444,14 @@ mod tests {
             fetched.as_millisecond()
         );
         let writer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(500));
+            use std::io::Write;
+            // Opening a FIFO to write waits for a reader to open it: once this returns,
+            // `usage_wait` is reading the cache (it cannot reach the end before this end is
+            // closed), and any time it took before that was taken before the reset.
+            let mut cache_file = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
             // The time moves past the reset, then the cache is there to be read.
             WRITTEN.store(true, Ordering::SeqCst);
-            std::fs::write(&fifo, cache).unwrap();
+            cache_file.write_all(cache.as_bytes()).unwrap();
         });
         let ctx = Context {
             args: Vec::new(),
@@ -1762,6 +1808,7 @@ mod tests {
                 percent: 100.0,
                 severity: None,
                 resets: Some(usage::Resets::At("2026-10-08T11:12:00Z".parse().unwrap())),
+                window_minutes: None,
             }],
         };
         let reading = usage::Snapshot::cached(&cached).at(now);

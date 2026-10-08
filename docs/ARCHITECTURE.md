@@ -114,7 +114,7 @@ The exceptions, all for a type or a small helper:
 | `setup` | Create the new home (through `owned`), link a member's to the source's session store and configuration (`share_links`, over the catalog of `home_items`), and register it; the login command | R5, R12, R13, R17, R18 |
 | `identity` | Parses `claude auth status --json`, `codex login status` and `account/read`; the `.claude.json` fallback | R10a |
 | `usage` | Cached and live usage for both providers as rows (what the agent said; a partly read answer is not used), window labels, the text of `remuda usage` | R10 |
-| `usage::history` | The usage history: the points of a reading, recorded under the lock of the directory of the file replaced (`owned::lock_state_file`; leaving out what is there, appending, or compacting), the window lengths read from labels, each current window's pace, the text of `remuda usage --history` | R24 |
+| `usage::history` | The usage history: the points of a reading, recorded under the lock of the directory of the file replaced (`owned::lock_state_file`; leaving out what is there, appending, or compacting), the window lengths (the minutes a point tells, else read from its label), each current window's pace, the text of `remuda usage --history` | R24 |
 | `usage::snapshot` | Rows read at an instant: each window's reset (ahead, passed since, unknown), its percentage and severity (unknown once it has reset since), the snapshot's age and staleness. The one place that compares a reset with now; `usage`, `pick`, `jev` and the TUI take it from here | R10, R23 |
 | `live` | Running claude sessions: parses `agents --json`, `sessions/*.json` fallback checked against `ps`; attach, logs, stop, rm | R7, R16 |
 | `checks` | Warnings for the Accounts view, among them what a member's home links and does not (the relations of `home_items`, put into words) | R11 |
@@ -122,7 +122,7 @@ The exceptions, all for a type or a small helper:
 | `tracking` | Keeping a cache up to date with the files below a set of directories: which are reused, read on or read whole, the worker threads, what vanished, progress, and a directory that cannot be listed. Private; `index` and `stats` each give it an adapter | R8, R20 |
 | `transcript` | Reading claude transcripts without loading them whole: windows, complete lines, preview; a session's last time, directory and model for `pick` (`session_tail`) | R8, R23 |
 | `attribution` | Which accounts a session belongs to: launch log, live sessions, `history.jsonl`; the latest launch that ran a session (`last_launch`, R23) | R9, R23 |
-| `stats` | Token counting, deduplication across copies, periods, sections, chart buckets, text table; its sources, how they are listed, its cache | R20 |
+| `stats` | Token counting, deduplication across copies, periods, sections by account or project, chart buckets, text table, CSV; its sources, how they are listed, its cache | R20 |
 | `pricing` | Built-in prices and `[prices]` overrides; the cost of one request in picodollars | R20 |
 | `account_config` | What an account's sessions load and where each item comes from, on top of `share::plan` | R22 |
 | `pick` | `[pick]`; candidates, which windows apply to a model, and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options; the session the arguments resume or fork and what the launch log and the session index say of it (`session_args`, `read_session`); when `--wait` tries again (`next_attempt`) | R3, R23 |
@@ -213,12 +213,14 @@ separate caches, because they need different parts of each file.
   codex rollouts (+ archived) ┤ stats::sources
                               ▼
                         stats::refresh ──────────────────► stats.json   (one row per request,
-                              │                                          whole files; schema 3)
-                              ▼
-                        stats::report(period, prices)  ◄── pricing (built-in + [prices])
-                              │
-                              ├─► stats::format        `remuda stats`
-                              └─► stats::chart_series  Stats view chart
+                              │                                          project dir per file,
+                              ▼                                          whole files; schema 5)
+                        stats::requests(prices)  ◄── pricing (built-in + [prices])
+                              │  (each request once: the copy that counts, its accounts, cost)
+                              ├─► stats::report(period) ─┬─► stats::format        `remuda stats`
+                              │                          └─► stats::chart_series  Stats view chart
+                              ├─► stats::projects(period) ──► stats::format_projects  `--by project`
+                              └─► stats::csv(period)                                  `--csv`
 ```
 
 Both refreshes follow the append-only rule of R8: an unchanged file is skipped, a grown file is

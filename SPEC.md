@@ -267,8 +267,9 @@ remuda usage --history [<account>] [--days N]      the usage recorded so far, wi
 remuda list [--timeout S]                          accounts, login identity, home (R10a)
 remuda sessions [--limit N]                        recent sessions: time, account attribution,
                                                    title, cwd (R8, R9)
-remuda stats [<account>] [--period P]              tokens and estimated cost per account and
-                                                   model (R20)
+remuda stats [<account>] [--period P]              tokens and estimated cost per account (or
+       [--by account|project | --csv]              project) and model, or each request as
+                                                   CSV (R20)
 remuda add [--provider P] <name> <path>            register an existing home directory (R14, R17)
 remuda setup [--provider P] <name> [--email E]     create a new home, link it to the source of
                                                    shared configuration if there is one (R18),
@@ -620,7 +621,10 @@ appeared in no `history.jsonl`.
   `Week (all models)`, any other duration `<N>h window` (`<N>d window` for whole days). A
   per-model limit's name replaces `all models` in `Week (<name>)` and is appended to the others
   (`Session (<name>)`). A window without a numeric percentage and a positive duration is dropped.
-  Rows: the general limit first, then per-model limits, each by window length.
+  Rows: the general limit first, then per-model limits, each by window length. Each row also
+  keeps the window's length as codex told it, in minutes (`window_minutes`, `windowDurationMins`),
+  which the label rounds: R24 records it and paces the window by it. Claude's rows have no
+  length (neither its cache nor `/usage` tells one); R24 reads theirs from the label.
 - Codex credits, reset credits, spend control, and upsell data are not shown (R4).
 - A live query does **not** refresh the local cache (verified for claude: `fetchedAtMs` is
   unchanged after consecutive runs); the two sources are displayed separately.
@@ -1429,8 +1433,8 @@ stays reserved so that the entries after it keep theirs.
 
 ## R20. Token statistics
 
-Token counts per account and model, read from the agents' own transcripts, for a period, and their
-estimated cost: what the requests would cost at the providers' public API list prices (prices as
+Token counts per account (or project) and model, read from the agents' own transcripts, for a
+period, and their estimated cost: what the requests would cost at the providers' public API list prices (prices as
 of 2026-10-07). Most accounts are subscription logins, so the cost is an estimate for comparison
 (≈ API list price), not a bill. Computing them runs no agent command and makes no network request:
 the prices are built into remuda and can be overridden in `config.toml` (R3).
@@ -1518,6 +1522,17 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   several accounts is counted once, for those accounts together (`max + team`); a claude session
   attributed to none is counted as unattributed. The sections therefore add up to the overall
   total.
+- **Projects.** A session's project is the directory it started in: the `cwd` of the first record of
+  its transcript that has one. Claude records it at the top level of a record; codex in
+  `payload.cwd` of the rollout's first record (its first line that parses as a record), its own
+  `session_meta`, else of the first `turn_context` (a later `session_meta` is a fork parent's,
+  written after a subagent's own, and other records, such as a command's `exec_command_begin`, carry
+  the command's directory; neither is read for it). It is the string as recorded, neither resolved
+  nor normalized: two spellings of one directory (a trailing `/`, a symlink) are two projects. A
+  session resumed in another directory stays in the one it started in (R8 shows and resumes the last
+  one, `cwd_last`). A message counts for the project of the transcript whose copy counts, the copy
+  that also gives its accounts. A transcript none of whose records gives a `cwd` is in no project,
+  shown as `(no directory)`.
 - **Periods**: today, the last 7 days, the last 30 days, all. A period starts at local midnight
   (the system time zone) of today, of 6 days before, or of 29 days before; a message is in it when
   its timestamp is not earlier than the start. All also includes messages without a timestamp.
@@ -1593,7 +1608,10 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
 - **Shown**, for a period: every account in registry order (including those with nothing in the
   period), then each group of accounts, then unattributed. Each lists the tokens and cost per
   model (the model id as recorded), most tokens first, and their total. Then the tokens and cost
-  per model over everything. Counts below 1,000 are shown whole, others in K, M, B, or T, with
+  per model over everything. By project, the sections are the projects instead, titled by the
+  directory as recorded, most tokens first, ties by directory (byte order) with
+  `(no directory)` last, and only those with tokens in the period; then the same overall
+  section. Counts below 1,000 are shown whole, others in K, M, B, or T, with
   one decimal below 100 (`1.2M`, `93.3B`, `118K`).
 - **Only transcripts that exist count**: tokens of transcripts deleted since (claude deletes those
   older than `cleanupPeriodDays`) are no longer counted. A transcript below a directory that
@@ -1608,26 +1626,47 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   from a directory that is gone (a home's `sessions`, say, while its `archived_sessions` cannot
   be resolved) or whose account left the registry is no longer counted. A codex rollout kept
   this way is counted as unattributed while that lasts: the accounts of its home are not known.
-- **Cache**: `$REMUDA_HOME/state/stats.json`, with a schema version, rebuilt on a mismatch,
-  written atomically, deletable at any time (R3). For each transcript it holds what was counted
-  from it (a 64-bit FNV-1a hash of each request's key, its timestamp, model, counts with the
-  cache write by lifetime, and whether it used fast mode or US-only inference), how far the
-  transcript was read, and, for codex, the last total and model. Beside the transcripts it
-  holds the real path each store and `archived_sessions` last resolved to (R8), which a cache
-  written before that was kept lacks and is read without. Transcripts are read like the
-  index (R8): an unchanged file is not read again, a grown one only from its last complete line,
-  any other one whole; only complete lines are parsed. Records of one message read in two
-  refreshes merge by their key. The first computation reads every transcript whole (measured:
-  20,895 files, 17.2 GB), and so does the first one after the schema version changes (version 2
-  added the cache lifetimes and pricing flags).
-- **Command**: `remuda stats [<account>] [--period today|7d|30d|all]` prints one period
-  (default `all`) with a COST column, then a line saying the cost is ≈ API list price and the
-  prices' date, and a line naming the models not priced, if any. With an account, it prints only
-  the sections that include that account, and no overall section. Reading progress goes to
-  stderr, as for `sessions`. A directory that could not be read is named in an `Incomplete:` line
-  on stdout, after the table and the lines that follow it, so that a report that is piped does
-  not pass for a complete one.
-- **TUI**: view `4`, Stats. The statistics are computed in the background the first time the
+- **Cache**: `$REMUDA_HOME/state/stats.json`, with a schema version, rebuilt on a mismatch, written
+  atomically, deletable at any time (R3). For each transcript it holds what was counted from it (a
+  64-bit FNV-1a hash of each request's key, its timestamp, model, counts with the cache write by
+  lifetime, and whether it used fast mode or US-only inference), its project directory, how far the
+  transcript was read, and, for codex, the last total and model and whether the first record was
+  read. Beside the transcripts it holds the real path each store and `archived_sessions` last
+  resolved to (R8), which a cache written before that was kept lacks and is read without.
+  Transcripts are read like the index (R8): an unchanged file is not read again, a grown one only
+  from its last complete line, any other one whole; only complete lines are parsed. Records of one
+  message read in two refreshes merge by their key. The first computation reads every transcript
+  whole (measured: 20,895 files, 17.2 GB), and so does the first one after the schema version
+  changes (version 2 added the cache lifetimes and pricing flags, version 3 codex's cache write,
+  version 5 the project directory: a transcript read on from where it was would never get one).
+- **Command**: `remuda stats [<account>] [--period today|7d|30d|all] [--by account|project]`
+  prints one period (default `all`) with sections by account (the default) or by project, and
+  a COST column, then a line saying the cost is ≈ API list price and the prices' date, and a
+  line naming the models not priced, if any. With an account, it counts only the sessions
+  attributed to that account: by account, it prints the sections that include it; by project,
+  the projects of those sessions, none if they have no tokens in the period; and no overall
+  section. Reading progress goes to stderr, as for `sessions`. A directory that could not be
+  read is named in an `Incomplete:` line on stdout, after the table and the lines that follow
+  it, so that a report that is piped does not pass for a complete one.
+- **CSV**: `remuda stats --csv [<account>] [--period today|7d|30d|all]` prints instead every
+  request counted in the period (once, as above), only of the sessions attributed to the
+  account if one is given, as CSV (RFC 4180, with lines ending in LF), for reconciling with a
+  bill; it does not go with `--by`. A header line names the columns:
+  `timestamp,provider,accounts,session_id,project,model,input,cache_read,cache_write_5m,cache_write_1h,output,reasoning,fast,us_only,cost_usd`.
+  `timestamp` is RFC 3339 in UTC to the second (`2026-10-08T03:04:05Z`), empty without one;
+  `accounts` the session's accounts joined by ` + ` as in the section titles, empty when it is
+  unattributed; `project` the directory as recorded, empty without one; the counts are whole
+  numbers, a count the provider does not record empty (claude's reasoning), codex's cache write
+  in `cache_write_5m`; `fast` and `us_only` are `true` or `false`; `cost_usd` is the request's
+  exact cost in US dollars (its picodollars in decimal, up to 12 decimals, no trailing zeros),
+  empty when it cannot be priced, so their sum is the cost the table shows rounded. Lines are in
+  order of timestamp, those without one last, then of the request's key. A field holding `,`,
+  `"`, CR or LF is quoted, each `"` in it doubled. Only CSV goes to stdout: when a directory
+  could not be read, the `Incomplete:` lines go to stderr and the exit status is 1, since a line
+  of prose would break the CSV; the status carries what the line on stdout carries for the text
+  report.
+- **TUI**: view `4`, Stats, by account; it has no project sections (a project is a path, which
+  the view would have to keep private, R21). The statistics are computed in the background the first time the
   view opens, and again on each `r` after that, with reading progress shown; `r` also reads the
   prices in `config.toml` again (when they cannot be read, the built-in prices are used and the
   status line says so). A directory that could not be read is named in the status line too
@@ -2101,14 +2140,18 @@ usage of a window can be followed to its reset. Nothing else records usage: `rem
 nothing (R23), and `remuda list` reads no usage.
 
 - **The file.** `$REMUDA_HOME/state/usage-history.jsonl`, one JSON object per line, appended:
-  `{"ts", "account", "label", "model", "percent", "resets_at", "source"}`. `ts` is the time of
-  the reading as R10 has it: the cache time (claude's `fetchedAtMs`, the codex rollout record's
-  `timestamp`) or the time a live answer arrived; never the time remuda ran, so the same cache
-  read again is the same reading. `account` is `provider:name`; `label` the window's label
-  (R10); `model` the name in its parentheses, null for `all models` and for a window without
-  one; `percent` the percentage used; `resets_at` the reset when it was ahead at the reading,
-  else null (none told, wording not read, or already behind when recorded); `source` `cached` or
-  `live`. Times are RFC 3339. A window is identified by `account`, `label`, and `model`.
+  `{"ts", "account", "label", "model", "percent", "resets_at", "source", "window_minutes"}`.
+  `ts` is the time of the reading as R10 has it: the cache time (claude's `fetchedAtMs`, the
+  codex rollout record's `timestamp`) or the time a live answer arrived; never the time remuda
+  ran, so the same cache read again is the same reading. `account` is `provider:name`; `label`
+  the window's label (R10); `model` the name in its parentheses, null for `all models` and for a
+  window without one; `percent` the percentage used; `resets_at` the reset when it was ahead at
+  the reading, else null (none told, wording not read, or already behind when recorded); `source`
+  `cached` or `live`; `window_minutes` the window's length in minutes as codex told it (R10),
+  written only when it is known: a point of claude's has no such key, nor has one recorded before
+  remuda kept the length. It is read when it is a whole number from 1 to 4294967295; null or any
+  other value is no length, and the line is still a point (the key does not tell points apart).
+  Times are RFC 3339. A window is identified by `account`, `label`, and `model`.
 - **What is recorded.** `remuda usage` records what it reads, cached or with `--live`; with
   `--wait` (R10), every reading it takes, the one printed at the end included, once the wait is
   over and that reading is printed; `remuda usage --history` records nothing. The TUI records
@@ -2118,7 +2161,8 @@ nothing (R23), and `remuda list` reads no usage.
   command started), whose percentage is unknown; a live query that failed, or whose answer told no usage or
   was not recognized (R10); a point older than the 45 days kept. A point already in the history,
   of the same window with the same `ts`, `percent`, and `resets_at`, is not recorded again, so
-  a cache read between two live answers adds nothing.
+  a cache read between two live answers adds nothing; `window_minutes` is not compared (a point
+  recorded without it and the same reading with it are one point).
 - **Writing.** The points of one run of `remuda usage` (every account) or of one batch of the
   TUI (the cached usage of the accounts it reads at once, or one account's live answer) are one
   write. Every write takes an exclusive lock and holds it while it reads the history, leaves out
@@ -2155,7 +2199,9 @@ nothing (R23), and `remuda list` reads no usage.
   the screen: a lock another remuda holds (one compacting, or one suspended) holds up no
   account's usage. Leaving the TUI waits for such recordings at most 2 seconds (R16), so a
   reading shown just before is not lost, and a lock held elsewhere delays the end no longer.
-- **Window length.** The pace needs a window's length, which remuda reads from its label (R10):
+- **Window length.** The pace, and the grouping of a window's points by reset (below), need the
+  window's length. A point that tells `window_minutes` is as long as that says (at most ten
+  years; a longer one is of unknown length). A point without it is read by its label (R10):
   `Session` is 5 hours and `Week …` 7 days (claude's `session`, `weekly_all`, and
   `weekly_scoped` limits, its older `five_hour` and `seven_day` fields, its live `Current session`
   and `Current week` lines; codex's windows of 5 and 168 hours); codex's `<N>h window`, `<N>d
@@ -2163,8 +2209,10 @@ nothing (R23), and `remuda list` reads no usage.
   years long); a claude limit of unknown kind, labeled by
   its kind, is 5 hours for `five_hour` and 7 days for `seven_day…`. Others are of unknown length,
   and a window of unknown length gets no pace.
-  Codex's labels round its windows to whole hours (R10), so a codex window of 90 minutes counts
-  as 2 hours.
+  Codex's labels round its windows to whole hours (R10), so a codex window of 90 minutes recorded
+  without `window_minutes` counts as 2 hours. When a window's points disagree (the earlier ones
+  recorded without `window_minutes`), the length is the latest point's, for grouping them and for
+  the pace of the current one.
 - **`remuda usage --history [<account>] [--days N]`** prints, for each account (the one named,
   else every account R1 lists, in order), each window it has points for since `N` days ago
   (default 7, at most 3650), in the order first recorded: the label, then its points in time

@@ -348,6 +348,27 @@ nothing could be; the models concerned are named below the table. Not modelled: 
 premium of Claude Sonnet 4.5 and 4, batch and priority processing, and server tools such as web
 search.
 
+`remuda stats --by project` divides the period by project instead of by account: one section per
+directory a session started in, as the transcript records it, most tokens first, then the same
+`overall` section. Two spellings of one directory (with a trailing `/`, or through a symlink) are
+two projects, and a session resumed elsewhere stays in the directory it started in. Sessions that
+record no directory are under `(no directory)`. With an account (`remuda stats work --by
+project`), only the projects of the sessions attributed to it.
+
+`remuda stats --csv` prints every request of the period instead, one CSV line each, for
+reconciling with a bill or a spreadsheet:
+
+```text
+timestamp,provider,accounts,session_id,project,model,input,cache_read,cache_write_5m,cache_write_1h,output,reasoning,fast,us_only,cost_usd
+2026-10-08T03:04:05Z,claude,claude:work,8f0c2d1e-5b7a-4c3e-9a10-6d2f0e4b1c55,/Users/me/src/app,claude-opus-5-5,3,41210,1650,0,412,,false,false,0.024744
+```
+
+Each request appears once, as in the table, and `cost_usd` is its exact estimated cost (not
+rounded to the cent; empty when it cannot be priced), so the column adds up to the table's
+cost. The CSV takes an account and `--period` like the table, but not `--by`. When a directory
+could not be read, the `Incomplete:` lines go to stderr and the command exits with status 1, so
+that a script does not take a partial CSV for a complete one.
+
 ## Account checks
 
 The Accounts view warns about conditions that silently break multi-account setups: an
@@ -401,8 +422,10 @@ Accounts with `share = false` and the source itself are not checked.
   --history` shows it per window, with the pace of the current window: `used 71% with 48% of the
   window elapsed: ahead of an even pace; at this pace 100% by Oct 8 20:00` says the window runs
   out before its reset at that rate; `behind an even pace; at this pace 83% at reset` says 17%
-  would go unused. The window lengths come from the labels (`Session` 5 hours, `Week` 7 days,
-  codex's `<N>h window`), so a codex window is counted to the hour. `remuda usage` also adds
+  would go unused. A codex window is as long as codex says, to the minute (each of its points
+  records `window_minutes`); Claude's windows, and codex points recorded before remuda kept the
+  minutes, take their length from the label (`Session` 5 hours, `Week` 7 days, codex's `<N>h
+  window`, counted to the hour). `remuda usage` also adds
   `note: resets in 42 min with 71% left` under a window that resets within the hour with a
   quarter or more left.
 - **Identity** comes from `claude auth status --json` and `codex login status`. `remuda list`
