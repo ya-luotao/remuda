@@ -23,8 +23,9 @@ use crate::transcript::{complete_lines, contains, read_at};
 use crate::{Env, owned};
 
 /// Bump whenever [`Row`], [`FileStats`] or the counting rules change: a mismatching cache is
-/// rebuilt (2: cache write by lifetime, fast / US flags; 3: codex's cache write).
-pub const SCHEMA_VERSION: u32 = 3;
+/// rebuilt (2: cache write by lifetime, fast / US flags; 3: codex's cache write; 4: the project
+/// directory).
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Read size; an unfinished line is carried over to the next read.
 const CHUNK: u64 = 8 * 1024 * 1024;
@@ -161,6 +162,9 @@ pub struct FileStats {
     /// Claude: the file stem at a project's top level, else the name of the session directory
     /// it is below. Codex: the id in the file name.
     pub session_id: String,
+    /// The project directory: the `cwd` of the first record that has one (claude: a record's
+    /// own; codex: a `session_meta`'s or `turn_context`'s), as recorded (R20).
+    pub cwd: Option<String>,
     /// [`Source::path`] of the source it was listed under (for attribution).
     pub source: PathBuf,
     pub size: u64,
@@ -499,6 +503,7 @@ fn count(
         None => FileStats {
             provider: source.kind.provider(),
             session_id: listed.session_id.clone(),
+            cwd: None,
             source: source.path.clone(),
             size: 0,
             mtime_ns: 0,
@@ -694,6 +699,36 @@ impl CodexUsage {
     }
 }
 
+/// A claude record's own `cwd`.
+#[derive(Deserialize)]
+struct ClaudeCwd {
+    cwd: Option<String>,
+}
+
+/// A codex record's `payload.cwd`, which `session_meta` and `turn_context` give as the
+/// session's directory (other records, such as `exec_command_begin` events, give a command's).
+#[derive(Deserialize)]
+struct CodexCwd {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    payload: Option<ClaudeCwd>,
+}
+
+/// The project directory a line records, as recorded (R20): claude, a record's own `cwd`; codex,
+/// the `payload.cwd` of a `session_meta` or `turn_context`. Only those fields are deserialized.
+fn cwd(provider: Provider, line: &[u8]) -> Option<String> {
+    match provider {
+        Provider::Claude => serde_json::from_slice::<ClaudeCwd>(line).ok()?.cwd,
+        Provider::Codex => {
+            let record = serde_json::from_slice::<CodexCwd>(line).ok()?;
+            match record.kind.as_deref() {
+                Some("session_meta" | "turn_context") => record.payload?.cwd,
+                _ => None,
+            }
+        }
+    }
+}
+
 /// Counts the lines of one file into its [`FileStats`], merging records of one request.
 struct Counter<'a> {
     file: &'a mut FileStats,
@@ -756,6 +791,11 @@ impl<'a> Counter<'a> {
     }
 
     fn line(&mut self, line: &[u8]) {
+        // Looked for in every line until found, ahead of the fast paths below, which skip the
+        // lines that carry it; parsed only from a line that mentions it.
+        if self.file.cwd.is_none() && contains(line, b"\"cwd\"") {
+            self.file.cwd = cwd(self.file.provider, line);
+        }
         match self.file.provider {
             Provider::Claude => self.claude(line),
             Provider::Codex => self.codex(line),
@@ -1135,18 +1175,83 @@ impl Winner<'_> {
 /// Model tokens and cost keyed by provider and model.
 type Models<'a> = BTreeMap<(Provider, &'a str), (Tokens, Cost)>;
 
-/// The statistics of `cache` for each period, counting each request once and pricing it with
-/// `prices` (R20). A claude session's accounts come from `attribution`, a codex rollout's from
-/// the source it was listed under; `accounts` is the registry, in order.
-pub fn report(
-    cache: &Cache,
+/// One request as counted (R20): the copy that counts, the accounts of its session, its model,
+/// and its cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request<'a> {
+    /// FNV-1a hash of the request's key ([`Row::key`]).
+    pub key: u64,
+    /// Seconds since the Unix epoch, of the copy that counts.
+    pub ts: Option<i64>,
+    /// The transcript or rollout of the copy that counts: its provider, session and project.
+    pub file: &'a FileStats,
+    /// Index into [`Counted::groups`]: the accounts of the session.
+    pub group: usize,
+    /// As recorded; `unknown` when the transcript names none.
+    pub model: &'a str,
+    /// Whether any copy used fast mode, or US-only inference.
+    pub fast: bool,
+    pub geo_us: bool,
+    /// Claude: the largest of each count over the copies; codex: the copy that counts, whole.
+    pub tokens: Tokens,
+    /// In picodollars; `None` when it cannot be priced.
+    pub cost: Option<u128>,
+}
+
+impl Request<'_> {
+    /// Whether it is in a period starting at `start` (seconds since the epoch; `None`: all,
+    /// which also includes requests without a timestamp).
+    fn within(&self, start: Option<i64>) -> bool {
+        match (start, self.ts) {
+            (None, _) => true,
+            (Some(start), Some(ts)) => ts >= start,
+            (Some(_), None) => false,
+        }
+    }
+
+    /// As summed in a table: its tokens are unpriced when it cannot be priced.
+    fn cost(&self) -> Cost {
+        match self.cost {
+            Some(pico_usd) => Cost {
+                pico_usd,
+                unpriced_tokens: 0,
+            },
+            None => Cost {
+                pico_usd: 0,
+                unpriced_tokens: self.tokens.total(),
+            },
+        }
+    }
+}
+
+/// Every request of a cache, counted once ([`requests`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Counted<'a> {
+    /// The accounts of each session with requests: `provider:name`, in registry order (accounts
+    /// no longer registered last, by name); empty for unattributed sessions.
+    pub groups: Vec<Vec<String>>,
+    /// In no particular order.
+    pub list: Vec<Request<'a>>,
+}
+
+impl Counted<'_> {
+    /// Whether the session of `request` is attributed to `account` (`provider:name`), or
+    /// `account` is `None`.
+    fn includes(&self, request: &Request<'_>, account: Option<&str>) -> bool {
+        account.is_none_or(|a| self.groups[request.group].iter().any(|g| g == a))
+    }
+}
+
+/// Each request of `cache` once, with the accounts of its session and its price at `prices`
+/// (R20). A claude session's accounts come from `attribution`, a codex rollout's from the source
+/// it was listed under; `accounts` is the registry, in order.
+pub fn requests<'a>(
+    cache: &'a Cache,
     sources: &[Source],
     attribution: &Attribution,
     accounts: &[Account],
     prices: &Prices,
-    now: Timestamp,
-    tz: &TimeZone,
-) -> Report {
+) -> Counted<'a> {
     let mut winners: HashMap<u64, Winner<'_>> = HashMap::new();
     for (path, file) in &cache.files {
         for row in &file.rows {
@@ -1184,39 +1289,15 @@ pub fn report(
             }
         }
     }
-    let first: Option<i64> = winners.values().filter_map(|w| w.ts).min();
 
     let registered: Vec<String> = accounts.iter().map(Account::qualified).collect();
     let position = |name: &str| registered.iter().position(|r| r == name);
     let mut groups: Vec<Vec<String>> = Vec::new();
     let mut group_of_accounts: HashMap<Vec<String>, usize> = HashMap::new();
     let mut group_of_file: HashMap<&Path, usize> = HashMap::new();
-    let starts: Vec<Option<i64>> = Period::ALL
-        .iter()
-        .map(|p| p.start(now, tz).map(|t| t.as_second()))
-        .collect();
-    // Per period, per group.
-    let mut counted: Vec<BTreeMap<usize, Models<'_>>> = vec![BTreeMap::new(); Period::ALL.len()];
-    // Per period: the chart's bucket starts (seconds), its end, and its buckets.
-    let mut charts: Vec<(Vec<i64>, i64, Vec<Bucket>)> = Period::ALL
-        .iter()
-        .map(|&p| {
-            let (starts, end) = bucket_starts(p, first, now, tz);
-            let buckets = starts
-                .iter()
-                .map(|&start| Bucket {
-                    start,
-                    tokens: Tokens::default(),
-                    cost: Cost::default(),
-                })
-                .collect();
-            let seconds = starts.iter().map(|t| t.as_second()).collect();
-            (seconds, end.as_second(), buckets)
-        })
-        .collect();
     let mut rates: HashMap<(Provider, &str), Option<Rate>> = HashMap::new();
-
-    for winner in winners.values() {
+    let mut list = Vec::with_capacity(winners.len());
+    for (key, winner) in winners {
         let file = winner.file;
         let group = *group_of_file.entry(winner.path).or_insert_with(|| {
             let mut names: Vec<String> = match file.provider {
@@ -1247,25 +1328,73 @@ pub fn report(
         let rate = *rates
             .entry((file.provider, model))
             .or_insert_with(|| prices.rate(file.provider, model));
-        let cost = match rate.and_then(|r| r.cost(&winner.tokens, winner.fast, winner.geo_us)) {
-            Some(pico_usd) => Cost {
-                pico_usd,
-                unpriced_tokens: 0,
-            },
-            None => Cost {
-                pico_usd: 0,
-                unpriced_tokens: winner.tokens.total(),
-            },
-        };
+        list.push(Request {
+            key,
+            ts: winner.ts,
+            file,
+            group,
+            model,
+            fast: winner.fast,
+            geo_us: winner.geo_us,
+            tokens: winner.tokens,
+            cost: rate.and_then(|r| r.cost(&winner.tokens, winner.fast, winner.geo_us)),
+        });
+    }
+    Counted { groups, list }
+}
+
+/// The statistics of `cache` for each period, counting each request once and pricing it with
+/// `prices` ([`requests`], R20); `accounts` is the registry, in order.
+pub fn report(
+    cache: &Cache,
+    sources: &[Source],
+    attribution: &Attribution,
+    accounts: &[Account],
+    prices: &Prices,
+    now: Timestamp,
+    tz: &TimeZone,
+) -> Report {
+    let Counted { groups, list } = requests(cache, sources, attribution, accounts, prices);
+    let first: Option<i64> = list.iter().filter_map(|r| r.ts).min();
+
+    let registered: Vec<String> = accounts.iter().map(Account::qualified).collect();
+    let position = |name: &str| registered.iter().position(|r| r == name);
+    let group_of_accounts: HashMap<&[String], usize> = groups
+        .iter()
+        .enumerate()
+        .map(|(i, names)| (names.as_slice(), i))
+        .collect();
+    let starts: Vec<Option<i64>> = Period::ALL
+        .iter()
+        .map(|p| p.start(now, tz).map(|t| t.as_second()))
+        .collect();
+    // Per period, per group.
+    let mut counted: Vec<BTreeMap<usize, Models<'_>>> = vec![BTreeMap::new(); Period::ALL.len()];
+    // Per period: the chart's bucket starts (seconds), its end, and its buckets.
+    let mut charts: Vec<(Vec<i64>, i64, Vec<Bucket>)> = Period::ALL
+        .iter()
+        .map(|&p| {
+            let (starts, end) = bucket_starts(p, first, now, tz);
+            let buckets = starts
+                .iter()
+                .map(|&start| Bucket {
+                    start,
+                    tokens: Tokens::default(),
+                    cost: Cost::default(),
+                })
+                .collect();
+            let seconds = starts.iter().map(|t| t.as_second()).collect();
+            (seconds, end.as_second(), buckets)
+        })
+        .collect();
+
+    for request in &list {
+        let (file, model, group) = (request.file, request.model, request.group);
+        let cost = request.cost();
         for ((period, start), (starts, end, buckets)) in
             counted.iter_mut().zip(&starts).zip(&mut charts)
         {
-            let within = match (start, winner.ts) {
-                (None, _) => true,
-                (Some(start), Some(ts)) => ts >= *start,
-                (Some(_), None) => false,
-            };
-            if !within {
+            if !request.within(*start) {
                 continue;
             }
             let (tokens, sum) = period
@@ -1273,12 +1402,12 @@ pub fn report(
                 .or_default()
                 .entry((file.provider, model))
                 .or_default();
-            tokens.add(&winner.tokens);
+            tokens.add(&request.tokens);
             sum.add(&cost);
-            if let Some(ts) = winner.ts.filter(|ts| ts < end) {
+            if let Some(ts) = request.ts.filter(|ts| ts < end) {
                 let i = starts.partition_point(|&s| s <= ts);
                 if i > 0 {
-                    buckets[i - 1].tokens.add(&winner.tokens);
+                    buckets[i - 1].tokens.add(&request.tokens);
                     buckets[i - 1].cost.add(&cost);
                 }
             }
@@ -1329,7 +1458,7 @@ pub fn report(
             });
             sections.extend(others.into_iter().map(|names| section(names)));
             if group_of_accounts
-                .get(&Vec::new())
+                .get(&[][..])
                 .is_some_and(|g| by_group.contains_key(g))
             {
                 sections.push(section(&[]));
@@ -1346,6 +1475,183 @@ pub fn report(
     Report {
         tables,
         files: cache.files.len(),
+    }
+}
+
+/// How `remuda stats` divides a period into sections (R20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum By {
+    /// The accounts of each session ([`Table::sections`]).
+    Account,
+    /// The project directory of each session ([`projects`]).
+    Project,
+}
+
+impl By {
+    /// As given to `--by`.
+    pub fn parse(name: &str) -> Option<By> {
+        match name {
+            "account" => Some(By::Account),
+            "project" => Some(By::Project),
+            _ => None,
+        }
+    }
+}
+
+/// The tokens of the sessions that started in one project directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Project {
+    /// [`FileStats::cwd`] as recorded; `None` for sessions that record none.
+    pub dir: Option<String>,
+    /// Most tokens first.
+    pub models: Vec<ModelRow>,
+}
+
+impl Project {
+    pub fn total(&self) -> Tokens {
+        sum(&self.models).0
+    }
+}
+
+/// The statistics of one period by project (R20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectTable {
+    pub period: Period,
+    /// Start of the period; `None` for all.
+    pub since: Option<Timestamp>,
+    /// Most tokens first, then by directory, `None` last.
+    pub sections: Vec<Project>,
+    /// Tokens per model over every request of the period, as in [`Table::overall`]; `None`
+    /// for one account's projects.
+    pub overall: Option<Vec<ModelRow>>,
+}
+
+/// The statistics of `period` by project (R20): a section per project directory of the copy
+/// that counts ([`Request::file`]), only of sessions attributed to `account` if given, and,
+/// without `account`, the tokens per model over everything.
+pub fn projects(
+    counted: &Counted<'_>,
+    period: Period,
+    now: Timestamp,
+    tz: &TimeZone,
+    account: Option<&str>,
+) -> ProjectTable {
+    let since = period.start(now, tz);
+    let start = since.map(|t| t.as_second());
+    let mut by_dir: BTreeMap<Option<&str>, Models<'_>> = BTreeMap::new();
+    let mut overall: Models<'_> = BTreeMap::new();
+    fn add<'a>(models: &mut Models<'a>, request: &Request<'a>) {
+        let (tokens, cost) = models
+            .entry((request.file.provider, request.model))
+            .or_default();
+        tokens.add(&request.tokens);
+        cost.add(&request.cost());
+    }
+    for request in counted.list.iter().filter(|r| r.within(start)) {
+        add(&mut overall, request);
+        if counted.includes(request, account) {
+            add(
+                by_dir.entry(request.file.cwd.as_deref()).or_default(),
+                request,
+            );
+        }
+    }
+    let mut sections: Vec<Project> = by_dir
+        .iter()
+        .map(|(dir, models)| Project {
+            dir: dir.map(str::to_string),
+            models: model_rows(models),
+        })
+        .collect();
+    sections.sort_by(|a, b| {
+        b.total()
+            .total()
+            .cmp(&a.total().total())
+            .then_with(|| (a.dir.is_none(), &a.dir).cmp(&(b.dir.is_none(), &b.dir)))
+    });
+    ProjectTable {
+        period,
+        since,
+        sections,
+        overall: account.is_none().then(|| model_rows(&overall)),
+    }
+}
+
+/// The columns of [`csv`].
+pub const CSV_HEADER: &str = "timestamp,provider,accounts,session_id,project,model,input,\
+cache_read,cache_write_5m,cache_write_1h,output,reasoning,fast,us_only,cost_usd";
+
+/// Every request of `period` as CSV (R20), only of sessions attributed to `account` if given:
+/// [`CSV_HEADER`], then a line per request, by timestamp (those without one last), then by key.
+/// Fields are quoted as RFC 4180 has it; lines end in `\n`.
+pub fn csv(
+    out: &mut impl std::io::Write,
+    counted: &Counted<'_>,
+    period: Period,
+    now: Timestamp,
+    tz: &TimeZone,
+    account: Option<&str>,
+) -> std::io::Result<()> {
+    let start = period.start(now, tz).map(|t| t.as_second());
+    let mut requests: Vec<&Request<'_>> = counted
+        .list
+        .iter()
+        .filter(|r| r.within(start) && counted.includes(r, account))
+        .collect();
+    requests.sort_by_key(|r| (r.ts.is_none(), r.ts, r.key));
+    writeln!(out, "{CSV_HEADER}")?;
+    for r in requests {
+        let file = r.file;
+        let t = &r.tokens;
+        let timestamp =
+            r.ts.and_then(|ts| Timestamp::from_second(ts).ok())
+                .map(|ts| ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string());
+        // Claude records no reasoning apart from output: unknown, not 0 (R20).
+        let reasoning = (file.provider == Provider::Codex).then(|| t.reasoning.to_string());
+        let fields = [
+            timestamp.unwrap_or_default(),
+            file.provider.name().to_string(),
+            counted.groups[r.group].join(" + "),
+            file.session_id.clone(),
+            file.cwd.clone().unwrap_or_default(),
+            r.model.to_string(),
+            t.input.to_string(),
+            t.cache_read.to_string(),
+            t.cache_write_5m.to_string(),
+            t.cache_write_1h.to_string(),
+            t.output.to_string(),
+            reasoning.unwrap_or_default(),
+            r.fast.to_string(),
+            r.geo_us.to_string(),
+            r.cost.map(decimal_usd).unwrap_or_default(),
+        ];
+        let line: Vec<_> = fields.iter().map(|f| csv_field(f)).collect();
+        writeln!(out, "{}", line.join(","))?;
+    }
+    out.flush()
+}
+
+/// `field` as a CSV field (RFC 4180): quoted when it holds `,`, `"`, `\r` or `\n`, with each `"`
+/// doubled.
+fn csv_field(field: &str) -> std::borrow::Cow<'_, str> {
+    if field.contains([',', '"', '\r', '\n']) {
+        format!("\"{}\"", field.replace('"', "\"\"")).into()
+    } else {
+        field.into()
+    }
+}
+
+/// Picodollars as decimal US dollars, exactly: up to 12 decimals, without trailing zeros
+/// (`1_500_000_000_000` is `1.5`).
+fn decimal_usd(pico_usd: u128) -> String {
+    const PER_USD: u128 = 1_000_000_000_000;
+    let (whole, frac) = (pico_usd / PER_USD, pico_usd % PER_USD);
+    match frac {
+        0 => whole.to_string(),
+        _ => {
+            let frac = format!("{frac:012}");
+            format!("{whole}.{}", frac.trim_end_matches('0'))
+        }
     }
 }
 
@@ -1471,26 +1777,56 @@ const COLUMNS: [&str; 8] = [
 /// providers of a row do not record is `-` (reasoning: codex only);
 /// costs are [`Cost::cell`]s. Columns align over the whole output.
 pub fn format(table: &Table, filter: Option<&str>, tz: &TimeZone) -> String {
-    let sections: Vec<&Section> = table
+    let mut blocks: Vec<(String, &[ModelRow])> = table
         .sections
         .iter()
         .filter(|s| filter.is_none_or(|f| s.accounts.iter().any(|a| a == f)))
-        .collect();
-    let mut blocks: Vec<(String, Vec<[String; 8]>)> = sections
-        .iter()
         .map(|s| {
             let label = match s.accounts.is_empty() {
                 true => "unattributed".to_string(),
                 false => s.accounts.join(" + "),
             };
-            (label, format_rows(&s.models))
+            (label, s.models.as_slice())
         })
         .collect();
-    let mut printed: Vec<&ModelRow> = sections.iter().flat_map(|s| &s.models).collect();
     if filter.is_none() {
-        blocks.push(("overall".to_string(), format_rows(&table.overall)));
-        printed.extend(&table.overall);
+        blocks.push(("overall".to_string(), &table.overall));
     }
+    render(table.period, table.since, &blocks, tz)
+}
+
+/// `table` as plain text for `remuda stats --by project`, like [`format`]: each project's
+/// section, titled by its directory as recorded or `(no directory)`, then `overall` if the table
+/// has it.
+pub fn format_projects(table: &ProjectTable, tz: &TimeZone) -> String {
+    let mut blocks: Vec<(String, &[ModelRow])> = table
+        .sections
+        .iter()
+        .map(|p| {
+            let label = p.dir.as_deref().unwrap_or("(no directory)").to_string();
+            (label, p.models.as_slice())
+        })
+        .collect();
+    if let Some(overall) = &table.overall {
+        blocks.push(("overall".to_string(), overall));
+    }
+    render(table.period, table.since, &blocks, tz)
+}
+
+/// The text of [`format`] and [`format_projects`]: the title of `period` (since `since`), the
+/// column headers, each block (its label, then its models and their total), then the cost note
+/// and the models of the blocks that are not priced.
+fn render(
+    period: Period,
+    since: Option<Timestamp>,
+    sections: &[(String, &[ModelRow])],
+    tz: &TimeZone,
+) -> String {
+    let blocks: Vec<(&str, Vec<[String; 8]>)> = sections
+        .iter()
+        .map(|(label, models)| (label.as_str(), format_rows(models)))
+        .collect();
+    let printed = sections.iter().flat_map(|(_, models)| models.iter());
     let header = COLUMNS.map(str::to_string);
     let mut widths = [0; 8];
     for row in blocks.iter().flat_map(|(_, rows)| rows).chain([&header]) {
@@ -1508,8 +1844,8 @@ pub fn format(table: &Table, filter: Option<&str>, tz: &TimeZone) -> String {
         line + "\n"
     };
 
-    let mut out = format!("Tokens · {}", table.period.label());
-    if let Some(since) = table.since {
+    let mut out = format!("Tokens · {}", period.label());
+    if let Some(since) = since {
         let since = since.to_zoned(tz.clone()).strftime("%Y-%m-%d %H:%M");
         out.push_str(&format!(" (since {since})"));
     }
@@ -2075,5 +2411,147 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
             ..Tokens::default()
         };
         assert_eq!(huge.total(), u64::MAX);
+    }
+
+    /// Counts `text` as a whole file of `provider`, then on from that after `more` is appended.
+    fn counted(provider: Provider, text: &str, more: &str) -> (FileStats, FileStats) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let source = Source {
+            kind: match provider {
+                Provider::Claude => SourceKind::Claude,
+                Provider::Codex => SourceKind::CodexSessions,
+            },
+            path: dir.path().to_path_buf(),
+            accounts: vec![],
+        };
+        let read = |cached: Option<&FileStats>| {
+            let file = File::open(&path).unwrap();
+            let stat = Stat::of(&file.metadata().unwrap());
+            let listed = Listed {
+                path: path.clone(),
+                session_id: "s".into(),
+                stat,
+            };
+            count(&source, &listed, &file, stat, cached, CHUNK)
+                .unwrap()
+                .0
+        };
+        fs::write(&path, text).unwrap();
+        let whole = read(None);
+        fs::write(&path, [text, more].concat()).unwrap();
+        let grown = read(Some(&whole));
+        (whole, grown)
+    }
+
+    /// R20: a claude transcript's project is the `cwd` of its first record that has one, as
+    /// recorded: not one nested in a record, not a `null`, not a later one (a session resumed
+    /// in another directory stays where it started). The record giving it may be one with
+    /// usage, which still counts.
+    #[test]
+    fn the_project_is_the_cwd_of_the_first_record_that_has_one() {
+        let text = [
+            "{\"type\":\"summary\",\"summary\":\"s\"}\n".to_string(),
+            "{\"type\":\"file-history-snapshot\",\"cwd\":null}\n".to_string(),
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\
+             \"input\":{\"cwd\":\"/nested\"}}]}}\n"
+                .to_string(),
+            message("msg_1", 10).replacen('{', "{\"cwd\":\"/w/a b, \\\"c\\\"/\",", 1),
+            "{\"type\":\"user\",\"cwd\":\"/w/later\"}\n".to_string(),
+        ]
+        .concat();
+        let (whole, grown) = counted(Provider::Claude, &text, &message("msg_2", 1));
+        assert_eq!(whole.cwd.as_deref(), Some("/w/a b, \"c\"/"));
+        assert_eq!(whole.rows.len(), 1, "the record with the cwd counts");
+        assert_eq!(grown.cwd, whole.cwd);
+        assert_eq!(grown.rows.len(), 2);
+
+        // Only records without a cwd: none.
+        let (whole, _) = counted(Provider::Claude, &message("msg_1", 10), "");
+        assert_eq!(whole.cwd, None);
+    }
+
+    /// R20, R8: a file read on from where it was keeps its project, and gets one from the part
+    /// read on if it had none.
+    #[test]
+    fn reading_on_keeps_the_project_or_finds_it() {
+        let user = |cwd: &str| format!("{{\"type\":\"user\",\"cwd\":\"{cwd}\"}}\n");
+        let (whole, grown) = counted(
+            Provider::Claude,
+            &[user("/w/first"), message("msg_1", 10)].concat(),
+            &[user("/w/second"), message("msg_2", 1)].concat(),
+        );
+        assert_eq!(whole.cwd.as_deref(), Some("/w/first"));
+        assert_eq!(grown.cwd.as_deref(), Some("/w/first"));
+
+        let (whole, grown) = counted(
+            Provider::Claude,
+            &message("msg_1", 10),
+            &[user("/w/second"), message("msg_2", 1)].concat(),
+        );
+        assert_eq!(whole.cwd, None);
+        assert_eq!(grown.cwd.as_deref(), Some("/w/second"));
+        assert_eq!(grown.rows.len(), 2);
+    }
+
+    /// R20: a codex rollout's project is its `session_meta`'s `cwd`, else its first
+    /// `turn_context`'s; a command's `cwd` (`exec_command_begin`) is not the session's, nor is a
+    /// fork parent's `session_meta` written after the rollout's own.
+    #[test]
+    fn a_rollouts_project_is_its_session_meta_cwd_else_its_first_turn_context_cwd() {
+        let record = |kind: &str, payload: &str| {
+            format!(
+                "{{\"timestamp\":\"2026-09-20T10:00:00Z\",\"type\":\"{kind}\",\"payload\":{payload}}}\n"
+            )
+        };
+        let command = record(
+            "event_msg",
+            "{\"type\":\"exec_command_begin\",\"cwd\":\"/w/command\"}",
+        );
+        let turn = |cwd: &str| {
+            record(
+                "turn_context",
+                &format!("{{\"cwd\":\"{cwd}\",\"model\":\"m\"}}"),
+            )
+        };
+        let text = [
+            record("session_meta", "{\"id\":\"r\",\"cwd\":\"/w/meta\"}"),
+            command.clone(),
+            turn("/w/turn"),
+            record("session_meta", "{\"id\":\"parent\",\"cwd\":\"/w/parent\"}"),
+        ]
+        .concat();
+        let (whole, _) = counted(Provider::Codex, &text, "");
+        assert_eq!(whole.cwd.as_deref(), Some("/w/meta"));
+
+        let text = [
+            record("session_meta", "{\"id\":\"r\"}"),
+            command,
+            turn("/w/turn"),
+            turn("/w/turn2"),
+        ]
+        .concat();
+        let (whole, _) = counted(Provider::Codex, &text, "");
+        assert_eq!(whole.cwd.as_deref(), Some("/w/turn"));
+    }
+
+    /// R20: CSV fields are quoted as RFC 4180 has it, and costs are exact decimal dollars.
+    #[test]
+    fn csv_fields_and_decimal_dollars() {
+        assert_eq!(csv_field("/w/proj"), "/w/proj");
+        assert_eq!(csv_field(""), "");
+        assert_eq!(csv_field("/w/a,b"), "\"/w/a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("a\nb"), "\"a\nb\"");
+        assert_eq!(csv_field("a\rb"), "\"a\rb\"");
+        assert_eq!(decimal_usd(0), "0");
+        assert_eq!(decimal_usd(1), "0.000000000001");
+        assert_eq!(decimal_usd(1_500_000_000_000), "1.5");
+        assert_eq!(decimal_usd(123_456_789_012), "0.123456789012");
+        assert_eq!(decimal_usd(12_000_000_000_000), "12");
+        assert_eq!(
+            decimal_usd(u128::MAX),
+            "340282366920938463463374607.431768211455"
+        );
     }
 }

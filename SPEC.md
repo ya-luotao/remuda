@@ -265,8 +265,9 @@ remuda usage --history [<account>] [--days N]      the usage recorded so far, wi
 remuda list [--timeout S]                          accounts, login identity, home (R10a)
 remuda sessions [--limit N]                        recent sessions: time, account attribution,
                                                    title, cwd (R8, R9)
-remuda stats [<account>] [--period P]              tokens and estimated cost per account and
-                                                   model (R20)
+remuda stats [<account>] [--period P]              tokens and estimated cost per account (or
+       [--by account|project | --csv]              project) and model, or each request as
+                                                   CSV (R20)
 remuda add [--provider P] <name> <path>            register an existing home directory (R14, R17)
 remuda setup [--provider P] <name> [--email E]     create a new home, link it to the source of
                                                    shared configuration if there is one (R18),
@@ -1427,8 +1428,8 @@ stays reserved so that the entries after it keep theirs.
 
 ## R20. Token statistics
 
-Token counts per account and model, read from the agents' own transcripts, for a period, and their
-estimated cost: what the requests would cost at the providers' public API list prices (prices as
+Token counts per account (or project) and model, read from the agents' own transcripts, for a
+period, and their estimated cost: what the requests would cost at the providers' public API list prices (prices as
 of 2026-10-07). Most accounts are subscription logins, so the cost is an estimate for comparison
 (≈ API list price), not a bill. Computing them runs no agent command and makes no network request:
 the prices are built into remuda and can be overridden in `config.toml` (R3).
@@ -1516,6 +1517,15 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   several accounts is counted once, for those accounts together (`max + team`); a claude session
   attributed to none is counted as unattributed. The sections therefore add up to the overall
   total.
+- **Projects.** A session's project is the directory it started in: the `cwd` of the first
+  record of its transcript that has one. Claude records it at the top level of a record; codex
+  in `payload.cwd` of `session_meta`, else of the first `turn_context` (other records, such as
+  a command's `exec_command_begin`, carry the command's directory and are not read for it). It
+  is the string as recorded, neither resolved nor normalized: two spellings of one directory
+  (a trailing `/`, a symlink) are two projects. A session resumed in another directory stays in
+  the one it started in (R8 shows and resumes the last one, `cwd_last`). A message counts for
+  the project of the transcript whose copy counts, the copy that also gives its accounts. A
+  transcript none of whose records has a `cwd` is in no project, shown as `(no directory)`.
 - **Periods**: today, the last 7 days, the last 30 days, all. A period starts at local midnight
   (the system time zone) of today, of 6 days before, or of 29 days before; a message is in it when
   its timestamp is not earlier than the start. All also includes messages without a timestamp.
@@ -1591,7 +1601,10 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
 - **Shown**, for a period: every account in registry order (including those with nothing in the
   period), then each group of accounts, then unattributed. Each lists the tokens and cost per
   model (the model id as recorded), most tokens first, and their total. Then the tokens and cost
-  per model over everything. Counts below 1,000 are shown whole, others in K, M, B, or T, with
+  per model over everything. By project, the sections are the projects instead, titled by the
+  directory as recorded, most tokens first, ties by directory (byte order) with
+  `(no directory)` last, and only those with tokens in the period; then the same overall
+  section. Counts below 1,000 are shown whole, others in K, M, B, or T, with
   one decimal below 100 (`1.2M`, `93.3B`, `118K`).
 - **Only transcripts that exist count**: tokens of transcripts deleted since (claude deletes those
   older than `cleanupPeriodDays`) are no longer counted. A transcript below a directory that
@@ -1609,23 +1622,44 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
 - **Cache**: `$REMUDA_HOME/state/stats.json`, with a schema version, rebuilt on a mismatch,
   written atomically, deletable at any time (R3). For each transcript it holds what was counted
   from it (a 64-bit FNV-1a hash of each request's key, its timestamp, model, counts with the
-  cache write by lifetime, and whether it used fast mode or US-only inference), how far the
-  transcript was read, and, for codex, the last total and model. Beside the transcripts it
+  cache write by lifetime, and whether it used fast mode or US-only inference), its project
+  directory, how far the transcript was read, and, for codex, the last total and model. Beside the transcripts it
   holds the real path each store and `archived_sessions` last resolved to (R8), which a cache
   written before that was kept lacks and is read without. Transcripts are read like the
   index (R8): an unchanged file is not read again, a grown one only from its last complete line,
   any other one whole; only complete lines are parsed. Records of one message read in two
   refreshes merge by their key. The first computation reads every transcript whole (measured:
   20,895 files, 17.2 GB), and so does the first one after the schema version changes (version 2
-  added the cache lifetimes and pricing flags).
-- **Command**: `remuda stats [<account>] [--period today|7d|30d|all]` prints one period
-  (default `all`) with a COST column, then a line saying the cost is ≈ API list price and the
-  prices' date, and a line naming the models not priced, if any. With an account, it prints only
-  the sections that include that account, and no overall section. Reading progress goes to
-  stderr, as for `sessions`. A directory that could not be read is named in an `Incomplete:` line
-  on stdout, after the table and the lines that follow it, so that a report that is piped does
-  not pass for a complete one.
-- **TUI**: view `4`, Stats. The statistics are computed in the background the first time the
+  added the cache lifetimes and pricing flags, version 3 codex's cache write, version 4 the
+  project directory: a transcript read on from where it was would never get one).
+- **Command**: `remuda stats [<account>] [--period today|7d|30d|all] [--by account|project]`
+  prints one period (default `all`) with sections by account (the default) or by project, and
+  a COST column, then a line saying the cost is ≈ API list price and the prices' date, and a
+  line naming the models not priced, if any. With an account, it counts only the sessions
+  attributed to that account: by account, it prints the sections that include it; by project,
+  the projects of those sessions, none if they have no tokens in the period; and no overall
+  section. Reading progress goes to stderr, as for `sessions`. A directory that could not be
+  read is named in an `Incomplete:` line on stdout, after the table and the lines that follow
+  it, so that a report that is piped does not pass for a complete one.
+- **CSV**: `remuda stats --csv [<account>] [--period today|7d|30d|all]` prints instead every
+  request counted in the period (once, as above), only of the sessions attributed to the
+  account if one is given, as CSV (RFC 4180, with lines ending in LF), for reconciling with a
+  bill; it does not go with `--by`. A header line names the columns:
+  `timestamp,provider,accounts,session_id,project,model,input,cache_read,cache_write_5m,cache_write_1h,output,reasoning,fast,us_only,cost_usd`.
+  `timestamp` is RFC 3339 in UTC to the second (`2026-10-08T03:04:05Z`), empty without one;
+  `accounts` the session's accounts joined by ` + ` as in the section titles, empty when it is
+  unattributed; `project` the directory as recorded, empty without one; the counts are whole
+  numbers, a count the provider does not record empty (claude's reasoning), codex's cache write
+  in `cache_write_5m`; `fast` and `us_only` are `true` or `false`; `cost_usd` is the request's
+  exact cost in US dollars (its picodollars in decimal, up to 12 decimals, no trailing zeros),
+  empty when it cannot be priced, so their sum is the cost the table shows rounded. Lines are in
+  order of timestamp, those without one last, then of the request's key. A field holding `,`,
+  `"`, CR or LF is quoted, each `"` in it doubled. Only CSV goes to stdout: when a directory
+  could not be read, the `Incomplete:` lines go to stderr and the exit status is 1, since a line
+  of prose would break the CSV; the status carries what the line on stdout carries for the text
+  report.
+- **TUI**: view `4`, Stats, by account; it has no project sections (a project is a path, which
+  the view would have to keep private, R21). The statistics are computed in the background the first time the
   view opens, and again on each `r` after that, with reading progress shown; `r` also reads the
   prices in `config.toml` again (when they cannot be read, the built-in prices are used and the
   status line says so). A directory that could not be read is named in the status line too
