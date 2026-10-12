@@ -183,6 +183,7 @@ Checks ────────────────────────�
 | `/` | History: fuzzy search over title, working directory and accounts |
 | `a` | History: also show teammate, SDK and Codex subagent sessions. Live: also show stopped background sessions |
 | `t` | Stats: next period (all time, today, last 7 days, last 30 days) |
+| `b` | Stats: sections by account or by project (the directory each session started in) |
 | `u` | Query live usage for every account |
 | `r` | Refresh the index, identities, live sessions and checks, and the statistics once the Stats view has been opened |
 | `Esc` | Go back: collapse the preview or the configuration pane, close logs, clear the search, or cancel a form or pending launch check |

@@ -36,7 +36,12 @@ says which `projects` to link.
 The Stats view computes the statistics in the background the first time it opens, with the
 reading progress in the status line, and again on each `r`; the first computation reads every
 transcript whole. Above the table, a chart shows the period's cost (or tokens, when nothing is
-priced) per hour, day, week or month, and each account's row shows its share.
+priced) per hour, day, week or month, and each account's row shows its share. `b` switches the
+sections between accounts and projects, as `remuda stats --by project` divides them: one per
+directory a session started in, most tokens first, `(no directory)` for sessions that record
+none, then the same Overall. A directory too long for its column keeps its end (`…/src/app`).
+The view starts by account; `t` and `r` keep the choice. In private mode each directory is masked
+as a path (`~/•••/•••`), so two projects may read the same.
 
 ## Private mode
 
