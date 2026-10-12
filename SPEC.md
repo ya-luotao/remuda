@@ -380,7 +380,43 @@ remuda help [<command>]                            help for remuda or a command
   strips none of them: that marker is claude's own finding that it runs nested, which remuda
   cannot tell from a terminal that inherited it by mistake, and claude documents the override,
   `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`, which is the user's to set (with it, the session
-  above was saved). The commands remuda runs for an account (R7, R10, R10a) keep them too.
+  above was saved). remuda warns instead: when claude reads `CLAUDE_CODE_CHILD_SESSION` as on and
+  `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE` as off, a launch of an interactive claude session (one
+  the classification above calls a new session, a fork, or an existing session, such as a resume
+  or a continue, without `-p` / `--print`; like the classification, either counts anywhere in the
+  arguments, also in a combined short flag such as `-pc`) gives one warning: on stderr from `run`
+  and `pick --run`; from the TUI, printed after the line that says what runs, before the terminal
+  is handed over (R16), so that the user can still quit and start again with the override, and
+  again among the warnings of the launch when it ends. The warning says that claude saves no
+  transcript or prompt history for the session, so what is said in it never reaches remuda's
+  session list and cannot be resumed, though the launch is logged, and to set
+  `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` to keep it. It names no value. A `-p` run, a subcommand
+  (`claude attach <id>` among them), help, version, and a codex launch (codex does not read the
+  marker) get none. The accounts view says the same (R11). The commands remuda runs for an account
+  (R7, R10, R10a) keep these variables too.
+  Both are read as claude reads a switch: on when the value, without the blanks around it and in
+  any case, is `1`, `true`, `yes` or `on`; off otherwise, unset and empty included. This is not
+  the rule of the variables of R11, whose value is what claude uses (a token, a URL): any
+  non-empty value of those counts.
+  Basis (claude 2.1.296, an interactive session in a temporary home and `CLAUDE_CONFIG_DIR`, with
+  `ANTHROPIC_BASE_URL` pointing at a local port with nothing listening, run inside tmux, one prompt
+  sent; the lane S5 records of 2026-10-12, `evidence/out-A.txt` to `out-R.txt`): with no marker
+  (A), one transcript and one `history.jsonl` line; with `CLAUDE_CODE_CHILD_SESSION=1`, no
+  transcript and no `history.jsonl`, and the bottom of the screen says "⚠ Transcript saving is off
+  — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with
+  CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 to keep …", alike with a stand-in `TMUX` and `TMUX_PANE`
+  (B), with the ones tmux itself gives its shell (B2), and with `TMUX` and `TMUX_PANE` removed from
+  the environment, still inside tmux (C): tmux is no exception. The values tried (the override
+  with the marker set, the marker without the override), by case:
+
+  | Variable | Read as on | Read as off |
+  | --- | --- | --- |
+  | `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE` | `1` (D), `true` (H), `yes` (I), `TRUE` (J), `on` (L): saved, no status line | `0` (E), `false` (F), empty (G), `2` (K), `y` (M): not saved, the status line above |
+  | `CLAUDE_CODE_CHILD_SESSION` | `1` (B, C), `true` (O), `yes` (P), `on` (Q): not saved, the status line above | `0` (N), `2` (R): saved, no status line |
+
+  `y` is off. Blanks around a value were not tried; they are dropped as claude does for its other
+  switches. claude's changelog (read 2026-10-12) mentions tmux often, and never a tmux
+  exemption for the inherited marker, nor the marker at all.
 - **[unverified]**: an inherited `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN`
   of a session that is still running; only a socket path that does not exist was tried, and claude
   documents that each session exports its own.
@@ -727,6 +763,11 @@ appeared in no `history.jsonl`.
   - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: claude's `/usage` then repeats an old reading at
     most; remuda removes it for its own live query (R10), but claude launched as any account
     keeps it.
+  - `CLAUDE_CODE_CHILD_SESSION`, when claude reads it as on and
+    `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE` as off (R6; unlike the variables above, these two
+    are switches, so `0` or `false` is off): claude saves no interactive session started there,
+    so what is said in one never reaches remuda's session list and cannot be resumed; the
+    message names the override.
 
   Basis: claude's authentication precedence (code.claude.com/docs/en/iam) puts
   `ANTHROPIC_AUTH_TOKEN` (sent as `Authorization: Bearer`), `ANTHROPIC_API_KEY`, and
@@ -1805,7 +1846,8 @@ Numbers (usage percentages, reset times, token counts, costs, and the Stats char
 plans, login methods, providers, session IDs, pids, and times stay visible, and so do the names
 of configuration items (R22): agents, skills, commands, plugins, hook events, settings keys,
 `env` variables, MCP servers, and an agent's model, effort, and tools. The line remuda prints
-before handing the terminal to a child (R16) shows no path and follows the same rules.
+before handing the terminal to a child (R16), and the warning of R6 it may print after it, show
+no path and follow the same rules.
 
 ## R22. Account configuration (TUI)
 

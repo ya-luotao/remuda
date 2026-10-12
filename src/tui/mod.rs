@@ -254,6 +254,10 @@ pub trait Screen {
     fn suspend(&mut self) -> io::Result<()>;
     /// Takes the terminal back; the next draw repaints everything.
     fn resume(&mut self) -> io::Result<()>;
+    /// Prints a line on the terminal handed over, before the child starts (R16).
+    fn print(&mut self, line: &str) {
+        println!("{line}");
+    }
 }
 
 impl Screen for Terminal<CrosstermBackend<io::Stdout>> {
@@ -392,6 +396,24 @@ fn launch_line(what: &str, cwd: Option<&Path>, private: bool) -> String {
     }
 }
 
+/// The lines printed before a launch hands the terminal over (R16): [`launch_line`], then the
+/// warning that claude will not save this session (R6), while the user can still quit and
+/// start again with the override. It holds no path or account, so private mode shows it as it
+/// is (R21); the other warnings come with the launch's result only.
+fn handover_lines(
+    what: &str,
+    cwd: Option<&Path>,
+    private: bool,
+    env: &Env,
+    plan: &launch::Launch,
+) -> Vec<String> {
+    let mut lines = vec![launch_line(what, cwd, private)];
+    lines.extend(
+        launch::unsaved_session_warning(env, plan).map(|w| format!("remuda: warning: {w}")),
+    );
+    lines
+}
+
 fn drain(rx: &Receiver<Event>, max: usize) -> Vec<Event> {
     rx.try_iter().take(max).collect()
 }
@@ -462,20 +484,49 @@ fn run_launch(
         Ok(plan) => plan,
         Err(e) => return Ok((Err(format!("{e:#}")), Vec::new())),
     };
-    let mut warnings = launch::env_warnings(&deps.env);
-    warnings.extend(plan.notices.iter().cloned());
+    // A directory that does not exist ends the launch before the terminal is handed over, as a
+    // missing executable does: nothing is printed, logged or run, so nothing is warned about.
+    if let Err(e) = launch::check_cwd(cwd) {
+        return Ok((Err(e.to_string()), Vec::new()));
+    }
     let log = owned::launch_log(&deps.state_dir);
     if let Err(e) = screen.suspend() {
         let _ = screen.resume();
-        return Ok((Err(format!("cannot hand the terminal over: {e}")), warnings));
+        // Nothing was logged or run: the warnings about this launch (the environment's, R2 and
+        // R6, and the shared configuration's notices, R18) would tell of one that never was.
+        return Ok((
+            Err(format!("cannot hand the terminal over: {e}")),
+            Vec::new(),
+        ));
     }
-    println!("{}", launch_line(&request.what, cwd, deps.private));
-    let ran = launch::perform(program, &plan, cwd, &log);
+    let mut warnings = launch::env_warnings(&deps.env, &plan);
+    warnings.extend(plan.notices.iter().cloned());
+    // Printed by `perform` once its own directory check has passed, right before claude starts:
+    // a directory removed since the check above (during the handover, say) prints nothing.
+    let lines = handover_lines(&request.what, cwd, deps.private, &deps.env, &plan);
+    let ran = launch::perform(program, &plan, cwd, &log, || {
+        for line in &lines {
+            screen.print(line);
+        }
+    });
     screen
         .resume()
         .with_context(|| format!("cannot take the terminal back after {}", provider.program()))?;
+    Ok(launch_result(ran, warnings))
+}
+
+/// How a launch that got the terminal ended, with its warnings (R16). A directory that was
+/// removed after the check before the handover is refused by [`launch::perform`] with nothing
+/// logged or run: the warnings about the launch would then tell of one that never was.
+fn launch_result(
+    ran: launch::Ran,
+    mut warnings: Vec<String>,
+) -> (Result<Exit, String>, Vec<String>) {
+    if ran.refused {
+        warnings.clear();
+    }
     warnings.extend(ran.log_error);
-    Ok((ran.status.map(exit_of).map_err(|e| e.to_string()), warnings))
+    (ran.status.map(exit_of).map_err(|e| e.to_string()), warnings)
 }
 
 /// `remuda setup --provider <p> <name>` from the TUI (R5, R16, R17): the same checks and steps
@@ -656,6 +707,125 @@ mod decode_tests {
             launch_line("new session as max", None, false),
             "remuda: new session as max"
         );
+    }
+
+    /// R6, R16: a launch whose directory was removed after the check before the handover is
+    /// refused by `launch::perform` with nothing logged or run, so its warnings are dropped; one
+    /// that ran keeps them, in order, with a launch log that could not be written after them.
+    #[test]
+    fn launch_result_drops_the_warnings_of_a_refused_launch() {
+        use std::os::unix::process::ExitStatusExt;
+        let warnings = || vec!["first".to_string(), "second".to_string()];
+        let refused = launch::Ran {
+            status: Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "/gone is not an existing directory",
+            )),
+            log_error: None,
+            refused: true,
+        };
+        assert_eq!(
+            launch_result(refused, warnings()),
+            (
+                Err("/gone is not an existing directory".to_string()),
+                Vec::new()
+            )
+        );
+        let ran = launch::Ran {
+            status: Ok(ExitStatus::from_raw(3 << 8)),
+            log_error: Some("cannot write launch log /x: denied".into()),
+            refused: false,
+        };
+        assert_eq!(
+            launch_result(ran, warnings()),
+            (
+                Ok(Exit::Code(3)),
+                vec![
+                    "first".to_string(),
+                    "second".to_string(),
+                    "cannot write launch log /x: denied".to_string()
+                ]
+            )
+        );
+    }
+
+    /// R6, R16, R21: before the terminal is handed over, the launch line is followed by the
+    /// warning that claude will not save the session, only for an interactive claude session
+    /// under the marker without the override, and alike in private mode. The Keychain warning
+    /// (with its path) waits for the launch's result.
+    #[test]
+    fn handover_lines_warn_about_an_unsaved_session_before_the_launch() {
+        let max = Account {
+            provider: crate::registry::CLAUDE,
+            name: "max".into(),
+            home: crate::registry::Home::Path("/p/max".into()),
+        };
+        let codex = Account {
+            provider: crate::registry::CODEX,
+            ..max.clone()
+        };
+        let plan = |account: &Account, args: &[&str]| {
+            launch::prepare(
+                account,
+                args.iter().map(|a| a.to_string()).collect(),
+                None,
+                "t".into(),
+                || "U".into(),
+            )
+        };
+        let env = |pairs: &[(&str, &str)]| -> Env {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let dir = Path::new("/Users/you/space/remuda");
+        let warning = format!("remuda: warning: {}", launch::child_session_warning());
+        let marked = env(&[
+            ("CLAUDE_CODE_CHILD_SESSION", "1"),
+            ("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/secure/x"),
+        ]);
+        assert_eq!(
+            handover_lines(
+                "new session as max",
+                Some(dir),
+                false,
+                &marked,
+                &plan(&max, &[])
+            ),
+            [
+                "remuda: new session as max in /Users/you/space/remuda".to_string(),
+                warning.clone()
+            ]
+        );
+        assert_eq!(
+            handover_lines(
+                "resume 766560c5 as account-1",
+                Some(dir),
+                true,
+                &marked,
+                &plan(&max, &["--resume", "766560c5-0000-4000-8000-000000000000"])
+            ),
+            [
+                "remuda: resume 766560c5 as account-1".to_string(),
+                warning.clone()
+            ]
+        );
+        let alone = |env: &Env, account: &Account, args: &[&str]| {
+            handover_lines("x", None, false, env, &plan(account, args))
+        };
+        assert_eq!(alone(&marked, &max, &["-p", "hi"]), ["remuda: x"]);
+        assert_eq!(alone(&marked, &codex, &[]), ["remuda: x"]);
+        let forced = env(&[
+            ("CLAUDE_CODE_CHILD_SESSION", "1"),
+            ("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "true"),
+        ]);
+        assert_eq!(alone(&forced, &max, &[]), ["remuda: x"]);
+        let not_marked = env(&[("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/secure/x")]);
+        assert_eq!(alone(&not_marked, &max, &[]), ["remuda: x"]);
+        for line in alone(&marked, &max, &[]) {
+            assert!(!line.contains("/secure/x"), "{line}");
+        }
     }
 }
 

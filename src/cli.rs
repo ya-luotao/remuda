@@ -656,7 +656,7 @@ fn exec_plan(
     plan: &launch::Launch,
     ctx: &Context,
 ) -> Result<ExitCode> {
-    for warning in launch::env_warnings(&ctx.env) {
+    for warning in launch::env_warnings(&ctx.env, plan) {
         eprintln!("remuda: warning: {warning}");
     }
     for notice in &plan.notices {

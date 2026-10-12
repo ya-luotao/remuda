@@ -325,6 +325,52 @@ fn checks_keep_what_they_say_around_their_paths_in_private_mode() {
     leaks_nothing(&private);
 }
 
+/// R6, R11, R21: the check about an inherited `CLAUDE_CODE_CHILD_SESSION` is remuda's own words
+/// with no path or account in them, last among the environment's: private mode shows it whole.
+#[test]
+fn the_child_session_check_stays_whole_in_private_mode() {
+    let h = Homes::new();
+    let accounts = h.accounts();
+    let mut env = h.env.clone();
+    env.insert(checks::API_KEY_VAR.into(), "sk-test".into());
+    env.insert("CLAUDE_CODE_CHILD_SESSION".into(), "TRUE".into());
+    let stores = index::stores(&accounts, &env);
+    let found = checks::run(&accounts, &env, &stores);
+    let said = "CLAUDE_CODE_CHILD_SESSION is set: claude saves no transcript or prompt history for \
+                an interactive session started here, so what is said in it never reaches remuda's \
+                session list and cannot be resumed, though the launch is logged; set \
+                CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 to keep it";
+    let messages: Vec<(Option<String>, String)> = found
+        .iter()
+        .map(|c| (c.account.clone(), c.message.to_string()))
+        .collect();
+    assert_eq!(
+        messages[..2],
+        [
+            (
+                None,
+                "ANTHROPIC_API_KEY is set: it overrides every account's /login".to_string()
+            ),
+            (None, said.to_string()),
+        ]
+    );
+
+    let mut app = h.app(accounts);
+    update(&mut app, Event::Checks(found));
+    app.private = true;
+    let copy = privacy::redacted(&app);
+    let masked: Vec<String> = copy
+        .checks
+        .iter()
+        .flatten()
+        .map(|c| c.message.to_string())
+        .collect();
+    assert_eq!(masked[1], said);
+    let private = screen(&app);
+    assert!(!private.contains("TRUE"), "{private}");
+    leaks_nothing(&private);
+}
+
 /// R11, R18, R21: the checks whose words come from the catalog of a home's items (what a
 /// member loses without a link, what breaks when an item is another account's), from the
 /// files to the screen. Each end of the link to make is a path of its own, a settings key read
