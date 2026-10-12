@@ -312,6 +312,26 @@ fn run_codex_resume_logs_the_resumed_id() {
     assert_eq!(log[1]["injected"], json!(false));
 }
 
+/// R6, R17: codex does not read `CLAUDE_CODE_CHILD_SESSION`, so a codex launch gets no
+/// warning about it, interactive or not.
+#[test]
+fn run_codex_does_not_warn_about_the_child_session_marker() {
+    let sb = Sandbox::new();
+    sb.install_codex();
+    register(&sb, &[("codex", "work", WORK_HOME)]);
+    let id = "019c1e08-e4f6-7d70-a129-38ec744a3f3c";
+    for args in [&[][..], &["fix it"], &["resume", id]] {
+        sb.remuda()
+            .env("CLAUDE_CODE_CHILD_SESSION", "1")
+            .args(["run", "codex:work"])
+            .args(args)
+            .assert()
+            .success()
+            .stderr("");
+    }
+    assert_eq!(sb.codex_invocations().len(), 3);
+}
+
 #[test]
 fn run_codex_without_codex_on_path() {
     let sb = Sandbox::new();

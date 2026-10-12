@@ -17,6 +17,11 @@ use crate::{Env, owned};
 
 pub const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
 pub const SECURESTORAGE_VAR: &str = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
+/// What a claude session gives the processes of its tools: claude's own finding that it runs
+/// nested (R6).
+pub const CHILD_SESSION_VAR: &str = "CLAUDE_CODE_CHILD_SESSION";
+/// claude's override that saves an interactive session despite [`CHILD_SESSION_VAR`] (R6).
+pub const FORCE_PERSISTENCE_VAR: &str = "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE";
 
 /// The one change remuda makes to the inherited environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +40,9 @@ pub fn env_change(account: &Account) -> EnvChange {
     }
 }
 
-/// Warnings about the inherited environment worth showing before a launch.
-pub fn env_warnings(env: &Env) -> Vec<String> {
+/// Warnings about the inherited environment worth showing before `plan` is launched, in a
+/// fixed order.
+pub fn env_warnings(env: &Env, plan: &Launch) -> Vec<String> {
     let mut warnings = Vec::new();
     if let Some(value) = env.get(SECURESTORAGE_VAR) {
         warnings.push(format!(
@@ -44,7 +50,46 @@ pub fn env_warnings(env: &Env) -> Vec<String> {
              so the Keychain entry is not keyed by the account home"
         ));
     }
+    warnings.extend(unsaved_session_warning(env, plan));
     warnings
+}
+
+/// The warning about an inherited [`CHILD_SESSION_VAR`] for `plan`: only before an interactive
+/// claude session that claude will not save (R6). The TUI also prints it before handing the
+/// terminal over (R16).
+pub fn unsaved_session_warning(env: &Env, plan: &Launch) -> Option<String> {
+    (plan.interactive_claude && child_session_unsaved(env)).then(child_session_warning)
+}
+
+/// Whether claude would save no interactive session started under `env`: the marker is on and
+/// the override is not, each read as claude reads a switch ([`claude_truthy`]; R6, R11). remuda
+/// does not strip the marker or set the override (R6).
+pub fn child_session_unsaved(env: &Env) -> bool {
+    let on = |var: &str| env.get(var).is_some_and(|v| claude_truthy(v));
+    on(CHILD_SESSION_VAR) && !on(FORCE_PERSISTENCE_VAR)
+}
+
+/// A switch in claude's environment is on when its value, without surrounding blanks and in
+/// any case, is `1`, `true`, `yes` or `on`; anything else, `0`, `false`, `y`, `2` and the empty
+/// string among them, is off (R6: verified on 2.1.296 for both variables of
+/// [`child_session_unsaved`], except the blanks).
+pub fn claude_truthy(value: &str) -> bool {
+    let value = value.trim();
+    ["1", "true", "yes", "on"]
+        .iter()
+        .any(|on| value.eq_ignore_ascii_case(on))
+}
+
+/// What remuda says when [`child_session_unsaved`], before a launch (R6) and in the accounts
+/// view (R11) alike: the consequence for remuda itself and the remedy, never a value. It has
+/// no `/`, quote or `@`, so private mode (R21) leaves it whole.
+pub fn child_session_warning() -> String {
+    format!(
+        "{CHILD_SESSION_VAR} is set: claude saves no transcript or prompt history for an \
+         interactive session started here, so what is said in it never reaches remuda's session \
+         list and cannot be resumed, though the launch is logged; set {FORCE_PERSISTENCE_VAR}=1 to \
+         keep it"
+    )
 }
 
 /// What a `claude` command line means for session tracking (R6). A `codex` command line is
@@ -170,6 +215,15 @@ pub fn classify(args: &[String]) -> Intent {
     }
 }
 
+/// claude's print mode (`-p` / `--print`, also in a combined short-flag token such as `-pc`),
+/// anywhere in the args: like [`classify`], a `--` changes nothing, and an argument that is
+/// exactly `-p` counts even where it may be a prompt.
+fn is_print(args: &[String]) -> bool {
+    args.iter().any(|a| {
+        matches!(a.as_str(), "-p" | "--print") || short_cluster(a).is_some_and(|c| c.contains('p'))
+    })
+}
+
 fn is_help_or_version(arg: &str) -> bool {
     matches!(arg, "-h" | "--help" | "-v" | "--version")
         || short_cluster(arg).is_some_and(|c| c.contains(['h', 'v']))
@@ -273,6 +327,11 @@ pub struct Launch {
     /// One-line messages for the user about this launch.
     pub notices: Vec<String>,
     pub record: LaunchRecord,
+    /// An interactive claude session: what [`classify`] calls a new session, a fork or an
+    /// existing one (a resume, a continue, ...), without `-p` / `--print`. The one kind of
+    /// launch claude does not save under an inherited [`CHILD_SESSION_VAR`] (R6); never a codex
+    /// launch, a subcommand (`attach <id>` included), help or version.
+    pub interactive_claude: bool,
 }
 
 /// Decides args, env and the log record. `new_session_id` is called only for new claude
@@ -328,6 +387,9 @@ pub fn prepare_with(
         Provider::Claude => classify(&user_args),
         Provider::Codex => codex_intent(&user_args),
     };
+    let interactive_claude = account.provider == Provider::Claude
+        && intent != Intent::NotASession
+        && !is_print(&user_args);
     let shared = match (account.provider, &intent) {
         (Provider::Claude, Intent::NewSession | Intent::Fork { .. } | Intent::Existing { .. }) => {
             shared(&user_args)?
@@ -367,6 +429,7 @@ pub fn prepare_with(
         unset_env: shared.unset,
         notices: shared.notices,
         record,
+        interactive_claude,
     })
 }
 
@@ -539,14 +602,225 @@ mod tests {
         );
     }
 
+    /// The plan `remuda run` would make for `args` as `account`.
+    fn planned(account: &Account, v: &[&str]) -> Launch {
+        prepare(account, args(v), None, "t".into(), || "U".into())
+    }
+
     #[test]
     fn securestorage_warning() {
+        let max = account("max", Home::Path("/p/max".into()));
+        let codex = Account {
+            provider: CODEX,
+            name: "x".into(),
+            home: Home::Path("/c/".into()),
+        };
         let mut env = Env::new();
-        assert!(env_warnings(&env).is_empty());
+        for plan in [
+            planned(&max, &[]),
+            planned(&max, &["-p", "hi"]),
+            planned(&codex, &[]),
+        ] {
+            assert!(env_warnings(&env, &plan).is_empty());
+        }
         env.insert(SECURESTORAGE_VAR.into(), "/s".into());
-        let w = env_warnings(&env);
-        assert_eq!(w.len(), 1);
-        assert!(w[0].contains(SECURESTORAGE_VAR));
+        // Unchanged by the plan: every launch, codex and `-p` included.
+        for plan in [
+            planned(&max, &[]),
+            planned(&max, &["-p", "hi"]),
+            planned(&codex, &[]),
+        ] {
+            let w = env_warnings(&env, &plan);
+            assert_eq!(w.len(), 1);
+            assert!(w[0].contains(SECURESTORAGE_VAR));
+        }
+    }
+
+    /// R6: what a plan says about claude saving the session is decided once, from the intent,
+    /// the provider and print mode, so no caller parses the args again.
+    #[test]
+    fn interactive_claude_is_decided_in_the_plan() {
+        let max = account("max", Home::Path("/p/max".into()));
+        let id = "766560c5-0000-4000-8000-000000000000";
+        for (v, interactive) in [
+            (&[][..], true),
+            (&["-n", "fix it"], true),
+            (&["--resume", id], true),
+            (&["--resume", id, "--fork-session"], true),
+            (&["-c"], true),
+            (&["--continue"], true),
+            (&["--teleport"], true),
+            (&["-p", "hi"], false),
+            (&["--print", "hi"], false),
+            (&["-pc"], false),
+            (&["--resume", id, "-p", "hi"], false),
+            (&["-c", "--fork-session", "-p", "go on"], false),
+            (&["--model", "opus", "--", "-p"], false),
+            (&["doctor"], false),
+            (&["attach", "abcd1234"], false),
+            (&["--help"], false),
+            (&["-v"], false),
+            // A prompt that only holds `-p` among other words is not print mode.
+            (&["explain -p"], true),
+            (&["--model", "opus", "--print-request"], true),
+        ] {
+            assert_eq!(planned(&max, v).interactive_claude, interactive, "{v:?}");
+        }
+        let codex = Account {
+            provider: CODEX,
+            name: "x".into(),
+            home: Home::Path("/c/".into()),
+        };
+        for v in [&[][..], &["resume", id], &["fork", id], &["fix the bug"]] {
+            assert!(!planned(&codex, v).interactive_claude, "codex {v:?}");
+        }
+    }
+
+    /// R6: the two switches are read as claude 2.1.296 reads them (the table of SPEC R6, one
+    /// row per value tried, `.lane` evidence E–R), and blanks around the value are dropped.
+    #[test]
+    fn switches_are_read_as_claude_reads_them() {
+        for on in ["1", "true", "yes", "TRUE", "on", " 1 ", "True\n", "\tON"] {
+            assert!(claude_truthy(on), "{on:?}");
+        }
+        for off in [
+            "0", "false", "", "2", "y", "no", "off", "  ", "1 1", "truthy",
+        ] {
+            assert!(!claude_truthy(off), "{off:?}");
+        }
+        let unsaved = |marker: &str, force: Option<&str>| {
+            let mut env = Env::new();
+            env.insert(CHILD_SESSION_VAR.into(), marker.into());
+            if let Some(force) = force {
+                env.insert(FORCE_PERSISTENCE_VAR.into(), force.into());
+            }
+            child_session_unsaved(&env)
+        };
+        // The override: D, H, I, J, L keep the session; E, F, G, K, M do not.
+        for force in ["1", "true", "yes", "TRUE", "on"] {
+            assert!(!unsaved("1", Some(force)), "{force:?}");
+        }
+        for force in ["0", "false", "", "2", "y"] {
+            assert!(unsaved("1", Some(force)), "{force:?}");
+        }
+        // The marker: B, C, O, P, Q are the marker; N, R are not.
+        for marker in ["1", "true", "yes", "on"] {
+            assert!(unsaved(marker, None), "{marker:?}");
+        }
+        for marker in ["0", "2"] {
+            assert!(!unsaved(marker, None), "{marker:?}");
+        }
+    }
+
+    /// R6: an inherited `CLAUDE_CODE_CHILD_SESSION` is warned about before an interactive
+    /// claude session, unless claude's override is set; an empty value is not set, for both.
+    /// The warning says what it means for remuda and the remedy, never the value.
+    #[test]
+    fn child_session_warning_before_interactive_claude_sessions_only() {
+        let max = account("max", Home::Path("/p/max".into()));
+        let codex = Account {
+            provider: CODEX,
+            name: "x".into(),
+            home: Home::Path("/c/".into()),
+        };
+        let id = "766560c5-0000-4000-8000-000000000000";
+        let said = "CLAUDE_CODE_CHILD_SESSION is set: claude saves no transcript or prompt history \
+                    for an interactive session started here, so what is said in it never reaches \
+                    remuda's session list and cannot be resumed, though the launch is logged; set \
+                    CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 to keep it";
+        assert_eq!(child_session_warning(), said);
+        let interactive = [
+            planned(&max, &[]),
+            planned(&max, &["--resume", id, "--fork-session"]),
+            planned(&max, &["--resume", id]),
+            planned(&max, &["-c"]),
+        ];
+        let not = [
+            planned(&max, &["-p", "hi"]),
+            planned(&max, &["--print", "hi"]),
+            planned(&max, &["--resume", id, "-p", "hi"]),
+            planned(&max, &["doctor"]),
+            planned(&max, &["--help"]),
+            planned(&codex, &[]),
+            planned(&codex, &["resume", id]),
+        ];
+        let env = |pairs: &[(&str, &str)]| -> Env {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+
+        let marked = env(&[(CHILD_SESSION_VAR, "TRUE")]);
+        assert!(child_session_unsaved(&marked));
+        for plan in &interactive {
+            let w = env_warnings(&marked, plan);
+            assert_eq!(w, [said], "{:?}", plan.record.args);
+            assert!(!w[0].contains("TRUE"));
+        }
+        for plan in &not {
+            assert!(env_warnings(&marked, plan).is_empty(), "{:?}", plan.record);
+        }
+
+        // Each read as claude reads a switch: the override on, nothing; off (`0`, empty), as
+        // if not set. The marker off (`0`, empty): nothing.
+        for (pairs, warns) in [
+            (
+                &[(CHILD_SESSION_VAR, "1"), (FORCE_PERSISTENCE_VAR, "1")][..],
+                false,
+            ),
+            (
+                &[(CHILD_SESSION_VAR, "1"), (FORCE_PERSISTENCE_VAR, "0")],
+                true,
+            ),
+            (
+                &[(CHILD_SESSION_VAR, "true"), (FORCE_PERSISTENCE_VAR, "On")],
+                false,
+            ),
+            (&[(CHILD_SESSION_VAR, "0")], false),
+            (&[(CHILD_SESSION_VAR, "yes")], true),
+            (
+                &[(CHILD_SESSION_VAR, "1"), (FORCE_PERSISTENCE_VAR, "")],
+                true,
+            ),
+            (&[(CHILD_SESSION_VAR, "")], false),
+            (
+                &[(CHILD_SESSION_VAR, ""), (FORCE_PERSISTENCE_VAR, "")],
+                false,
+            ),
+            (&[(FORCE_PERSISTENCE_VAR, "1")], false),
+            (&[], false),
+        ] {
+            let e = env(pairs);
+            assert_eq!(child_session_unsaved(&e), warns, "{pairs:?}");
+            for plan in &interactive {
+                assert_eq!(
+                    env_warnings(&e, plan).len(),
+                    usize::from(warns),
+                    "{pairs:?}"
+                );
+            }
+        }
+
+        // Both warnings: the Keychain one first, then this one, every time.
+        let both = env(&[(SECURESTORAGE_VAR, "/s"), (CHILD_SESSION_VAR, "1")]);
+        for plan in &interactive {
+            let w = env_warnings(&both, plan);
+            assert_eq!(w.len(), 2);
+            assert!(
+                w[0].starts_with("CLAUDE_SECURESTORAGE_CONFIG_DIR is set"),
+                "{w:?}"
+            );
+            assert_eq!(w[1], said);
+        }
+        for plan in &not {
+            let w = env_warnings(&both, plan);
+            assert_eq!(w.len(), 1);
+            assert!(
+                w[0].starts_with("CLAUDE_SECURESTORAGE_CONFIG_DIR is set"),
+                "{w:?}"
+            );
+        }
     }
 
     #[test]

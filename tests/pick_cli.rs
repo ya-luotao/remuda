@@ -1481,6 +1481,37 @@ fn run_launches_codex_with_the_options() {
     );
 }
 
+/// R6, R23: `pick --run` launches through `run`'s path, so an inherited
+/// `CLAUDE_CODE_CHILD_SESSION` gets the same warning before an interactive session, and none
+/// before a `-p` run.
+#[test]
+fn run_warns_about_an_inherited_child_session_marker() {
+    let (sb, _, _) = two_accounts(MODELS);
+    let warning = "remuda: warning: CLAUDE_CODE_CHILD_SESSION is set: claude saves no transcript \
+                   or prompt history for an interactive session started here, so what is said in \
+                   it never reaches remuda's session list and cannot be resumed, though the launch \
+                   is logged; set CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 to keep it\n";
+    let launch = |args: &[&str]| {
+        let out = sb
+            .remuda()
+            .env("CLAUDE_CODE_CHILD_SESSION", "TRUE")
+            .args(["pick", "--run", "--"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stderr).unwrap()
+    };
+    let stderr = launch(&["-n", "fix it"]);
+    assert!(stderr.starts_with("remuda: pick: "), "{stderr}");
+    assert!(stderr.ends_with(warning), "{stderr}");
+    assert_eq!(stderr.matches("CLAUDE_CODE_CHILD_SESSION").count(), 1);
+    assert!(!stderr.contains("TRUE"), "{stderr}");
+    let stderr = launch(&["-p", "hello"]);
+    assert!(!stderr.contains("CLAUDE_CODE_CHILD_SESSION"), "{stderr}");
+    assert_eq!(sb.invocations().len(), 2);
+}
+
 /// An option the user set is not injected; arguments that neither start a new session nor
 /// name one to resume are refused before anything runs, with `--run` or without (R23
 /// Resuming); `--run --json` is a usage error, and arguments after `--` no longer need `--run`.

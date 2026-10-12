@@ -423,6 +423,68 @@ fn tui_launches_name_authentication_read_through_a_link() {
     );
 }
 
+/// R6, R16, R21: a launch from the TUI gives the same warning as `run` about an inherited
+/// `CLAUDE_CODE_CHILD_SESSION`, among the launch's warnings, before an interactive session
+/// only. It names no path or account, so private mode shows it whole.
+#[test]
+fn tui_launches_warn_about_an_inherited_child_session_marker() {
+    let sb = Sandbox::new();
+    let max = named("max", "/p/max");
+    register(&sb, &[&max]);
+    let dir = project(&sb);
+    let launch = |env: &[(&str, &str)], args: &[&str]| {
+        let mut deps = deps(&sb);
+        for (k, v) in env {
+            deps.env.insert(k.to_string(), v.to_string());
+        }
+        let request = LaunchRequest {
+            account: max.clone(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            cwd: Some(dir.clone()),
+            what: "new session as max".into(),
+        };
+        let mut screen = FakeScreen::default();
+        match tui::launch_in_foreground(&mut screen, &deps, request, &quiet()).unwrap() {
+            Event::Launched {
+                warnings, result, ..
+            } => {
+                assert_eq!(result, Ok(Exit::Code(0)));
+                warnings
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    let said = launch::child_session_warning();
+    assert_eq!(
+        said,
+        "CLAUDE_CODE_CHILD_SESSION is set: claude saves no transcript or prompt history for an \
+         interactive session started here, so what is said in it never reaches remuda's session \
+         list and cannot be resumed, though the launch is logged; set \
+         CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 to keep it"
+    );
+    let marker = [("CLAUDE_CODE_CHILD_SESSION", "TRUE")];
+    assert_eq!(launch(&marker, &["-n", "fix it"]), [said.as_str()]);
+    assert_eq!(
+        launch(
+            &marker,
+            &["--resume", "766560c5-0000-4000-8000-000000000000"]
+        ),
+        [said.as_str()]
+    );
+    assert_eq!(launch(&marker, &["-p", "hi"]), Vec::<String>::new());
+    let forced = [
+        ("CLAUDE_CODE_CHILD_SESSION", "1"),
+        ("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "1"),
+    ];
+    assert_eq!(launch(&forced, &[]), Vec::<String>::new());
+    assert_eq!(launch(&[], &[]), Vec::<String>::new());
+    assert_eq!(sb.invocations().len(), 5);
+    // Private mode masks text from elsewhere from its first path on: there is none.
+    for c in ['/', '@', '"', '\u{201c}'] {
+        assert!(!said.contains(c), "{c:?}");
+    }
+}
+
 /// R16, R18: the TUI launches through the same path as `run`: shared configuration from the
 /// registry as it is at launch goes before the arguments, and its notices come back as
 /// warnings.

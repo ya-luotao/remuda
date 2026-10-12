@@ -13,7 +13,7 @@ use crate::index::Store;
 use crate::privacy::Marked;
 use crate::registry::{Account, CLAUDE, Home, Sharing};
 use crate::share::{self, Installs};
-use crate::usage;
+use crate::{launch, usage};
 
 /// One problem worth a warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +77,13 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
                 message: say(format!("{var} is set: {what}")),
             });
         }
+    }
+    // Last of the environment: it needs two variables, the marker and claude's override (R6).
+    if launch::child_session_unsaved(env) {
+        checks.push(Check {
+            account: None,
+            message: say(launch::child_session_warning()),
+        });
     }
     // Claude and codex homes alike: only directory listings and `lstat`/`stat`/`readlink`, so
     // codex's `auth.json` (credentials, R4) is never opened.
@@ -582,6 +589,7 @@ mod tests {
             ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "zq-traffic"),
             ("ANTHROPIC_BASE_URL", "https://zq-gateway.example/v1"),
             ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-zq"),
+            ("CLAUDE_CODE_CHILD_SESSION", "TRUE"),
             ("ANTHROPIC_AUTH_TOKEN", "zq-bearer"),
         ];
         for (var, value) in values {
@@ -596,6 +604,11 @@ mod tests {
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC is set: claude's /usage then only repeats \
              a reading taken within the hour, if any; remuda removes it for its own live usage \
              queries, but claude launched as any account keeps it",
+            // Last, whatever its place among the variables (R6).
+            "CLAUDE_CODE_CHILD_SESSION is set: claude saves no transcript or prompt history for an \
+             interactive session started here, so what is said in it never reaches remuda's \
+             session list and cannot be resumed, though the launch is logged; set \
+             CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 to keep it",
         ];
         assert_eq!(
             messages(&got),
@@ -610,7 +623,7 @@ mod tests {
         // After the API key, which keeps its place first.
         f.env.insert(API_KEY_VAR.into(), "sk-test".into());
         let got = run(&[], &f.env, &[]);
-        assert_eq!(got.len(), 5);
+        assert_eq!(got.len(), 6);
         assert_eq!(
             messages(&got)[0],
             (
@@ -622,6 +635,36 @@ mod tests {
             f.env.insert(var.into(), String::new());
         }
         assert_eq!(run(&[], &f.env, &[]).len(), 1);
+    }
+
+    /// R11, R6: the inherited marker is told only while claude's override is off; each is read
+    /// as claude reads a switch, so an empty value, `0` or `false` is off.
+    #[test]
+    fn child_session_check_needs_the_marker_without_the_override() {
+        let said = launch::child_session_warning();
+        let child = |marker: Option<&str>, force: Option<&str>| {
+            let mut f = Root::new();
+            if let Some(v) = marker {
+                f.env.insert(launch::CHILD_SESSION_VAR.into(), v.into());
+            }
+            if let Some(v) = force {
+                f.env.insert(launch::FORCE_PERSISTENCE_VAR.into(), v.into());
+            }
+            messages(&run(&[], &f.env, &[]))
+                .into_iter()
+                .map(|(account, m)| (account.map(str::to_string), m.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(child(Some("1"), None), [(None, said.clone())]);
+        assert_eq!(child(Some("1"), Some("")), [(None, said.clone())]);
+        assert_eq!(child(Some("on"), Some("0")), [(None, said.clone())]);
+        assert_eq!(child(Some("1"), Some("false")), [(None, said)]);
+        assert_eq!(child(Some("1"), Some("1")), []);
+        assert_eq!(child(Some("1"), Some("YES")), []);
+        assert_eq!(child(Some(""), None), []);
+        assert_eq!(child(Some("0"), None), []);
+        assert_eq!(child(None, Some("1")), []);
+        assert_eq!(child(None, None), []);
     }
 
     #[test]

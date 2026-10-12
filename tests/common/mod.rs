@@ -28,8 +28,8 @@ use tempfile::TempDir;
 /// `css=<unset|set:VALUE>` (CLAUDE_SECURESTORAGE_CONFIG_DIR),
 /// `acm=<unset|set:VALUE>` (CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD, R18),
 /// `rmd=<unset|set:VALUE>` (CLAUDE_CODE_REMOTE_MEMORY_DIR, R18),
-/// `dnt=<unset|set:VALUE>` (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, R10), then `arg=<argv[i]>`
-/// per argument.
+/// `dnt=<unset|set:VALUE>` (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, R10),
+/// `chs=<unset|set:VALUE>` (CLAUDE_CODE_CHILD_SESSION, R6), then `arg=<argv[i]>` per argument.
 ///
 /// Fixtures live in `$CLAUDE_CONFIG_DIR/<name>`, or `$HOME/.<name>` when it is unset:
 /// - `fake-sleep`: if present, `exec sleep <its contents>` (simulates a hang);
@@ -91,6 +91,11 @@ if [ -n "${FAKE_CLAUDE_OUT+x}" ]; then
       printf 'dnt=set:%s\0' "$CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
     else
       printf 'dnt=unset\0'
+    fi
+    if [ -n "${CLAUDE_CODE_CHILD_SESSION+x}" ]; then
+      printf 'chs=set:%s\0' "$CLAUDE_CODE_CHILD_SESSION"
+    else
+      printf 'chs=unset\0'
     fi
     for a in "$@"; do
       printf 'arg=%s\0' "$a"
@@ -346,6 +351,8 @@ pub struct Invocation {
     pub memory_dir: Option<String>,
     /// `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` (R10); `None` when unset.
     pub nonessential_traffic: Option<String>,
+    /// `CLAUDE_CODE_CHILD_SESSION` (R6); `None` when unset.
+    pub child_session: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -805,6 +812,7 @@ pub fn parse_invocations(bytes: &[u8]) -> Vec<Invocation> {
         let add_dir_claude_md = parse_var(iter.next().and_then(|f| f.strip_prefix("acm=")));
         let memory_dir = parse_var(iter.next().and_then(|f| f.strip_prefix("rmd=")));
         let nonessential_traffic = parse_var(iter.next().and_then(|f| f.strip_prefix("dnt=")));
+        let child_session = parse_var(iter.next().and_then(|f| f.strip_prefix("chs=")));
         let mut args = Vec::new();
         while let Some(f) = iter.peek() {
             if *f == "@@invocation" {
@@ -821,6 +829,7 @@ pub fn parse_invocations(bytes: &[u8]) -> Vec<Invocation> {
             add_dir_claude_md,
             memory_dir,
             nonessential_traffic,
+            child_session,
             args,
         });
     }

@@ -205,6 +205,118 @@ fn run_without_securestorage_dir_does_not_set_it() {
     assert_eq!(sb.only_invocation().securestorage_dir, None);
 }
 
+/// The warning `remuda run` gives before an interactive claude session under an inherited
+/// `CLAUDE_CODE_CHILD_SESSION` (R6), whole.
+const CHILD_SESSION_WARNING: &str = "remuda: warning: CLAUDE_CODE_CHILD_SESSION is set: claude \
+    saves no transcript or prompt history for an interactive session started here, so what is said \
+    in it never reaches remuda's session list and cannot be resumed, though the launch is logged; \
+    set CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 to keep it\n";
+
+/// R6: an inherited `CLAUDE_CODE_CHILD_SESSION` gets one warning before an interactive claude
+/// session (new, resumed), never with its value, and is passed on unchanged: remuda strips
+/// nothing.
+#[test]
+fn run_warns_about_an_inherited_child_session_marker() {
+    let sb = sandbox_with_max();
+    let id = "766560c5-0000-4000-8000-000000000000";
+    for args in [&["-n", "fix it"][..], &["--resume", id]] {
+        sb.remuda()
+            .env("CLAUDE_CODE_CHILD_SESSION", "TRUE")
+            .args(["run", "max"])
+            .args(args)
+            .assert()
+            .success()
+            .stderr(CHILD_SESSION_WARNING);
+    }
+    let all = sb.invocations();
+    assert_eq!(all.len(), 2);
+    for inv in all {
+        assert_eq!(
+            inv.child_session.as_deref(),
+            Some("TRUE"),
+            "R6: not stripped"
+        );
+    }
+    // The launches are logged, as the warning says.
+    assert_eq!(sb.launches().len(), 2);
+}
+
+/// R6: no warning for a `-p` run, a subcommand, with claude's override on, or with the marker
+/// off; each is read as claude reads a switch (`1`, `true`, `yes`, `on`, any case, blanks
+/// dropped). The marker still goes on.
+#[test]
+fn run_does_not_warn_about_the_marker_when_claude_saves_the_session() {
+    let sb = sandbox_with_max();
+    type Case<'a> = (&'a [(&'a str, &'a str)], &'a [&'a str]);
+    let quiet: [Case; 9] = [
+        (&[("CLAUDE_CODE_CHILD_SESSION", "1")], &["-p", "hi"]),
+        (&[("CLAUDE_CODE_CHILD_SESSION", "1")], &["--print", "hi"]),
+        (&[("CLAUDE_CODE_CHILD_SESSION", "1")], &["doctor"]),
+        (
+            &[
+                ("CLAUDE_CODE_CHILD_SESSION", "1"),
+                ("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "1"),
+            ],
+            &[],
+        ),
+        (
+            &[
+                ("CLAUDE_CODE_CHILD_SESSION", "yes"),
+                ("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", " On "),
+            ],
+            &[],
+        ),
+        (&[("CLAUDE_CODE_CHILD_SESSION", "")], &[]),
+        (&[("CLAUDE_CODE_CHILD_SESSION", "0")], &[]),
+        (&[("CLAUDE_CODE_CHILD_SESSION", "2")], &[]),
+        (&[("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "1")], &[]),
+    ];
+    for (env, args) in quiet {
+        sb.remuda()
+            .envs(env.iter().copied())
+            .args(["run", "max"])
+            .args(args)
+            .assert()
+            .success()
+            .stderr("");
+    }
+    // An override that claude reads as off is no override: empty, `0`, `false`, `y`.
+    for force in ["", "0", "false", "y"] {
+        sb.remuda()
+            .env("CLAUDE_CODE_CHILD_SESSION", "1")
+            .env("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", force)
+            .args(["run", "max"])
+            .assert()
+            .success()
+            .stderr(CHILD_SESSION_WARNING);
+    }
+    let all = sb.invocations();
+    assert_eq!(all.len(), 13);
+    assert_eq!(all[0].child_session.as_deref(), Some("1"));
+}
+
+/// R6, R2: both warnings, the Keychain one first.
+#[test]
+fn run_gives_both_environment_warnings_in_order() {
+    let sb = sandbox_with_max();
+    let out = sb
+        .remuda()
+        .env("CLAUDE_CODE_CHILD_SESSION", "1")
+        .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/secure/x")
+        .args(["run", "max"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 2, "{stderr}");
+    assert!(
+        lines[0].starts_with("remuda: warning: CLAUDE_SECURESTORAGE_CONFIG_DIR is set"),
+        "{stderr}"
+    );
+    assert_eq!(format!("{}\n", lines[1]), CHILD_SESSION_WARNING);
+}
+
 #[test]
 fn run_keeps_cwd() {
     let sb = sandbox_with_max();

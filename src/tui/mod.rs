@@ -392,6 +392,24 @@ fn launch_line(what: &str, cwd: Option<&Path>, private: bool) -> String {
     }
 }
 
+/// The lines printed before a launch hands the terminal over (R16): [`launch_line`], then the
+/// warning that claude will not save this session (R6), while the user can still quit and
+/// start again with the override. It holds no path or account, so private mode shows it as it
+/// is (R21); the other warnings come with the launch's result only.
+fn handover_lines(
+    what: &str,
+    cwd: Option<&Path>,
+    private: bool,
+    env: &Env,
+    plan: &launch::Launch,
+) -> Vec<String> {
+    let mut lines = vec![launch_line(what, cwd, private)];
+    lines.extend(
+        launch::unsaved_session_warning(env, plan).map(|w| format!("remuda: warning: {w}")),
+    );
+    lines
+}
+
 fn drain(rx: &Receiver<Event>, max: usize) -> Vec<Event> {
     rx.try_iter().take(max).collect()
 }
@@ -462,14 +480,16 @@ fn run_launch(
         Ok(plan) => plan,
         Err(e) => return Ok((Err(format!("{e:#}")), Vec::new())),
     };
-    let mut warnings = launch::env_warnings(&deps.env);
+    let mut warnings = launch::env_warnings(&deps.env, &plan);
     warnings.extend(plan.notices.iter().cloned());
     let log = owned::launch_log(&deps.state_dir);
     if let Err(e) = screen.suspend() {
         let _ = screen.resume();
         return Ok((Err(format!("cannot hand the terminal over: {e}")), warnings));
     }
-    println!("{}", launch_line(&request.what, cwd, deps.private));
+    for line in handover_lines(&request.what, cwd, deps.private, &deps.env, &plan) {
+        println!("{line}");
+    }
     let ran = launch::perform(program, &plan, cwd, &log);
     screen
         .resume()
@@ -656,6 +676,85 @@ mod decode_tests {
             launch_line("new session as max", None, false),
             "remuda: new session as max"
         );
+    }
+
+    /// R6, R16, R21: before the terminal is handed over, the launch line is followed by the
+    /// warning that claude will not save the session, only for an interactive claude session
+    /// under the marker without the override, and alike in private mode. The Keychain warning
+    /// (with its path) waits for the launch's result.
+    #[test]
+    fn handover_lines_warn_about_an_unsaved_session_before_the_launch() {
+        let max = Account {
+            provider: crate::registry::CLAUDE,
+            name: "max".into(),
+            home: crate::registry::Home::Path("/p/max".into()),
+        };
+        let codex = Account {
+            provider: crate::registry::CODEX,
+            ..max.clone()
+        };
+        let plan = |account: &Account, args: &[&str]| {
+            launch::prepare(
+                account,
+                args.iter().map(|a| a.to_string()).collect(),
+                None,
+                "t".into(),
+                || "U".into(),
+            )
+        };
+        let env = |pairs: &[(&str, &str)]| -> Env {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let dir = Path::new("/Users/you/space/remuda");
+        let warning = format!("remuda: warning: {}", launch::child_session_warning());
+        let marked = env(&[
+            ("CLAUDE_CODE_CHILD_SESSION", "1"),
+            ("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/secure/x"),
+        ]);
+        assert_eq!(
+            handover_lines(
+                "new session as max",
+                Some(dir),
+                false,
+                &marked,
+                &plan(&max, &[])
+            ),
+            [
+                "remuda: new session as max in /Users/you/space/remuda".to_string(),
+                warning.clone()
+            ]
+        );
+        assert_eq!(
+            handover_lines(
+                "resume 766560c5 as account-1",
+                Some(dir),
+                true,
+                &marked,
+                &plan(&max, &["--resume", "766560c5-0000-4000-8000-000000000000"])
+            ),
+            [
+                "remuda: resume 766560c5 as account-1".to_string(),
+                warning.clone()
+            ]
+        );
+        let alone = |env: &Env, account: &Account, args: &[&str]| {
+            handover_lines("x", None, false, env, &plan(account, args))
+        };
+        assert_eq!(alone(&marked, &max, &["-p", "hi"]), ["remuda: x"]);
+        assert_eq!(alone(&marked, &codex, &[]), ["remuda: x"]);
+        let forced = env(&[
+            ("CLAUDE_CODE_CHILD_SESSION", "1"),
+            ("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "true"),
+        ]);
+        assert_eq!(alone(&forced, &max, &[]), ["remuda: x"]);
+        let not_marked = env(&[("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/secure/x")]);
+        assert_eq!(alone(&not_marked, &max, &[]), ["remuda: x"]);
+        for line in alone(&marked, &max, &[]) {
+            assert!(!line.contains("/secure/x"), "{line}");
+        }
     }
 }
 

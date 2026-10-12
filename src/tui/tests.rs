@@ -949,6 +949,33 @@ fn a_finished_launch_reports_its_exit_and_refreshes_sessions() {
     assert_eq!(notice(&app), None);
 }
 
+/// R6, R16, R21: the warning about an inherited `CLAUDE_CODE_CHILD_SESSION` comes with the
+/// launch's result; it holds no path, account or quote, so private mode shows it whole.
+#[test]
+fn the_child_session_warning_stays_whole_in_private_mode() {
+    let mut app = idle_app();
+    let said = crate::launch::child_session_warning();
+    update(
+        &mut app,
+        Event::Launched {
+            request: request("max", &[], Some("/w"), "new session as max"),
+            result: Ok(Exit::Code(0)),
+            warnings: vec![said.clone()],
+        },
+    );
+    let shown = format!("new session as max: claude exited 0 · {said}");
+    assert_eq!(notice(&app), Some((shown.as_str(), Level::Warn)));
+    app.private = true;
+    let copy = super::privacy::redacted(&app);
+    assert_eq!(
+        notice(&copy),
+        Some((
+            format!("new session as account-1: claude exited 0 · {said}").as_str(),
+            Level::Warn
+        ))
+    );
+}
+
 #[test]
 fn a_refresh_already_running_when_a_launch_ends_runs_again() {
     let mut app = app();

@@ -15,12 +15,17 @@ opened by `remuda run` without an account, `Enter` launches the selected account
 exits without launching anything.
 
 A terminal started from inside a Claude session (by its Bash tool, for example a background
-launcher or a `screen` session) may carry `CLAUDE_CODE_CHILD_SESSION=1`. Claude then saves no
-transcript and no prompt history for an interactive session started there, and says
-"Transcript saving is off" at the bottom of the screen; Remuda passes the variable on like the
-rest of the environment, so such a session never appears in the session list and cannot be
-resumed. Set `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` in that terminal if it is your own. `-p`
-runs are saved either way.
+launcher, a `screen` or a tmux session) may carry `CLAUDE_CODE_CHILD_SESSION=1`. Claude then
+saves no transcript and no prompt history for an interactive session started there, so such a
+session never appears in the session list and cannot be resumed. Remuda passes the variable on
+like the rest of the environment, and says so: `remuda run` and `remuda pick --run` warn on
+stderr before an interactive Claude session starts, a launch from the TUI prints the warning
+before Claude starts (quit Claude right away to start again with the override) and lists it
+again when Claude exits, and the Accounts view shows it among its checks. Set
+`CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` in that terminal if it is your own, and the warning
+goes away. Claude reads both variables as switches: `1`, `true`, `yes` and `on` (in any case)
+turn them on, anything else, `0` and `y` included, leaves them off, and Remuda reads them the
+same way. `-p` runs are saved either way and get no warning.
 
 Resuming a Claude session that is still running elsewhere is refused, because two processes
 writing the same session would overwrite each other. Codex has no source of running sessions, so

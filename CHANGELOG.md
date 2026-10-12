@@ -10,6 +10,15 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Added
 
+- A warning when `CLAUDE_CODE_CHILD_SESSION` is inherited (a terminal started from inside a Claude
+  session, tmux included) and `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE` is not on: Claude then saves
+  no interactive session, so what is said in it never reaches Remuda's session list. Both are read
+  as Claude reads a switch (`1`, `true`, `yes` or `on`, in any case, is on; `0`, `false`, `y` and
+  an empty value are off). `remuda run` and `remuda pick --run` say so on stderr before an
+  interactive Claude session (not for `-p` runs, subcommands or Codex); a launch from the TUI
+  prints it before handing the terminal over and lists it again among the launch's warnings; the
+  Accounts view shows it last among the environment checks. The value is never shown, and the
+  variable is still passed on unchanged (SPEC R6, R11, R16).
 - The TUI's Stats view can show its sections by project, as `remuda stats --by project` does:
   `b` switches between accounts and projects (by account when the TUI starts; `t` and `r` keep
   the choice), a directory too long for its column keeps its end, and the shares, chart and
