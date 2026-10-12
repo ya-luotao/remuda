@@ -8,6 +8,8 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-13
+
 ### Added
 
 - A warning when `CLAUDE_CODE_CHILD_SESSION` is inherited (a terminal started from inside a Claude
@@ -508,6 +510,7 @@ Initial release.
   `sessions`; a session index over Codex rollouts; resume and fork from the TUI, with confirmation
   before resuming in place.
 
-[Unreleased]: https://github.com/ya-luotao/remuda/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ya-luotao/remuda/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ya-luotao/remuda/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ya-luotao/remuda/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ya-luotao/remuda/releases/tag/v0.1.0

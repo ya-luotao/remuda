@@ -1,6 +1,6 @@
 # remuda roadmap
 
-**Status:** v0.2.0. Milestones M0–M3 and M2.5 are complete; M2.5 went out with 0.2.0.
+**Status:** v0.3.0. Milestones M0–M3 and M2.5 are complete; M2.5 went out with 0.2.0.
 
 remuda is a multi-account and session manager for coding agents (Claude Code and Codex). Its
 behavior contract is [SPEC.md](SPEC.md); this document records the design principles, decisions,
