@@ -1027,6 +1027,600 @@ fn codex_requests_with_one_total_keep_one_usage() {
     );
 }
 
+/// A codex 0.153+ rollout of `id`: its `session_meta`, a `turn_context` naming `model`, then
+/// `rest`.
+fn recorded_rollout(id: &str, model: &str, rest: &[String]) -> String {
+    [
+        cx::meta(id, "/w/proj", json!("cli"), 0, &cx::ts(0)),
+        cx::model_turn(model, &cx::ts(1)),
+    ]
+    .iter()
+    .chain(rest)
+    .map(String::as_str)
+    .collect()
+}
+
+/// R20 **Codex**: a `token_usage_record` counts its request, at its timestamp; the
+/// `token_count` event after it is that request's, and is not counted again, nor is a repeat of
+/// it.
+#[test]
+fn codex_a_usage_record_and_its_token_count_count_once() {
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let text = recorded_rollout(
+        R1,
+        "gpt-test-a",
+        &[
+            cx::request(R1, "resp_1", [100, 50, 10, 4], [100, 50, 10, 4], &cx::ts(2)),
+            cx::tokens([100, 50, 10, 4], [100, 50, 10, 4], &cx::ts(2)),
+            cx::request(
+                R1,
+                "resp_2",
+                [250, 150, 30, 10],
+                [150, 100, 20, 6],
+                &cx::ts(3),
+            ),
+        ],
+    );
+    cx::write_rollout(&work, R1, &text);
+    let table = f.all();
+    assert_eq!(model_names(&table.overall), ["gpt-test-a"]);
+    assert_eq!(of(&table.overall, "gpt-test-a"), toks(100, 150, 0, 30, 10));
+    assert_eq!(
+        table.overall[0].tokens.total(),
+        280,
+        "the last total_tokens"
+    );
+    // At the records' time (2026-09-20, in the last 7 days).
+    assert_eq!(f.report().table(Period::Week).overall, table.overall);
+}
+
+/// R20 **Copies count once**: the first requests of two unrelated rollouts with the same usage
+/// (as two `codex exec` runs started in the same second on 2026-09-27 recorded them) have
+/// different `response_id`s: they are two requests, not one copied.
+#[test]
+fn codex_unrelated_first_requests_with_one_usage_count_twice() {
+    let mut f = Fixture::new();
+    let first = [29_888, 6_912, 138, 0];
+    for (store, id, response) in [
+        (
+            "a",
+            R1,
+            "resp_03419ecb910d74c0016ab932f0c7f487d1b79314196d6ebefc",
+        ),
+        (
+            "b",
+            R2,
+            "resp_07c96b3d25865b1a016ab932f0e19c87d2a4d98c0c5a8e3ea6",
+        ),
+    ] {
+        let home = f.codex(store);
+        let text = recorded_rollout(
+            id,
+            "gpt-test-a",
+            &[cx::request(id, response, first, first, &cx::ts(2))],
+        );
+        cx::write_rollout(&home, id, &text);
+    }
+    let table = f.all();
+    assert_eq!(
+        of(&table.overall, "gpt-test-a"),
+        toks(2 * (29_888 - 6_912), 2 * 6_912, 0, 2 * 138, 0)
+    );
+    for store in ["codex:a", "codex:b"] {
+        assert_eq!(
+            of(&section(&table, &[store]).models, "gpt-test-a").total(),
+            29_888 + 138,
+            "{store}"
+        );
+    }
+}
+
+/// R20 **Codex**: codex records a compaction's request too; the event after it records the
+/// new context size with an unchanged total. The compaction counts its usage, the event
+/// nothing; from then on the record's cumulative `thread_token_usage` exceeds the event's
+/// total by the compaction, and the requests after it count once each.
+#[test]
+fn codex_compaction_requests_count_from_their_records() {
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let text = recorded_rollout(
+        R1,
+        "gpt-test-a",
+        &[
+            cx::request(R1, "resp_1", [100, 50, 10, 4], [100, 50, 10, 4], &cx::ts(2)),
+            cx::usage_record(
+                R1,
+                "resp_compact",
+                cx::usage([300, 0, 20, 0]),
+                cx::usage([400, 50, 30, 4]),
+                &cx::ts(3),
+            ),
+            cx::compacted(&cx::ts(3)),
+            cx::tokens([100, 50, 10, 4], [60, 0, 0, 0], &cx::ts(3)),
+            cx::usage_record(
+                R1,
+                "resp_3",
+                cx::usage([150, 100, 20, 6]),
+                cx::usage([550, 150, 50, 10]),
+                &cx::ts(4),
+            ),
+            cx::tokens([250, 150, 30, 10], [150, 100, 20, 6], &cx::ts(4)),
+            cx::request(
+                R1,
+                "resp_4",
+                [400, 250, 45, 12],
+                [150, 100, 15, 2],
+                &cx::ts(5),
+            ),
+        ],
+    );
+    cx::write_rollout(&work, R1, &text);
+    let table = f.all();
+    assert_eq!(
+        of(&table.overall, "gpt-test-a"),
+        toks(
+            50 + 300 + 50 + 50,
+            50 + 100 + 100,
+            0,
+            10 + 20 + 20 + 15,
+            4 + 6 + 2
+        )
+    );
+}
+
+/// R20 **Codex**: a rollout resumed by a codex that writes records: the events before its first
+/// record count as before, the records after; each request once.
+#[test]
+fn codex_a_rollout_with_both_counts_each_request_once() {
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let text = recorded_rollout(
+        R1,
+        "gpt-test-a",
+        &[
+            cx::tokens([100, 50, 10, 4], [100, 50, 10, 4], &cx::ts(2)),
+            cx::tokens([100, 50, 10, 4], [100, 50, 10, 4], &cx::ts(2)),
+            cx::request(
+                R1,
+                "resp_2",
+                [250, 150, 30, 10],
+                [150, 100, 20, 6],
+                &cx::ts(3),
+            ),
+            cx::tokens([250, 150, 30, 10], [150, 100, 20, 6], &cx::ts(3)),
+            cx::request(
+                R1,
+                "resp_3",
+                [400, 250, 45, 12],
+                [150, 100, 15, 2],
+                &cx::ts(4),
+            ),
+        ],
+    );
+    cx::write_rollout(&work, R1, &text);
+    let table = f.all();
+    assert_eq!(
+        of(&table.overall, "gpt-test-a"),
+        toks(50 + 50 + 50, 50 + 100 + 100, 0, 45, 12)
+    );
+}
+
+/// R20 **Codex**: a record without `usage`, or with an empty or no `response_id`, is not
+/// counted; the event after it counts the request.
+#[test]
+fn codex_records_without_usage_or_response_id_leave_their_event_to_count() {
+    let request = |minute: u32, total: [u64; 4], last: [u64; 4], edit: &dyn Fn(&mut Value)| {
+        let ts = cx::ts(minute);
+        [
+            edited(
+                &cx::usage_record(R1, "resp_x", cx::usage(last), cx::usage(total), &ts),
+                edit,
+            ),
+            cx::tokens(total, last, &ts),
+        ]
+        .concat()
+    };
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let text = recorded_rollout(
+        R1,
+        "gpt-test-a",
+        &[
+            request(2, [100, 50, 10, 4], [100, 50, 10, 4], &|v| {
+                v["payload"].as_object_mut().unwrap().remove("usage");
+            }),
+            request(3, [250, 150, 30, 10], [150, 100, 20, 6], &|v| {
+                v["payload"]["response_id"] = json!("");
+            }),
+            request(4, [400, 250, 45, 12], [150, 100, 15, 2], &|v| {
+                v["payload"].as_object_mut().unwrap().remove("response_id");
+            }),
+        ],
+    );
+    cx::write_rollout(&work, R1, &text);
+    let table = f.all();
+    assert_eq!(
+        of(&table.overall, "gpt-test-a"),
+        toks(50 + 50 + 50, 50 + 100 + 100, 0, 45, 12)
+    );
+}
+
+/// What gpt-test-a counts of a rollout holding request A's record (100 input, 10 output) and no
+/// event after it, then `rest`; read whole, or with a refresh, saved and loaded, between.
+fn after_a_record_whose_event_has_not_come(rest: &str, saved: bool) -> Tokens {
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let path = cx::write_rollout(
+        &work,
+        R1,
+        &recorded_rollout(
+            R1,
+            "gpt-test-a",
+            &[cx::usage_record(
+                R1,
+                "resp_a",
+                cx::usage([100, 0, 10, 0]),
+                cx::usage([100, 0, 10, 0]),
+                &cx::ts(2),
+            )],
+        ),
+    );
+    if saved {
+        f.refresh();
+        let file = f.root.join("remuda/state/stats.json");
+        f.cache.save(&file).unwrap();
+        f.cache = Cache::load(&file);
+        let rollout = f.cache.files.values().next().unwrap();
+        assert!(rollout.codex_record.is_some(), "the marker is saved");
+    }
+    append(&path, rest);
+    of(&f.all().overall, "gpt-test-a")
+}
+
+/// R20 **Codex** (critic reviews 1 and 2 of S4B): a record that is not counted, after a request
+/// whose event never came, is the next request's: its event counts that request. Not counted: no
+/// `usage`, an empty or no `response_id`, and a record whose payload cannot be read (a count that
+/// is not a number, a `usage` or `payload` of another type, a `null` payload).
+#[test]
+fn codex_an_uncounted_record_after_one_whose_event_never_came_leaves_its_event_to_count() {
+    let edit = |what: &str, v: &mut Value| match what {
+        "no usage" => {
+            v["payload"].as_object_mut().unwrap().remove("usage");
+        }
+        "an empty response_id" => v["payload"]["response_id"] = json!(""),
+        "no response_id" => {
+            v["payload"].as_object_mut().unwrap().remove("response_id");
+        }
+        "a string input_tokens" => v["payload"]["usage"]["input_tokens"] = json!("200"),
+        "a usage array" => v["payload"]["usage"] = json!([200, 0, 20, 0]),
+        "a number payload" => v["payload"] = json!(7),
+        "a null payload" => v["payload"] = Value::Null,
+        _ => unreachable!(),
+    };
+    let mut wrong = Vec::new();
+    for what in [
+        "no usage",
+        "an empty response_id",
+        "no response_id",
+        "a string input_tokens",
+        "a usage array",
+        "a number payload",
+        "a null payload",
+    ] {
+        // Request B: its record, not counted, then its event.
+        let rest = [
+            edited(
+                &cx::usage_record(
+                    R1,
+                    "resp_b",
+                    cx::usage([200, 0, 20, 0]),
+                    cx::usage([300, 0, 30, 0]),
+                    &cx::ts(3),
+                ),
+                |v| edit(what, v),
+            ),
+            cx::tokens([300, 0, 30, 0], [200, 0, 20, 0], &cx::ts(3)),
+        ]
+        .concat();
+        for saved in [false, true] {
+            let counted = after_a_record_whose_event_has_not_come(&rest, saved);
+            if counted != toks(100 + 200, 0, 0, 10 + 20, 0) {
+                wrong.push(format!("{what}, saved between: {saved}: {counted:?}"));
+            }
+        }
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+}
+
+/// R20 **Codex** (critic review 2 of S4B): a record is a JSON object whose `type` is
+/// `token_usage_record`. A line that is not one (an array or a string naming the type, or an
+/// object of another type that mentions it) neither counts nor leaves the request before it
+/// without its event: that event, after it, is still that request's and is not counted again.
+#[test]
+fn codex_lines_that_are_not_records_leave_the_awaited_event_alone() {
+    let usage = r#"{"input_tokens":200,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":20,"reasoning_output_tokens":0,"total_tokens":220}"#;
+    let lines = [
+        (
+            "an array",
+            "[\"token_usage_record\",null,null]\n".to_string(),
+        ),
+        (
+            "a one-element array",
+            "[\"token_usage_record\"]\n".to_string(),
+        ),
+        (
+            "an array with a payload",
+            format!(
+                "[\"token_usage_record\",\"2026-09-20T10:03:00.000Z\",\
+                 {{\"response_id\":\"resp_x\",\"usage\":{usage}}}]\n"
+            ),
+        ),
+        ("a string", "\"token_usage_record\"\n".to_string()),
+        (
+            "another type",
+            "{\"timestamp\":\"2026-09-20T10:03:00.000Z\",\"type\":\"event_msg\",\
+             \"payload\":{\"type\":\"token_usage_record\"}}\n"
+                .to_string(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, line) in &lines {
+        let rest = [
+            line.as_str(),
+            &cx::tokens([100, 0, 10, 0], [100, 0, 10, 0], &cx::ts(3)),
+        ]
+        .concat();
+        for saved in [false, true] {
+            let counted = after_a_record_whose_event_has_not_come(&rest, saved);
+            if counted != toks(100, 0, 0, 10, 0) {
+                wrong.push(format!("{what}, saved between: {saved}: {counted:?}"));
+            }
+        }
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+}
+
+/// R20 **Codex** (critic review 3 of S4B): a record is told by its decoded `type`, which a JSON
+/// escape may spell otherwise in the line (`"\u0074oken_usage_record"`, here on a line that
+/// another field's `"token_count"` lets past the first look). It is the next request's: counted,
+/// or with a payload that cannot be read not counted and its event counting the request; either
+/// way the request before it, whose event never came, does not take that event.
+#[test]
+fn codex_a_record_type_spelled_with_an_escape_is_a_record() {
+    let escaped = |payload: Value| {
+        let line = json!({"timestamp": cx::ts(3), "note": "token_count",
+                          "type": "token_usage_record", "payload": payload})
+        .to_string();
+        let line = line.replacen(r#""token_usage_record""#, r#""\u0074oken_usage_record""#, 1);
+        assert!(!line.contains(r#""token_usage_record""#), "{line}");
+        let parsed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["type"], "token_usage_record");
+        line + "\n"
+    };
+    let records = [
+        (
+            "counted",
+            escaped(json!({"response_id": "resp_b", "usage": cx::usage([200, 0, 20, 0])})),
+        ),
+        ("a number payload", escaped(json!(7))),
+    ];
+    let mut wrong = Vec::new();
+    for (what, record) in &records {
+        let rest = [
+            record.as_str(),
+            &cx::tokens([300, 0, 30, 0], [200, 0, 20, 0], &cx::ts(3)),
+        ]
+        .concat();
+        for saved in [false, true] {
+            let counted = after_a_record_whose_event_has_not_come(&rest, saved);
+            if counted != toks(100 + 200, 0, 0, 10 + 20, 0) {
+                wrong.push(format!("{what}, saved between: {saved}: {counted:?}"));
+            }
+        }
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+}
+
+/// R20 **Codex**, **Periods** (critic review 1 of S4B): a request counts at its record's time,
+/// not at its event's, written later: a record before midnight and its event after it count the
+/// request in the day before, also when the event is read in a later refresh.
+#[test]
+fn codex_a_request_counts_at_its_records_time_not_its_events() {
+    let usage = [100, 50, 10, 4];
+    let record = [
+        cx::meta(R1, "/w/proj", json!("cli"), 0, "2026-09-23T23:58:00.000Z"),
+        cx::model_turn("gpt-test-a", "2026-09-23T23:58:01.000Z"),
+        cx::usage_record(
+            R1,
+            "resp_1",
+            cx::usage(usage),
+            cx::usage(usage),
+            "2026-09-23T23:59:30.250Z",
+        ),
+    ]
+    .concat();
+    let event = cx::tokens(usage, usage, "2026-09-24T00:00:40.500Z");
+    let check = |f: &Fixture, when: &str| {
+        let sources = f.sources();
+        let counted = stats::requests(&f.cache, &sources, &f.attribution, &f.accounts, &f.prices);
+        let at: Timestamp = "2026-09-23T23:59:30Z".parse().unwrap();
+        assert_eq!(
+            counted.list.iter().map(|r| r.ts).collect::<Vec<_>>(),
+            [Some(at.as_second())],
+            "{when}"
+        );
+        let report = f.report();
+        assert_eq!(report.table(Period::Today).overall, [], "{when}");
+        assert_eq!(
+            of(&report.table(Period::Week).overall, "gpt-test-a"),
+            toks(50, 50, 0, 10, 4),
+            "{when}"
+        );
+    };
+
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    cx::write_rollout(&work, R1, &[record.as_str(), &event].concat());
+    f.refresh();
+    check(&f, "read whole");
+
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let path = cx::write_rollout(&work, R1, &record);
+    f.refresh();
+    check(&f, "before its event");
+    append(&path, &event);
+    f.refresh();
+    check(&f, "its event read in a later refresh");
+}
+
+/// R20 **Codex**, **Codex cache write**: a record's usage converts as an event's does: the
+/// cache write is part of `input_tokens`, counted and priced as cache write. Here the record is
+/// the last line written: its event has not followed yet.
+#[test]
+fn codex_record_cache_write_converts_as_events_do() {
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let text = recorded_rollout(
+        R1,
+        "gpt-5.6-sol",
+        &[cx::usage_record(
+            R1,
+            "resp_1",
+            cx::usage_with_write(written(REAL_LAST, 2_000)),
+            cx::usage_with_write(written(REAL_TOTAL, 2_000)),
+            &cx::ts(2),
+        )],
+    );
+    cx::write_rollout(&work, R1, &text);
+    let table = f.all();
+    assert_eq!(
+        table.overall,
+        [ModelRow {
+            provider: Provider::Codex,
+            model: "gpt-5.6-sol".into(),
+            tokens: toks6(435, 136_704, 2_000, 0, 529, 90),
+            // Input 4, cached 0.40, cache write 5, output 20.
+            cost: Cost {
+                pico_usd: 435 * 4_000_000
+                    + 136_704 * 400_000
+                    + 2_000 * 5_000_000
+                    + 529 * 20_000_000,
+                unpriced_tokens: 0,
+            },
+        }]
+    );
+}
+
+/// R20 **Codex**: a record before the first `turn_context` (a rollout that starts compacted)
+/// takes its model, also when it arrives in a later refresh.
+#[test]
+fn codex_records_before_the_first_turn_take_its_model() {
+    let before = [
+        cx::meta(R1, "/w/proj", json!("cli"), 0, &cx::ts(0)),
+        cx::usage_record(
+            R1,
+            "resp_compact",
+            cx::usage([300, 0, 20, 0]),
+            cx::usage([300, 0, 20, 0]),
+            &cx::ts(1),
+        ),
+        cx::compacted(&cx::ts(1)),
+        cx::tokens([60, 20, 6, 0], [0, 0, 0, 0], &cx::ts(1)),
+    ]
+    .concat();
+    let after = [
+        cx::model_turn("gpt-test-c", &cx::ts(3)),
+        cx::request(R1, "resp_2", [90, 40, 9, 0], [30, 20, 3, 0], &cx::ts(4)),
+    ]
+    .concat();
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    cx::write_rollout(&work, R1, &[before.as_str(), &after].concat());
+    let table = f.all();
+    assert_eq!(model_names(&table.overall), ["gpt-test-c"]);
+    assert_eq!(of(&table.overall, "gpt-test-c"), toks(310, 20, 0, 23, 0));
+
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    let path = cx::write_rollout(&work, R1, &before);
+    let table = f.all();
+    assert_eq!(model_names(&table.overall), ["unknown"]);
+    assert_eq!(of(&table.overall, "unknown"), toks(300, 0, 0, 20, 0));
+    append(&path, &after);
+    let table = f.all();
+    assert_eq!(model_names(&table.overall), ["gpt-test-c"]);
+    assert_eq!(of(&table.overall, "gpt-test-c"), toks(310, 20, 0, 23, 0));
+}
+
+/// R20 **Copies count once** (a known limitation): a subagent forked from a rollout in codex's
+/// legacy history mode replays its parent's `token_count` events without their records (codex
+/// 0.162.1, `spawn.rs`). Where the parent recorded its requests, they are keyed by
+/// `response_id` there and by their totals in the replay: counted again, under the subagent's
+/// model, time and directory.
+#[test]
+fn codex_a_fork_replaying_only_the_events_of_recorded_requests_counts_them_again() {
+    let parent = |ts: &dyn Fn(u32) -> String| {
+        [
+            cx::meta(R1, "/w/proj", json!("cli"), 0, &ts(0)),
+            cx::model_turn("gpt-test-a", &ts(1)),
+            cx::request(R1, "resp_1", [100, 50, 10, 4], [100, 50, 10, 4], &ts(2)),
+            cx::request(R1, "resp_2", [250, 150, 30, 10], [150, 100, 20, 6], &ts(3)),
+        ]
+        .concat()
+    };
+    let today = |m: u32| format!("2026-09-24T01:{m:02}:00.000Z");
+    let replay: String = parent(&|m| today(m + 10))
+        .lines()
+        .filter(|l| l.contains("\"token_count\""))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let child = [
+        cx::meta(
+            R2,
+            "/w/fork",
+            json!({"subagent": {"thread_spawn": {"parent_thread_id": R1, "depth": 1}}}),
+            0,
+            &today(10),
+        ),
+        replay,
+        cx::model_turn("gpt-test-b", &today(20)),
+        cx::request(
+            R2,
+            "resp_3",
+            [370, 230, 40, 11],
+            [120, 80, 10, 1],
+            &today(21),
+        ),
+    ]
+    .concat();
+    let mut f = Fixture::new();
+    let work = f.codex("work");
+    // The parent 40 days ago.
+    cx::write_rollout(
+        &work,
+        R1,
+        &parent(&|m| format!("2026-08-15T10:{m:02}:00.000Z")),
+    );
+    cx::write_rollout(&work, R2, &child);
+    f.refresh();
+    let report = f.report();
+    let all = &report.table(Period::All).overall;
+    assert_eq!(of(all, "gpt-test-a"), toks(100, 150, 0, 30, 10));
+    assert_eq!(
+        of(all, "gpt-test-b"),
+        toks(100 + 40, 150 + 80, 0, 30 + 10, 10 + 1)
+    );
+    assert_eq!(
+        project_totals(&f, None),
+        [
+            (Some("/w/fork".into()), 280 + 130),
+            (Some("/w/proj".into()), 280)
+        ]
+    );
+}
+
 /// R20, R17: a rollout of a store several codex homes share counts for those accounts
 /// together.
 #[test]
@@ -1302,10 +1896,11 @@ fn cache_round_trips_and_a_schema_mismatch_rebuilds() {
     );
     // A cache of schema 1 (a single cache write), 2 (codex's cache write not read: its rows
     // would keep it in the input), 3 (no project directory: a file read on from its offset
-    // would never get one) or 4 (never released: codex's project by an earlier rule) is
-    // rebuilt.
+    // would never get one), 4 (never released: codex's project by an earlier rule) or 5 (codex
+    // requests keyed by their totals: a rollout read on from its offset would key the rest by
+    // `response_id`) is rebuilt.
     let old = f.root.join("old-stats.json");
-    for version in [1, 2, 3, 4] {
+    for version in [1, 2, 3, 4, 5] {
         let mut older = v.clone();
         older["schema_version"] = json!(version);
         fs::write(&old, older.to_string()).unwrap();
@@ -1316,7 +1911,7 @@ fn cache_round_trips_and_a_schema_mismatch_rebuilds() {
         );
         assert_eq!(loaded.schema_version, SCHEMA_VERSION);
     }
-    assert_eq!(SCHEMA_VERSION, 5);
+    assert_eq!(SCHEMA_VERSION, 6);
 
     let mut other = v.clone();
     other["schema_version"] = json!(SCHEMA_VERSION + 1);

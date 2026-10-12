@@ -214,7 +214,7 @@ separate caches, because they need different parts of each file.
                               ▼
                         stats::refresh ──────────────────► stats.json   (one row per request,
                               │                                          project dir per file,
-                              ▼                                          whole files; schema 5)
+                              ▼                                          whole files; schema 6)
                         stats::requests(prices)  ◄── pricing (built-in + [prices])
                               │  (each request once: the copy that counts, its accounts, cost)
                               ├─► stats::report(period) ─┬─► stats::format        `remuda stats`
@@ -270,9 +270,13 @@ real path alone: a store that is gone or that left the registry drops out as usu
 cannot be resolved beside it, and an account's name carries nothing from one home to another.
 
 Deduplication is the heart of the statistics: a claude message counts once by `message.id`
-across records, forks and shared stores; a codex request counts once by its
-cumulative total. A session attributed to several accounts is counted once, for all of them
-together, so the sections add up to the overall total.
+across records, forks and shared stores; a codex request counts once by the `response_id` of
+its `token_usage_record` (codex 0.153 on), or, in a rollout without records, by the cumulative
+total of its `token_count` event. The two keys never match each other, so a request counted
+from its record in one rollout and from a replay of its event alone in another counts twice
+(SPEC R20 **Copies count once** names when codex writes such a replay). A session attributed to
+several accounts is counted once, for all of them together, so the sections add up to the
+overall total.
 
 ## The TUI
 

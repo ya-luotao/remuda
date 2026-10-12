@@ -1311,3 +1311,82 @@ fn a_cache_of_schema_4_with_the_parents_project_is_rebuilt() {
     fs::remove_file(&cache).unwrap();
     assert_eq!(stats(&sb, &["--csv"]), grown, "as read whole");
 }
+
+/// R20 **Cache**: a cache of schema 5 keyed a codex request by its total, so the first requests
+/// of two unrelated rollouts with the same usage were one row key; read as it is, it would still
+/// count them once. It is rebuilt, and they count as two.
+#[test]
+fn a_cache_of_schema_5_keyed_by_totals_is_rebuilt() {
+    let sb = Sandbox::new();
+    let codex = sb.home().join(".codex");
+    let first = [29_888, 6_912, 138, 0];
+    for (id, response) in [(R1, "resp_1"), (R2, "resp_2")] {
+        cx::write_rollout(
+            &codex,
+            id,
+            &[
+                cx::meta(id, "/w/proj", json!("exec"), 0, &cx::ts(0)),
+                cx::model_turn("gpt-test", &cx::ts(1)),
+                cx::request(id, response, first, first, &cx::ts(2)),
+            ]
+            .concat(),
+        );
+    }
+    let complete = stats(&sb, &["--csv"]);
+    assert_eq!(complete.lines().count(), 3, "{complete}");
+
+    // As the previous keying rule left it: one key for both.
+    let cache = sb.remuda_home().join("state/stats.json");
+    let mut v: Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+    v["schema_version"] = json!(5);
+    let files = v["files"].as_object_mut().unwrap();
+    assert_eq!(files.len(), 2);
+    for file in files.values_mut() {
+        file["rows"][0][0] = json!(7);
+        file.as_object_mut().unwrap().remove("codex_record");
+    }
+    fs::write(&cache, v.to_string()).unwrap();
+    assert_eq!(stats(&sb, &["--csv"]), complete);
+    let v: Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+    assert_eq!(v["schema_version"], remuda::stats::SCHEMA_VERSION);
+}
+
+/// R20 **Codex**, **CSV** (critic review 1 of S4B): a request's time is its record's, to the
+/// second, before its event is written, after it is read in a later run, and read whole.
+#[test]
+fn stats_csv_codex_request_at_its_records_time() {
+    let sb = Sandbox::new();
+    let codex = sb.home().join(".codex");
+    let usage = [100, 50, 10, 4];
+    let rollout = cx::write_rollout(
+        &codex,
+        R1,
+        &[
+            cx::meta(R1, "/w/proj", json!("cli"), 0, &cx::ts(0)),
+            cx::model_turn("gpt-test", &cx::ts(1)),
+            cx::usage_record(
+                R1,
+                "resp_1",
+                cx::usage(usage),
+                cx::usage(usage),
+                "2026-09-20T10:02:59.900Z",
+            ),
+        ]
+        .concat(),
+    );
+    let times = |csv: &str| -> Vec<String> {
+        csv.lines()
+            .skip(1)
+            .map(|l| l.split(',').next().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(times(&stats(&sb, &["--csv"])), ["2026-09-20T10:02:59Z"]);
+    append(
+        &rollout,
+        &cx::tokens(usage, usage, "2026-09-20T10:47:01.000Z"),
+    );
+    let grown = stats(&sb, &["--csv"]);
+    assert_eq!(times(&grown), ["2026-09-20T10:02:59Z"], "{grown}");
+    fs::remove_file(sb.remuda_home().join("state/stats.json")).unwrap();
+    assert_eq!(stats(&sb, &["--csv"]), grown, "as read whole");
+}
