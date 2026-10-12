@@ -337,6 +337,8 @@ fn event_loop(
                         let size = terminal.size()?;
                         let _ = tx.send(Event::Resize(size.width, size.height));
                     }
+                    // The terminal's own: written between two frames, it draws nothing.
+                    Effect::Copy(text) => copy_to_clipboard(&mut io::stdout(), &text)?,
                     other => workers::spawn(other, &deps, &tx),
                 }
             }
@@ -349,6 +351,35 @@ fn event_loop(
         }
         terminal.draw(|f| render::render_with(&app, &mut snapshot, f))?;
     }
+}
+
+/// Hands `text` to the clipboard through the terminal (OSC 52, R16): the terminal (or tmux,
+/// with `set-clipboard`) takes it from there; one that does not know the sequence ignores it.
+/// Nothing is shown.
+fn copy_to_clipboard(out: &mut impl io::Write, text: &str) -> Result<()> {
+    write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()))
+        .context("cannot write to the terminal")?;
+    out.flush().context("cannot write to the terminal")
+}
+
+/// Standard base64 with padding, as OSC 52 takes it.
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(TABLE[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// When `effect` ends the TUI (R16), what it ends with: no account for `Quit`, the one chosen
@@ -653,6 +684,25 @@ fn decode(key: KeyEvent) -> Option<Key> {
 #[cfg(test)]
 mod decode_tests {
     use super::*;
+
+    /// R16: OSC 52 takes standard base64; the sequence is what the terminal reads.
+    #[test]
+    fn copies_through_osc_52() {
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(plain.as_bytes()), encoded, "{plain}");
+        }
+        let mut out = Vec::new();
+        copy_to_clipboard(&mut out, "foo").unwrap();
+        assert_eq!(out, b"\x1b]52;c;Zm9v\x07");
+    }
 
     #[test]
     fn decodes_keys() {

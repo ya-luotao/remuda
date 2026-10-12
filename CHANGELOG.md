@@ -8,6 +8,24 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ## [Unreleased]
 
+### Added
+
+- The session card: `p` (or Space) in the TUI's Live and History views now opens a card over the
+  view instead of expanding the preview pane, with what Remuda knows of the selected session
+  above the preview: its id, provider and entry point, its accounts and whether it runs (as what,
+  with which pid or background id, in which state), when it started and was last active and for
+  how long, its directory, its transcript and store. The movement keys scroll the preview; `Esc`,
+  `p` or Space closes the card, `[` and `]` move to the previous or next session behind it. In
+  the card, `Enter` and `f` work as before; `R` and `F` resume or fork choosing the account
+  (every claude account, the session's own first); `n` opens the new-session form in the
+  session's directory as its account (the picker when several are attributed); `y` and `Y`
+  copy the session id or the transcript path to the clipboard through the terminal (OSC 52;
+  tmux passes it on with `set-clipboard`); `m` reads more of the transcript (the last 100, 500,
+  then all messages, then 20 again), back to the start of the file where the preview of a
+  selection reads its last 4 MB at most. Live's `l`, `x`, `D` and `a` work in the card too. In
+  private mode the card masks what the lists mask, and shows neither the transcript nor the
+  store path (SPEC R16, R21).
+
 ## [0.3.0] - 2026-10-13
 
 ### Added

@@ -683,6 +683,7 @@ impl Redactor<'_> {
             loaded,
             expanded,
             scroll,
+            limit,
         } = preview;
         Preview {
             target: target.as_deref().map(key_path),
@@ -694,6 +695,7 @@ impl Redactor<'_> {
             }),
             expanded: *expanded,
             scroll: *scroll,
+            limit: *limit,
         }
     }
 

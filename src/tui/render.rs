@@ -14,6 +14,7 @@ use crate::account_config::{
 };
 use crate::identity::Identity;
 use crate::index::Entry;
+use crate::live::LiveSession;
 use crate::pricing::PRICES_AS_OF;
 use crate::stats::{self, By, Cost, ModelRow, Step, Table, Tokens};
 use crate::transcript::{Role, one_line};
@@ -83,19 +84,13 @@ fn screen(app: &App) -> Rect {
 }
 
 /// Areas of a list view (live, history): the list with its column header (and search line)
-/// and the preview; the list is absent while the preview is expanded.
+/// and the preview pane; the session card (R16) is drawn over both.
 struct Split {
     list: Option<Rect>,
     preview: Rect,
 }
 
-fn split(app: &App, body: Rect) -> Split {
-    if app.preview.expanded {
-        return Split {
-            list: None,
-            preview: body,
-        };
-    }
+fn split(body: Rect) -> Split {
     let (list, preview) = if body.width >= WIDE {
         let [list, _, preview] = Layout::horizontal([
             Constraint::Percentage(58),
@@ -127,17 +122,20 @@ pub fn list_height(app: &App, view: View) -> usize {
     match view {
         View::Accounts => app.accounts.len(),
         View::Live | View::History => {
-            let area = split(app, body).list.unwrap_or_default();
+            let area = split(body).list.unwrap_or_default();
             area.height.saturating_sub(list_chrome(app, view)) as usize
         }
         View::Stats => stats_height(app),
     }
 }
 
-/// The preview's text area (below its title line).
+/// The preview's text area: the pane's, below its title line, or the card's while it is open.
 fn preview_text_area(app: &App) -> Rect {
+    if app.preview.expanded {
+        return card_layout(app).preview;
+    }
     let body = frame_areas(screen(app)).body;
-    let area = split(app, body).preview;
+    let area = split(body).preview;
     Rect {
         y: area.y + 1,
         height: area.height.saturating_sub(1),
@@ -195,21 +193,29 @@ fn draw(app: &App, f: &mut Frame) {
     }
     match app.view {
         View::Accounts => accounts_view(app, f, areas.body),
+        // The pane stays blank under the card, which is the preview then.
         View::Live => {
-            let s = split(app, areas.body);
+            let s = split(areas.body);
             if let Some(list) = s.list {
                 live_list(app, f, list);
             }
-            preview(app, f, s.preview);
+            if !app.preview.expanded {
+                preview(app, f, s.preview);
+            }
         }
         View::History => {
-            let s = split(app, areas.body);
+            let s = split(areas.body);
             if let Some(list) = s.list {
                 history_list(app, f, list);
             }
-            preview(app, f, s.preview);
+            if !app.preview.expanded {
+                preview(app, f, s.preview);
+            }
         }
         View::Stats => stats_view(app, f, areas.body),
+    }
+    if app.preview.expanded && matches!(app.view, View::Live | View::History) {
+        card(app, f);
     }
     f.render_widget(Paragraph::new(status_line(app)), areas.status);
     f.render_widget(Paragraph::new(Line::styled(hints(app), DIM)), areas.hints);
@@ -362,7 +368,7 @@ fn hints(app: &App) -> String {
     } else if app.history.searching && app.view == View::History {
         "type to filter · ↑/↓: move · enter: keep filter · esc: clear"
     } else if app.preview.expanded && app.view != View::Accounts {
-        "j/k/pgup/pgdn: scroll · esc/p: back · enter: resume · f: fork"
+        return format!(" {}", card_hints(app));
     } else if app.view == View::Accounts && app.config.expanded {
         "j/k/pgup/pgdn: scroll · p: close · esc: back · r: refresh"
     } else if app.view == View::Accounts && app.config.open {
@@ -373,9 +379,9 @@ fn hints(app: &App) -> String {
                 "n: new session · p: config · s: set up · D: remove · u: live usage · r: refresh"
             }
             View::Live => {
-                "enter: attach · f: fork · p: preview · l: logs · x: stop · D: rm · a: stopped"
+                "enter: attach · f: fork · p: session · l: logs · x: stop · D: rm · a: stopped"
             }
-            View::History => "enter: resume · f: fork · p: preview · /: search · a: show all",
+            View::History => "enter: resume · f: fork · p: session · /: search · a: show all",
             View::Stats => {
                 // What `b` switches to; what is shown is in the title.
                 return format!(
@@ -1646,7 +1652,9 @@ fn preview_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn preview_title(app: &App) -> String {
+/// What the selected session is called: a live session's name, else its title (the
+/// `ai-title`, else the first user text), on one line.
+fn selected_name(app: &App) -> Option<String> {
     let name = match app.view {
         View::Live => app.selected_live().map(|s| {
             s.name
@@ -1664,16 +1672,41 @@ fn preview_title(app: &App) -> String {
             .selected_entry()
             .and_then(|e| e.display_title().map(|t| one_line(t, 200))),
     };
-    match name {
-        Some(n) if !n.is_empty() => format!("Preview · {n}"),
-        _ => "Preview".to_string(),
+    name.filter(|n| !n.is_empty())
+}
+
+fn preview_title(app: &App) -> String {
+    match selected_name(app) {
+        Some(n) => format!("Preview · {n}"),
+        None => "Preview".to_string(),
+    }
+}
+
+/// How much of the transcript is shown: the last so many messages, or all of them, which only
+/// what `m` asked for can say (it is read back to the start; the preview a selection gets reads
+/// 4 MB at most, and says how many it holds). While a reading is out, what was asked for.
+fn preview_count(app: &App) -> String {
+    let p = &app.preview;
+    let shown = match (&p.target, &p.loaded) {
+        (Some(target), Some((path, Ok(messages))))
+            if target == path && p.work.running() != Some(target) =>
+        {
+            Some(messages.len())
+        }
+        _ => None,
+    };
+    match shown {
+        Some(n) if n < p.limit && p.limit > PREVIEW_MESSAGES => format!("all {n} messages"),
+        Some(n) if n < p.limit => format!("last {n} messages"),
+        _ if p.limit == usize::MAX => "all messages".to_string(),
+        _ => format!("last {} messages", p.limit),
     }
 }
 
 fn preview(app: &App, f: &mut Frame, area: Rect) {
     let title = match &app.logs {
         Some(logs) => format!("Logs · {} (claude logs · esc: back)", logs.short_id),
-        None => format!("{} (last {PREVIEW_MESSAGES} messages)", preview_title(app)),
+        None => format!("{} ({})", preview_title(app), preview_count(app)),
     };
     f.render_widget(
         Paragraph::new(section(
@@ -1687,6 +1720,14 @@ fn preview(app: &App, f: &mut Frame, area: Rect) {
         height: area.height.saturating_sub(1),
         ..area
     };
+    preview_body(app, f, text_area);
+}
+
+/// The messages (or logs) scrolled up from the bottom, or why there are none.
+fn preview_body(app: &App, f: &mut Frame, text_area: Rect) {
+    if text_area.height == 0 || text_area.width == 0 {
+        return;
+    }
     if let Some(note) = preview_note(app) {
         f.render_widget(Paragraph::new(Line::styled(note, DIM)), text_area);
         return;
@@ -1697,6 +1738,367 @@ fn preview(app: &App, f: &mut Frame, area: Rect) {
     let end = lines.len() - scroll;
     let start = end.saturating_sub(height);
     f.render_widget(Paragraph::new(lines[start..end].to_vec()), text_area);
+}
+
+// ---- Session card (R16) --------------------------------------------------------------
+
+/// The widest the card gets: longer lines read badly.
+const CARD_MAX_WIDTH: u16 = 110;
+/// Lines the card keeps for the preview: with less room, the facts give way, last ones first.
+const CARD_MIN_PREVIEW: u16 = 6;
+/// Width of a fact's label (`Transcript` and a space).
+const FACT_LABEL: usize = 11;
+
+/// The card over the body: a margin where there is room, at most [`CARD_MAX_WIDTH`] wide.
+pub fn card_area(app: &App) -> Rect {
+    let body = frame_areas(screen(app)).body;
+    let dx = if body.width >= 60 { 3 } else { 0 };
+    let dy = u16::from(body.height >= 14);
+    let w = body.width.saturating_sub(2 * dx).min(CARD_MAX_WIDTH);
+    let h = body.height.saturating_sub(2 * dy);
+    Rect::new(body.x + (body.width - w) / 2, body.y + dy, w, h)
+}
+
+/// Inside the card's border: the facts, the preview's title line, the preview.
+struct CardLayout {
+    facts: Rect,
+    title: Rect,
+    preview: Rect,
+}
+
+fn card_layout(app: &App) -> CardLayout {
+    let inner = Block::new().borders(Borders::ALL).inner(card_area(app));
+    let room = inner.height.saturating_sub(1 + CARD_MIN_PREVIEW) as usize;
+    let facts = card_facts(app, inner.width as usize).len().min(room) as u16;
+    let title = u16::from(inner.height > facts);
+    CardLayout {
+        facts: Rect {
+            height: facts,
+            ..inner
+        },
+        title: Rect {
+            y: inner.y + facts,
+            height: title,
+            ..inner
+        },
+        preview: Rect {
+            y: inner.y + facts + title,
+            height: inner.height.saturating_sub(facts + title),
+            ..inner
+        },
+    }
+}
+
+/// The session the card is for: its index entry (History: the row's; Live: the running
+/// session's copy, once indexed) and its live session (Live: the row's; History: the one
+/// running the entry's id, if any).
+fn card_subject(app: &App) -> (Option<&Entry>, Option<&LiveSession>) {
+    match app.view {
+        View::History => {
+            let entry = app.selected_entry();
+            let live = entry.and_then(|e| {
+                app.live
+                    .iter()
+                    .find(|s| s.session_id.as_deref() == Some(e.session_id.as_str()))
+            });
+            (entry, live)
+        }
+        View::Live => {
+            let live = app.selected_live();
+            let entry = live
+                .and_then(|s| app.transcript_for_live(s))
+                .and_then(|p| app.index.entries.get(&p));
+            (entry, live)
+        }
+        View::Accounts | View::Stats => (None, None),
+    }
+}
+
+fn fact(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
+    let mut spans = vec![Span::styled(text::pad(label, FACT_LABEL), DIM)];
+    spans.extend(value);
+    Line::from(spans)
+}
+
+fn sep() -> Span<'static> {
+    Span::styled(" · ", DIM)
+}
+
+/// A moment in the local time zone, with how long ago it was; on the same day as `after`, the
+/// time alone.
+fn stamp(app: &App, t: Timestamp, after: Option<Timestamp>) -> String {
+    let zoned = t.to_zoned(app.tz.clone());
+    let same_day = after.is_some_and(|a| a.to_zoned(app.tz.clone()).date() == zoned.date());
+    let when = if same_day {
+        zoned.strftime("%H:%M")
+    } else {
+        zoned.strftime("%Y-%m-%d %H:%M")
+    };
+    format!("{when} ({})", format_age(t, app.now))
+}
+
+/// A span of time, to the minute: `3d 02h`, `1h 51m`, `12m`; under a minute (or backwards),
+/// none.
+fn span_text(secs: i64) -> Option<String> {
+    if secs < 0 {
+        return None;
+    }
+    let (d, h, m) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
+    match (d, h, m) {
+        (0, 0, 0) => None,
+        (0, 0, m) => Some(format!("{m}m")),
+        (0, h, m) => Some(format!("{h}h {m:02}m")),
+        (d, h, _) => Some(format!("{d}d {h:02}h")),
+    }
+}
+
+/// What the card says of the session above the preview, one fact a line, at `width`: what
+/// it is called, its id, provider and entry point, its accounts and whether it runs, when it
+/// started and was last active, its directory, its transcript and store (R16). Paths keep
+/// their end; in private mode the transcript and store, which are keys, are not shown at all.
+fn card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
+    let (entry, live) = card_subject(app);
+    let value_w = width.saturating_sub(FACT_LABEL);
+    let dash = || vec![Span::styled("-", DIM)];
+    let mut facts = Vec::new();
+
+    // A live session's name and its transcript's title are two things; the box title has one
+    // (Live: the name; History: the title), the first fact the other. The first words come
+    // when a title replaced them.
+    if let (Some(e), Some(s)) = (entry, live)
+        && let Some(name) = &s.name
+    {
+        match (app.view, e.display_title()) {
+            (View::Live, Some(title)) => {
+                facts.push(fact("Title", vec![Span::raw(one_line(title, 200))]));
+            }
+            (View::History, _) => facts.push(fact("Name", vec![Span::raw(name.clone())])),
+            _ => {}
+        }
+    }
+    if let Some(e) = entry
+        && e.title.is_some()
+        && let Some(first) = &e.first_user_text
+    {
+        facts.push(fact("First", vec![Span::raw(one_line(first, 200))]));
+    }
+
+    let id = entry
+        .map(|e| e.session_id.clone())
+        .or_else(|| live.and_then(|s| s.session_id.clone()));
+    let mut session = match id {
+        Some(id) => vec![Span::styled(id, BOLD)],
+        None => vec![Span::styled("id unknown", DIM)],
+    };
+    if let Some(e) = entry {
+        let (provider, style) = match e.provider {
+            Provider::Claude => ("claude", Style::new()),
+            Provider::Codex => ("codex", CODEX_STYLE),
+        };
+        session.push(sep());
+        session.push(Span::styled(provider, style));
+        let how = match e.provider {
+            Provider::Claude => e.entrypoint.clone(),
+            Provider::Codex => {
+                let parts: Vec<&str> = [e.source.as_deref(), e.originator.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join(" / "))
+            }
+        };
+        if let Some(how) = how {
+            session.push(sep());
+            session.push(Span::raw(how));
+        }
+    } else if let Some(s) = live
+        && let Some(kind) = &s.kind
+    {
+        session.push(sep());
+        session.push(Span::raw(kind.clone()));
+    }
+    facts.push(fact("Session", session));
+
+    let names = entry.map(|e| app.entry_accounts(e)).unwrap_or_default();
+    let mut accounts = if names.is_empty() {
+        match live {
+            Some(s) => vec![Span::raw(short(&s.account).to_string())],
+            None => dash(),
+        }
+    } else {
+        let names = names
+            .iter()
+            .map(|a| short(a))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match entry.map(|e| e.provider) {
+            Some(Provider::Codex) => vec![Span::styled(names, CODEX_STYLE)],
+            _ => vec![Span::raw(names)],
+        }
+    };
+    if let Some(s) = live {
+        let status = s.status.clone().unwrap_or_else(|| "-".to_string());
+        let style = match status.as_str() {
+            "busy" => WARN,
+            "idle" => OK,
+            _ if s.is_inactive() => DIM,
+            _ => Style::new(),
+        };
+        let state = match (s.is_background(), &s.short_id, s.pid) {
+            (true, Some(sid), _) => format!("background {sid} in {}", short(&s.account)),
+            (true, None, _) => format!("background in {}", short(&s.account)),
+            (false, _, Some(pid)) => format!("running in {} (pid {pid})", short(&s.account)),
+            (false, _, None) => format!("running in {}", short(&s.account)),
+        };
+        accounts.push(sep());
+        accounts.push(Span::raw(state));
+        accounts.push(Span::raw(" "));
+        accounts.push(Span::styled(status, style));
+    }
+    facts.push(fact("Accounts", accounts));
+
+    let first = entry.and_then(|e| e.ts_first.as_deref()?.parse::<Timestamp>().ok());
+    let last = entry.and_then(|e| {
+        e.last_activity()
+            .or_else(|| Timestamp::from_nanosecond(e.mtime_ns).ok())
+    });
+    let mut started = match first {
+        Some(t) => vec![Span::raw(stamp(app, t, None))],
+        None => dash(),
+    };
+    if let Some(t) = last {
+        started.push(sep());
+        started.push(Span::styled("last ", DIM));
+        started.push(Span::raw(stamp(app, t, first)));
+    }
+    if let (Some(a), Some(b)) = (first, last)
+        && let Some(active) = span_text(b.as_second() - a.as_second())
+    {
+        started.push(sep());
+        started.push(Span::styled("active ", DIM));
+        started.push(Span::raw(active));
+    }
+    // The run's own start: a session is older than its process.
+    if let Some(t) = live
+        .and_then(|s| s.started_at)
+        .and_then(|ms| Timestamp::from_millisecond(ms).ok())
+    {
+        started.push(sep());
+        started.push(Span::styled("up since ", DIM));
+        started.push(Span::raw(stamp(app, t, first.or(last))));
+    }
+    facts.push(fact("Started", started));
+
+    let (cwd_last, cwd_first) = match (entry, live) {
+        (Some(e), _) => (e.cwd_last.as_deref(), e.cwd_first.as_deref()),
+        (None, Some(s)) => (s.cwd.as_deref(), None),
+        (None, None) => (None, None),
+    };
+    let mut directory = match cwd_last {
+        Some(c) => vec![Span::raw(tail(&tilde(app, c), value_w))],
+        None => dash(),
+    };
+    if let Some(c) = cwd_first
+        && cwd_first != cwd_last
+    {
+        directory.push(sep());
+        directory.push(Span::styled("started in ", DIM));
+        directory.push(Span::raw(tail(&tilde(app, c), value_w / 2)));
+    }
+    facts.push(fact("Directory", directory));
+
+    match entry {
+        Some(e) if app.private => {
+            facts.push(fact("Transcript", vec![Span::styled(privacy::MASK, DIM)]));
+            facts.push(fact("Store", vec![Span::styled(privacy::MASK, DIM)]));
+            let _ = e;
+        }
+        Some(e) => {
+            let path = tilde(app, &e.path.display().to_string());
+            facts.push(fact(
+                "Transcript",
+                vec![
+                    Span::raw(tail(&path, value_w.saturating_sub(12))),
+                    sep(),
+                    Span::raw(byte_size(e.size)),
+                ],
+            ));
+            let store = tilde(app, &e.store.display().to_string());
+            facts.push(fact("Store", vec![Span::raw(tail(&store, value_w))]));
+        }
+        None => {
+            if live.is_some() {
+                facts.push(fact(
+                    "Transcript",
+                    vec![Span::styled("not indexed yet", DIM)],
+                ));
+            }
+        }
+    }
+    facts
+}
+
+fn card_title(app: &App) -> String {
+    match selected_name(app) {
+        Some(n) => format!("Session · {n}"),
+        None => "Session".to_string(),
+    }
+}
+
+/// The preview's title line in the card: what is shown of the transcript, or the logs.
+fn card_preview_title(app: &App) -> String {
+    match &app.logs {
+        Some(logs) => format!("Logs · {} (claude logs)", logs.short_id),
+        None => format!("Messages · {}", preview_count(app)),
+    }
+}
+
+/// The hints line while the card is open: what acts on the session (R16).
+fn card_hints(app: &App) -> String {
+    let open = match app.view {
+        View::Live => "enter: attach",
+        _ => "enter: resume",
+    };
+    format!("{open} · f: fork · R/F: as… · n: new here · y/Y: copy · [ ]: move")
+}
+
+/// The card's bottom edge: how to read it, and Live's own keys (`m` is the transcript's, not
+/// the logs').
+fn card_edge(app: &App) -> &'static str {
+    match app.view {
+        View::Live if app.logs.is_some() => "j/k: scroll · l: logs · x: stop · D: rm · esc: close",
+        View::Live => "j/k: scroll · m: more · l: logs · x: stop · D: rm · esc: close",
+        _ => "j/k: scroll · m: more · esc: close",
+    }
+}
+
+fn card(app: &App, f: &mut Frame) {
+    let area = card_area(app);
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    let fits = |s: &str| text::truncate(s, area.width.saturating_sub(4) as usize);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(DIM)
+        .title(Line::styled(format!(" {} ", fits(&card_title(app))), BOLD))
+        .title_bottom(Line::styled(format!(" {} ", fits(card_edge(app))), DIM));
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    let layout = card_layout(app);
+    let mut facts = card_facts(app, layout.facts.width as usize);
+    facts.truncate(layout.facts.height as usize);
+    f.render_widget(Paragraph::new(facts), layout.facts);
+    if layout.title.height > 0 {
+        f.render_widget(
+            Paragraph::new(section(
+                &text::truncate(&card_preview_title(app), layout.title.width as usize),
+                layout.title.width,
+            )),
+            layout.title,
+        );
+    }
+    preview_body(app, f, layout.preview);
 }
 
 // ---- Help ----------------------------------------------------------------------------
@@ -1718,9 +2120,20 @@ pub const KEYS: &[(&str, &str)] = &[
     ),
     (
         "p / space",
-        "expand the preview · accounts: show the account's configuration, then expand it",
+        "live, history: open / close the session card (what remuda knows of the session, and \
+         its preview) · accounts: show the account's configuration, then expand it",
     ),
-    ("n", "accounts: new session with the selected account"),
+    (
+        "R F · y Y · m · [ ]",
+        "session card: resume / fork choosing the account · copy the session id / the \
+         transcript path (OSC 52) · more of the transcript (100, 500, all) · previous / next \
+         session",
+    ),
+    (
+        "n",
+        "accounts: new session with the selected account · session card: one in the \
+         session's directory as its account",
+    ),
     (
         "s",
         "accounts: set up a new account, claude or codex (remuda setup)",
@@ -1734,7 +2147,8 @@ pub const KEYS: &[(&str, &str)] = &[
     ),
     (
         "esc",
-        "back / clear the search / cancel (a form, a launch check)",
+        "back / close the card or the logs / clear the search / cancel (a form, a launch \
+         check)",
     ),
     ("/", "search history (fuzzy: title, cwd, accounts)"),
     (
@@ -2200,11 +2614,19 @@ fn boxed(f: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>) {
 }
 
 fn pick_box(app: &App, pick: &Pick, f: &mut Frame, area: Rect) {
-    let verb = match pick.action {
-        PickFor::Resume => "Resume",
-        PickFor::Fork => "Fork",
+    let title = match pick.action {
+        PickFor::Resume => format!("Resume {} as…", short_id(&pick.session_id)),
+        PickFor::Fork => format!("Fork {} as…", short_id(&pick.session_id)),
+        PickFor::NewSession => {
+            let dir = app
+                .index
+                .entries
+                .get(&pick.path)
+                .and_then(|e| e.cwd_last.as_deref())
+                .map_or_else(|| "remuda's directory".to_string(), |c| tilde(app, c));
+            format!("New session in {dir} as…")
+        }
     };
-    let title = format!("{verb} {} as…", short_id(&pick.session_id));
     let name_w = pick
         .options
         .iter()

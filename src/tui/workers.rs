@@ -17,7 +17,7 @@ use crate::{account_config, attribution, checks, identity, live, owned, stats, t
 
 use super::Deps;
 use super::accounts::Reading;
-use super::app::{self, Effect, Event, LaunchRequest, Marked, PREVIEW_MESSAGES};
+use super::app::{self, Effect, Event, LaunchRequest, Marked};
 
 /// `claude auth status` / `codex login status` per account; the same default as `remuda list`.
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -37,7 +37,11 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
     let deps = Arc::clone(deps);
     let tx = tx.clone();
     match effect {
-        Effect::Quit | Effect::Pick(_) | Effect::Launch(_) | Effect::Setup { .. } => {}
+        Effect::Quit
+        | Effect::Pick(_)
+        | Effect::Launch(_)
+        | Effect::Setup { .. }
+        | Effect::Copy(_) => {}
         Effect::ReadAccounts => {
             thread::spawn(move || {
                 deps.listing.read(&tx);
@@ -202,10 +206,17 @@ pub fn spawn(effect: Effect, deps: &Arc<Deps>, tx: &Sender<Event>) {
                 let _ = tx.send(Event::AccountRemoved { account, result });
             });
         }
-        Effect::Preview(path, provider) => answer(&deps, &tx, move |_| {
+        // The preview a selection gets reads the last 4 MB at most; what `m` asks for is read
+        // back to the start, so that fewer than asked for means all (R16).
+        Effect::Preview(path, provider, limit) => answer(&deps, &tx, move |_| {
+            let cap = if limit > app::PREVIEW_MESSAGES {
+                u64::MAX
+            } else {
+                transcript::PREVIEW_CAP
+            };
             let result = match provider {
-                Provider::Claude => transcript::preview(&path, PREVIEW_MESSAGES),
-                Provider::Codex => codex::preview(&path, PREVIEW_MESSAGES),
+                Provider::Claude => transcript::preview_within(&path, limit, cap),
+                Provider::Codex => codex::preview_within(&path, limit, cap),
             }
             .map_err(|e| e.to_string());
             Event::Preview { path, result }
@@ -1142,7 +1153,7 @@ mod tests {
         let deps = deps(dir.path());
         let path = dir.path().join("max/projects/-w/s1.jsonl");
         let events = collect(
-            Effect::Preview(path.clone(), Provider::Claude),
+            Effect::Preview(path.clone(), Provider::Claude, app::PREVIEW_MESSAGES),
             &deps,
             |_| true,
         );
