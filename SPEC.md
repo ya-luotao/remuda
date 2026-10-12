@@ -1038,7 +1038,8 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
   account it runs as; History: the one account of its provider it is attributed to, else the
   picker among them, and none is refused with a notice, unless the attribution (the first time,
   or again after the account list changed), or the stores a codex rollout attributed to none
-  falls back on, are still being read, which asks to try again); `y` and `Y` copy the session
+  falls back on (read with the index, so while the index is read again too), are still being
+  read, which asks to try again); `y` and `Y` copy the session
   id and the
   transcript path to the clipboard through the terminal (OSC 52; the terminal, or tmux, must pass
   it on), and a notice says so; `m` reads more of the transcript (the last 20 messages, then 100,

@@ -1080,6 +1080,32 @@ fn n_in_the_card_waits_for_the_attribution_and_the_stores() {
             Level::Warn
         ))
     );
+    // Known from before, but being read again with the index (after `r`, or an account list
+    // change): the same.
+    update(&mut app, Event::Stores(vec![]));
+    let entries: Vec<Entry> = app.index.entries.values().cloned().collect();
+    keys(&mut app, &[Key::Char('r')]);
+    update(&mut app, Event::Attribution(Attribution::default()));
+    assert!(app.work.index.is_running());
+    keys(&mut app, &[Key::Char('n')]);
+    assert_eq!(
+        notice(&app).map(|(text, _)| text),
+        Some("still reading the transcript stores; try again in a moment")
+    );
+    update(
+        &mut app,
+        Event::IndexDone {
+            entries,
+            error: None,
+        },
+    );
+    keys(&mut app, &[Key::Char('n')]);
+    assert_eq!(
+        notice(&app).map(|(text, _)| text),
+        Some(
+            "session 019c1e08 is attributed to no registered account: start one from Accounts (n)"
+        )
+    );
 }
 
 /// R16: `m` in the card reads the transcript again with the next limit (100, 500, all, 20);

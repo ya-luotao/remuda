@@ -1566,10 +1566,16 @@ impl App {
                             "still reading which accounts the sessions belong to; try again in a \
                          moment",
                         ),
-                    [] if provider == Some(CODEX) && self.stores.is_none() => self.notify(
-                        Level::Warn,
-                        "still reading the transcript stores; try again in a moment",
-                    ),
+                    // The stores come with the index: while it is read again, the list shown
+                    // is the one from before.
+                    [] if provider == Some(CODEX)
+                        && (self.stores.is_none() || self.work.index.is_running()) =>
+                    {
+                        self.notify(
+                            Level::Warn,
+                            "still reading the transcript stores; try again in a moment",
+                        );
+                    }
                     [] => {
                         let text = format!(
                             "session {} is attributed to no registered account: start one from \
