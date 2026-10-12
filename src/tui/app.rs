@@ -1558,12 +1558,14 @@ impl App {
                     self.index.entries.get(&path).map(|e| e.provider),
                 );
                 match accounts.as_slice() {
-                    // Nothing found while what says is still being read is not an answer.
-                    [] if !self.attribution_loaded => self.notify(
-                        Level::Warn,
-                        "still reading which accounts the sessions belong to; try again in a \
+                    // Nothing found while what says is still being read (the first time, or
+                    // again after the account list changed, R16) is not an answer.
+                    [] if !self.attribution_loaded || self.work.attribution.is_running() => self
+                        .notify(
+                            Level::Warn,
+                            "still reading which accounts the sessions belong to; try again in a \
                          moment",
-                    ),
+                        ),
                     [] if provider == Some(CODEX) && self.stores.is_none() => self.notify(
                         Level::Warn,
                         "still reading the transcript stores; try again in a moment",

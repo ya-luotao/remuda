@@ -1039,6 +1039,30 @@ fn n_in_the_card_waits_for_the_attribution_and_the_stores() {
         )
     );
 
+    // The account list changed: the attribution is read again, and until it answers a session
+    // of the account that was added is not attributed to none.
+    let mut app = history_with(&[]);
+    update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("max"), account("new")]),
+    );
+    assert!(app.work.attribution.is_running());
+    keys(&mut app, &[Key::Char('p'), Key::Char('n')]);
+    assert_eq!(
+        notice(&app).map(|(text, _)| text),
+        Some("still reading which accounts the sessions belong to; try again in a moment")
+    );
+    let mut attribution = Attribution::default();
+    attribution.add(A, "claude:new");
+    update(&mut app, Event::Attribution(attribution));
+    keys(&mut app, &[Key::Char('n')]);
+    assert_eq!(
+        form(&app).kind,
+        FormKind::NewSession {
+            account: account("new")
+        }
+    );
+
     // A codex rollout: its store's owners stand in for the attribution, once the stores are
     // known.
     let mut app = codex_app();

@@ -1036,9 +1036,10 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
   as the picker orders them; codex: the owners of the store, R17); `n` opens the new-session form
   (as `n` in Accounts) for the session's account in the session's last directory (Live: the
   account it runs as; History: the one account of its provider it is attributed to, else the
-  picker among them, and none is refused with a notice, unless the attribution, or the stores a
-  codex rollout attributed to none falls back on, are still being read, which asks to try
-  again); `y` and `Y` copy the session id and the
+  picker among them, and none is refused with a notice, unless the attribution (the first time,
+  or again after the account list changed), or the stores a codex rollout attributed to none
+  falls back on, are still being read, which asks to try again); `y` and `Y` copy the session
+  id and the
   transcript path to the clipboard through the terminal (OSC 52; the terminal, or tmux, must pass
   it on), and a notice says so; `m` reads more of the transcript (the last 20 messages, then 100,
   500, all, and 20 again; another selection starts at 20), what is shown staying until the
