@@ -485,6 +485,60 @@ fn tui_launches_warn_about_an_inherited_child_session_marker() {
     }
 }
 
+/// R2, R6, R16: the environment's warnings are about a launch that happens. When the terminal
+/// cannot be handed over, nothing is logged or run, and the result carries neither the Keychain
+/// warning nor the one that the session will not be saved; once it is handed over, both come.
+#[test]
+fn tui_environment_warnings_only_come_with_a_launch_that_ran() {
+    let sb = Sandbox::new();
+    let max = named("max", "/p/max");
+    register(&sb, &[&max]);
+    let mut deps = deps(&sb);
+    deps.env
+        .insert("CLAUDE_CODE_CHILD_SESSION".into(), "1".into());
+    deps.env
+        .insert("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), "/secure/x".into());
+    let launch = |screen: &mut FakeScreen| {
+        let request = LaunchRequest {
+            account: max.clone(),
+            args: vec!["-n".into(), "fix it".into()],
+            cwd: Some(project(&sb)),
+            what: "new session as max".into(),
+        };
+        match tui::launch_in_foreground(screen, &deps, request, &quiet()).unwrap() {
+            Event::Launched {
+                result, warnings, ..
+            } => (result, warnings),
+            other => panic!("{other:?}"),
+        }
+    };
+
+    let mut screen = FakeScreen {
+        fail_suspend: true,
+        ..FakeScreen::default()
+    };
+    let (result, warnings) = launch(&mut screen);
+    let Err(e) = &result else {
+        panic!("{result:?}")
+    };
+    assert!(e.contains("cannot hand the terminal over"), "{e}");
+    assert_eq!(warnings, Vec::<String>::new());
+    assert!(sb.invocations().is_empty());
+    assert!(!sb.launch_log().exists());
+
+    let mut screen = FakeScreen::default();
+    let (result, warnings) = launch(&mut screen);
+    assert_eq!(result, Ok(Exit::Code(0)));
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with("CLAUDE_SECURESTORAGE_CONFIG_DIR is set"),
+        "{warnings:?}"
+    );
+    assert_eq!(warnings[1], launch::child_session_warning());
+    assert_eq!(sb.invocations().len(), 1);
+    assert_eq!(sb.launches().len(), 1);
+}
+
 /// R16, R18: the TUI launches through the same path as `run`: shared configuration from the
 /// registry as it is at launch goes before the arguments, and its notices come back as
 /// warnings.

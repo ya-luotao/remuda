@@ -480,13 +480,18 @@ fn run_launch(
         Ok(plan) => plan,
         Err(e) => return Ok((Err(format!("{e:#}")), Vec::new())),
     };
-    let mut warnings = launch::env_warnings(&deps.env, &plan);
-    warnings.extend(plan.notices.iter().cloned());
     let log = owned::launch_log(&deps.state_dir);
     if let Err(e) = screen.suspend() {
         let _ = screen.resume();
-        return Ok((Err(format!("cannot hand the terminal over: {e}")), warnings));
+        // Nothing was logged or run: the warnings about this launch (the environment's, R2 and
+        // R6, and the shared configuration's notices, R18) would tell of one that never was.
+        return Ok((
+            Err(format!("cannot hand the terminal over: {e}")),
+            Vec::new(),
+        ));
     }
+    let mut warnings = launch::env_warnings(&deps.env, &plan);
+    warnings.extend(plan.notices.iter().cloned());
     for line in handover_lines(&request.what, cwd, deps.private, &deps.env, &plan) {
         println!("{line}");
     }
