@@ -50,6 +50,7 @@ fn a_new_session_is_logged_then_run_in_its_directory() {
     );
     assert_eq!(ran.status.unwrap().code(), Some(0));
     assert_eq!(ran.log_error, None);
+    assert!(!ran.refused);
 
     let inv = sb.only_invocation();
     assert_eq!(inv.cwd, dir.canonicalize().unwrap());
@@ -130,8 +131,13 @@ fn a_missing_directory_fails_before_anything_runs() {
         Some(&gone),
         &sb.launch_log(),
     );
-    assert!(ran.status.is_err());
+    assert_eq!(
+        ran.status.unwrap_err().to_string(),
+        format!("{} is not an existing directory", gone.display())
+    );
+    assert!(ran.refused, "R16: refused before anything is logged or run");
     assert!(sb.invocations().is_empty());
+    assert!(!sb.launch_log().exists());
 }
 
 /// remuda ignores Ctrl-C while claude owns the terminal, but claude itself must not: its
@@ -537,6 +543,48 @@ fn tui_environment_warnings_only_come_with_a_launch_that_ran() {
     assert_eq!(warnings[1], launch::child_session_warning());
     assert_eq!(sb.invocations().len(), 1);
     assert_eq!(sb.launches().len(), 1);
+}
+
+/// R6, R16: a session whose directory does not exist is refused before the terminal is handed
+/// over, with the same words as `launch::perform`: nothing is printed, logged or run, and the
+/// result carries none of the environment's warnings (the Keychain one, and that the session
+/// would not be saved though the launch is logged).
+#[test]
+fn tui_launch_in_a_missing_directory_warns_of_nothing() {
+    let sb = Sandbox::new();
+    let max = named("max", "/p/max");
+    register(&sb, &[&max]);
+    let mut deps = deps(&sb);
+    deps.env
+        .insert("CLAUDE_CODE_CHILD_SESSION".into(), "1".into());
+    deps.env
+        .insert("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), "/secure/x".into());
+    let gone = sb.root().join("gone");
+    let request = LaunchRequest {
+        account: max,
+        args: vec![
+            "--resume".into(),
+            "766560c5-0000-4000-8000-000000000000".into(),
+        ],
+        cwd: Some(gone.clone()),
+        what: "resume 766560c5 as max".into(),
+    };
+    let mut screen = FakeScreen::default();
+    let event = tui::launch_in_foreground(&mut screen, &deps, request, &quiet()).unwrap();
+    let Event::Launched {
+        result, warnings, ..
+    } = &event
+    else {
+        panic!("{event:?}")
+    };
+    assert_eq!(
+        result,
+        &Err(format!("{} is not an existing directory", gone.display()))
+    );
+    assert_eq!(warnings, &Vec::<String>::new());
+    assert!(screen.calls.is_empty(), "{:?}", screen.calls);
+    assert!(sb.invocations().is_empty());
+    assert!(!sb.launch_log().exists());
 }
 
 /// R16, R18: the TUI launches through the same path as `run`: shared configuration from the

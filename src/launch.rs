@@ -519,21 +519,30 @@ pub struct Ran {
     pub status: io::Result<ExitStatus>,
     /// The launch log could not be written (claude ran anyway, as with `run`).
     pub log_error: Option<String>,
+    /// [`check_cwd`] refused the directory: nothing was logged or run, and `status` says why.
+    pub refused: bool,
+}
+
+/// The directory a TUI launch runs in must exist (R6, R16): `None` is remuda's own.
+pub fn check_cwd(cwd: Option<&Path>) -> io::Result<()> {
+    match cwd {
+        Some(dir) if !dir.is_dir() => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} is not an existing directory", dir.display()),
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// A launch from the TUI (R6, R16): `plan` is logged exactly as `remuda run` logs it, then
 /// claude runs in the foreground in `cwd` and remuda waits for it. A directory that does not
-/// exist fails before anything is logged or run.
+/// exist ([`check_cwd`]) fails before anything is logged or run.
 pub fn perform(program: &Path, plan: &Launch, cwd: Option<&Path>, log: &Path) -> Ran {
-    if let Some(dir) = cwd
-        && !dir.is_dir()
-    {
+    if let Err(e) = check_cwd(cwd) {
         return Ran {
-            status: Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("{} is not an existing directory", dir.display()),
-            )),
+            status: Err(e),
             log_error: None,
+            refused: true,
         };
     }
     let log_error = append_log(log, &plan.record)
@@ -545,7 +554,11 @@ pub fn perform(program: &Path, plan: &Launch, cwd: Option<&Path>, log: &Path) ->
     }
     cmd.envs(plan.extra_env.iter().map(|(k, v)| (k, v)));
     let status = foreground(cmd);
-    Ran { status, log_error }
+    Ran {
+        status,
+        log_error,
+        refused: false,
+    }
 }
 
 /// Applies `change` on top of the environment `cmd` inherits.

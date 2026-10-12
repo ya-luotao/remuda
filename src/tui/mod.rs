@@ -480,6 +480,11 @@ fn run_launch(
         Ok(plan) => plan,
         Err(e) => return Ok((Err(format!("{e:#}")), Vec::new())),
     };
+    // A directory that does not exist ends the launch before the terminal is handed over, as a
+    // missing executable does: nothing is printed, logged or run, so nothing is warned about.
+    if let Err(e) = launch::check_cwd(cwd) {
+        return Ok((Err(e.to_string()), Vec::new()));
+    }
     let log = owned::launch_log(&deps.state_dir);
     if let Err(e) = screen.suspend() {
         let _ = screen.resume();
@@ -499,8 +504,21 @@ fn run_launch(
     screen
         .resume()
         .with_context(|| format!("cannot take the terminal back after {}", provider.program()))?;
+    Ok(launch_result(ran, warnings))
+}
+
+/// How a launch that got the terminal ended, with its warnings (R16). A directory that was
+/// removed after the check before the handover is refused by [`launch::perform`] with nothing
+/// logged or run: the warnings about the launch would then tell of one that never was.
+fn launch_result(
+    ran: launch::Ran,
+    mut warnings: Vec<String>,
+) -> (Result<Exit, String>, Vec<String>) {
+    if ran.refused {
+        warnings.clear();
+    }
     warnings.extend(ran.log_error);
-    Ok((ran.status.map(exit_of).map_err(|e| e.to_string()), warnings))
+    (ran.status.map(exit_of).map_err(|e| e.to_string()), warnings)
 }
 
 /// `remuda setup --provider <p> <name>` from the TUI (R5, R16, R17): the same checks and steps
@@ -680,6 +698,46 @@ mod decode_tests {
         assert_eq!(
             launch_line("new session as max", None, false),
             "remuda: new session as max"
+        );
+    }
+
+    /// R6, R16: a launch whose directory was removed after the check before the handover is
+    /// refused by `launch::perform` with nothing logged or run, so its warnings are dropped; one
+    /// that ran keeps them, in order, with a launch log that could not be written after them.
+    #[test]
+    fn launch_result_drops_the_warnings_of_a_refused_launch() {
+        use std::os::unix::process::ExitStatusExt;
+        let warnings = || vec!["first".to_string(), "second".to_string()];
+        let refused = launch::Ran {
+            status: Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "/gone is not an existing directory",
+            )),
+            log_error: None,
+            refused: true,
+        };
+        assert_eq!(
+            launch_result(refused, warnings()),
+            (
+                Err("/gone is not an existing directory".to_string()),
+                Vec::new()
+            )
+        );
+        let ran = launch::Ran {
+            status: Ok(ExitStatus::from_raw(3 << 8)),
+            log_error: Some("cannot write launch log /x: denied".into()),
+            refused: false,
+        };
+        assert_eq!(
+            launch_result(ran, warnings()),
+            (
+                Ok(Exit::Code(3)),
+                vec![
+                    "first".to_string(),
+                    "second".to_string(),
+                    "cannot write launch log /x: denied".to_string()
+                ]
+            )
         );
     }
 
