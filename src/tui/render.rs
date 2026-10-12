@@ -1132,6 +1132,9 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
                 }
                 out.line(&line, Style::new());
             }
+            (None, Origin::NotShared(Skip::Builtin)) => {
+                out.line(&format!("  {} · {origin}", p.name), Style::new());
+            }
             (None, Origin::NotShared(_)) => {
                 out.line(&format!("  {} · {origin}", p.name), DIM);
             }
@@ -1384,6 +1387,7 @@ fn origin_label(origin: &Origin, src: Option<&str>) -> String {
         Origin::NotShared(Skip::UnrecognizedList) => {
             "not shared: installed_plugins.json not recognized".to_string()
         }
+        Origin::NotShared(Skip::Builtin) => "bundled with claude".to_string(),
     }
 }
 

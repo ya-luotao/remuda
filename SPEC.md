@@ -790,7 +790,8 @@ appeared in no `history.jsonl`.
   the memory of user-scope subagents is not shared); rules of the source whose frontmatter has
   `paths`, when some member gets
   the rules at launch (they are not applied there); an enabled plugin whose install path does not
-  exist; an `installed_plugins.json` whose format is not recognized; authentication keys in the
+  exist (not one of the `builtin` marketplace, which claude bundles and never installs); an
+  `installed_plugins.json` whose format is not recognized; authentication keys in the
   source's settings that are withheld from the settings injected at launch (said of the
   accounts that get their settings that way when some member links `settings.json` instead,
   and not said when every member does).
@@ -1370,8 +1371,11 @@ not see the sessions in the source's store (R11, R16).
   or similar variables (2.1.281 bundle). remuda shares them anyway; the case is rare.
 - **Plugins.** Enabled plugins are the keys whose value in the source settings' `enabledPlugins` is
   `true` or an array (claude treats both as enabled), except those set to `false` in the
-  `enabledPlugins` of the home or of the project settings above, and those the home has installed
-  itself in a way claude loads here, which would otherwise load twice. claude loads an install
+  `enabledPlugins` of the home or of the project settings above (the highest layer that sets the
+  key decides, as claude merges it), and those the home has installed
+  itself in a way claude loads here, which would otherwise load twice, and those of the `builtin`
+  marketplace (`<name>@builtin`), which claude bundles and loads from its own bundle (2.1.296):
+  they have no install, and none is injected for them. claude loads an install
   (2.1.281 bundle) when its scope is `user` or `managed`, or when its `projectPath` equals the start
   directory, or when both the `projectPath` and the start directory are inside git repositories
   with the same project root (auto-memory rule below). If the home's own `installed_plugins.json`
@@ -1884,7 +1888,8 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   resolves by realpath to the source's, so nothing is injected for it, R12), or *not shared*
   with the reason (authentication where settings are injected, turned off by the home or the
   project, installed by the home itself, no user install, an unrecognized
-  `installed_plugins.json`). An account that is the
+  `installed_plugins.json`), or *bundled with claude* (a plugin of the `builtin` marketplace,
+  loaded by claude itself: no install, nothing injected). An account that is the
   source, has `share = false`, or whose source home is missing says so once instead of listing
   the source's items. A symlink shows as `-> <target>`; one whose target does not exist, as
   broken.
@@ -1908,7 +1913,9 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
 - **Plugins.** The home's enabled plugins (`enabledPlugins` `true` or an array), each with the
   install claude loads for that directory (R18's load rule; when several do, one made for the
   directory, `local` then `project`, before `user` then `managed`, else the first in the file),
-  its version and scope, and the number of install records; or marked not installed. Plugins set
+  its version and scope, and the number of install records; or marked not installed; or, for
+  one of the `builtin` marketplace, marked bundled with claude (turned off, when the project's
+  settings set it to `false`), and listed once when the source enables it too. Plugins set
   to `false` are counted, not listed. Then the source's enabled plugins, injected or not with the
   reason. For each installed plugin: its agents, skills, and commands (as above, in its install
   directory), its hook events with counts (`hooks/hooks.json`, or `hooks` in

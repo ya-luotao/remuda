@@ -151,6 +151,9 @@ pub enum Skip {
     NotInstalled,
     /// The home's or the source's `installed_plugins.json` is not recognized (R11).
     UnrecognizedList,
+    /// Bundled with claude (`<name>@builtin`): claude loads it from its own bundle, so there is
+    /// no install to inject.
+    Builtin,
 }
 
 /// What `account` gets from the source of `sharing` for a session launched with `user_args`
@@ -314,16 +317,17 @@ pub fn plan(
         let own_installs = installed_plugins(&home);
         // Which of them the home has cannot be told: nothing is injected (R11 warns).
         let own_unknown = matches!(own_installs, Installs::Unrecognized(_));
-        let off = |plugin: &str| {
-            std::iter::once(&own).chain(&layers).any(|settings| {
-                settings
-                    .get("enabledPlugins")
-                    .and_then(|p| p.get(plugin))
-                    .is_some_and(|on| on.as_bool() == Some(false))
-            })
-        };
+        let off = |plugin: &str| turned_off(plugin, &own, &layers);
         for plugin in enabled_plugins(&source_settings) {
-            let outcome = if own_unknown {
+            let outcome = if bundled(&plugin) {
+                // Nothing to inject either way; what the home or the project turned off is
+                // said to be.
+                Err(if off(&plugin) {
+                    Skip::TurnedOff
+                } else {
+                    Skip::Builtin
+                })
+            } else if own_unknown {
                 Err(Skip::UnrecognizedList)
             } else if off(&plugin) {
                 Err(Skip::TurnedOff)
@@ -1372,6 +1376,25 @@ pub fn enabled_plugins(settings: &Map<String, Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether the home's settings `own` or the project's `layers` above them (in claude's order,
+/// each later layer above the earlier) turn `plugin` off: the highest layer that sets it in
+/// `enabledPlugins` decides, as claude merges the key.
+pub fn turned_off(plugin: &str, own: &Map<String, Value>, layers: &[Map<String, Value>]) -> bool {
+    std::iter::once(own)
+        .chain(layers)
+        .rev()
+        .find_map(|settings| settings.get("enabledPlugins")?.get(plugin))
+        .is_some_and(|on| on.as_bool() == Some(false))
+}
+
+/// Whether `plugin` (`name@marketplace`) is one claude bundles: the `builtin` marketplace is
+/// claude's own, its plugins are never installed, and claude loads them everywhere.
+pub fn bundled(plugin: &str) -> bool {
+    plugin
+        .rsplit_once('@')
+        .is_some_and(|(_, marketplace)| marketplace == "builtin")
+}
+
 /// The source's `plugins/installed_plugins.json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Installs {
@@ -2046,6 +2069,26 @@ mod tests {
             ["a@m", "d@m"]
         );
         assert!(enabled_plugins(&map(json!({"enabledPlugins": []}))).is_empty());
+    }
+
+    /// R18: the highest settings layer that sets a plugin decides whether it is turned off;
+    /// an array there, like `true`, enables it.
+    #[test]
+    fn the_highest_layer_decides_whether_a_plugin_is_off() {
+        let layer = |v: Value| map(json!({"enabledPlugins": {"a@m": v}}));
+        let own = layer(json!(false));
+        assert!(turned_off("a@m", &own, &[]));
+        assert!(!turned_off("a@m", &map(json!({})), &[]));
+        assert!(!turned_off("a@m", &own, &[layer(json!(true))]));
+        assert!(!turned_off("a@m", &own, &[layer(json!([]))]));
+        assert!(turned_off(
+            "a@m",
+            &own,
+            &[layer(json!(true)), layer(json!(false))]
+        ));
+        // A layer that says nothing about it leaves the one below in force.
+        assert!(turned_off("a@m", &own, &[map(json!({"model": "opus"}))]));
+        assert!(!turned_off("b@m", &own, &[layer(json!(false))]));
     }
 
     /// Sorted entry names of a directory.
@@ -3929,8 +3972,9 @@ mod tests {
         fs::create_dir_all(work.join(".claude")).unwrap();
         fs::write(
             source_home.join("settings.json"),
-            json!({"enabledPlugins": {"a@m": true, "b@m": true, "c@m": true, "d@m": true}})
-                .to_string(),
+            json!({"enabledPlugins": {"a@m": true, "b@m": true, "c@m": true, "d@m": true,
+                                      "e@builtin": true, "f@builtin": true}})
+            .to_string(),
         )
         .unwrap();
         let install =
@@ -3944,8 +3988,15 @@ mod tests {
         )
         .unwrap();
         fs::write(
+            work.join(".claude/settings.json"),
+            json!({"enabledPlugins": {"e@builtin": false}}).to_string(),
+        )
+        .unwrap();
+        // The local settings sit above the project's: `e` is on again.
+        fs::write(
             work.join(".claude/settings.local.json"),
-            json!({"enabledPlugins": {"a@m": false}}).to_string(),
+            json!({"enabledPlugins": {"a@m": false, "e@builtin": true, "f@builtin": false}})
+                .to_string(),
         )
         .unwrap();
         let own_list = max.join("plugins/installed_plugins.json");
@@ -3983,6 +4034,10 @@ mod tests {
                 ("b@m".to_string(), Err(Skip::OwnInstall)),
                 ("c@m".to_string(), installed("c")),
                 ("d@m".to_string(), installed("d")),
+                // Bundled with claude: nothing to inject, and no install to look for; one
+                // the project turned off is said to be (the highest layer decides).
+                ("e@builtin".to_string(), Err(Skip::Builtin)),
+                ("f@builtin".to_string(), Err(Skip::TurnedOff)),
             ]
         );
 
@@ -3990,14 +4045,21 @@ mod tests {
         fs::remove_dir_all(cache.join("d")).unwrap();
         assert_eq!(outcomes()[3], ("d@m".to_string(), Err(Skip::NotInstalled)));
 
-        // The home's list cannot be read: none is injected.
+        // The home's list cannot be read: none is injected (the bundled one needs no list).
         fs::write(&own_list, r#"{"version": 9}"#).unwrap();
         assert_eq!(
             outcomes()
                 .into_iter()
                 .map(|(_, outcome)| outcome)
                 .collect::<Vec<_>>(),
-            vec![Err(Skip::UnrecognizedList); 4]
+            [
+                Err(Skip::UnrecognizedList),
+                Err(Skip::UnrecognizedList),
+                Err(Skip::UnrecognizedList),
+                Err(Skip::UnrecognizedList),
+                Err(Skip::Builtin),
+                Err(Skip::TurnedOff),
+            ]
         );
     }
 

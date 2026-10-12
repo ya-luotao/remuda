@@ -442,6 +442,20 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         None => Installs::Missing,
     };
     for name in share::enabled_plugins(&own) {
+        if share::bundled(&name) {
+            // Loaded by claude itself, unless the project's settings turn it off.
+            let off = share::turned_off(&name, &own, &layers);
+            view.plugins.push(Plugin {
+                name,
+                origin: Origin::NotShared(if off { Skip::TurnedOff } else { Skip::Builtin }),
+                version: None,
+                scope: None,
+                installs: 0,
+                path: None,
+                contents: None,
+            });
+            continue;
+        }
         let install = installs.effective(&name, project.start.as_deref());
         let path = install.and_then(|i| i.path.clone());
         let already = plan.items.linked(Id::Plugins)
@@ -483,6 +497,12 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
                 contents: Some(plugin_contents(&dir.path)),
             },
             Err(Skip::OwnInstall) if view.plugins.iter().any(|own| own.name == p.name) => {
+                continue;
+            }
+            // A bundled plugin the home enables too: its row above says whether it loads.
+            Err(Skip::Builtin | Skip::TurnedOff)
+                if share::bundled(&p.name) && view.plugins.iter().any(|own| own.name == p.name) =>
+            {
                 continue;
             }
             Err(skip) => Plugin {
@@ -2211,13 +2231,24 @@ mod tests {
                 "model": "opus",
                 "theme": "dark",
                 "env": {"DISABLE_TELEMETRY": "1", "ANTHROPIC_API_KEY": "k"},
-                "enabledPlugins": {"a@m": true, "b@m": true, "c@m": true},
+                "enabledPlugins": {"a@m": true, "b@m": true, "c@m": true, "e@builtin": true,
+                                   "f@builtin": true},
             })
             .to_string(),
         );
         write(
             &max.join("settings.json"),
-            &json!({"enabledPlugins": {"c@m": false}}).to_string(),
+            &json!({"enabledPlugins": {"c@m": false, "e@builtin": true, "f@builtin": true}})
+                .to_string(),
+        );
+        write(
+            &work.join(".claude/settings.json"),
+            &json!({"enabledPlugins": {"e@builtin": false, "f@builtin": false}}).to_string(),
+        );
+        // The local settings sit above the project's: `e` is on again.
+        write(
+            &work.join(".claude/settings.local.json"),
+            &json!({"enabledPlugins": {"e@builtin": true}}).to_string(),
         );
         let (source, member) = (named("src", &src), named("max", &max));
         let sharing = sharing(&source);
@@ -2247,6 +2278,16 @@ mod tests {
                 .iter()
                 .any(|p| p.name == "c@m" && p.origin == Origin::NotShared(Skip::TurnedOff))
         );
+        // A plugin bundled with claude: enabled by both, listed once, no install looked for;
+        // one the project turns off is listed once as turned off.
+        let bundled = |name: &str| {
+            let rows: Vec<_> = view.plugins.iter().filter(|p| p.name == name).collect();
+            assert_eq!(rows.len(), 1, "{name}");
+            assert_eq!(rows[0].path, None, "{name}");
+            rows[0].origin
+        };
+        assert_eq!(bundled("e@builtin"), Origin::NotShared(Skip::Builtin));
+        assert_eq!(bundled("f@builtin"), Origin::NotShared(Skip::TurnedOff));
 
         let file = shared
             .args

@@ -176,7 +176,8 @@ arguments:
   `env.CLAUDE_CODE_USE_BEDROCK`) are never injected. If you pass `--settings` or
   `--setting-sources` yourself, remuda injects no settings and says so.
 - **Plugins:** `--plugin-dir` for each plugin the source enables and has installed, unless the
-  account or the project turns it off, or the account has installed it itself.
+  account or the project turns it off, or the account has installed it itself. A plugin claude
+  bundles (`<name>@builtin`) is loaded by claude itself: nothing is injected for it.
 - **Auto-memory:** the source's memory directory for the project (found the way claude finds it),
   so every account remembers the same things about it.
 - **Agent memory:** subagents with `memory: user` keep their memory in the source's
