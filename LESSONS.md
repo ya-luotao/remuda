@@ -6,7 +6,7 @@ has come up. It is reread after every merged batch of work; an entry seen on thr
 is promoted into [SPEC.md](SPEC.md) or [CONTRIBUTING.md](CONTRIBUTING.md) and marked so here.
 Review records live under `docs/` in the maintainer's checkout (`docs/review-2026-10-02.md`,
 `docs/arch-2026-10-06/`, `docs/study-2026-10-07/`, `docs/study-2026-10-08/`,
-`docs/study-2026-10-08-batch3/`), git-excluded; the dates below point at them.
+`docs/study-2026-10-08-batch3/`, `docs/study-2026-10-12-batch4/`), git-excluded; the dates below point at them.
 
 ## Data and time
 
@@ -188,3 +188,20 @@ the GitHub review caught. A merge that joins a producer and a consumer is a chan
 and gets a review of its own.
 *Evidence:* 2026-10-08 batch 3 (lane C added `UsageRow.window_minutes`, lane A's pace read the
 label; found on merge commit 2c7ddda by the GitHub review, fixed in 76b27fc). *Seen:* 1 day.
+
+**A shortcut next to a parser decides nothing the parser decides.** A fast raw-text check added
+beside a decoder answered the same question (is this line a record?) from the bytes instead of
+from the decoded value, and the two disagreed on a JSON-escaped type name: the record was seen by
+the decoder and skipped by the shortcut, and a pending request swallowed the next one's event. A
+byte filter may say which lines are worth decoding; what a line is comes from the decode.
+*Evidence:* 2026-10-12 batch 4 lane B (critic round 3 found the regression that the round-2 fix
+introduced; round 4 approved the decode-only decision). *Seen:* 1 day.
+
+**State that waits for a later record is retired by the next record of its kind, readable or
+not.** A marker meaning "this request's event has not come yet" was left in place by a record
+that could not be read, and the unreadable request's event was counted as the earlier one's.
+Whatever follows the marker's own kind of record ends the wait, and a test covers each way a
+record can fail to read, with a save and load between them.
+*Evidence:* 2026-10-12 batch 4 lane B (critic rounds 1 and 2: three malformed shapes, then
+three more and a positional array; the live corpus had none of them). *Seen:* 1 day.
+
