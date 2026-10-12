@@ -536,8 +536,16 @@ pub fn check_cwd(cwd: Option<&Path>) -> io::Result<()> {
 
 /// A launch from the TUI (R6, R16): `plan` is logged exactly as `remuda run` logs it, then
 /// claude runs in the foreground in `cwd` and remuda waits for it. A directory that does not
-/// exist ([`check_cwd`]) fails before anything is logged or run.
-pub fn perform(program: &Path, plan: &Launch, cwd: Option<&Path>, log: &Path) -> Ran {
+/// exist ([`check_cwd`]) fails before anything is logged or run. `before_spawn` runs only
+/// once the directory has passed and the launch is logged, right before claude starts: what
+/// the TUI prints there is never said of a launch that did not happen.
+pub fn perform(
+    program: &Path,
+    plan: &Launch,
+    cwd: Option<&Path>,
+    log: &Path,
+    before_spawn: impl FnOnce(),
+) -> Ran {
     if let Err(e) = check_cwd(cwd) {
         return Ran {
             status: Err(e),
@@ -548,6 +556,7 @@ pub fn perform(program: &Path, plan: &Launch, cwd: Option<&Path>, log: &Path) ->
     let log_error = append_log(log, &plan.record)
         .err()
         .map(|e| format!("cannot write launch log {}: {e:#}", log.display()));
+    before_spawn();
     let mut cmd = command(program, &plan.args, &plan.env, cwd);
     for name in &plan.unset_env {
         cmd.env_remove(name);

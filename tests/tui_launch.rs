@@ -47,6 +47,7 @@ fn a_new_session_is_logged_then_run_in_its_directory() {
         &plan,
         Some(&dir),
         &sb.launch_log(),
+        || {},
     );
     assert_eq!(ran.status.unwrap().code(), Some(0));
     assert_eq!(ran.log_error, None);
@@ -94,6 +95,7 @@ fn the_default_account_runs_without_config_dir() {
         &plan,
         Some(&sb.work()),
         &sb.launch_log(),
+        || {},
     );
     assert!(ran.status.unwrap().success());
     let inv = sb.only_invocation();
@@ -114,6 +116,7 @@ fn a_log_failure_is_reported_and_claude_still_runs() {
         &plan,
         Some(&sb.work()),
         &sb.launch_log(),
+        || {},
     );
     assert!(ran.status.unwrap().success());
     assert!(ran.log_error.is_some());
@@ -130,6 +133,7 @@ fn a_missing_directory_fails_before_anything_runs() {
         &plan,
         Some(&gone),
         &sb.launch_log(),
+        || {},
     );
     assert_eq!(
         ran.status.unwrap_err().to_string(),
@@ -171,11 +175,25 @@ use remuda::tui::app::{Event, Exit, LaunchRequest};
 use remuda::tui::{self, Deps, Screen};
 
 /// Records suspend/resume instead of touching a terminal; either can be made to fail.
+/// What is printed on the terminal handed over is kept in `printed`, each line with whether
+/// the fake claude had run (`ran`) and the launch log existed (`log`) at that moment.
 #[derive(Default)]
 struct FakeScreen {
     calls: Vec<&'static str>,
     fail_suspend: bool,
     fail_resume: bool,
+    /// A directory removed while the terminal is handed over.
+    remove_on_suspend: Option<std::path::PathBuf>,
+    /// The fake claude's record and the launch log, looked at when a line is printed.
+    watch: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    printed: Vec<Printed>,
+}
+
+#[derive(Debug, PartialEq)]
+struct Printed {
+    line: String,
+    ran: bool,
+    log: bool,
 }
 
 impl Screen for FakeScreen {
@@ -184,7 +202,21 @@ impl Screen for FakeScreen {
         if self.fail_suspend {
             return Err(std::io::Error::other("no tty"));
         }
+        if let Some(dir) = &self.remove_on_suspend {
+            fs::remove_dir(dir).unwrap();
+        }
         Ok(())
+    }
+    fn print(&mut self, line: &str) {
+        let (ran, log) = self
+            .watch
+            .as_ref()
+            .map_or((false, false), |(out, log)| (out.exists(), log.exists()));
+        self.printed.push(Printed {
+            line: line.to_string(),
+            ran,
+            log,
+        });
     }
     fn resume(&mut self) -> std::io::Result<()> {
         self.calls.push("resume");
@@ -585,6 +617,100 @@ fn tui_launch_in_a_missing_directory_warns_of_nothing() {
     assert!(screen.calls.is_empty(), "{:?}", screen.calls);
     assert!(sb.invocations().is_empty());
     assert!(!sb.launch_log().exists());
+}
+
+/// R6, R16: a directory removed after the check before the handover (here, while the terminal
+/// is handed over) is refused by the launch's own check, and the lines of the handover wait
+/// for that check: nothing is printed, logged or run, and the result is the refusal alone,
+/// with none of the environment's warnings.
+#[test]
+fn tui_handover_lines_wait_for_the_launchs_own_directory_check() {
+    let sb = Sandbox::new();
+    let max = named("max", "/p/max");
+    register(&sb, &[&max]);
+    let mut deps = deps(&sb);
+    deps.env
+        .insert("CLAUDE_CODE_CHILD_SESSION".into(), "1".into());
+    deps.env
+        .insert("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), "/secure/x".into());
+    let dir = project(&sb);
+    let request = LaunchRequest {
+        account: max,
+        args: vec!["-n".into(), "fix it".into()],
+        cwd: Some(dir.clone()),
+        what: "new session as max".into(),
+    };
+    let mut screen = FakeScreen {
+        remove_on_suspend: Some(dir.clone()),
+        ..FakeScreen::default()
+    };
+    let event = tui::launch_in_foreground(&mut screen, &deps, request, &quiet()).unwrap();
+    let Event::Launched {
+        result, warnings, ..
+    } = &event
+    else {
+        panic!("{event:?}")
+    };
+    assert_eq!(
+        result,
+        &Err(format!("{} is not an existing directory", dir.display()))
+    );
+    assert_eq!(warnings, &Vec::<String>::new());
+    assert_eq!(screen.printed, []);
+    assert_eq!(screen.calls, ["suspend", "resume"]);
+    assert!(sb.invocations().is_empty());
+    assert!(!sb.launch_log().exists());
+}
+
+/// R6, R16: a launch that runs prints the line that says what runs, then the warning that the
+/// session will not be saved, in that order, after the launch is logged and before claude
+/// starts; the result still carries the environment's warnings.
+#[test]
+fn tui_handover_lines_come_after_the_log_and_before_claude() {
+    let sb = Sandbox::new();
+    let max = named("max", "/p/max");
+    register(&sb, &[&max]);
+    let mut deps = deps(&sb);
+    deps.env
+        .insert("CLAUDE_CODE_CHILD_SESSION".into(), "1".into());
+    let dir = project(&sb);
+    let request = LaunchRequest {
+        account: max,
+        args: vec!["-n".into(), "fix it".into()],
+        cwd: Some(dir.clone()),
+        what: "new session as max".into(),
+    };
+    let mut screen = FakeScreen {
+        watch: Some((sb.claude_out(), sb.launch_log())),
+        ..FakeScreen::default()
+    };
+    let event = tui::launch_in_foreground(&mut screen, &deps, request, &quiet()).unwrap();
+    let Event::Launched {
+        result, warnings, ..
+    } = &event
+    else {
+        panic!("{event:?}")
+    };
+    assert_eq!(result, &Ok(Exit::Code(0)));
+    assert_eq!(warnings, &[launch::child_session_warning()]);
+    let before = |line: String| Printed {
+        line,
+        ran: false,
+        log: true,
+    };
+    assert_eq!(
+        screen.printed,
+        [
+            before(format!("remuda: new session as max in {}", dir.display())),
+            before(format!(
+                "remuda: warning: {}",
+                launch::child_session_warning()
+            )),
+        ]
+    );
+    assert_eq!(screen.calls, ["suspend", "resume"]);
+    assert_eq!(sb.invocations().len(), 1);
+    assert_eq!(sb.launches().len(), 1);
 }
 
 /// R16, R18: the TUI launches through the same path as `run`: shared configuration from the

@@ -254,6 +254,10 @@ pub trait Screen {
     fn suspend(&mut self) -> io::Result<()>;
     /// Takes the terminal back; the next draw repaints everything.
     fn resume(&mut self) -> io::Result<()>;
+    /// Prints a line on the terminal handed over, before the child starts (R16).
+    fn print(&mut self, line: &str) {
+        println!("{line}");
+    }
 }
 
 impl Screen for Terminal<CrosstermBackend<io::Stdout>> {
@@ -497,10 +501,14 @@ fn run_launch(
     }
     let mut warnings = launch::env_warnings(&deps.env, &plan);
     warnings.extend(plan.notices.iter().cloned());
-    for line in handover_lines(&request.what, cwd, deps.private, &deps.env, &plan) {
-        println!("{line}");
-    }
-    let ran = launch::perform(program, &plan, cwd, &log);
+    // Printed by `perform` once its own directory check has passed, right before claude starts:
+    // a directory removed since the check above (during the handover, say) prints nothing.
+    let lines = handover_lines(&request.what, cwd, deps.private, &deps.env, &plan);
+    let ran = launch::perform(program, &plan, cwd, &log, || {
+        for line in &lines {
+            screen.print(line);
+        }
+    });
     screen
         .resume()
         .with_context(|| format!("cannot take the terminal back after {}", provider.program()))?;
