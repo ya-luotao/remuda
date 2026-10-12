@@ -23,12 +23,18 @@ fn iso(offset: i64) -> String {
 
 /// A claude usage limit: `session`, `weekly_all`, or a model name for `weekly_scoped`.
 fn limit(kind: &str, percent: f64, resets_in: i64) -> Value {
+    limit_at(kind, percent, now() + resets_in)
+}
+
+/// [`limit`] with its reset at the second `resets_at`.
+fn limit_at(kind: &str, percent: f64, resets_at: i64) -> Value {
+    let resets_at = jiff::Timestamp::from_second(resets_at).unwrap().to_string();
     match kind {
         "session" | "weekly_all" => {
-            json!({"kind": kind, "percent": percent, "severity": "normal", "resets_at": iso(resets_in)})
+            json!({"kind": kind, "percent": percent, "severity": "normal", "resets_at": resets_at})
         }
         model => json!({"kind": "weekly_scoped", "percent": percent, "severity": "normal",
-                        "resets_at": iso(resets_in),
+                        "resets_at": resets_at,
                         "scope": {"model": {"id": null, "display_name": model}}}),
     }
 }
@@ -2664,25 +2670,42 @@ fn wait_with_nothing_to_wait_for_exits_at_once() {
 
 /// `max`, whose week is used up until an hour from now; `default` is logged out.
 fn used_up_for_an_hour() -> (Sandbox, PathBuf) {
+    let (sb, max, _) = used_up_for(3600);
+    (sb, max)
+}
+
+/// `max`, whose week is used up until `resets_in` seconds from now; `default` is logged out.
+/// Also the second the week resets at, as written.
+fn used_up_for(resets_in: i64) -> (Sandbox, PathBuf, i64) {
+    let resets_at = now() + resets_in;
     let sb = Sandbox::new();
     let max = sb.make_claude_home("h/max");
     sb.write_claude_json(
         Some(&max),
-        &claude_json("max@example.com", 60, &[limit("weekly_all", 100.0, 3600)]),
+        &claude_json(
+            "max@example.com",
+            60,
+            &[limit_at("weekly_all", 100.0, resets_at)],
+        ),
     );
     configure(&sb, &[("claude", "max", &max)], "");
-    (sb, max)
+    (sb, max, resets_at)
 }
 
-/// R23 `--max-wait`: when the next check (the reset an hour away, plus the margin) would come
+/// R23 `--max-wait`: when the next check (the reset a day away, plus the margin) would come
 /// after the deadline, remuda gives up at once: the reasons as without `--wait`, exit 1, and
 /// when the next check would have been. `--max-wait 0` is one look.
+///
+/// The reasons name the reset (`resets in 1d1h`), and the runs below are compared word for
+/// word, so the reset is placed where that wording holds for the next 30 minutes: an hour
+/// away, it read `1h` in the second the sandbox was written and `59m` from the next second on.
+/// The next check is expected from the reset as written, not from a later look at the clock.
 #[test]
 fn max_wait_gives_up_when_the_next_check_is_later() {
-    let (sb, _) = used_up_for_an_hour();
+    let (sb, _, resets_at) = used_up_for(86_400 + 5_400);
     let plain = pick(&sb, false, &[]);
     assert_eq!(plain.code, Some(1));
-    let next = jiff::Timestamp::from_second(now() + 3600 + 30)
+    let next = jiff::Timestamp::from_second(resets_at + 30)
         .unwrap()
         .to_zoned(jiff::tz::TimeZone::UTC)
         .strftime("%b %-d %H:%M")
@@ -2703,15 +2726,12 @@ fn max_wait_gives_up_when_the_next_check_is_later() {
             .stderr
             .strip_prefix(&plain.stderr)
             .unwrap_or_else(|| panic!("{max_wait}: {}", out.stderr));
-        // The minute may turn between the two clocks.
-        assert!(
-            gave_up.starts_with("remuda: gave up waiting: the next check (")
-                && gave_up.ends_with(") would come after --max-wait\n"),
-            "{gave_up}"
-        );
-        assert!(
-            gave_up.contains(&next) || max_wait != "0",
-            "{gave_up} (expected about {next})"
+        assert_eq!(
+            gave_up,
+            format!(
+                "remuda: gave up waiting: the next check ({next}) would come after --max-wait\n"
+            ),
+            "{max_wait}"
         );
     }
     let out = pick(&sb, false, &["--wait", "--max-wait", "1", "--json"]);
