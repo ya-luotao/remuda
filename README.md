@@ -146,9 +146,10 @@ Your native login is already an account: `default` is `~/.claude` (and `codex:de
    `remuda run work -p "..."`). In the TUI, `n` on an account does the same, and `Enter` on a
    session in History resumes it under an account that holds it.
 
-5. **Let remuda choose.** `remuda pick` names the account, model and effort with the most room,
-   from every account's limits and your `[pick]` rules; `remuda pick --run` launches it, and
-   `--wait` waits for a limit to reset first.
+5. **Let remuda choose.** `remuda pick` names the account, model and effort that your `[pick]`
+   rules rank first among the options with room left on every window (model preference first,
+   then headroom in bands, then freshness and reset time); `remuda pick --run` launches it. When
+   nothing has room, `--wait` waits for a limit to reset and tries again.
 
 Codex accounts work the same way: `remuda add --provider codex research ~/.codex-research`, then
 `remuda run codex:research`. Where to go next: [Configuration](#configuration) to share one
