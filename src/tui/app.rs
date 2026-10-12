@@ -32,8 +32,10 @@ use super::{accounts, render, search};
 pub const LIVE_EVERY: SignedDuration = SignedDuration::from_secs(5);
 /// A selection must stay put for this many ticks before its preview is loaded.
 pub const PREVIEW_DEBOUNCE_TICKS: u8 = 2;
-/// Messages shown in a preview (R8).
+/// Messages shown in a preview (R8): the first of [`PREVIEW_LIMITS`].
 pub const PREVIEW_MESSAGES: usize = 20;
+/// What `m` in the session card reads, in turn (R16): the last so many messages, then all.
+pub const PREVIEW_LIMITS: [usize; 4] = [PREVIEW_MESSAGES, 100, 500, usize::MAX];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -271,8 +273,12 @@ pub enum Effect {
     Checks,
     /// Token statistics (R20): the statistics cache brought up to date, then a report.
     Stats,
-    /// The last messages of a transcript or rollout of this provider.
-    Preview(PathBuf, Provider),
+    /// The last so many messages of a transcript or rollout of this provider (`usize::MAX`:
+    /// all of them).
+    Preview(PathBuf, Provider, usize),
+    /// Text for the clipboard, sent through the terminal (OSC 52): the session id or the
+    /// transcript path of the session card (R16).
+    Copy(String),
     /// The account's configuration for a new session in `cwd` (R22), answered by
     /// [`Event::Config`].
     Config {
@@ -579,6 +585,8 @@ impl Form {
 pub enum PickFor {
     Resume,
     Fork,
+    /// A new session in the session's directory as the chosen account (R16).
+    NewSession,
 }
 
 /// The accounts are `provider:name`, not rows of [`App::accounts`]: rows move when the
@@ -630,7 +638,7 @@ pub struct History {
     pub searching: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Preview {
     /// The transcript the current selection wants shown.
     pub target: Option<PathBuf>,
@@ -639,10 +647,26 @@ pub struct Preview {
     /// The transcript being read.
     pub work: Slot<PathBuf>,
     pub loaded: Option<(PathBuf, Result<Vec<Message>, String>)>,
-    /// `Enter`: the preview takes the whole body.
+    /// `p`: the session card is open over the view (R16).
     pub expanded: bool,
-    /// Lines scrolled up from the bottom (expanded only).
+    /// Lines scrolled up from the bottom (in the card only).
     pub scroll: usize,
+    /// Messages asked for: one of [`PREVIEW_LIMITS`]; `m` in the card takes the next.
+    pub limit: usize,
+}
+
+impl Default for Preview {
+    fn default() -> Self {
+        Preview {
+            target: None,
+            settled: 0,
+            work: Slot::default(),
+            loaded: None,
+            expanded: false,
+            scroll: 0,
+            limit: PREVIEW_MESSAGES,
+        }
+    }
 }
 
 /// The Configuration pane of the accounts view (R22).
@@ -733,6 +757,9 @@ pub struct App {
 
     /// Launch log + `history.jsonl`; `attribution` adds live sessions to it.
     pub(super) attribution_base: Attribution,
+    /// The launch log and the `history.jsonl` files have been read once: a session attributed
+    /// to no account now is attributed to none.
+    pub attribution_loaded: bool,
     pub attribution: Attribution,
 
     pub live: Vec<LiveSession>,
@@ -795,6 +822,7 @@ impl App {
             index_error: None,
             by_session: HashMap::new(),
             attribution_base: Attribution::default(),
+            attribution_loaded: false,
             attribution: Attribution::default(),
             live: Vec::new(),
             live_rows: Vec::new(),
@@ -1365,15 +1393,7 @@ impl App {
             _ if self.view == View::Accounts && self.config.expanded => {
                 self.scroll_config(key);
             }
-            _ if self.preview.expanded => match key {
-                Key::Esc => {
-                    self.preview.expanded = false;
-                    self.preview.scroll = 0;
-                }
-                other => {
-                    self.scroll_preview(other);
-                }
-            },
+            _ if self.preview.expanded => self.on_card_key(key, fx),
             Key::Char('n') if self.view == View::Accounts => self.open_new_session(),
             Key::Char('D') if self.view == View::Accounts => self.confirm_remove(),
             Key::Char('s') if self.view == View::Accounts => {
@@ -1402,6 +1422,254 @@ impl App {
             other => {
                 self.navigate(other);
             }
+        }
+    }
+
+    /// Keys while the session card is open (R16): the movement keys scroll the preview, the
+    /// rest act on the session shown. What Live binds first (`Enter`, `f`, `l`, `x`, `D`, `a`)
+    /// is matched before this.
+    fn on_card_key(&mut self, key: Key, fx: &mut Vec<Effect>) {
+        match key {
+            Key::Esc => self.close_card(),
+            Key::Char('[') => {
+                self.navigate(Key::Char('k'));
+            }
+            Key::Char(']') => {
+                self.navigate(Key::Char('j'));
+            }
+            Key::Char('R') => self.resume_choosing(false, fx),
+            Key::Char('F') => self.resume_choosing(true, fx),
+            Key::Char('n') => self.new_session_here(),
+            Key::Char('y') => self.copy_session_id(fx),
+            Key::Char('Y') => self.copy_transcript_path(fx),
+            // The logs shown (`l`) are not the transcript: `m` waits for the messages.
+            Key::Char('m') if self.logs.is_none() => self.more_preview(fx),
+            other => {
+                self.scroll_preview(other);
+            }
+        }
+    }
+
+    fn close_card(&mut self) {
+        self.preview.expanded = false;
+        self.preview.scroll = 0;
+    }
+
+    /// The transcript the card's actions are for: the row's in History; in Live, the running
+    /// session's copy, once it is indexed (else a notice says why not).
+    fn card_transcript(&mut self) -> Option<PathBuf> {
+        match self.view {
+            View::History => {
+                let path = self.selected_entry().map(|e| e.path.clone());
+                if path.is_none() {
+                    self.notify(Level::Warn, "no session selected");
+                }
+                path
+            }
+            View::Live => {
+                let Some(session) = self.selected_live().cloned() else {
+                    self.notify(Level::Warn, "no session selected");
+                    return None;
+                };
+                let Some(id) = session.session_id.as_deref() else {
+                    self.notify(Level::Warn, "this session's id is unknown");
+                    return None;
+                };
+                let path = self.transcript_for_live(&session);
+                if path.is_none() {
+                    let text = format!("session {} is not indexed yet", short_id(id));
+                    self.notify(Level::Warn, text);
+                }
+                path
+            }
+            View::Accounts | View::Stats => None,
+        }
+    }
+
+    /// `R` / `F` in the card: resume or fork, choosing the account (R16).
+    fn resume_choosing(&mut self, fork: bool, fx: &mut Vec<Effect>) {
+        if let Some(path) = self.card_transcript() {
+            self.resume_with(&path, fork, true, fx);
+        }
+    }
+
+    /// `y` in the card: the session id to the clipboard (R16).
+    fn copy_session_id(&mut self, fx: &mut Vec<Effect>) {
+        let id = match self.view {
+            View::History => self.selected_entry().map(|e| e.session_id.clone()),
+            View::Live => self.selected_live().and_then(|s| s.session_id.clone()),
+            View::Accounts | View::Stats => None,
+        };
+        match id {
+            Some(id) => {
+                fx.push(Effect::Copy(id));
+                self.notify(Level::Info, "session id copied to the clipboard (OSC 52)");
+            }
+            None if self.view == View::Live && self.selected_live().is_some() => {
+                self.notify(Level::Warn, "this session's id is unknown");
+            }
+            None => self.notify(Level::Warn, "no session selected"),
+        }
+    }
+
+    /// `Y` in the card: the transcript path to the clipboard (R16).
+    fn copy_transcript_path(&mut self, fx: &mut Vec<Effect>) {
+        if let Some(path) = self.card_transcript() {
+            fx.push(Effect::Copy(path.display().to_string()));
+            self.notify(
+                Level::Info,
+                "transcript path copied to the clipboard (OSC 52)",
+            );
+        }
+    }
+
+    /// `n` in the card: the new-session form in the session's last directory, as the account
+    /// it runs as (Live) or the one of its provider it is attributed to (History); several of
+    /// those: the picker; none: refused (R16).
+    fn new_session_here(&mut self) {
+        match self.view {
+            View::Live => {
+                let Some(session) = self.selected_live().cloned() else {
+                    self.notify(Level::Warn, "no session selected");
+                    return;
+                };
+                let Some(account) = self.account_named(&session.account) else {
+                    let text = format!(
+                        "{} is no longer registered",
+                        short_account(&session.account)
+                    );
+                    self.notify(Level::Error, text);
+                    return;
+                };
+                self.open_new_session_as(account, session.cwd.clone());
+            }
+            View::History => {
+                let Some(entry) = self.selected_entry() else {
+                    self.notify(Level::Warn, "no session selected");
+                    return;
+                };
+                let (path, session_id, dir) = (
+                    entry.path.clone(),
+                    entry.session_id.clone(),
+                    entry.cwd_last.clone(),
+                );
+                let Some(dir) = dir else {
+                    self.notify(Level::Error, no_directory(&session_id));
+                    return;
+                };
+                let (accounts, provider) = (
+                    self.session_accounts(&path),
+                    self.index.entries.get(&path).map(|e| e.provider),
+                );
+                match accounts.as_slice() {
+                    // Nothing found while what says is still being read (the first time, or
+                    // again after the account list changed, R16) is not an answer.
+                    [] if !self.attribution_loaded || self.work.attribution.is_running() => self
+                        .notify(
+                            Level::Warn,
+                            "still reading which accounts the sessions belong to; try again in a \
+                         moment",
+                        ),
+                    // The stores come with the index: while it is read again, the list shown
+                    // is the one from before.
+                    [] if provider == Some(CODEX)
+                        && (self.stores.is_none() || self.work.index.is_running()) =>
+                    {
+                        self.notify(
+                            Level::Warn,
+                            "still reading the transcript stores; try again in a moment",
+                        );
+                    }
+                    [] => {
+                        let text = format!(
+                            "session {} is attributed to no registered account: start one from \
+                             Accounts (n)",
+                            short_id(&session_id)
+                        );
+                        self.notify(Level::Warn, text);
+                    }
+                    [only] => {
+                        let only = only.clone();
+                        self.open_new_session_as(only, Some(dir));
+                    }
+                    several => {
+                        let options: Vec<String> = several.iter().map(Account::qualified).collect();
+                        self.open(Overlay::Pick(Pick {
+                            path,
+                            session_id,
+                            action: PickFor::NewSession,
+                            attributed: options.clone(),
+                            options,
+                            selected: 0,
+                        }));
+                    }
+                }
+            }
+            View::Accounts | View::Stats => {}
+        }
+    }
+
+    /// The registered accounts of the session's provider it is attributed to (R9), in the
+    /// registry's order; a codex rollout attributed to none: the owners of its store (R17).
+    fn session_accounts(&self, path: &Path) -> Vec<Account> {
+        let Some(entry) = self.index.entries.get(path) else {
+            return Vec::new();
+        };
+        let owners = self.attribution.accounts(&entry.session_id);
+        let mut accounts: Vec<Account> = self
+            .accounts
+            .iter()
+            .filter(|a| {
+                a.account.provider == entry.provider
+                    && owners.contains(&a.account.qualified().as_str())
+            })
+            .map(|a| a.account.clone())
+            .collect();
+        if accounts.is_empty() && entry.provider == CODEX {
+            accounts = self
+                .stores
+                .iter()
+                .flatten()
+                .filter(|s| s.provider == CODEX && s.path == entry.store)
+                .flat_map(|s| &s.accounts)
+                .filter_map(|q| self.account_named(q))
+                .collect();
+        }
+        accounts
+    }
+
+    /// The picker's choice for a new session (R16): resolved by name, as a resume's is. The
+    /// session is looked up again: the index may have been read again while the picker was
+    /// open, and a session it no longer lists is not started in remuda's own directory.
+    fn new_session_picked(&mut self, path: &Path, session_id: &str, qualified: &str) {
+        let Some(account) = self.account_named(qualified) else {
+            let text = format!("{} is no longer registered", short_account(qualified));
+            self.notify(Level::Error, text);
+            return;
+        };
+        let Some(entry) = self.index.entries.get(path) else {
+            let text = format!("session {} is no longer listed", short_id(session_id));
+            self.notify(Level::Error, text);
+            return;
+        };
+        match entry.cwd_last.clone() {
+            Some(dir) => self.open_new_session_as(account, Some(dir)),
+            None => self.notify(Level::Error, no_directory(session_id)),
+        }
+    }
+
+    /// `m` in the card: the next of [`PREVIEW_LIMITS`] of the transcript shown; what is shown
+    /// stays until the reading answers (R16).
+    fn more_preview(&mut self, fx: &mut Vec<Effect>) {
+        let i = PREVIEW_LIMITS
+            .iter()
+            .position(|l| *l == self.preview.limit)
+            .unwrap_or(0);
+        self.preview.limit = PREVIEW_LIMITS[(i + 1) % PREVIEW_LIMITS.len()];
+        if let Some(target) = self.preview.target.clone()
+            && self.preview.work.restart(target.clone()).is_some()
+        {
+            fx.push(self.preview_effect(target));
         }
     }
 
@@ -1516,12 +1784,20 @@ impl App {
                 }
                 Key::Char('k') | Key::Up => pick.selected = pick.selected.saturating_sub(1),
                 Key::Enter => {
-                    let (path, action) = (pick.path.clone(), pick.action);
+                    let (path, session_id, action) =
+                        (pick.path.clone(), pick.session_id.clone(), pick.action);
                     let chosen = pick.options.get(pick.selected).cloned();
                     self.overlay = None;
                     if let Some(qualified) = chosen {
-                        let fork = action == PickFor::Fork;
-                        self.resume_picked(&path, fork, &qualified, fx);
+                        match action {
+                            PickFor::NewSession => {
+                                self.new_session_picked(&path, &session_id, &qualified);
+                            }
+                            PickFor::Resume | PickFor::Fork => {
+                                let fork = action == PickFor::Fork;
+                                self.resume_picked(&path, fork, &qualified, fx);
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -1535,15 +1811,19 @@ impl App {
         let Some(state) = self.accounts.get(self.accounts_list.selected) else {
             return;
         };
-        let dir = self
-            .cwd
-            .as_ref()
-            .map_or(String::new(), |d| d.display().to_string());
+        let account = state.account.clone();
+        self.open_new_session_as(account, None);
+    }
+
+    /// The new-session form for `account` in `dir` (`None`: remuda's own directory).
+    fn open_new_session_as(&mut self, account: Account, dir: Option<String>) {
+        let dir = dir
+            .or_else(|| self.cwd.as_ref().map(|d| d.display().to_string()))
+            .unwrap_or_default();
         let mut fields = vec![("Directory", dir, Mask::Path)];
-        if state.account.provider.names_sessions() {
+        if account.provider.names_sessions() {
             fields.push(("Name (optional)", String::new(), Mask::Text));
         }
-        let account = state.account.clone();
         self.open(Overlay::Form(Form::new(
             FormKind::NewSession { account },
             &fields,
@@ -1881,7 +2161,7 @@ impl App {
 
     /// The transcript of a live session: the copy in its account's store when its id is in
     /// several stores.
-    fn transcript_for_live(&self, session: &LiveSession) -> Option<PathBuf> {
+    pub(super) fn transcript_for_live(&self, session: &LiveSession) -> Option<PathBuf> {
         let id = session.session_id.as_deref()?;
         let store = self
             .stores
@@ -1901,6 +2181,13 @@ impl App {
     /// running background session is attached instead; the account is the one the session
     /// belongs to, else the user picks.
     fn resume(&mut self, path: &Path, fork: bool, fx: &mut Vec<Effect>) {
+        self.resume_with(path, fork, false, fx);
+    }
+
+    /// [`App::resume`]; `choose`: the picker opens whenever there is more than one claude
+    /// account, the session's own or not (`R` / `F` in the session card, R16). Codex has its
+    /// own rule: the owners of the store, and only those (R17).
+    fn resume_with(&mut self, path: &Path, fork: bool, choose: bool, fx: &mut Vec<Effect>) {
         let Some(entry) = self.index.entries.get(path) else {
             return;
         };
@@ -1956,7 +2243,8 @@ impl App {
             .cloned()
             .collect();
         let sees = |q: &String| self.store_problem(q, path).is_none();
-        if let [only] = attributed.as_slice()
+        if (!choose || claude.len() == 1)
+            && let [only] = attributed.as_slice()
             && (sees(only) || !claude.iter().any(sees))
             && let Some(account) = self.account_named(only)
         {
@@ -2353,7 +2641,7 @@ impl App {
     /// The reading of the transcript at `path`, as its provider writes it.
     fn preview_effect(&self, path: PathBuf) -> Effect {
         let provider = self.index.entries.get(&path).map_or(CLAUDE, |e| e.provider);
-        Effect::Preview(path, provider)
+        Effect::Preview(path, provider, self.preview.limit)
     }
 
     /// Merges newly read entries into the index.
@@ -2440,6 +2728,7 @@ impl App {
             self.preview.target = target;
             self.preview.settled = 0;
             self.preview.scroll = 0;
+            self.preview.limit = PREVIEW_MESSAGES;
         }
     }
 
@@ -2488,6 +2777,14 @@ pub fn running_text(session: &LiveSession) -> String {
             format!("{which} is running in {account}{pid}: switch to its terminal {WHY}")
         }
     }
+}
+
+/// A session without a recorded directory can be neither resumed nor started from (R16).
+fn no_directory(session_id: &str) -> String {
+    format!(
+        "session {} has no recorded directory to start in",
+        short_id(session_id)
+    )
 }
 
 /// The first 8 characters of a session id, as claude shows it.
@@ -2622,6 +2919,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 app.aliases.note(name);
             }
             app.attribution_base = base;
+            app.attribution_loaded = true;
             app.merge_attribution();
             // Accounts are searched.
             if !app.history.query.is_empty() {

@@ -336,8 +336,15 @@ fn thread_names_of(path: &Path) -> HashMap<String, (Option<Timestamp>, String)> 
 /// The last `n` user / assistant messages of a rollout, oldest first (R17): user text without
 /// codex's injections, assistant text, tool calls as `[tool: <name>]`; reasoning, tool output
 /// and developer text are skipped. Everything the assistant does between two user messages is
-/// one message. Reads a growing tail window like [`crate::transcript::preview`].
+/// one message. Reads a growing tail window like [`crate::transcript::preview`], to
+/// [`PREVIEW_CAP`].
 pub fn preview(path: &Path, n: usize) -> io::Result<Vec<Message>> {
+    preview_within(path, n, PREVIEW_CAP)
+}
+
+/// [`preview`] with the window allowed to grow to `cap` bytes, like
+/// [`crate::transcript::preview_within`].
+pub fn preview_within(path: &Path, n: usize, cap: u64) -> io::Result<Vec<Message>> {
     let file = File::open(path)?;
     let size = file.metadata()?.len();
     if n == 0 {
@@ -350,12 +357,12 @@ pub fn preview(path: &Path, n: usize) -> io::Result<Vec<Message>> {
         let buf = read_at(&file, read_from, size - read_from)?;
         let lines = complete_lines(&buf, start > 0);
         let mut messages = messages(&lines.lines);
-        if messages.len() > n || start == 0 || window >= PREVIEW_CAP {
+        if messages.len() > n || start == 0 || window >= cap {
             let skip = messages.len().saturating_sub(n);
             messages.drain(..skip);
             return Ok(messages);
         }
-        window *= 4;
+        window = window.saturating_mul(4);
     }
 }
 

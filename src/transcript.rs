@@ -35,12 +35,20 @@ pub struct Message {
 /// The last `n` user / assistant messages of a transcript, oldest first.
 ///
 /// Reads a tail window that grows (64 KB, 256 KB, 1 MB, 4 MB) until it holds more than `n`
-/// messages (so the oldest one kept is not cut by the window) or reaches the file start.
+/// messages (so the oldest one kept is not cut by the window) or reaches the file start;
+/// [`preview_within`] with [`PREVIEW_CAP`]: a transcript with fewer than `n` messages in its
+/// last 4 MB gives what is there.
 /// User messages: string content or `text` blocks (`isMeta` records, local commands and
 /// records that only carry tool results are skipped). Assistant messages: `text` blocks, `tool_use` as
 /// `[tool: <name>]`, thinking skipped; claude writes one record per content block, so
 /// consecutive assistant records sharing `message.id` form one message.
 pub fn preview(path: &Path, n: usize) -> io::Result<Vec<Message>> {
+    preview_within(path, n, PREVIEW_CAP)
+}
+
+/// [`preview`] with the window allowed to grow to `cap` bytes: `u64::MAX` reads back to the
+/// file start, so fewer than `n` messages means there are no more (R16: what `m` asks for).
+pub fn preview_within(path: &Path, n: usize, cap: u64) -> io::Result<Vec<Message>> {
     let file = File::open(path)?;
     let size = file.metadata()?.len();
     if n == 0 {
@@ -53,12 +61,12 @@ pub fn preview(path: &Path, n: usize) -> io::Result<Vec<Message>> {
         let buf = read_at(&file, read_from, size - read_from)?;
         let lines = complete_lines(&buf, start > 0);
         let mut messages = messages(&lines.lines);
-        if messages.len() > n || start == 0 || window >= PREVIEW_CAP {
+        if messages.len() > n || start == 0 || window >= cap {
             let skip = messages.len().saturating_sub(n);
             messages.drain(..skip);
             return Ok(messages);
         }
-        window *= 4;
+        window = window.saturating_mul(4);
     }
 }
 
@@ -468,6 +476,35 @@ mod tests {
         assert_eq!(l.end, None);
         let l = complete_lines(b"", false);
         assert!(l.lines.is_empty());
+    }
+
+    /// R8, R16: the preview reads the last 4 MB at most, and says what is there; asked for
+    /// without that cap (`m` in the session card), it reads back to the start.
+    #[test]
+    fn the_preview_stops_at_the_cap_unless_asked_past_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let user = |text: &str| format!(r#"{{"type":"user","message":{{"content":"{text}"}}}}"#);
+        // A record that carries only a tool result is no message; this one is 4 MB and a bit.
+        let filler = format!(
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","content":"{}"}}]}}}}"#,
+            "x".repeat((PREVIEW_CAP + 200 * 1024) as usize)
+        );
+        let lines = [user("first"), filler, user("last")];
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let texts = |messages: Vec<Message>| -> Vec<String> {
+            messages.into_iter().map(|m| m.text).collect()
+        };
+        assert_eq!(texts(preview(&path, 20).unwrap()), ["last"]);
+        assert_eq!(
+            texts(preview_within(&path, 20, u64::MAX).unwrap()),
+            ["first", "last"]
+        );
+        assert_eq!(
+            texts(preview_within(&path, 1, u64::MAX).unwrap()),
+            ["last"],
+            "more than asked for: the oldest go"
+        );
     }
 
     /// R23 (Resuming): the last time, directory and model of a transcript; claude's

@@ -1026,8 +1026,28 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
   (2 seconds): what is still under way then (held up by a lock another remuda holds) is not
   recorded, and the TUI ends all the same. The TUI never compacts the history and does not show
   it, so private mode (R21) has nothing of it to hide.
-- **Preview** (`p` or Space in History / Live): expands or collapses the preview (R8); `Enter`
-  resumes or attaches, as above.
+- **Session card** (`p` or Space in History / Live): opens a card over the view with what remuda
+  knows of the selected session (its id, provider and entry point, its accounts and whether it
+  runs, when it started and was last active, its directory, its transcript and store) and the
+  preview (R8), which the movement keys scroll; `p`, Space or `Esc` closes it, and `[` / `]`
+  move the selection to the previous / next row behind it. In the card, `Enter` resumes or
+  attaches and `f` forks, as above; `R` and `F` resume or fork through the account picker
+  whenever there is more than one account to choose from (claude: every claude account, ordered
+  as the picker orders them; codex: the owners of the store, R17); `n` opens the new-session form
+  (as `n` in Accounts) for the session's account in the session's last directory (Live: the
+  account it runs as; History: the one account of its provider it is attributed to, else the
+  picker among them, a session without a recorded directory or one the index no longer lists
+  when the picker answers being refused, and none is refused with a notice, unless the attribution (the first time,
+  or again after the account list changed), or the stores a codex rollout attributed to none
+  falls back on (read with the index, so while the index is read again too), are still being
+  read, which asks to try again); `y` and `Y` copy the session
+  id and the
+  transcript path to the clipboard through the terminal (OSC 52; the terminal, or tmux, must pass
+  it on), and a notice says so; `m` reads more of the transcript (the last 20 messages, then 100,
+  500, all, and 20 again; another selection starts at 20), what is shown staying until the
+  reading answers; what `m` asks for is read back to the start of the file, past the 4 MB the
+  preview of a selection reads at most (R8), so that fewer messages than asked for means there
+  are no more, and the card says "all N". Live: `l`, `x`, `D` and `a` work as in the list.
 
 ## R17. Codex
 

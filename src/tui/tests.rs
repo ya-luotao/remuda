@@ -9,7 +9,7 @@ use ratatui::backend::TestBackend;
 
 use super::app::{
     App, Confirm, Effect, Event, Exit, Form, FormKind, Key, LaunchRequest, Level, Marked, Mode,
-    Notice, Overlay, Pick, PickFor, ResumeCodex, StatsState, View, update,
+    Notice, Overlay, PREVIEW_MESSAGES, Pick, PickFor, ResumeCodex, StatsState, View, update,
 };
 use super::render;
 use crate::attribution::Attribution;
@@ -441,7 +441,10 @@ fn preview_loads_after_the_selection_settles() {
     assert_eq!(tick(&mut app, 0), []);
     keys(&mut app, &[Key::Char('j')]);
     assert_eq!(tick(&mut app, 0), []);
-    assert_eq!(tick(&mut app, 0), [Effect::Preview(path("a"), CLAUDE)]);
+    assert_eq!(
+        tick(&mut app, 0),
+        [Effect::Preview(path("a"), CLAUDE, PREVIEW_MESSAGES)]
+    );
     // Loading: no second request.
     assert_eq!(tick(&mut app, 0), []);
     // A result for a path that is no longer wanted is dropped.
@@ -459,7 +462,10 @@ fn preview_loads_after_the_selection_settles() {
     );
     assert_eq!(app.preview.loaded, None);
     tick(&mut app, 0);
-    assert_eq!(tick(&mut app, 0), [Effect::Preview(path("b"), CLAUDE)]);
+    assert_eq!(
+        tick(&mut app, 0),
+        [Effect::Preview(path("b"), CLAUDE, PREVIEW_MESSAGES)]
+    );
     update(
         &mut app,
         Event::Preview {
@@ -820,6 +826,503 @@ fn p_or_space_expands_the_preview_and_scrolls_it() {
     assert_eq!(app.preview.scroll, 0);
     // Moving still works after collapsing.
     assert_eq!(app.history.list.selected, 0);
+}
+
+/// R16: `p` opens the session card over the view: what remuda knows of the session above the
+/// preview, the list's column header still behind it; `Esc`, Space and `p` close it.
+#[test]
+fn the_session_card_shows_the_facts_and_the_preview() {
+    let mut app = populated_history();
+    update(&mut app, Event::Stores(stores()));
+    update(
+        &mut app,
+        Event::Live(vec![live("claude:max", 7, Some("a"))]),
+    );
+    while app.selected_entry().unwrap().session_id != "a" {
+        keys(&mut app, &[Key::Char('j')]);
+    }
+    tick(&mut app, 0);
+    tick(&mut app, 0);
+    update(
+        &mut app,
+        Event::Preview {
+            path: path("a"),
+            result: Ok(vec![
+                Message {
+                    role: Role::User,
+                    text: "please check the scan".into(),
+                },
+                Message {
+                    role: Role::Assistant,
+                    text: "Looking.".into(),
+                },
+            ]),
+        },
+    );
+    keys(&mut app, &[Key::Char('p')]);
+    let lines = screen(&app);
+    let all = lines.join("\n");
+    assert!(all.contains("Session · 修复索引的增量扫描"), "{all}");
+    let (_, name) = line_with(&lines, "Name ");
+    assert!(name.contains("fix index"), "{name}");
+    assert!(!all.contains("Title "), "the box title has it: {all}");
+    let (_, first) = line_with(&lines, "First ");
+    assert!(first.contains("first words"), "{first}");
+    let (_, session) = line_with(&lines, "Session  ");
+    assert!(session.contains("a · claude · cli"), "{session}");
+    let (_, accounts) = line_with(&lines, "Accounts   ");
+    assert!(
+        accounts.contains("max, team · running in max (pid 7) busy"),
+        "{accounts}"
+    );
+    let (_, started) = line_with(&lines, "Started");
+    assert!(
+        started.contains("- · last 2026-09-24 10:03 (1h ago) · up since 11:57 (3m ago)"),
+        "{started}"
+    );
+    let (_, directory) = line_with(&lines, "Directory");
+    assert!(directory.contains("~/space/remuda"), "{directory}");
+    let (_, transcript) = line_with(&lines, "Transcript");
+    assert!(transcript.contains("/s/-w/a.jsonl · 10 B"), "{transcript}");
+    let (_, store) = line_with(&lines, "Store");
+    assert!(store.contains("Store      /s "), "{store}");
+    assert!(all.contains("Messages · last 2 messages"), "{all}");
+    let (_, user) = line_with(&lines, "please check the scan");
+    assert!(user.contains("› please check the scan"), "{user}");
+    assert!(
+        all.contains("enter: resume · f: fork · R/F: as… · n: new here · y/Y: copy · [ ]: move"),
+        "{all}"
+    );
+    assert!(all.contains("j/k: scroll · m: more · esc: close"), "{all}");
+    // The list's column header is still there, behind the card; the pane is not drawn.
+    assert!(all.contains("TIME"), "{all}");
+    assert!(!all.contains("Preview ·"), "{all}");
+
+    keys(&mut app, &[Key::Esc]);
+    assert!(!app.preview.expanded);
+    keys(&mut app, &[Key::Char(' ')]);
+    assert!(app.preview.expanded);
+    keys(&mut app, &[Key::Char('p')]);
+    assert!(!app.preview.expanded);
+    assert!(!text(&app).contains("Transcript"));
+}
+
+/// R16: in the card, `y` and `Y` hand the session id and the transcript path to the terminal's
+/// clipboard and say so; `R` and `F` open the picker although the session has one account;
+/// `n` opens the new-session form in the session's directory as that account; `[` and `]`
+/// move the selection behind the card.
+#[test]
+fn card_keys_copy_choose_and_start() {
+    let mut app = history_with(&["max"]);
+    keys(&mut app, &[Key::Char('p')]);
+    assert!(app.preview.expanded);
+    assert_eq!(
+        keys(&mut app, &[Key::Char('y')]),
+        [Effect::Copy(A.to_string())]
+    );
+    assert_eq!(
+        notice(&app),
+        Some(("session id copied to the clipboard (OSC 52)", Level::Info))
+    );
+    assert_eq!(
+        keys(&mut app, &[Key::Char('Y')]),
+        [Effect::Copy(format!("/s/-w/{A}.jsonl"))]
+    );
+    assert_eq!(
+        notice(&app),
+        Some((
+            "transcript path copied to the clipboard (OSC 52)",
+            Level::Info
+        ))
+    );
+
+    // Enter would resume as max, its one account; `R` asks, max first (C4).
+    assert_eq!(keys(&mut app, &[Key::Char('R')]), []);
+    let Some(Overlay::Pick(pick)) = &app.overlay else {
+        panic!("{:?}", app.overlay)
+    };
+    assert_eq!(pick.action, PickFor::Resume);
+    assert_eq!(
+        pick.options,
+        ["claude:max", "claude:default", "claude:team"]
+    );
+    assert_eq!(pick.attributed, ["claude:max"]);
+    keys(&mut app, &[Key::Esc]);
+    assert_eq!(app.overlay, None);
+    assert!(app.preview.expanded, "the card stays under the picker");
+    keys(&mut app, &[Key::Char('F')]);
+    let Some(Overlay::Pick(pick)) = &app.overlay else {
+        panic!("{:?}", app.overlay)
+    };
+    assert_eq!(pick.action, PickFor::Fork);
+    keys(&mut app, &[Key::Esc]);
+
+    // `n`: the form for max, in the session's last directory.
+    keys(&mut app, &[Key::Char('n')]);
+    assert_eq!(
+        form(&app).kind,
+        FormKind::NewSession {
+            account: account("max")
+        }
+    );
+    assert_eq!(values(&app), [CWD, ""]);
+    keys(&mut app, &[Key::Esc]);
+    assert_eq!(app.overlay, None);
+
+    // `[` / `]`: the previous / next row; the card stays.
+    keys(&mut app, &[Key::Char('[')]);
+    assert_eq!(app.selected_entry().unwrap().session_id, B);
+    assert!(app.preview.expanded);
+    keys(&mut app, &[Key::Char(']')]);
+    assert_eq!(app.selected_entry().unwrap().session_id, A);
+    keys(&mut app, &[Key::Char(']')]);
+    assert_eq!(app.selected_entry().unwrap().session_id, A, "the last row");
+}
+
+/// R16: `n` in the card with several accounts attributed asks which (the picker, in the
+/// registry's order), with none refuses.
+#[test]
+fn n_in_the_card_picks_among_several_accounts_and_refuses_none() {
+    let mut app = history_with(&["team", "max"]);
+    keys(&mut app, &[Key::Char('p'), Key::Char('n')]);
+    let Some(Overlay::Pick(pick)) = &app.overlay else {
+        panic!("{:?}", app.overlay)
+    };
+    assert_eq!(pick.action, PickFor::NewSession);
+    assert_eq!(pick.options, ["claude:max", "claude:team"]);
+    assert!(text(&app).contains("New session in ~/space/remuda as…"));
+    keys(&mut app, &[Key::Char('j'), Key::Enter]);
+    assert_eq!(
+        form(&app).kind,
+        FormKind::NewSession {
+            account: account("team")
+        }
+    );
+    assert_eq!(values(&app), [CWD, ""]);
+
+    let mut app = history_with(&[]);
+    assert_eq!(keys(&mut app, &[Key::Char('p'), Key::Char('n')]), []);
+    assert_eq!(app.overlay, None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "session aaaaaaaa is attributed to no registered account: start one from Accounts \
+             (n)",
+            Level::Warn
+        ))
+    );
+}
+
+/// R16: `n` in the card starts nowhere but in the session's directory: a session without one
+/// is refused, and one the index no longer lists when the picker's choice is made (it was
+/// read again meanwhile) too, rather than started in remuda's own directory.
+#[test]
+fn n_in_the_card_refuses_a_session_without_a_directory_or_gone() {
+    let mut app = history_with(&["team", "max"]);
+    keys(&mut app, &[Key::Char('p'), Key::Char('n')]);
+    assert!(matches!(app.overlay, Some(Overlay::Pick(_))));
+    update(
+        &mut app,
+        Event::IndexDone {
+            entries: vec![entry(B, "b", 2)],
+            error: None,
+        },
+    );
+    keys(&mut app, &[Key::Enter]);
+    assert_eq!(app.overlay, None);
+    assert_eq!(
+        notice(&app),
+        Some(("session aaaaaaaa is no longer listed", Level::Error))
+    );
+
+    let mut app = history_with(&["max"]);
+    let mut gone = entry(A, "a", 1);
+    gone.cwd_last = None;
+    update(&mut app, Event::IndexLoaded(vec![gone, entry(B, "b", 2)]));
+    assert_eq!(app.selected_entry().unwrap().session_id, A);
+    keys(&mut app, &[Key::Char('p'), Key::Char('n')]);
+    assert_eq!(app.overlay, None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "session aaaaaaaa has no recorded directory to start in",
+            Level::Error
+        ))
+    );
+}
+
+/// R16: `n` in the card finds no account while the attribution is still being read (the
+/// index came first), or the stores for a codex rollout attributed to none: that is not an
+/// answer, and it asks to try again; once they are read, none is none.
+#[test]
+fn n_in_the_card_waits_for_the_attribution_and_the_stores() {
+    let mut app = app();
+    app.start();
+    update(&mut app, Event::IndexLoaded(vec![entry(A, "a", 1)]));
+    keys(&mut app, &[Key::Char('3'), Key::Char('p'), Key::Char('n')]);
+    assert_eq!(app.overlay, None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "still reading which accounts the sessions belong to; try again in a moment",
+            Level::Warn
+        ))
+    );
+    update(&mut app, Event::Attribution(Attribution::default()));
+    keys(&mut app, &[Key::Char('n')]);
+    assert_eq!(
+        notice(&app).map(|(text, _)| text),
+        Some(
+            "session aaaaaaaa is attributed to no registered account: start one from Accounts (n)"
+        )
+    );
+
+    // The account list changed: the attribution is read again, and until it answers a session
+    // of the account that was added is not attributed to none.
+    let mut app = history_with(&[]);
+    update(
+        &mut app,
+        Event::Accounts(vec![account("default"), account("max"), account("new")]),
+    );
+    assert!(app.work.attribution.is_running());
+    keys(&mut app, &[Key::Char('p'), Key::Char('n')]);
+    assert_eq!(
+        notice(&app).map(|(text, _)| text),
+        Some("still reading which accounts the sessions belong to; try again in a moment")
+    );
+    let mut attribution = Attribution::default();
+    attribution.add(A, "claude:new");
+    update(&mut app, Event::Attribution(attribution));
+    keys(&mut app, &[Key::Char('n')]);
+    assert_eq!(
+        form(&app).kind,
+        FormKind::NewSession {
+            account: account("new")
+        }
+    );
+
+    // A codex rollout: its store's owners stand in for the attribution, once the stores are
+    // known.
+    let mut app = codex_app();
+    app.stores = None;
+    app.attribution = Attribution::default();
+    while app.selected_entry().unwrap().session_id != C {
+        keys(&mut app, &[Key::Char('j')]);
+    }
+    keys(&mut app, &[Key::Char('p'), Key::Char('n')]);
+    assert_eq!(app.overlay, None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "still reading the transcript stores; try again in a moment",
+            Level::Warn
+        ))
+    );
+    // Known from before, but being read again with the index (after `r`, or an account list
+    // change): the same.
+    update(&mut app, Event::Stores(vec![]));
+    let entries: Vec<Entry> = app.index.entries.values().cloned().collect();
+    keys(&mut app, &[Key::Char('r')]);
+    update(&mut app, Event::Attribution(Attribution::default()));
+    assert!(app.work.index.is_running());
+    keys(&mut app, &[Key::Char('n')]);
+    assert_eq!(
+        notice(&app).map(|(text, _)| text),
+        Some("still reading the transcript stores; try again in a moment")
+    );
+    update(
+        &mut app,
+        Event::IndexDone {
+            entries,
+            error: None,
+        },
+    );
+    keys(&mut app, &[Key::Char('n')]);
+    assert_eq!(
+        notice(&app).map(|(text, _)| text),
+        Some(
+            "session 019c1e08 is attributed to no registered account: start one from Accounts (n)"
+        )
+    );
+}
+
+/// R16: `m` in the card reads the transcript again with the next limit (100, 500, all, 20);
+/// what is shown stays until the reading answers; pressed again meanwhile, the reading runs
+/// once more when it answers; another selection starts at 20 again.
+#[test]
+fn m_in_the_card_reads_more_of_the_transcript() {
+    let messages = |n: usize| -> Vec<Message> {
+        (0..n)
+            .map(|i| Message {
+                role: Role::Assistant,
+                text: format!("line {i}"),
+            })
+            .collect()
+    };
+    let mut app = app();
+    update(
+        &mut app,
+        Event::IndexLoaded(vec![entry("a", "a", 1), entry("b", "b", 2)]),
+    );
+    keys(&mut app, &[Key::Char('3')]);
+    tick(&mut app, 0);
+    assert_eq!(
+        tick(&mut app, 0),
+        [Effect::Preview(path("b"), CLAUDE, PREVIEW_MESSAGES)]
+    );
+    update(
+        &mut app,
+        Event::Preview {
+            path: path("b"),
+            result: Ok(messages(20)),
+        },
+    );
+    keys(&mut app, &[Key::Char('p')]);
+    assert!(text(&app).contains("Messages · last 20 messages"));
+    assert_eq!(
+        keys(&mut app, &[Key::Char('m')]),
+        [Effect::Preview(path("b"), CLAUDE, 100)]
+    );
+    assert_eq!(app.preview.limit, 100);
+    let all = text(&app);
+    assert!(all.contains("Messages · last 100 messages"), "{all}");
+    assert!(all.contains("line 19"), "what was shown stays: {all}");
+    // Pressed again while the reading is out: nothing starts; it runs again when it answers.
+    assert_eq!(keys(&mut app, &[Key::Char('m')]), []);
+    assert_eq!(app.preview.limit, 500);
+    assert_eq!(
+        update(
+            &mut app,
+            Event::Preview {
+                path: path("b"),
+                result: Ok(messages(100)),
+            }
+        ),
+        [Effect::Preview(path("b"), CLAUDE, 500)]
+    );
+    assert!(text(&app).contains("line 99"), "shown meanwhile");
+    assert_eq!(
+        update(
+            &mut app,
+            Event::Preview {
+                path: path("b"),
+                result: Ok(messages(300)),
+            }
+        ),
+        []
+    );
+    assert!(text(&app).contains("Messages · all 300 messages"));
+    assert_eq!(
+        keys(&mut app, &[Key::Char('m')]),
+        [Effect::Preview(path("b"), CLAUDE, usize::MAX)]
+    );
+    assert!(text(&app).contains("Messages · all messages"));
+    update(
+        &mut app,
+        Event::Preview {
+            path: path("b"),
+            result: Ok(messages(300)),
+        },
+    );
+    assert!(text(&app).contains("Messages · all 300 messages"));
+    assert_eq!(
+        keys(&mut app, &[Key::Char('m')]),
+        [Effect::Preview(path("b"), CLAUDE, PREVIEW_MESSAGES)]
+    );
+    // Another row: 20 again.
+    keys(&mut app, &[Key::Char('m'), Key::Char(']')]);
+    assert_eq!(app.preview.limit, PREVIEW_MESSAGES);
+    tick(&mut app, 0);
+    assert_eq!(
+        tick(&mut app, 0),
+        [Effect::Preview(path("a"), CLAUDE, PREVIEW_MESSAGES)]
+    );
+}
+
+/// R16: in Live, the card is the running session's, with its transcript's facts once it is
+/// indexed; `n` takes the account it runs as and its directory; a session whose id is unknown
+/// has nothing to copy.
+#[test]
+fn the_card_in_live_shows_the_running_session_and_its_copy() {
+    let mut app = history_with(&["max"]);
+    update(
+        &mut app,
+        Event::Live(vec![background("claude:max", "0a1b2c3d", A, "idle")]),
+    );
+    keys(&mut app, &[Key::Char('2'), Key::Char('p')]);
+    let lines = screen(&app);
+    let all = lines.join("\n");
+    assert!(all.contains("Session · bg task"), "{all}");
+    let (_, title) = line_with(&lines, "Title ");
+    assert!(
+        title.contains("Title      a "),
+        "the transcript's, beside the name: {title}"
+    );
+    assert!(!all.contains("Name "), "the box title has it: {all}");
+    let (_, session) = line_with(&lines, "Session  ");
+    assert!(
+        session.contains(&format!("{A} · claude · cli")),
+        "{session}"
+    );
+    let (_, accounts) = line_with(&lines, "Accounts   ");
+    assert!(
+        accounts.contains("max · background 0a1b2c3d in max idle"),
+        "{accounts}"
+    );
+    let (_, started) = line_with(&lines, "Started");
+    assert!(
+        started.contains("- · last 2026-09-24 10:01 (1h ago) · up since 11:50 (10m ago)"),
+        "{started}"
+    );
+    assert!(all.contains("enter: attach · f: fork"), "{all}");
+    assert!(
+        all.contains("l: logs · x: stop · D: rm · esc: close"),
+        "{all}"
+    );
+    assert_eq!(
+        keys(&mut app, &[Key::Char('y')]),
+        [Effect::Copy(A.to_string())]
+    );
+    assert_eq!(
+        keys(&mut app, &[Key::Char('Y')]),
+        [Effect::Copy(format!("/s/-w/{A}.jsonl"))]
+    );
+    keys(&mut app, &[Key::Char('n')]);
+    assert_eq!(
+        form(&app).kind,
+        FormKind::NewSession {
+            account: account("max")
+        }
+    );
+    assert_eq!(values(&app), ["/w/bg", ""]);
+    keys(&mut app, &[Key::Esc]);
+
+    // An interactive session whose id is not known: nothing to copy, nothing indexed.
+    update(&mut app, Event::Live(vec![live("claude:max", 9, None)]));
+    let lines = screen(&app);
+    let all = lines.join("\n");
+    assert!(all.contains("Session · fix index"), "{all}");
+    let (_, session) = line_with(&lines, "Session  ");
+    assert!(session.contains("id unknown · interactive"), "{session}");
+    let (_, transcript) = line_with(&lines, "Transcript");
+    assert!(transcript.contains("not indexed yet"), "{transcript}");
+    let (_, accounts) = line_with(&lines, "Accounts   ");
+    assert!(
+        accounts.contains("max · running in max (pid 9) busy"),
+        "{accounts}"
+    );
+    assert_eq!(keys(&mut app, &[Key::Char('y')]), []);
+    assert_eq!(
+        notice(&app),
+        Some(("this session's id is unknown", Level::Warn))
+    );
+    assert_eq!(keys(&mut app, &[Key::Char('Y')]), []);
+    assert_eq!(
+        notice(&app),
+        Some(("this session's id is unknown", Level::Warn))
+    );
+    assert_eq!(keys(&mut app, &[Key::Char('R')]), []);
+    assert_eq!(app.overlay, None);
 }
 
 // ---- launching -------------------------------------------------------------------
@@ -3285,7 +3788,7 @@ fn history_view_populated_narrow() {
     let all = lines.join("\n");
     assert!(all.contains("showing 3 of 5 (a: show all)"), "{all}");
     assert!(
-        all.contains("enter: resume") && all.contains("f: fork") && all.contains("p: preview"),
+        all.contains("enter: resume") && all.contains("f: fork") && all.contains("p: session"),
         "{all}"
     );
     assert!(!all.contains("M2"), "{all}");
@@ -3421,6 +3924,46 @@ fn tiny_terminal_does_not_panic() {
             keys(&mut app, &[Key::Ctrl('p')]);
             screen(&app);
             keys(&mut app, &[Key::Ctrl('p')]);
+        }
+        // The session card (R16), with a preview loaded in History, none in Live.
+        for view in ['3', '2'] {
+            keys(&mut app, &[Key::Char(view)]);
+            if let Some(target) = app.preview.target.clone() {
+                tick(&mut app, 0);
+                tick(&mut app, 0);
+                update(
+                    &mut app,
+                    Event::Preview {
+                        path: target,
+                        result: Ok((0..30)
+                            .map(|i| Message {
+                                role: Role::Assistant,
+                                text: format!("message {i} of a preview that wraps"),
+                            })
+                            .collect()),
+                    },
+                );
+            }
+            keys(&mut app, &[Key::Char('p')]);
+            for key in [
+                Key::Char('j'),
+                Key::Char('k'),
+                Key::PageUp,
+                Key::Char('g'),
+                Key::Char('m'),
+                Key::Char(']'),
+                Key::Char('['),
+                Key::Char('n'),
+                Key::Esc,
+            ] {
+                keys(&mut app, &[key]);
+                screen(&app);
+                keys(&mut app, &[Key::Ctrl('p')]);
+                screen(&app);
+                keys(&mut app, &[Key::Ctrl('p')]);
+            }
+            keys(&mut app, &[Key::Esc]);
+            assert!(!app.preview.expanded);
         }
     }
 }
@@ -3791,7 +4334,10 @@ fn codex_sessions_are_in_history_with_their_account() {
         keys(&mut app, &[Key::Char('j')]);
     }
     tick(&mut app, 0);
-    assert_eq!(tick(&mut app, 0), [Effect::Preview(codex_path(C), CODEX)]);
+    assert_eq!(
+        tick(&mut app, 0),
+        [Effect::Preview(codex_path(C), CODEX, PREVIEW_MESSAGES)]
+    );
 }
 
 /// R17: nothing tells whether a codex session runs elsewhere: an in-place resume always asks
@@ -5907,6 +6453,42 @@ fn secret_states() -> Vec<SecretState> {
             },
             "zqanswer",
         ),
+        state(
+            "history card: the directory",
+            |app| {
+                keys(app, &[Key::Char('3')]);
+                load_preview(app);
+                keys(app, &[Key::Char('p')]);
+            },
+            "~/zq work/zqproj",
+        ),
+        state(
+            "history card: the first words",
+            |app| {
+                keys(app, &[Key::Char('3')]);
+                load_preview(app);
+                keys(app, &[Key::Char('p')]);
+            },
+            "zqfirst words",
+        ),
+        state(
+            "live card: the title beside the name",
+            |app| {
+                keys(app, &[Key::Char('2')]);
+                load_preview(app);
+                keys(app, &[Key::Char('p')]);
+            },
+            "zqtitle one",
+        ),
+        state(
+            "new session from the card: the picker",
+            |app| {
+                // Two accounts: the picker, titled with the directory.
+                app.attribution.add(ZQ_A, "claude:default");
+                keys(app, &[Key::Char('3'), Key::Char('p'), Key::Char('n')]);
+            },
+            "New session in ~/zq work/zqproj as…",
+        ),
         state("stats", |app| drop(keys(app, &[Key::Char('4')])), "zqalpha"),
         state(
             "stats by project",
@@ -5938,10 +6520,10 @@ fn secret_states() -> Vec<SecretState> {
         state(
             "help",
             |app| {
-                // At 24 rows the help box covers the whole body; one row more leaves the status
-                // line, and what it says, below the box.
+                // At 24 rows the help box covers the whole body; two rows more leave the
+                // status line, and what it says, below the box.
                 let (w, h) = app.size;
-                update(app, Event::Resize(w, h + 1));
+                update(app, Event::Resize(w, h + 2));
                 keys(app, &[Key::Char('?')]);
             },
             "zqalpha",
@@ -7826,10 +8408,16 @@ fn a_preview_left_and_selected_again_waits_for_the_reading_that_is_out() {
     );
     keys(&mut app, &[Key::Char('3')]);
     tick(&mut app, 0);
-    assert_eq!(tick(&mut app, 0), [Effect::Preview(path("b"), CLAUDE)]);
+    assert_eq!(
+        tick(&mut app, 0),
+        [Effect::Preview(path("b"), CLAUDE, PREVIEW_MESSAGES)]
+    );
     keys(&mut app, &[Key::Char('j')]);
     tick(&mut app, 0);
-    assert_eq!(tick(&mut app, 0), [Effect::Preview(path("a"), CLAUDE)]);
+    assert_eq!(
+        tick(&mut app, 0),
+        [Effect::Preview(path("a"), CLAUDE, PREVIEW_MESSAGES)]
+    );
     // Back on `b` while its first reading is out: no second one beside it.
     keys(&mut app, &[Key::Char('k')]);
     assert_eq!(tick(&mut app, 0), []);
@@ -7840,7 +8428,7 @@ fn a_preview_left_and_selected_again_waits_for_the_reading_that_is_out() {
     // Read before the selection left: shown, and read once more.
     assert_eq!(
         answer(&mut app, "b", "read first"),
-        [Effect::Preview(path("b"), CLAUDE)]
+        [Effect::Preview(path("b"), CLAUDE, PREVIEW_MESSAGES)]
     );
     assert_eq!(app.preview.loaded, Some((path("b"), Ok(msg("read first")))));
     assert_eq!(answer(&mut app, "b", "read second"), []);
@@ -7959,7 +8547,7 @@ fn a_preview_shown_meanwhile_does_not_stand_in_for_the_reading_still_out() {
             },
         )
     };
-    let read_b = [Effect::Preview(path("b"), CLAUDE)];
+    let read_b = [Effect::Preview(path("b"), CLAUDE, PREVIEW_MESSAGES)];
     for answers_before_settling in [false, true] {
         let mut app = app();
         update(
