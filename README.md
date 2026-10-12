@@ -131,7 +131,8 @@ Your native login is already an account: `default` is `~/.claude` (and `codex:de
    remuda setup personal                 # or: create ~/.remuda/homes/claude/personal and run `claude auth login`
    ```
 
-   `remuda list` then shows each account with its email, organization, plan and home.
+   `remuda list` then shows each account with its home and its login identity: email,
+   organization and plan for a Claude account, the login method for a Codex one.
 
 2. **See what is left.** `remuda usage` prints every account's limits from the agents' local
    caches, in a second, without asking anyone; `remuda usage --live` asks each agent now.
