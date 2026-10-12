@@ -1383,8 +1383,8 @@ pub fn turned_off(plugin: &str, own: &Map<String, Value>, layers: &[Map<String, 
     std::iter::once(own)
         .chain(layers)
         .rev()
-        .find_map(|settings| settings.get("enabledPlugins")?.get(plugin)?.as_bool())
-        == Some(false)
+        .find_map(|settings| settings.get("enabledPlugins")?.get(plugin))
+        .is_some_and(|on| on.as_bool() == Some(false))
 }
 
 /// Whether `plugin` (`name@marketplace`) is one claude bundles: the `builtin` marketplace is
@@ -2069,6 +2069,26 @@ mod tests {
             ["a@m", "d@m"]
         );
         assert!(enabled_plugins(&map(json!({"enabledPlugins": []}))).is_empty());
+    }
+
+    /// R18: the highest settings layer that sets a plugin decides whether it is turned off;
+    /// an array there, like `true`, enables it.
+    #[test]
+    fn the_highest_layer_decides_whether_a_plugin_is_off() {
+        let layer = |v: Value| map(json!({"enabledPlugins": {"a@m": v}}));
+        let own = layer(json!(false));
+        assert!(turned_off("a@m", &own, &[]));
+        assert!(!turned_off("a@m", &map(json!({})), &[]));
+        assert!(!turned_off("a@m", &own, &[layer(json!(true))]));
+        assert!(!turned_off("a@m", &own, &[layer(json!([]))]));
+        assert!(turned_off(
+            "a@m",
+            &own,
+            &[layer(json!(true)), layer(json!(false))]
+        ));
+        // A layer that says nothing about it leaves the one below in force.
+        assert!(turned_off("a@m", &own, &[map(json!({"model": "opus"}))]));
+        assert!(!turned_off("b@m", &own, &[layer(json!(false))]));
     }
 
     /// Sorted entry names of a directory.
