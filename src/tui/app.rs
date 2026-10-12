@@ -757,6 +757,9 @@ pub struct App {
 
     /// Launch log + `history.jsonl`; `attribution` adds live sessions to it.
     pub(super) attribution_base: Attribution,
+    /// The launch log and the `history.jsonl` files have been read once: a session attributed
+    /// to no account now is attributed to none.
+    pub attribution_loaded: bool,
     pub attribution: Attribution,
 
     pub live: Vec<LiveSession>,
@@ -819,6 +822,7 @@ impl App {
             index_error: None,
             by_session: HashMap::new(),
             attribution_base: Attribution::default(),
+            attribution_loaded: false,
             attribution: Attribution::default(),
             live: Vec::new(),
             live_rows: Vec::new(),
@@ -1549,8 +1553,21 @@ impl App {
                     entry.session_id.clone(),
                     entry.cwd_last.clone(),
                 );
-                let accounts = self.session_accounts(&path);
+                let (accounts, provider) = (
+                    self.session_accounts(&path),
+                    self.index.entries.get(&path).map(|e| e.provider),
+                );
                 match accounts.as_slice() {
+                    // Nothing found while what says is still being read is not an answer.
+                    [] if !self.attribution_loaded => self.notify(
+                        Level::Warn,
+                        "still reading which accounts the sessions belong to; try again in a \
+                         moment",
+                    ),
+                    [] if provider == Some(CODEX) && self.stores.is_none() => self.notify(
+                        Level::Warn,
+                        "still reading the transcript stores; try again in a moment",
+                    ),
                     [] => {
                         let text = format!(
                             "session {} is attributed to no registered account: start one from \
@@ -2874,6 +2891,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 app.aliases.note(name);
             }
             app.attribution_base = base;
+            app.attribution_loaded = true;
             app.merge_attribution();
             // Accounts are searched.
             if !app.history.query.is_empty() {

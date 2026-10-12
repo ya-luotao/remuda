@@ -1013,6 +1013,51 @@ fn n_in_the_card_picks_among_several_accounts_and_refuses_none() {
     );
 }
 
+/// R16: `n` in the card finds no account while the attribution is still being read (the
+/// index came first), or the stores for a codex rollout attributed to none: that is not an
+/// answer, and it asks to try again; once they are read, none is none.
+#[test]
+fn n_in_the_card_waits_for_the_attribution_and_the_stores() {
+    let mut app = app();
+    app.start();
+    update(&mut app, Event::IndexLoaded(vec![entry(A, "a", 1)]));
+    keys(&mut app, &[Key::Char('3'), Key::Char('p'), Key::Char('n')]);
+    assert_eq!(app.overlay, None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "still reading which accounts the sessions belong to; try again in a moment",
+            Level::Warn
+        ))
+    );
+    update(&mut app, Event::Attribution(Attribution::default()));
+    keys(&mut app, &[Key::Char('n')]);
+    assert_eq!(
+        notice(&app).map(|(text, _)| text),
+        Some(
+            "session aaaaaaaa is attributed to no registered account: start one from Accounts (n)"
+        )
+    );
+
+    // A codex rollout: its store's owners stand in for the attribution, once the stores are
+    // known.
+    let mut app = codex_app();
+    app.stores = None;
+    app.attribution = Attribution::default();
+    while app.selected_entry().unwrap().session_id != C {
+        keys(&mut app, &[Key::Char('j')]);
+    }
+    keys(&mut app, &[Key::Char('p'), Key::Char('n')]);
+    assert_eq!(app.overlay, None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "still reading the transcript stores; try again in a moment",
+            Level::Warn
+        ))
+    );
+}
+
 /// R16: `m` in the card reads the transcript again with the next limit (100, 500, all, 20);
 /// what is shown stays until the reading answers; pressed again meanwhile, the reading runs
 /// once more when it answers; another selection starts at 20 again.

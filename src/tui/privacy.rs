@@ -348,6 +348,7 @@ pub fn redacted(app: &App) -> App {
         index_error,
         by_session,
         attribution_base,
+        attribution_loaded,
         attribution,
         live,
         live_rows,
@@ -394,6 +395,7 @@ pub fn redacted(app: &App) -> App {
             .map(|(id, p)| (id.clone(), key_path(p)))
             .collect::<HashMap<_, _>>(),
         attribution_base: attribution_base.redacted(|q| r.alias(q)),
+        attribution_loaded: *attribution_loaded,
         attribution: attribution.redacted(|q| r.alias(q)),
         live: live.iter().map(|s| r.live_session(s)).collect(),
         live_rows: live_rows.clone(),
