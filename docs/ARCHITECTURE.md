@@ -218,7 +218,8 @@ separate caches, because they need different parts of each file.
                         stats::requests(prices)  ◄── pricing (built-in + [prices])
                               │  (each request once: the copy that counts, its accounts, cost)
                               ├─► stats::report(period) ─┬─► stats::format        `remuda stats`
-                              │                          └─► stats::chart_series  Stats view chart
+                              │   (tables, and projects  ├─► stats::chart_series  Stats view chart
+                              │    of every period)      └─► Report::projects     Stats view, `b`
                               ├─► stats::projects(period) ──► stats::format_projects  `--by project`
                               └─► stats::csv(period)                                  `--csv`
 ```

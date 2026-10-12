@@ -15,7 +15,7 @@ use crate::account_config::{
 use crate::identity::Identity;
 use crate::index::Entry;
 use crate::pricing::PRICES_AS_OF;
-use crate::stats::{self, Cost, ModelRow, Step, Table, Tokens};
+use crate::stats::{self, By, Cost, ModelRow, Step, Table, Tokens};
 use crate::transcript::{Role, one_line};
 use crate::usage::{self, Reset, Source, Window};
 use crate::{text, usage::format_age};
@@ -376,7 +376,13 @@ fn hints(app: &App) -> String {
                 "enter: attach · f: fork · p: preview · l: logs · x: stop · D: rm · a: stopped"
             }
             View::History => "enter: resume · f: fork · p: preview · /: search · a: show all",
-            View::Stats => "t: period · j/k: scroll · r: refresh",
+            View::Stats => {
+                // What `b` switches to; what is shown is in the title.
+                return format!(
+                    " t: period · b: {} · j/k: scroll · r: refresh",
+                    by_label(app.stats.by.other())
+                );
+            }
         }
     };
     format!(" {text}")
@@ -1732,6 +1738,7 @@ pub const KEYS: &[(&str, &str)] = &[
         "history: show teammate, SDK and codex subagent sessions · live: show stopped ones",
     ),
     ("t", "stats: next period (all, today, 7 days, 30 days)"),
+    ("b", "stats: sections by account or by project"),
     ("u", "query live usage for every account"),
     (
         "r",
@@ -1762,7 +1769,10 @@ const STATS_COLUMNS: [(&str, usize); 8] = [
 /// CACHE WRITE go.
 const STATS_DROP: [usize; 3] = [4, 7, 2];
 const STATS_MIN_NAME: usize = 16;
-const STATS_NAME: &str = "ACCOUNT / MODEL";
+/// The name column's header, by account and by project.
+const STATS_NAME: [&str; 2] = ["ACCOUNT / MODEL", "PROJECT / MODEL"];
+/// A project section of sessions that record no directory (R20): remuda's own words.
+const NO_DIRECTORY: &str = "(no directory)";
 /// Only the title stays put above the scrolled lines (the column header is pinned in place of
 /// the first one once scrolled past).
 const STATS_CHROME: u16 = 1;
@@ -1793,6 +1803,46 @@ fn stats_table(app: &App) -> Option<&Table> {
     Some(app.stats.report.as_ref()?.table(app.stats.period))
 }
 
+/// The sections of the period as shown, each name with its models: by account, every
+/// section of [`stats_table`]; by project, every project of the period, titled by its
+/// directory as recorded, in the report's order (R20).
+fn stats_sections(app: &App) -> Vec<(String, &[ModelRow])> {
+    let Some(report) = app.stats.report.as_ref() else {
+        return Vec::new();
+    };
+    match app.stats.by {
+        By::Account => report
+            .table(app.stats.period)
+            .sections
+            .iter()
+            .map(|s| (stats_label(&s.accounts), s.models.as_slice()))
+            .collect(),
+        By::Project => report
+            .projects(app.stats.period)
+            .sections
+            .iter()
+            .map(|p| {
+                let dir = p.dir.as_deref().unwrap_or(NO_DIRECTORY);
+                (dir.to_string(), p.models.as_slice())
+            })
+            .collect(),
+    }
+}
+
+fn stats_name(by: By) -> &'static str {
+    match by {
+        By::Account => STATS_NAME[0],
+        By::Project => STATS_NAME[1],
+    }
+}
+
+fn by_label(by: By) -> &'static str {
+    match by {
+        By::Account => "by account",
+        By::Project => "by project",
+    }
+}
+
 /// A section's accounts, short (`default + max`), or `unattributed`.
 fn stats_label(accounts: &[String]) -> String {
     match accounts.is_empty() {
@@ -1810,12 +1860,10 @@ fn stats_label(accounts: &[String]) -> String {
 /// next to the names), at most what the columns leave; narrower than [`STATS_MIN_NAME`], it
 /// takes the places of [`STATS_DROP`] in turn.
 fn stats_columns(app: &App, width: u16) -> (usize, Vec<usize>) {
-    let mut widest = text::width(STATS_NAME);
-    if let Some(table) = stats_table(app) {
-        for s in &table.sections {
-            widest = widest.max(text::width(&stats_label(&s.accounts)));
-        }
-        for m in table.sections.iter().flat_map(|s| &s.models) {
+    let mut widest = text::width(stats_name(app.stats.by));
+    for (name, models) in stats_sections(app) {
+        widest = widest.max(text::width(&name));
+        for m in models {
             widest = widest.max(2 + text::width(&m.model));
         }
     }
@@ -2046,7 +2094,7 @@ pub fn stats_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Option<usize>)
     let header_at = lines.len();
     let [a, b, c, d, e, f, g, share] = STATS_COLUMNS.map(|(h, _)| h.to_string());
     lines.push(stats_row(
-        STATS_NAME,
+        stats_name(app.stats.by),
         &[a, b, c, d, e, f, g],
         &share,
         DIM,
@@ -2055,14 +2103,13 @@ pub fn stats_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Option<usize>)
     let by_cost = stats_measure(table);
     let (total, cost, _) = stats::sum(&table.overall);
     let base = measure(by_cost, &total, &cost);
-    for s in &table.sections {
-        stats_block(
-            &stats_label(&s.accounts),
-            &s.models,
-            &columns,
-            Some((by_cost, base)),
-            &mut lines,
-        );
+    for (name, models) in stats_sections(app) {
+        // A directory keeps its end, as History's does: the name says more than the root.
+        let name = match app.stats.by {
+            By::Account => name,
+            By::Project => tail(&name, columns.0),
+        };
+        stats_block(&name, models, &columns, Some((by_cost, base)), &mut lines);
     }
     lines.push(Line::raw(""));
     stats_block("Overall", &table.overall, &columns, None, &mut lines);
@@ -2076,8 +2123,9 @@ pub fn stats_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Option<usize>)
 
 fn stats_view(app: &App, f: &mut Frame, area: Rect) {
     let title = format!(
-        "Tokens · {} · cost ≈ API list price (t: period)",
-        app.stats.period.label()
+        "Tokens · {} · {} · cost ≈ API list price (t: period · b: by)",
+        app.stats.period.label(),
+        by_label(app.stats.by)
     );
     let mut lines = vec![section(&title, area.width)];
     let (body, header_at) = stats_lines(app, area.width);

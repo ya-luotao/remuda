@@ -21,7 +21,7 @@ pub use crate::privacy::Marked;
 use crate::provider::Provider;
 use crate::registry::{self, Account, CLAUDE, CODEX, Home};
 use crate::setup;
-use crate::stats::{self, Period};
+use crate::stats::{self, By, Period};
 use crate::transcript::Message;
 use crate::usage::{CachedUsage, LiveResult, LiveUsage, Reading, Snapshot, UsageRow};
 
@@ -680,6 +680,8 @@ pub struct StatsState {
     /// When the last report arrived.
     pub computed: Option<Timestamp>,
     pub period: Period,
+    /// Sections by account or by project (`b`); by account when the TUI starts (R20).
+    pub by: By,
     /// Lines scrolled down.
     pub scroll: usize,
 }
@@ -693,6 +695,7 @@ impl Default for StatsState {
             progress: None,
             computed: None,
             period: Period::All,
+            by: By::Account,
             scroll: 0,
         }
     }
@@ -1337,6 +1340,10 @@ impl App {
             }
             Key::Char('t') if self.view == View::Stats => {
                 self.stats.period = self.stats.period.next();
+                self.stats.scroll = 0;
+            }
+            Key::Char('b') if self.view == View::Stats => {
+                self.stats.by = self.stats.by.other();
                 self.stats.scroll = 0;
             }
             Key::Char('p' | ' ') if matches!(self.view, View::Live | View::History) => {

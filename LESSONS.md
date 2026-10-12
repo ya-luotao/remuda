@@ -180,3 +180,11 @@ a SPEC contradiction, a red suite).
 *Evidence:* 2026-10-06 (four rounds on two lanes before the rule); 2026-10-07 (three rounds,
 converged); 2026-10-08 (lane C took eight rounds, each later round one finding in the blocker
 set, so the rule held). *Seen:* 3 days → promoted: CONTRIBUTING "Review gate" (2026-10-08).
+
+**Review the merge head when two lanes changed the two ends of one piece of data.** Each branch
+was reviewed green on its own; the one that added the exact window length and the one that
+computed a pace from the window length never met until the merge, and the merge commit was what
+the GitHub review caught. A merge that joins a producer and a consumer is a change of its own
+and gets a review of its own.
+*Evidence:* 2026-10-08 batch 3 (lane C added `UsageRow.window_minutes`, lane A's pace read the
+label; found on merge commit 2c7ddda by the GitHub review, fixed in 76b27fc). *Seen:* 1 day.

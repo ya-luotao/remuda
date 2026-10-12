@@ -10,6 +10,11 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Added
 
+- The TUI's Stats view can show its sections by project, as `remuda stats --by project` does:
+  `b` switches between accounts and projects (by account when the TUI starts; `t` and `r` keep
+  the choice), a directory too long for its column keeps its end, and the shares, chart and
+  Overall are the same either way. In private mode each directory is masked as a path
+  (`~/•••/•••`); `(no directory)` stays (SPEC R20, R21).
 - `[pick] strategy = "pace"` (default `"headroom"`, unchanged): the rules rank the feasible pairs
   by their pace, the percent left per hour until reset on the tightest weekly window (a
   five-hour window only without a longer one; never over less than an hour; a window's whole

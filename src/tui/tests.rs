@@ -9,7 +9,7 @@ use ratatui::backend::TestBackend;
 
 use super::app::{
     App, Confirm, Effect, Event, Exit, Form, FormKind, Key, LaunchRequest, Level, Marked, Mode,
-    Notice, Overlay, Pick, PickFor, ResumeCodex, View, update,
+    Notice, Overlay, Pick, PickFor, ResumeCodex, StatsState, View, update,
 };
 use super::render;
 use crate::attribution::Attribution;
@@ -18,7 +18,9 @@ use crate::identity::Identity;
 use crate::index::{Entry, Store};
 use crate::live::{Control, LiveSession, Source};
 use crate::registry::{Account, CLAUDE, CODEX, Home};
-use crate::stats::{self, Cost, ModelRow, Period, Report, Section, Table, Tokens};
+use crate::stats::{
+    self, By, Cost, ModelRow, Period, Project, ProjectTable, Report, Section, Table, Tokens,
+};
 use crate::transcript::{Message, Role};
 use crate::usage::{CachedUsage, LiveResult, LiveUsage, Resets, Untold, UsageRow};
 
@@ -4451,6 +4453,38 @@ fn priced(m: ModelRow, pico: u128) -> ModelRow {
     }
 }
 
+fn stats_project(dir: Option<&str>, models: Vec<ModelRow>) -> Project {
+    Project {
+        dir: dir.map(str::to_string),
+        models,
+    }
+}
+
+/// For each table, its period by project: `projects(period)`, and the table's own overall.
+fn project_tables(
+    tables: &[Table],
+    projects: impl Fn(Period) -> Vec<Project>,
+) -> Vec<ProjectTable> {
+    tables
+        .iter()
+        .map(|t| ProjectTable {
+            period: t.period,
+            since: t.since,
+            sections: projects(t.period),
+            overall: Some(t.overall.clone()),
+        })
+        .collect()
+}
+
+/// The directories of [`stats_report`]'s projects, most tokens first: one too long for the
+/// name column at 80 columns, one with a comma and quotes, and two tied, `(no directory)` last.
+const STATS_DIRS: [&str; 4] = [
+    "/Users/me/src/app",
+    "/Users/me/work/a very long directory name/remuda",
+    "/w/b, \"q\"",
+    "/w/tie",
+];
+
 fn stats_section(accounts: &[&str], models: Vec<ModelRow>) -> Section {
     Section {
         accounts: accounts.iter().map(|a| a.to_string()).collect(),
@@ -4479,22 +4513,41 @@ fn stats_report() -> Report {
     ];
     let overall = vec![
         model(CLAUDE, "claude-test", [22, 1_234_567, 160, 104, 0]),
-        gpt,
-        haiku,
+        gpt.clone(),
+        haiku.clone(),
+    ];
+    let tables = Period::ALL
+        .map(|period| Table {
+            period,
+            since: None,
+            sections: match period {
+                Period::Today => sections[..1].to_vec(),
+                _ => sections.clone(),
+            },
+            overall: overall.clone(),
+            series: vec![],
+        })
+        .to_vec();
+    // The same requests by project: default's in the first, the unattributed split in two.
+    let projects = vec![
+        stats_project(Some(STATS_DIRS[0]), vec![test.clone(), haiku.clone()]),
+        stats_project(Some(STATS_DIRS[1]), vec![gpt.clone()]),
+        stats_project(
+            Some(STATS_DIRS[2]),
+            vec![model(CLAUDE, "claude-test", [5, 0, 0, 5, 0])],
+        ),
+        stats_project(
+            Some(STATS_DIRS[3]),
+            vec![model(CLAUDE, "claude-test", [4, 0, 0, 5, 0])],
+        ),
+        stats_project(None, vec![model(CLAUDE, "claude-test", [5, 0, 0, 4, 0])]),
     ];
     Report {
-        tables: Period::ALL
-            .map(|period| Table {
-                period,
-                since: None,
-                sections: match period {
-                    Period::Today => sections[..1].to_vec(),
-                    _ => sections.clone(),
-                },
-                overall: overall.clone(),
-                series: vec![],
-            })
-            .to_vec(),
+        projects: project_tables(&tables, |period| match period {
+            Period::Today => projects[..1].to_vec(),
+            _ => projects.clone(),
+        }),
+        tables,
         files: 42,
     }
 }
@@ -4589,7 +4642,7 @@ fn stats_view_computes_on_first_visit_then_on_r() {
     let lines = screen(&app);
     line_with(
         &lines,
-        "Tokens · all time · cost ≈ API list price (t: period)",
+        "Tokens · all time · by account · cost ≈ API list price (t: period · b: by)",
     );
     let (body, _) = line_with(&lines, "reading transcripts 3/10…");
     let (status, _) = line_with(&lines[body + 1..], "reading transcripts 3/10…");
@@ -4812,7 +4865,7 @@ fn t_cycles_the_period_and_p_is_inert_in_stats() {
         let (_, title) = line_with(&lines, "Tokens · ");
         titles.push(
             title
-                .split(" (t: period)")
+                .split(" (t: period · b: by)")
                 .next()
                 .unwrap()
                 .trim()
@@ -4823,11 +4876,11 @@ fn t_cycles_the_period_and_p_is_inert_in_stats() {
     assert_eq!(
         titles,
         [
-            "Tokens · all time · cost ≈ API list price",
-            "Tokens · today · cost ≈ API list price",
-            "Tokens · last 7 days · cost ≈ API list price",
-            "Tokens · last 30 days · cost ≈ API list price",
-            "Tokens · all time · cost ≈ API list price"
+            "Tokens · all time · by account · cost ≈ API list price",
+            "Tokens · today · by account · cost ≈ API list price",
+            "Tokens · last 7 days · by account · cost ≈ API list price",
+            "Tokens · last 30 days · by account · cost ≈ API list price",
+            "Tokens · all time · by account · cost ≈ API list price"
         ]
     );
     assert_eq!(app.stats.period, Period::Today);
@@ -4849,7 +4902,7 @@ fn t_cycles_the_period_and_p_is_inert_in_stats() {
     assert!(!app.preview.expanded);
     assert_eq!(text(&app), before);
     assert!(
-        before.contains("t: period · j/k: scroll · r: refresh"),
+        before.contains("t: period · b: by project · j/k: scroll · r: refresh"),
         "{before}"
     );
 
@@ -4906,18 +4959,305 @@ fn stats_scrolls() {
     assert_eq!(app.stats.scroll, 0);
 }
 
+/// R20: by project (`b`), the sections are the report's projects in its order, each titled by
+/// its directory as recorded (one too wide keeps its end, after `…`, as History's directories
+/// do), `(no directory)` for the sessions that record none, under `PROJECT / MODEL`; a
+/// project's share is of the period's total, as an account's is; then the same Overall as by
+/// account.
+#[test]
+fn stats_view_by_project_shows_the_projects_then_the_same_overall() {
+    let mut app = stats_app();
+    let by_account = screen(&app);
+    keys(&mut app, &[Key::Char('b')]);
+    let lines = screen(&app);
+    let rows: Vec<String> = lines[2..].iter().map(|l| squeezed(l)).collect();
+    let expected = [
+        "PROJECT / MODEL INPUT CACHE READ CACHE WRITE OUTPUT TOTAL COST SHARE",
+        "/Users/me/src/app 38 1.2M 160 95 1.2M $12.34+ ██████",
+        "claude-test 8 1.2M 160 90 1.2M -",
+        "claude-haiku-4… 30 0 0 5 35 $12.34",
+        "…tory name/remuda 1.5K 200 0 30 1.7K -",
+        "gpt-test 1.5K 200 0 30 1.7K -",
+        "/w/b, \"q\" 5 0 0 5 10 -",
+        "claude-test 5 0 0 5 10 -",
+        "/w/tie 4 0 0 5 9 -",
+        "claude-test 4 0 0 5 9 -",
+        "(no directory) 5 0 0 4 9 -",
+        "claude-test 5 0 0 4 9 -",
+        "",
+    ];
+    assert_eq!(rows[..expected.len()], expected, "{}", lines.join("\n"));
+    // Cut from the left to the name column, which `/Users/me/src/app` fills.
+    let (_, long) = line_with(&lines, "name/remuda");
+    assert!(long.starts_with("…tory name/remuda "), "{long}");
+    // Overall and the models not priced, line for line as by account.
+    let overall = |lines: &[String]| {
+        let (at, _) = line_with(lines, "Overall");
+        let (end, _) = line_with(lines, "not priced:");
+        lines[at..=end].to_vec()
+    };
+    assert_eq!(overall(&lines).len(), 5, "{}", lines.join("\n"));
+    assert_eq!(overall(&lines), overall(&by_account));
+}
+
+/// R20: by project, each project's share bar is of the period's total, as an account's is: the
+/// cost when anything is priced ($6 and $2 of $8), else the tokens (30 and 10 of 40); never of
+/// the project's own total.
+#[test]
+fn stats_view_by_project_shares_are_of_the_period_total() {
+    let haiku = |t, dollars: u128| {
+        priced(
+            model(CLAUDE, "claude-haiku-4-5", t),
+            dollars * 1_000_000_000_000,
+        )
+    };
+    let test = |t| model(CLAUDE, "claude-test", t);
+    let cases = [
+        (
+            "by cost",
+            vec![
+                ("/w/six", haiku([60, 0, 0, 0, 0], 6)),
+                ("/w/two", haiku([20, 0, 0, 0, 0], 2)),
+            ],
+            haiku([80, 0, 0, 0, 0], 8),
+        ),
+        (
+            "by tokens, nothing priced",
+            vec![
+                ("/w/six", test([30, 0, 0, 0, 0])),
+                ("/w/two", test([10, 0, 0, 0, 0])),
+            ],
+            test([40, 0, 0, 0, 0]),
+        ),
+    ];
+    for (what, projects, overall) in cases {
+        let mut app = stats_app();
+        let mut report = report_of(
+            vec![stats_section(&["claude:default"], vec![overall.clone()])],
+            vec![overall.clone()],
+            vec![],
+        );
+        for table in &mut report.projects {
+            table.sections = projects
+                .iter()
+                .map(|(dir, m)| stats_project(Some(dir), vec![m.clone()]))
+                .collect();
+        }
+        update(
+            &mut app,
+            Event::Stats {
+                report,
+                error: None,
+            },
+        );
+        keys(&mut app, &[Key::Char('b')]);
+        let lines = screen(&app);
+        let bar = |dir: &str| {
+            let (_, row) = line_with(&lines, dir);
+            row.split_whitespace().last().unwrap().to_string()
+        };
+        assert_eq!(
+            [bar("/w/six"), bar("/w/two")],
+            ["████▌", "█▌"],
+            "{what}:\n{}",
+            lines.join("\n")
+        );
+    }
+}
+
+/// R20: `b` switches Stats between sections by account and by project, back at the top; the
+/// title says which it is, the hint line what `b` switches to. `t` and a new report (`r`) keep
+/// it, and in the other views `b` does nothing. The view is by account when the TUI starts.
+#[test]
+fn b_switches_the_sections_and_t_and_r_keep_them() {
+    assert_eq!(StatsState::default().by, By::Account);
+    // Pressed while the first report is computed: it is by project once it arrives.
+    let mut app = app();
+    assert_eq!(
+        keys(&mut app, &[Key::Char('4'), Key::Char('b')]),
+        [Effect::Stats]
+    );
+    let all = text(&app);
+    assert!(all.contains("Tokens · all time · by project"), "{all}");
+    assert!(all.contains("computing…"), "{all}");
+    update(
+        &mut app,
+        Event::Stats {
+            report: stats_report(),
+            error: None,
+        },
+    );
+    assert_eq!(app.stats.by, By::Project);
+    assert!(text(&app).contains("PROJECT / MODEL"));
+
+    let mut app = stats_app();
+    assert_eq!(app.stats.by, By::Account);
+    update(&mut app, Event::Resize(80, 12));
+    let shows = |app: &App| {
+        let lines = screen(app);
+        let (_, title) = line_with(&lines, "Tokens · ");
+        let title = title.split(" ─").next().unwrap().to_string();
+        let name = lines[2].split("  ").next().unwrap().to_string();
+        let hint = lines.last().unwrap().trim().to_string();
+        [title, name, hint]
+    };
+    let by_account = [
+        "Tokens · all time · by account · cost ≈ API list price (t: period · b: by)",
+        "ACCOUNT / MODEL",
+        "t: period · b: by project · j/k: scroll · r: refresh",
+    ];
+    let by_project = [
+        "Tokens · all time · by project · cost ≈ API list price (t: period · b: by)",
+        "PROJECT / MODEL",
+        "t: period · b: by account · j/k: scroll · r: refresh",
+    ];
+    assert_eq!(shows(&app), by_account);
+    keys(&mut app, &[Key::Char('G')]);
+    assert!(app.stats.scroll > 0);
+    assert_eq!(keys(&mut app, &[Key::Char('b')]), []);
+    assert_eq!((app.stats.by, app.stats.scroll), (By::Project, 0));
+    assert_eq!(shows(&app), by_project);
+    assert!(screen(&app)[3].starts_with("/Users/me/src/app "));
+    keys(&mut app, &[Key::Char('G')]);
+    assert!(app.stats.scroll > 0);
+    keys(&mut app, &[Key::Char('b')]);
+    assert_eq!((app.stats.by, app.stats.scroll), (By::Account, 0));
+    assert_eq!(shows(&app), by_account);
+
+    // The period changes, the sections stay by project.
+    keys(&mut app, &[Key::Char('b'), Key::Char('t')]);
+    assert_eq!(
+        (app.stats.period, app.stats.by),
+        (Period::Today, By::Project)
+    );
+    let all = text(&app);
+    assert!(all.contains("Tokens · today · by project"), "{all}");
+    assert!(all.contains("/Users/me/src/app"), "{all}");
+    assert!(!all.contains("/w/tie"), "today has one project: {all}");
+    // A report computed again keeps them too.
+    let fx = keys(&mut app, &[Key::Char('r')]);
+    assert!(fx.contains(&Effect::Stats), "{fx:?}");
+    update(
+        &mut app,
+        Event::Stats {
+            report: stats_report(),
+            error: None,
+        },
+    );
+    assert_eq!(
+        (app.stats.period, app.stats.by),
+        (Period::Today, By::Project)
+    );
+    assert!(text(&app).contains("PROJECT / MODEL"));
+
+    // Elsewhere `b` is no key.
+    for view in ['1', '2', '3'] {
+        keys(&mut app, &[Key::Char(view)]);
+        let before = app.clone();
+        assert_eq!(keys(&mut app, &[Key::Char('b')]), [], "{view}");
+        assert_eq!(app, before, "{view}");
+    }
+    keys(&mut app, &[Key::Char('4')]);
+    assert_eq!(app.stats.by, By::Project);
+
+    update(&mut app, Event::Resize(80, 24));
+    keys(&mut app, &[Key::Char('?')]);
+    let lines = screen(&app);
+    let (_, help) = line_with(&lines, "stats: sections by account or by project");
+    assert!(help.starts_with("│b "), "{help}");
+}
+
+/// R21: in private mode each project directory of the Stats view is masked as the path it is,
+/// component by component (blanks, commas, quotes and `;` are in a component), `$HOME` as `~`,
+/// not as text from elsewhere; masked, two directories may read the same. An empty one stays
+/// empty. `(no directory)` is remuda's own words and stays, as do the column header, Overall,
+/// the numbers and the model names.
+#[test]
+fn private_mode_masks_the_project_directories_as_paths() {
+    let dirs = [
+        format!("{ZQ_HOME}/zq work/Bob's \"zq\", acme; x/zqproj"),
+        format!("{ZQ_HOME}/zqother/zqtoo/zqthree"),
+        "/zqvol/zq disk, \"zqclient\"".to_string(),
+        "zqrelative dir/zqx".to_string(),
+        String::new(),
+    ];
+    let mut app = secret_app();
+    update(&mut app, Event::Resize(160, 40));
+    let test = |n| model(CLAUDE, "claude-test", [n, 0, 0, n, 0]);
+    for table in &mut app.stats.report.as_mut().unwrap().projects {
+        table.sections = dirs
+            .iter()
+            .zip(1..)
+            .map(|(dir, n)| stats_project(Some(dir), vec![test(1000 - n)]))
+            .chain([stats_project(None, vec![test(1)])])
+            .collect();
+    }
+    keys(&mut app, &[Key::Char('4'), Key::Char('b')]);
+    let open = text(&app);
+    assert!(open.contains(&dirs[0]), "as recorded:\n{open}");
+
+    app.private = true;
+    let lines = screen(&app);
+    let (header, _) = line_with(&lines, "PROJECT / MODEL");
+    let titles: Vec<String> = lines[header + 1..]
+        .iter()
+        .step_by(2)
+        .take(dirs.len() + 1)
+        .map(|l| squeezed(l))
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            "~/•••/•••/••• 999 0 0 999 - 2K -",
+            "~/•••/•••/••• 998 0 0 998 - 2K -",
+            "/•••/••• 997 0 0 997 - 2K -",
+            "•••/••• 996 0 0 996 - 2K -",
+            "995 0 0 995 - 2K -",
+            "(no directory) 1 0 0 1 - 2 -",
+        ],
+        "{}",
+        lines.join("\n")
+    );
+    let all = lines.join("\n");
+    assert!(!all.to_lowercase().contains("zq"), "{all}");
+    for shown in ["PRIVATE", "Overall", "1.2M", "claude-test", "$12.34"] {
+        assert!(all.contains(shown), "{shown}:\n{all}");
+    }
+
+    // Each directory of every period, as a path; none stays none; the numbers stay.
+    let copy = super::privacy::redacted(&app);
+    let (masked, open) = (copy.stats.report.unwrap(), app.stats.report.unwrap());
+    assert_eq!(masked.projects.len(), Period::ALL.len());
+    for (masked, open) in masked.projects.iter().zip(&open.projects) {
+        assert_eq!(masked.sections.len(), dirs.len() + 1);
+        for (m, o) in masked.sections.iter().zip(&open.sections) {
+            let dir = o.dir.as_deref();
+            assert_eq!(
+                m.dir.as_deref(),
+                dir.map(|d| super::privacy::mask_path(d, Some(ZQ_HOME)))
+                    .as_deref()
+            );
+            assert_eq!(m.models, o.models);
+        }
+        assert_eq!(masked.overall, open.overall);
+        assert_eq!((masked.period, masked.since), (open.period, open.since));
+    }
+}
+
 /// A report with the same `sections`, `overall` and `series` in every period.
 fn report_of(sections: Vec<Section>, overall: Vec<ModelRow>, series: Vec<stats::Bucket>) -> Report {
+    let tables = Period::ALL
+        .map(|period| Table {
+            period,
+            since: None,
+            sections: sections.clone(),
+            overall: overall.clone(),
+            series: series.clone(),
+        })
+        .to_vec();
     Report {
-        tables: Period::ALL
-            .map(|period| Table {
-                period,
-                since: None,
-                sections: sections.clone(),
-                overall: overall.clone(),
-                series: series.clone(),
-            })
-            .to_vec(),
+        projects: project_tables(&tables, |_| vec![]),
+        tables,
         files: 1,
     }
 }
@@ -5320,49 +5660,7 @@ fn secret_app() -> App {
     update(
         &mut app,
         Event::Stats {
-            report: Report {
-                tables: Period::ALL
-                    .map(|period| Table {
-                        period,
-                        since: None,
-                        sections: vec![
-                            stats_section(&["claude:default"], vec![]),
-                            stats_section(
-                                &["claude:zqalpha"],
-                                vec![model(CLAUDE, "claude-test", [8, 1_234_567, 160, 90, 0])],
-                            ),
-                            stats_section(
-                                &["codex:zqbeta"],
-                                vec![model(CODEX, "gpt-test", [1500, 200, 0, 30, 12])],
-                            ),
-                            stats_section(
-                                &["claude:default", "claude:zqalpha"],
-                                vec![model(CLAUDE, "claude-test", [5, 0, 0, 5, 0])],
-                            ),
-                            stats_section(
-                                &["claude:zqgone"],
-                                vec![model(CLAUDE, "claude-test", [9, 0, 0, 9, 0])],
-                            ),
-                        ],
-                        overall: vec![
-                            model(CLAUDE, "claude-test", [22, 1_234_567, 160, 104, 0]),
-                            priced(
-                                model(CLAUDE, "claude-haiku-test", [1, 0, 0, 1, 0]),
-                                12_340_000_000_000,
-                            ),
-                        ],
-                        series: vec![stats::Bucket {
-                            start: ts(NOW),
-                            tokens: Tokens::default(),
-                            cost: Cost {
-                                pico_usd: 12_340_000_000_000,
-                                unpriced_tokens: 0,
-                            },
-                        }],
-                    })
-                    .to_vec(),
-                files: 3,
-            },
+            report: secret_report(),
             error: Some(
                 Marked::default()
                     .words("stats cache: ")
@@ -5379,6 +5677,66 @@ fn secret_app() -> App {
         },
     );
     app
+}
+
+/// The statistics of [`secret_app`]: by account, and by project in personal directories (a
+/// home's, one with blanks, a comma and quotes, one outside the home) and none.
+fn secret_report() -> Report {
+    let tables = Period::ALL
+        .map(|period| Table {
+            period,
+            since: None,
+            sections: vec![
+                stats_section(&["claude:default"], vec![]),
+                stats_section(
+                    &["claude:zqalpha"],
+                    vec![model(CLAUDE, "claude-test", [8, 1_234_567, 160, 90, 0])],
+                ),
+                stats_section(
+                    &["codex:zqbeta"],
+                    vec![model(CODEX, "gpt-test", [1500, 200, 0, 30, 12])],
+                ),
+                stats_section(
+                    &["claude:default", "claude:zqalpha"],
+                    vec![model(CLAUDE, "claude-test", [5, 0, 0, 5, 0])],
+                ),
+                stats_section(
+                    &["claude:zqgone"],
+                    vec![model(CLAUDE, "claude-test", [9, 0, 0, 9, 0])],
+                ),
+            ],
+            overall: vec![
+                model(CLAUDE, "claude-test", [22, 1_234_567, 160, 104, 0]),
+                priced(
+                    model(CLAUDE, "claude-haiku-test", [1, 0, 0, 1, 0]),
+                    12_340_000_000_000,
+                ),
+            ],
+            series: vec![stats::Bucket {
+                start: ts(NOW),
+                tokens: Tokens::default(),
+                cost: Cost {
+                    pico_usd: 12_340_000_000_000,
+                    unpriced_tokens: 0,
+                },
+            }],
+        })
+        .to_vec();
+    let test = |t| model(CLAUDE, "claude-test", t);
+    Report {
+        projects: project_tables(&tables, |_| {
+            vec![
+                stats_project(Some(ZQ_CWD), vec![test([8, 1_234_567, 160, 90, 0])]),
+                stats_project(
+                    Some("/zqvol/zq disk, \"zqclient\"/zqbilling"),
+                    vec![model(CODEX, "gpt-test", [1500, 200, 0, 30, 12])],
+                ),
+                stats_project(None, vec![test([14, 0, 0, 14, 0])]),
+            ]
+        }),
+        tables,
+        files: 3,
+    }
 }
 
 /// The preview of the current selection, loaded: read once the selection has settled.
@@ -5524,6 +5882,11 @@ fn secret_states() -> Vec<SecretState> {
         ),
         state("stats", |app| drop(keys(app, &[Key::Char('4')])), "zqalpha"),
         state(
+            "stats by project",
+            |app| drop(keys(app, &[Key::Char('4'), Key::Char('b')])),
+            "zqproj",
+        ),
+        state(
             "stats error",
             |app| drop(keys(app, &[Key::Char('4')])),
             "stats cache: zqalpha",
@@ -5545,7 +5908,17 @@ fn secret_states() -> Vec<SecretState> {
             },
             "zqnomatch",
         ),
-        state("help", |app| drop(keys(app, &[Key::Char('?')])), "zqalpha"),
+        state(
+            "help",
+            |app| {
+                // At 24 rows the help box covers the whole body; one row more leaves the status
+                // line, and what it says, below the box.
+                let (w, h) = app.size;
+                update(app, Event::Resize(w, h + 1));
+                keys(app, &[Key::Char('?')]);
+            },
+            "zqalpha",
+        ),
         state("pick resume", |app| pick(app, PickFor::Resume), "zqalpha ●"),
         state("pick fork", |app| pick(app, PickFor::Fork), "zqalpha ●"),
         state(

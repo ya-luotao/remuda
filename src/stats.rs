@@ -1269,6 +1269,9 @@ pub struct Table {
 pub struct Report {
     /// One per [`Period`], in [`Period::ALL`] order.
     pub tables: Vec<Table>,
+    /// The same periods by project ([`projects`]), in the same order: of every request, so
+    /// each one's `overall` is its period's [`Table::overall`].
+    pub projects: Vec<ProjectTable>,
     /// Transcripts and rollouts counted from.
     pub files: usize,
 }
@@ -1280,6 +1283,14 @@ impl Report {
             .iter()
             .find(|t| t.period == period)
             .expect("a report has a table per period")
+    }
+
+    /// The table of `period` by project; a report holds one per period.
+    pub fn projects(&self, period: Period) -> &ProjectTable {
+        self.projects
+            .iter()
+            .find(|t| t.period == period)
+            .expect("a report has a project table per period")
     }
 }
 
@@ -1475,8 +1486,8 @@ pub fn requests<'a>(
     Counted { groups, list }
 }
 
-/// The statistics of `cache` for each period, counting each request once and pricing it with
-/// `prices` ([`requests`], R20); `accounts` is the registry, in order.
+/// The statistics of `cache` for each period, by account and by project, counting each request
+/// once and pricing it with `prices` ([`requests`], R20); `accounts` is the registry, in order.
 pub fn report(
     cache: &Cache,
     sources: &[Source],
@@ -1486,7 +1497,8 @@ pub fn report(
     now: Timestamp,
     tz: &TimeZone,
 ) -> Report {
-    let Counted { groups, list } = requests(cache, sources, attribution, accounts, prices);
+    let all = requests(cache, sources, attribution, accounts, prices);
+    let Counted { groups, list } = &all;
     let first: Option<i64> = list.iter().filter_map(|r| r.ts).min();
 
     let registered: Vec<String> = accounts.iter().map(Account::qualified).collect();
@@ -1520,7 +1532,7 @@ pub fn report(
         })
         .collect();
 
-    for request in &list {
+    for request in list {
         let (file, model, group) = (request.file, request.model, request.group);
         let cost = request.cost();
         for ((period, start), (starts, end, buckets)) in
@@ -1604,8 +1616,14 @@ pub fn report(
             }
         })
         .collect();
+    // From the same requests: their overall is the tables' (R20).
+    let projects = Period::ALL
+        .iter()
+        .map(|&period| projects(&all, period, now, tz, None))
+        .collect();
     Report {
         tables,
+        projects,
         files: cache.files.len(),
     }
 }
@@ -1626,6 +1644,14 @@ impl By {
             "account" => Some(By::Account),
             "project" => Some(By::Project),
             _ => None,
+        }
+    }
+
+    /// The other one: what `b` switches the Stats view to.
+    pub fn other(self) -> By {
+        match self {
+            By::Account => By::Project,
+            By::Project => By::Account,
         }
     }
 }
@@ -2832,6 +2858,122 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
         assert_eq!(
             decimal_usd(u128::MAX),
             "340282366920938463463374607.431768211455"
+        );
+    }
+
+    /// R20: a report holds each period by project too, made from the same requests as its
+    /// tables: what [`projects`] makes of [`requests`] without an account, so each period's
+    /// overall is its table's; projects with most tokens first, ties by directory with
+    /// `(no directory)` last.
+    #[test]
+    fn a_reports_projects_are_its_requests_by_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("projects");
+        // A claude record of `id` at `ts` (none when empty), in `cwd` (none when empty).
+        let record = |id: &str, ts: &str, cwd: &str, model: &str, input: u64, output: u64| {
+            let ts = match ts {
+                "" => String::new(),
+                ts => format!("\"timestamp\":\"{ts}\","),
+            };
+            let cwd = match cwd {
+                "" => String::new(),
+                cwd => format!("\"cwd\":\"{cwd}\","),
+            };
+            format!(
+                "{{\"type\":\"assistant\",{cwd}{ts}\"message\":{{\"id\":\"{id}\",\
+                 \"model\":\"{model}\",\"usage\":{{\"input_tokens\":{input},\
+                 \"output_tokens\":{output}}}}}}}\n"
+            )
+        };
+        let write = |session: &str, lines: &[String]| {
+            let path = store.join("-w").join(format!("{session}.jsonl"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, lines.concat()).unwrap();
+        };
+        let haiku = "claude-haiku-4-5";
+        write(
+            "s1",
+            &[
+                record("a1", "2026-09-24T01:00:00Z", "/w/a", "claude-test", 1, 100),
+                record("a2", "2026-09-05T00:00:00Z", "/w/a", haiku, 1, 50),
+            ],
+        );
+        write(
+            "s2",
+            &[
+                record("b1", "2026-09-21T00:00:00Z", "/w/b", haiku, 1, 30),
+                record("b2", "2026-07-01T00:00:00Z", "/w/b", "claude-test", 1, 1000),
+            ],
+        );
+        // No directory: tied with `/w/c` today, more than it over all.
+        write(
+            "s3",
+            &[
+                record("n1", "2026-09-24T00:30:00Z", "", "claude-test", 1, 5),
+                record("n2", "", "", "claude-test", 1, 10),
+            ],
+        );
+        write(
+            "s4",
+            &[record("c1", "2026-09-24T00:10:00Z", "/w/c", haiku, 1, 5)],
+        );
+        let sources = [Source {
+            kind: SourceKind::Claude,
+            path: store.clone(),
+            accounts: vec!["claude:default".into()],
+        }];
+        let mut cache = Cache::default();
+        refresh(&mut cache, &sources, |_, _| {});
+        let accounts = [Account::default_for(Provider::Claude)];
+        let mut attribution = Attribution::default();
+        attribution.add("s1", "claude:default");
+        attribution.add("s2", "claude:max");
+        let prices = Prices::default();
+        let now: Timestamp = "2026-09-24T02:00:00Z".parse().unwrap();
+        let tz = TimeZone::UTC;
+        let report = report(&cache, &sources, &attribution, &accounts, &prices, now, &tz);
+
+        let counted = requests(&cache, &sources, &attribution, &accounts, &prices);
+        let dirs = |p: Period| -> Vec<(Option<&str>, u64)> {
+            let sections = &report.projects(p).sections;
+            sections
+                .iter()
+                .map(|s| (s.dir.as_deref(), s.total().total()))
+                .collect()
+        };
+        let (a, b, c) = (Some("/w/a"), Some("/w/b"), Some("/w/c"));
+        let expected = [
+            (Period::Today, vec![(a, 101), (c, 6), (None, 6)]),
+            (Period::Week, vec![(a, 101), (b, 31), (c, 6), (None, 6)]),
+            (Period::Month, vec![(a, 152), (b, 31), (c, 6), (None, 6)]),
+            (Period::All, vec![(b, 1032), (a, 152), (None, 17), (c, 6)]),
+        ];
+        assert_eq!(report.projects.len(), Period::ALL.len());
+        for (period, sections) in expected {
+            let table = report.table(period);
+            let by_project = report.projects(period);
+            assert_eq!(dirs(period), sections, "{period:?}");
+            assert_eq!(
+                by_project,
+                &projects(&counted, period, now, &tz, None),
+                "{period:?}"
+            );
+            assert_eq!(
+                by_project.overall.as_ref(),
+                Some(&table.overall),
+                "{period:?}"
+            );
+            assert_eq!(
+                (by_project.period, by_project.since),
+                (table.period, table.since)
+            );
+        }
+        // Priced and not: the overall carries both.
+        let overall = report.table(Period::All).overall.clone();
+        assert!(overall.iter().any(|m| m.cost.pico_usd > 0), "{overall:?}");
+        assert!(
+            overall.iter().any(|m| m.cost.unpriced_tokens > 0),
+            "{overall:?}"
         );
     }
 }
