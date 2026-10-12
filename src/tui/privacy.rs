@@ -21,7 +21,7 @@ use crate::live::{LiveId, LiveSession};
 use crate::privacy::{Aliases, Piece, alias_words};
 use crate::registry::{Account, DEFAULT_NAME, Home};
 use crate::share::Skip;
-use crate::stats::{self, ModelRow, Report, Section, Table};
+use crate::stats::{self, ModelRow, Project, ProjectTable, Report, Section, Table};
 use crate::transcript::Message;
 use crate::usage::{CachedUsage, Resets, UsageRow};
 
@@ -705,6 +705,7 @@ impl Redactor<'_> {
             progress,
             computed,
             period,
+            by,
             scroll,
         } = stats;
         StatsState {
@@ -714,12 +715,17 @@ impl Redactor<'_> {
             progress: *progress,
             computed: *computed,
             period: *period,
+            by: *by,
             scroll: *scroll,
         }
     }
 
     fn report(&self, report: &Report) -> Report {
-        let Report { tables, files } = report;
+        let Report {
+            tables,
+            projects,
+            files,
+        } = report;
         let tables = tables
             .iter()
             .map(|table| {
@@ -749,8 +755,39 @@ impl Redactor<'_> {
                 }
             })
             .collect();
+        let projects = projects
+            .iter()
+            .map(|table| {
+                let ProjectTable {
+                    period,
+                    since,
+                    sections,
+                    overall,
+                } = table;
+                ProjectTable {
+                    period: *period,
+                    since: *since,
+                    sections: sections
+                        .iter()
+                        .map(|p| {
+                            let Project { dir, models } = p;
+                            Project {
+                                // A working directory (R21 Paths); none stays none, shown in
+                                // remuda's own words.
+                                dir: dir.as_deref().map(|d| self.path(d)),
+                                models: models.iter().map(model_row).collect(),
+                            }
+                        })
+                        .collect(),
+                    overall: overall
+                        .as_ref()
+                        .map(|rows| rows.iter().map(model_row).collect()),
+                }
+            })
+            .collect();
         Report {
             tables,
+            projects,
             files: *files,
         }
     }

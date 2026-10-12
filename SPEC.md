@@ -1665,8 +1665,13 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   could not be read, the `Incomplete:` lines go to stderr and the exit status is 1, since a line
   of prose would break the CSV; the status carries what the line on stdout carries for the text
   report.
-- **TUI**: view `4`, Stats, by account; it has no project sections (a project is a path, which
-  the view would have to keep private, R21). The statistics are computed in the background the first time the
+- **TUI**: view `4`, Stats, with sections by account or by project, as **Shown** above; `b` in
+  the view switches between the two, the title says which is shown, and `t` and `r` keep it. It
+  is by account when the TUI starts, and is not saved. A project's section is titled by its
+  directory as recorded, cut from the left (`…` first, the end kept) when it is too wide; in
+  private mode the directory is masked as a path (R21), and `(no directory)`, remuda's own
+  words, stays. The shares, the chart, and the overall section are the same either way. The
+  statistics are computed in the background the first time the
   view opens, and again on each `r` after that, with reading progress shown; `r` also reads the
   prices in `config.toml` again (when they cannot be read, the built-in prices are used and the
   status line says so). A directory that could not be read is named in the status line too
@@ -1699,7 +1704,8 @@ status and hint lines, notices, the help box) shows:
   (`codex:account-1`). An alias does not change while the TUI runs, even when accounts are added
   or removed.
 - **Emails and organization names**: shown as `•••@•••` and `•••`.
-- **Paths** (homes, working directories, stores, the directory remuda started in, form values):
+- **Paths** (homes, working directories, stores, the directory remuda started in, the project
+  directories of the Stats view, form values):
   each component is shown as `•••`, and a leading `$HOME` as `~` (`~/•••/•••`).
 - **Session content**: titles, first messages, session names, preview messages, background
   session logs, search text, and the descriptions in the configuration pane (R22) are shown as
