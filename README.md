@@ -168,9 +168,11 @@ session store and one configuration between your Claude accounts, the
   (all models, and per model), and Codex's windows under the same labels by their length. Remuda
   reads them from the agents' caches, asks live on request, and records what it read for
   `usage --history` ([data sources](docs/GUIDE.md#data-sources)).
-- **Launch and attribution.** Every launch is logged with the session ID remuda assigns, so each
-  session can later be shown under the account that ran it, and resumed as that account
-  ([SPEC R6, R9](SPEC.md)).
+- **Launch and attribution.** Every launch is logged with its account. A new Claude session gets a
+  session ID from remuda before it starts, so it can later be shown under the account that ran it
+  and resumed as that account; a Claude session the log cannot name is attributed from the
+  home's `history.jsonl`. Codex chooses its own IDs, so a Codex session is attributed to the
+  accounts of the home it lives in ([SPEC R6, R9, R17](SPEC.md)).
 - **Source and members.** With `[share.claude]`, one Claude account's home is the source whose
   session store and configuration the other accounts link or receive at launch; the login stays
   per account ([shared configuration](docs/GUIDE.md#shared-configuration)).
