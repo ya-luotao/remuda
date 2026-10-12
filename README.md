@@ -17,6 +17,25 @@ Remuda never touches credentials. Its only network request of its own is optiona
 asks TypeSafe's Jev model for a recommendation when `TYPESAFE_API_KEY` is set and you have written
 notes for it.
 
+## Is remuda for you?
+
+- You are logged in to Claude Code or Codex **more than once** (work and personal, two plans, a
+  team account) and keep switching `CLAUDE_CONFIG_DIR` or `CODEX_HOME` by hand.
+- You want to know **which account has usage left** before you start, and when each limit resets.
+- Your sessions are **spread over several homes** and you want one list to search, resume and
+  fork from, whatever account started them.
+
+Remuda is not a gateway or a proxy: it does not switch models or providers, does not route one
+agent to another vendor's model, and never copies, moves or reads a login. If you want one agent
+on another provider's model, or automatic failover between accounts inside the agent, look at
+[magpie](https://github.com/yetone/magpie) instead (see [Acknowledgements](#acknowledgements)).
+
+**Contents:** [First launch](#first-launch-in-five-minutes) · [Concepts](#concepts) ·
+[How it works](#how-it-works) · [Highlights](#highlights) · [Commands](#commands) · [TUI](#tui) ·
+[Configuration](#configuration) · [Safety guarantees](#safety-guarantees) ·
+[Troubleshooting](#troubleshooting) · [Developing](#developing) · [Status](#status) ·
+[Documentation](#documentation) · [Acknowledgements](#acknowledgements) · [License](#license)
+
 ## How it works
 
 An account is a name for an agent home directory: the directory where that login keeps its
@@ -99,21 +118,71 @@ cargo install --git https://github.com/ya-luotao/remuda
 
 Or from a local checkout: `git clone https://github.com/ya-luotao/remuda && cd remuda && cargo install --path .`
 
-## Quick start
+## First launch in five minutes
 
-```sh
-remuda add work ~/.claude-work        # register an existing Claude home, as is
-remuda setup personal                 # or create a new account and log in to it
+Your native login is already an account: `default` is `~/.claude` (and `codex:default` is
+`~/.codex`). Nothing has to be registered for it.
 
-remuda usage                          # usage left on every account (add --live to ask each agent now)
-remuda usage --history                # how each window's usage went, and its pace to the reset
-remuda                                # open the TUI: accounts, live sessions, history, stats
+1. **Register a second account.** Either an existing home, as it is, or a new one that remuda
+   creates and logs in:
 
-remuda run work                       # launch claude as `work`; extra args go to claude unchanged
-```
+   ```sh
+   remuda add work ~/.claude-work        # an existing Claude home; nothing in it is touched
+   remuda setup personal                 # or: create ~/.remuda/homes/claude/personal and run `claude auth login`
+   ```
+
+   `remuda list` then shows each account with its home and its login identity: email,
+   organization and plan for a Claude account, the login method for a Codex one.
+
+2. **See what is left.** `remuda usage` prints every account's limits from the agents' local
+   caches, in a second, without asking anyone; `remuda usage --live` asks each agent now.
+   `remuda usage --history` shows how each window's usage went and its pace to the reset.
+
+3. **Open the TUI** with `remuda`: `1` Accounts (limits, resets, checks), `2` Live sessions,
+   `3` History of every account, `4` Stats. `?` lists the keys, `q` quits.
+
+4. **Launch as an account.** `remuda run work` starts `claude` with that account's home; anything
+   after the account name goes to `claude` unchanged (`remuda run work --resume <id>`,
+   `remuda run work -p "..."`). In the TUI, `n` on an account does the same, and `Enter` on a
+   session in History resumes it under an account that holds it.
+
+5. **Let remuda choose.** `remuda pick` names the account, model and effort that your `[pick]`
+   rules rank first among the options with room left on every window (model preference first,
+   then headroom in bands, then freshness and reset time); `remuda pick --run` launches it. When
+   nothing has room, `--wait` waits for a limit to reset and tries again.
 
 Codex accounts work the same way: `remuda add --provider codex research ~/.codex-research`, then
-`remuda run codex:research`.
+`remuda run codex:research`. Where to go next: [Configuration](#configuration) to share one
+session store and one configuration between your Claude accounts, the
+[guide](docs/GUIDE.md) for the TUI, private mode and recommendations in detail, and
+[Troubleshooting](#troubleshooting) when something looks wrong.
+
+## Concepts
+
+- **Account.** A name for an agent home directory: the directory where one login keeps its
+  credentials, sessions and settings (`~/.claude`, or any `CLAUDE_CONFIG_DIR`; `~/.codex`, or any
+  `CODEX_HOME`). Accounts are written `name` or `provider:name`; `default` is the native login
+  of each provider. The registry is `~/.remuda/config.toml` ([SPEC R1–R3](SPEC.md)).
+- **Home.** The directory behind an account. Remuda records its path byte for byte and never
+  moves, rewrites or logs in to it; the agent may key its Keychain entry to that exact string
+  ([SPEC R2](SPEC.md)).
+- **Usage window.** A limit with a reset: Claude's five-hour session window and weekly windows
+  (all models, and per model), and Codex's windows under the same labels by their length. Remuda
+  reads them from the agents' caches, asks live on request, and records what it read for
+  `usage --history` ([data sources](docs/GUIDE.md#data-sources)).
+- **Launch and attribution.** Every launch is logged with its account. A new Claude session gets a
+  session ID from remuda before it starts, so it can later be shown under the account that ran it
+  and resumed as that account; a Claude session the log cannot name is attributed from the
+  home's `history.jsonl`. Codex chooses its own IDs, so a Codex session is attributed to the
+  accounts of the home it lives in ([SPEC R6, R9, R17](SPEC.md)).
+- **Source and members.** With `[share.claude]`, one Claude account's home is the source whose
+  session store and configuration the other accounts link or receive at launch; the login stays
+  per account ([shared configuration](docs/GUIDE.md#shared-configuration)).
+- **Pick.** The recommendation of account, model and effort, from rules over every window's
+  headroom (or its pace to the reset) and, with a key, Jev's choice among what the rules allow
+  ([recommendations](docs/GUIDE.md#recommendations)).
+- **Private mode.** `Ctrl-P` in the TUI: names, emails, paths and session content masked, numbers
+  kept, for screenshots ([private mode](docs/GUIDE.md#private-mode)).
 
 ## Commands
 
@@ -266,27 +335,16 @@ overrides a model's price or prices one remuda does not know (for Codex, `cache_
 cached-input price).
 
 With `[share.claude]`, the other Claude accounts share the source's session store and
-configuration through symlinks in their homes: `projects` and `file-history`, `settings.json`,
-`CLAUDE.md`, skills, commands, agents, hooks, plugins, rules, agent memory, output styles and
-key bindings. `remuda setup` makes the links in the home it creates, for the items the source
-has; in a home registered with `remuda add` you make them, and the Accounts view says which are
-missing. Any linked account can then resume any session. The login stays per account:
-`.claude.json` (with its MCP servers and project trust), `history.jsonl` and `sessions` are
-never linked. When the account is set up, a source `settings.json` that sets authentication
-(`apiKeyHelper`, `env.ANTHROPIC_API_KEY` and the like) is not linked either: that account
-gets the settings at launch instead, without them. A linked `settings.json` is shared whole,
-so authentication you add to it later is read by every account that links it; remuda warns
-about that in the Accounts view and at each launch, so keep such settings out of the shared
-file.
-
-A home without the links still launches with the source's instructions (`CLAUDE.md`, skills,
-commands, agents and rules), settings (without authentication or provider settings), enabled
-plugins and memory locations (auto-memory and the memory of user-scope subagents), injected as
-launch options; what a home links is not injected again. Sessions cannot be injected: such an
-account resumes only the sessions in its own `projects` directory. Each account's own settings
-still take precedence, and `share = false` opts an account out. See
-[Shared configuration](docs/GUIDE.md#shared-configuration) for the layout and for exactly what
-is passed and how.
+configuration: through symlinks in their homes (`projects`, `settings.json`, `CLAUDE.md`, skills,
+commands, agents, hooks, plugins, rules, agent memory and more; `remuda setup` makes them, and
+the Accounts view says which are missing in a home registered with `remuda add`), or, in a home
+without the links, as options injected at launch (instructions, settings without authentication
+or provider settings, enabled plugins and memory locations; sessions cannot be injected). The
+login stays per account: `.claude.json`, `history.jsonl` and `sessions` are never linked, and
+settings that choose credentials are neither linked at setup nor injected. `share = false` opts
+an account out. [Shared configuration](docs/GUIDE.md#shared-configuration) in the guide has the
+layout, what is linked and what is injected, and the warnings that go with a shared
+`settings.json`.
 
 ## Safety guarantees
 
@@ -329,6 +387,71 @@ the specification ([SPEC.md](SPEC.md), R2 and R13):
   request without sending it, `--offline` never sends, and without a key the local rules
   decide.
 
+## Troubleshooting
+
+- **The first `remuda stats` (or the first Stats view) takes long.** It reads every transcript and
+  rollout whole, once; later runs read only what changed. The same happens once after an upgrade
+  that changes the statistics cache ([cost estimates](docs/GUIDE.md#cost-estimates)).
+- **Every account shows the same login, or `/login` seems ignored.** `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN` is set in your environment and overrides
+  every account's login; the Accounts view says so ([account checks](docs/GUIDE.md#account-checks)).
+- **Live usage repeats an old reading.** `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set:
+  claude's `/usage` then answers from its cache. Remuda removes it for its own live query, but
+  claude launched as any account keeps it.
+- **A session started through remuda is missing from History.** The terminal was started from
+  inside a Claude session and carries `CLAUDE_CODE_CHILD_SESSION`, so claude saved no transcript
+  for it. Remuda warns before such a launch and in the Accounts view; set
+  `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` in that terminal if it is your own. `-p` runs are
+  saved either way ([account checks](docs/GUIDE.md#account-checks)).
+- **A Codex live query changed the account's state.** `codex app-server` behaves like launching
+  Codex: it may refresh the login token and writes Codex's own state into the home. Only
+  `--live` and `u` trigger it.
+- **Something in the Accounts view is marked `!`.** Each check names what is wrong and, where there
+  is one, the fix: a dangling symlink, a missing or logged-out home, a shared `settings.json` that
+  sets authentication ([account checks](docs/GUIDE.md#account-checks)).
+
+## Developing
+
+Remuda is one Rust crate (a library and a binary), edition 2024, minimum Rust 1.88, for macOS
+and Linux. The sixty-second version of [CONTRIBUTING.md](CONTRIBUTING.md):
+
+```sh
+git clone https://github.com/ya-luotao/remuda && cd remuda
+cargo build && cargo run -- --help
+cargo test                                      # safe on the machine you use the agents on
+cargo fmt --check && cargo clippy --all-targets -- -D warnings   # with the tests, the three CI checks
+```
+
+- **The test suite is sealed.** Every test runs with a fresh `HOME` and `REMUDA_HOME` in a
+  temporary directory, a cleared environment, and fake `claude`, `codex` and `curl` scripts
+  first on `PATH`, so it never reaches your logins, Keychain, homes, sessions or the network
+  ([hermetic tests](CONTRIBUTING.md#hermetic-tests)). It takes a few minutes: two tests wait a
+  real minute to check `--wait`. Run it as a regular user, not root.
+- **The specification comes first.** [SPEC.md](SPEC.md) is the contract, one anchor per promise
+  (`R6`, `R20`, ...); the tests cite the anchors they cover, and a change to a promise lands with
+  its tests in the same commit ([spec-first workflow](CONTRIBUTING.md#spec-first-workflow)).
+  Behavior that is not in SPEC.md, such as screen layout and wording, may change freely.
+- **A change, end to end:** amend or add the SPEC entry → write the test that cites it and is red
+  without the fix → implement → `cargo fmt`, `clippy`, `test` → an entry under `## [Unreleased]`
+  in [CHANGELOG.md](CHANGELOG.md) for anything user-visible → a pull request that says which test
+  goes red with the fix reverted → a review of the diff before merge
+  ([review gate](CONTRIBUTING.md#review-gate)).
+- **Where to start reading:** [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) maps SPEC entries to
+  modules and ends with a table, [Where to make a change](docs/ARCHITECTURE.md#where-to-make-a-change),
+  that names the module and test file for the common kinds of change. [LESSONS.md](LESSONS.md)
+  lists the rules that review rounds keep teaching.
+
+```text
+src/              the library: one module per concern (registry, launch, usage, index, stats, pick, ...)
+src/cli.rs        the subcommands        src/tui/   the TUI (app state, workers, render, privacy)
+src/owned.rs      every write below $REMUDA_HOME goes through here (SPEC R13)
+tests/            integration tests, one file per area, each naming its SPEC anchors
+tests/common/     the sealed sandbox: fake agents, fixture builders for transcripts and rollouts
+examples/         read-only timing of the session index against your real claude or codex home
+SPEC.md           the behavior contract      docs/ARCHITECTURE.md   the code map
+docs/GUIDE.md     the user guide             CHANGELOG.md · ROADMAP.md · LESSONS.md
+```
+
 ## Status
 
 Remuda is at version 0.2.0. Its behavior is specified in [SPEC.md](SPEC.md) and covered by
@@ -354,9 +477,23 @@ degrades to missing fields rather than errors.
   launch, indexing and TUI flows
 - [ROADMAP.md](ROADMAP.md): milestones, planned work and open questions
 - [CHANGELOG.md](CHANGELOG.md): release history
-- [CONTRIBUTING.md](CONTRIBUTING.md): development workflow and release process
+- [CONTRIBUTING.md](CONTRIBUTING.md): development workflow, review gate and release process
+- [LESSONS.md](LESSONS.md): the rules that review rounds keep teaching, and which were promoted
 - [SECURITY.md](SECURITY.md): how to report a vulnerability
 - [docs/VI.md](docs/VI.md): visual identity and logo assets
+
+## Acknowledgements
+
+[magpie](https://github.com/yetone/magpie) by [yetone](https://github.com/yetone) (Go, MIT),
+"Every agent's model. One place.", is a local gateway and model picker for coding agents. A study
+of it on 2026-10-07 shaped several of remuda's features, as design rather than code: usage
+rolled up by project and exported request by request for reconciling with a bill
+(`stats --by project`, `stats --csv`), waiting for a limit to come back instead of failing
+(`pick --wait`, `usage --wait`), usage recorded over time with a pace to the reset
+(`usage --history`, the `pace` strategy of `pick`), and the checks for environment variables
+that quietly redirect every account. The two tools then part ways on purpose: remuda runs no
+gateway, switches no models or providers, never handles a credential and never fails over on
+its own (SPEC R13, R23); magpie does those things, and does them well.
 
 ## License
 
