@@ -405,7 +405,8 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
                 .words(" is not in a recognized format: plugins are not shared"),
         }),
         installs => {
-            for plugin in plugins {
+            // A plugin claude bundles (`@builtin`) has no install to look for.
+            for plugin in plugins.into_iter().filter(|plugin| !share::bundled(plugin)) {
                 if installs.install_path(&plugin).is_none() {
                     checks.push(Check {
                         account: Some(name.clone()),
@@ -1604,7 +1605,8 @@ mod tests {
     }
 
     /// R11: enabled plugins without an existing user install, and an unrecognized
-    /// `installed_plugins.json`.
+    /// `installed_plugins.json`. A plugin bundled with claude (`@builtin`) has no install and
+    /// is not reported.
     #[test]
     fn plugin_problems() {
         let f = Root::new();
@@ -1612,7 +1614,8 @@ mod tests {
         fs::create_dir_all(native.join("plugins/cache/ok")).unwrap();
         fs::write(
             native.join("settings.json"),
-            r#"{"enabledPlugins": {"ok@m": true, "gone@m": true, "off@m": false}}"#,
+            r#"{"enabledPlugins": {"ok@m": true, "gone@m": true, "off@m": false,
+                                  "cc-plugin-you-should-know@builtin": true}}"#,
         )
         .unwrap();
         let file = native.join("plugins/installed_plugins.json");

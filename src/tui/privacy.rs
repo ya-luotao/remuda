@@ -1099,6 +1099,7 @@ fn origin_copy(origin: &Origin) -> Origin {
             Skip::OwnInstall => Skip::OwnInstall,
             Skip::NotInstalled => Skip::NotInstalled,
             Skip::UnrecognizedList => Skip::UnrecognizedList,
+            Skip::Builtin => Skip::Builtin,
         }),
         Origin::Project => Origin::Project,
     }
