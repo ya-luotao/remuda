@@ -1036,7 +1036,8 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
   as the picker orders them; codex: the owners of the store, R17); `n` opens the new-session form
   (as `n` in Accounts) for the session's account in the session's last directory (Live: the
   account it runs as; History: the one account of its provider it is attributed to, else the
-  picker among them, and none is refused with a notice, unless the attribution (the first time,
+  picker among them, a session without a recorded directory or one the index no longer lists
+  when the picker answers being refused, and none is refused with a notice, unless the attribution (the first time,
   or again after the account list changed), or the stores a codex rollout attributed to none
   falls back on (read with the index, so while the index is read again too), are still being
   read, which asks to try again); `y` and `Y` copy the session

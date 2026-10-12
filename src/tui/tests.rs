@@ -1013,6 +1013,44 @@ fn n_in_the_card_picks_among_several_accounts_and_refuses_none() {
     );
 }
 
+/// R16: `n` in the card starts nowhere but in the session's directory: a session without one
+/// is refused, and one the index no longer lists when the picker's choice is made (it was
+/// read again meanwhile) too, rather than started in remuda's own directory.
+#[test]
+fn n_in_the_card_refuses_a_session_without_a_directory_or_gone() {
+    let mut app = history_with(&["team", "max"]);
+    keys(&mut app, &[Key::Char('p'), Key::Char('n')]);
+    assert!(matches!(app.overlay, Some(Overlay::Pick(_))));
+    update(
+        &mut app,
+        Event::IndexDone {
+            entries: vec![entry(B, "b", 2)],
+            error: None,
+        },
+    );
+    keys(&mut app, &[Key::Enter]);
+    assert_eq!(app.overlay, None);
+    assert_eq!(
+        notice(&app),
+        Some(("session aaaaaaaa is no longer listed", Level::Error))
+    );
+
+    let mut app = history_with(&["max"]);
+    let mut gone = entry(A, "a", 1);
+    gone.cwd_last = None;
+    update(&mut app, Event::IndexLoaded(vec![gone, entry(B, "b", 2)]));
+    assert_eq!(app.selected_entry().unwrap().session_id, A);
+    keys(&mut app, &[Key::Char('p'), Key::Char('n')]);
+    assert_eq!(app.overlay, None);
+    assert_eq!(
+        notice(&app),
+        Some((
+            "session aaaaaaaa has no recorded directory to start in",
+            Level::Error
+        ))
+    );
+}
+
 /// R16: `n` in the card finds no account while the attribution is still being read (the
 /// index came first), or the stores for a codex rollout attributed to none: that is not an
 /// answer, and it asks to try again; once they are read, none is none.

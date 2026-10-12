@@ -1553,6 +1553,10 @@ impl App {
                     entry.session_id.clone(),
                     entry.cwd_last.clone(),
                 );
+                let Some(dir) = dir else {
+                    self.notify(Level::Error, no_directory(&session_id));
+                    return;
+                };
                 let (accounts, provider) = (
                     self.session_accounts(&path),
                     self.index.entries.get(&path).map(|e| e.provider),
@@ -1586,7 +1590,7 @@ impl App {
                     }
                     [only] => {
                         let only = only.clone();
-                        self.open_new_session_as(only, dir);
+                        self.open_new_session_as(only, Some(dir));
                     }
                     several => {
                         let options: Vec<String> = several.iter().map(Account::qualified).collect();
@@ -1634,19 +1638,24 @@ impl App {
         accounts
     }
 
-    /// The picker's choice for a new session (R16): resolved by name, as a resume's is.
-    fn new_session_picked(&mut self, path: &Path, qualified: &str) {
+    /// The picker's choice for a new session (R16): resolved by name, as a resume's is. The
+    /// session is looked up again: the index may have been read again while the picker was
+    /// open, and a session it no longer lists is not started in remuda's own directory.
+    fn new_session_picked(&mut self, path: &Path, session_id: &str, qualified: &str) {
         let Some(account) = self.account_named(qualified) else {
             let text = format!("{} is no longer registered", short_account(qualified));
             self.notify(Level::Error, text);
             return;
         };
-        let dir = self
-            .index
-            .entries
-            .get(path)
-            .and_then(|e| e.cwd_last.clone());
-        self.open_new_session_as(account, dir);
+        let Some(entry) = self.index.entries.get(path) else {
+            let text = format!("session {} is no longer listed", short_id(session_id));
+            self.notify(Level::Error, text);
+            return;
+        };
+        match entry.cwd_last.clone() {
+            Some(dir) => self.open_new_session_as(account, Some(dir)),
+            None => self.notify(Level::Error, no_directory(session_id)),
+        }
     }
 
     /// `m` in the card: the next of [`PREVIEW_LIMITS`] of the transcript shown; what is shown
@@ -1775,12 +1784,15 @@ impl App {
                 }
                 Key::Char('k') | Key::Up => pick.selected = pick.selected.saturating_sub(1),
                 Key::Enter => {
-                    let (path, action) = (pick.path.clone(), pick.action);
+                    let (path, session_id, action) =
+                        (pick.path.clone(), pick.session_id.clone(), pick.action);
                     let chosen = pick.options.get(pick.selected).cloned();
                     self.overlay = None;
                     if let Some(qualified) = chosen {
                         match action {
-                            PickFor::NewSession => self.new_session_picked(&path, &qualified),
+                            PickFor::NewSession => {
+                                self.new_session_picked(&path, &session_id, &qualified);
+                            }
                             PickFor::Resume | PickFor::Fork => {
                                 let fork = action == PickFor::Fork;
                                 self.resume_picked(&path, fork, &qualified, fx);
@@ -2765,6 +2777,14 @@ pub fn running_text(session: &LiveSession) -> String {
             format!("{which} is running in {account}{pid}: switch to its terminal {WHY}")
         }
     }
+}
+
+/// A session without a recorded directory can be neither resumed nor started from (R16).
+fn no_directory(session_id: &str) -> String {
+    format!(
+        "session {} has no recorded directory to start in",
+        short_id(session_id)
+    )
 }
 
 /// The first 8 characters of a session id, as claude shows it.
