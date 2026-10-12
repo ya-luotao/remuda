@@ -1497,13 +1497,16 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   `total_token_usage` does not (the two differed in 19,385 of the 38,441 record and event pairs).
   The event after a record is always that record's request's, also after a request whose event
   never came. A record is a line holding a JSON object whose `type` is `token_usage_record`
-  (not an array or a string that names it). A record without `usage`, with an empty or no
-  `response_id`, or whose payload cannot be read is not counted, and the event after it counts
-  as below. Events count the requests no record counts: in a rollout
-  written before codex 0.153, and before a rollout's first record (in the corpus, the 26 events
-  there each recorded the context size of a rollout that starts compacted, with no request's
-  usage, and the rollouts of codex 0.153 or later without a record had no event). An
-  `event_msg` of type `token_count` with an `info` carries `total_token_usage`, the session's
+  (not an array or a string that names it). A line is read only when it spells one of the three
+  type names, `"token_count"`, `"turn_context"` and `"token_usage_record"`, as written plainly; a
+  line that names its type only with JSON escapes (`"\u0074oken_usage_record"`) is not read, a
+  record no more than an event (codex does not write them so; a known limitation). A record
+  without `usage`, with an empty or no `response_id`, or whose payload cannot be read is not
+  counted, and the event after it counts as below. Events count the requests no record counts:
+  in a rollout written before codex 0.153, and before a rollout's first record (in the corpus,
+  the 26 events there each recorded the context size of a rollout that starts compacted, with
+  no request's usage, and the rollouts of codex 0.153 or later without a record had no event).
+  An `event_msg` of type `token_count` with an `info` carries `total_token_usage`, the session's
   cumulative usage, and `last_token_usage`, the latest request's; each has `input_tokens` (cached
   and cache write included), `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`
   (part of output), and `total_tokens`, and from a later codex `cache_write_input_tokens`, a

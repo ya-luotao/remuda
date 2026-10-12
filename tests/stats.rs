@@ -1382,10 +1382,12 @@ fn codex_lines_that_are_not_records_leave_the_awaited_event_alone() {
 }
 
 /// R20 **Codex** (critic review 3 of S4B): a record is told by its decoded `type`, which a JSON
-/// escape may spell otherwise in the line (`"\u0074oken_usage_record"`, here on a line that
-/// another field's `"token_count"` lets past the first look). It is the next request's: counted,
-/// or with a payload that cannot be read not counted and its event counting the request; either
-/// way the request before it, whose event never came, does not take that event.
+/// escape may spell otherwise in the line (`"\u0074oken_usage_record"`). The `note` field holds
+/// `"token_count"` as written plainly, so that the line is read at all: a line that names none of
+/// the three types plainly is not (`codex_a_line_that_spells_its_type_with_escapes_alone_is_not_read`).
+/// It is the next request's: counted, or with a payload that cannot be read not counted and its
+/// event counting the request; either way the request before it, whose event never came, does not
+/// take that event.
 #[test]
 fn codex_a_record_type_spelled_with_an_escape_is_a_record() {
     let escaped = |payload: Value| {
@@ -1417,6 +1419,76 @@ fn codex_a_record_type_spelled_with_an_escape_is_a_record() {
             if counted != toks(100 + 200, 0, 0, 10 + 20, 0) {
                 wrong.push(format!("{what}, saved between: {saved}: {counted:?}"));
             }
+        }
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+}
+
+/// R20 **Codex** (GitHub review of #33; a known limitation): a line is read only when it spells
+/// one of the three type names as written plainly; a record whose `type` is spelled with a JSON
+/// escape, on a line that names no type plainly, is not read (codex does not write so). It counts
+/// nothing and leaves no marker: its event counts the request, at the event's time. After a
+/// request whose event never came, that request's marker stays, and takes this event.
+#[test]
+fn codex_a_line_that_spells_its_type_with_escapes_alone_is_not_read() {
+    let line = json!({"timestamp": cx::ts(3), "type": "token_usage_record",
+                      "payload": {"response_id": "resp_b", "usage": cx::usage([200, 0, 20, 0])}})
+    .to_string()
+    .replacen(r#""token_usage_record""#, r#""\u0074oken_usage_record""#, 1);
+    for name in [
+        r#""token_count""#,
+        r#""turn_context""#,
+        r#""token_usage_record""#,
+    ] {
+        assert!(!line.contains(name), "{line}");
+    }
+    let parsed: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(parsed["type"], "token_usage_record");
+    let record = line + "\n";
+    let event = cx::tokens([200, 0, 20, 0], [200, 0, 20, 0], &cx::ts(4));
+    let at = |minute: u32| cx::ts(minute).parse::<Timestamp>().unwrap().as_second();
+
+    let mut wrong = Vec::new();
+    for saved in [false, true] {
+        // Alone: not read, then its event counts the request at the event's time.
+        let mut f = Fixture::new();
+        let work = f.codex("work");
+        let path = cx::write_rollout(
+            &work,
+            R1,
+            &recorded_rollout(R1, "gpt-test-a", std::slice::from_ref(&record)),
+        );
+        f.refresh();
+        if saved {
+            let file = f.root.join("remuda/state/stats.json");
+            f.cache.save(&file).unwrap();
+            f.cache = Cache::load(&file);
+        }
+        let rollout = f.cache.files.values().next().unwrap();
+        if !rollout.rows.is_empty() || rollout.codex_record.is_some() {
+            wrong.push(format!(
+                "alone, saved: {saved}: read, {:?}, {:?}",
+                rollout.rows, rollout.codex_record
+            ));
+        }
+        append(&path, &event);
+        f.refresh();
+        let sources = f.sources();
+        let counted = stats::requests(&f.cache, &sources, &f.attribution, &f.accounts, &f.prices);
+        let requests: Vec<_> = counted
+            .list
+            .iter()
+            .map(|r| (r.ts, r.tokens.total()))
+            .collect();
+        if requests != [(Some(at(4)), 220)] {
+            wrong.push(format!("alone, saved: {saved}: {requests:?}"));
+        }
+
+        // After a request whose event never came: that request's marker takes the event.
+        let counted =
+            after_a_record_whose_event_has_not_come(&[record.as_str(), &event].concat(), saved);
+        if counted != toks(100, 0, 0, 10, 0) {
+            wrong.push(format!("after A, saved: {saved}: {counted:?}"));
         }
     }
     assert_eq!(wrong, Vec::<String>::new());
