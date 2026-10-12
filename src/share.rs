@@ -317,14 +317,7 @@ pub fn plan(
         let own_installs = installed_plugins(&home);
         // Which of them the home has cannot be told: nothing is injected (R11 warns).
         let own_unknown = matches!(own_installs, Installs::Unrecognized(_));
-        let off = |plugin: &str| {
-            std::iter::once(&own).chain(&layers).any(|settings| {
-                settings
-                    .get("enabledPlugins")
-                    .and_then(|p| p.get(plugin))
-                    .is_some_and(|on| on.as_bool() == Some(false))
-            })
-        };
+        let off = |plugin: &str| turned_off(plugin, &own, &layers);
         for plugin in enabled_plugins(&source_settings) {
             let outcome = if bundled(&plugin) {
                 // Nothing to inject either way; what the home or the project turned off is
@@ -1381,6 +1374,17 @@ pub fn enabled_plugins(settings: &Map<String, Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Whether the home's settings `own` or the project's `layers` above them (in claude's order,
+/// each later layer above the earlier) turn `plugin` off: the highest layer that sets it in
+/// `enabledPlugins` decides, as claude merges the key.
+pub fn turned_off(plugin: &str, own: &Map<String, Value>, layers: &[Map<String, Value>]) -> bool {
+    std::iter::once(own)
+        .chain(layers)
+        .rev()
+        .find_map(|settings| settings.get("enabledPlugins")?.get(plugin)?.as_bool())
+        == Some(false)
 }
 
 /// Whether `plugin` (`name@marketplace`) is one claude bundles: the `builtin` marketplace is
@@ -3964,8 +3968,15 @@ mod tests {
         )
         .unwrap();
         fs::write(
+            work.join(".claude/settings.json"),
+            json!({"enabledPlugins": {"e@builtin": false}}).to_string(),
+        )
+        .unwrap();
+        // The local settings sit above the project's: `e` is on again.
+        fs::write(
             work.join(".claude/settings.local.json"),
-            json!({"enabledPlugins": {"a@m": false, "f@builtin": false}}).to_string(),
+            json!({"enabledPlugins": {"a@m": false, "e@builtin": true, "f@builtin": false}})
+                .to_string(),
         )
         .unwrap();
         let own_list = max.join("plugins/installed_plugins.json");
@@ -4004,7 +4015,7 @@ mod tests {
                 ("c@m".to_string(), installed("c")),
                 ("d@m".to_string(), installed("d")),
                 // Bundled with claude: nothing to inject, and no install to look for; one
-                // the project turned off is said to be.
+                // the project turned off is said to be (the highest layer decides).
                 ("e@builtin".to_string(), Err(Skip::Builtin)),
                 ("f@builtin".to_string(), Err(Skip::TurnedOff)),
             ]

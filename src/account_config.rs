@@ -444,12 +444,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
     for name in share::enabled_plugins(&own) {
         if share::bundled(&name) {
             // Loaded by claude itself, unless the project's settings turn it off.
-            let off = layers.iter().any(|settings| {
-                settings
-                    .get("enabledPlugins")
-                    .and_then(|p| p.get(&name))
-                    .is_some_and(|on| on.as_bool() == Some(false))
-            });
+            let off = share::turned_off(&name, &own, &layers);
             view.plugins.push(Plugin {
                 name,
                 origin: Origin::NotShared(if off { Skip::TurnedOff } else { Skip::Builtin }),
@@ -2248,7 +2243,12 @@ mod tests {
         );
         write(
             &work.join(".claude/settings.json"),
-            &json!({"enabledPlugins": {"f@builtin": false}}).to_string(),
+            &json!({"enabledPlugins": {"e@builtin": false, "f@builtin": false}}).to_string(),
+        );
+        // The local settings sit above the project's: `e` is on again.
+        write(
+            &work.join(".claude/settings.local.json"),
+            &json!({"enabledPlugins": {"e@builtin": true}}).to_string(),
         );
         let (source, member) = (named("src", &src), named("max", &max));
         let sharing = sharing(&source);

@@ -1371,7 +1371,8 @@ not see the sessions in the source's store (R11, R16).
   or similar variables (2.1.281 bundle). remuda shares them anyway; the case is rare.
 - **Plugins.** Enabled plugins are the keys whose value in the source settings' `enabledPlugins` is
   `true` or an array (claude treats both as enabled), except those set to `false` in the
-  `enabledPlugins` of the home or of the project settings above, and those the home has installed
+  `enabledPlugins` of the home or of the project settings above (the highest layer that sets the
+  key decides, as claude merges it), and those the home has installed
   itself in a way claude loads here, which would otherwise load twice, and those of the `builtin`
   marketplace (`<name>@builtin`), which claude bundles and loads from its own bundle (2.1.296):
   they have no install, and none is injected for them. claude loads an install

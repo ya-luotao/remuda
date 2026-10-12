@@ -192,6 +192,9 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   with claude and never installed: enabling it no longer draws the `has no user install whose
   path exists` check, the Accounts view lists it as bundled with claude instead of not installed,
   and a launch injects nothing for it (SPEC R11, R18).
+- A plugin set to `false` in one settings layer and to `true` in a higher one (the project's
+  `settings.json` and `settings.local.json`, say) is enabled, as claude merges the key; the
+  launch plan and the Accounts view said it was turned off (SPEC R18).
 - `remuda usage` reads each account's cached usage against the time it was read, not the time
   the command started, and `remuda usage --wait` each of its cached attempts likewise (SPEC R10):
   a window whose reset fell in between shows `reset since cached` instead of its old percentage
