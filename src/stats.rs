@@ -24,8 +24,9 @@ use crate::{Env, owned};
 
 /// Bump whenever [`Row`], [`FileStats`] or the counting rules change: a mismatching cache is
 /// rebuilt (2: cache write by lifetime, fast / US flags; 3: codex's cache write; 5: the project
-/// directory; 4, never released, read codex's project by an earlier rule).
-pub const SCHEMA_VERSION: u32 = 5;
+/// directory; 4, never released, read codex's project by an earlier rule; 6: codex requests keyed
+/// by their `response_id`).
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Read size; an unfinished line is carried over to the next read.
 const CHUNK: u64 = 8 * 1024 * 1024;
@@ -93,8 +94,8 @@ impl Tokens {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "RowRepr", into = "RowRepr")]
 pub struct Row {
-    /// FNV-1a hash of the request's key: its `message.id` (claude), or its cumulative total
-    /// (codex).
+    /// FNV-1a hash of the request's key: its `message.id` (claude); its `response_id`, or for a
+    /// request counted from a `token_count` event its cumulative total (codex).
     pub key: u64,
     /// Seconds since the Unix epoch; the earliest of the request's records.
     pub ts: Option<i64>,
@@ -182,6 +183,10 @@ pub struct FileStats {
     pub codex_total: Option<[u64; 5]>,
     /// Codex: the model of the last `turn_context` seen.
     pub codex_model: Option<String>,
+    /// Codex: the key of the request last counted from a `token_usage_record` while its
+    /// `token_count` event, which follows it, has not been read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_record: Option<u64>,
     /// The models [`Row::model`] indexes.
     pub models: Vec<String>,
     pub rows: Vec<Row>,
@@ -517,6 +522,7 @@ fn count(
             scanned_offset: 0,
             codex_total: None,
             codex_model: None,
+            codex_record: None,
             models: Vec::new(),
             rows: Vec::new(),
         },
@@ -672,6 +678,10 @@ struct CodexPayload {
     model: Option<String>,
     /// `token_count` only; `null` in some events.
     info: Option<CodexInfo>,
+    /// `token_usage_record` only: the request's id (`resp_…`).
+    response_id: Option<String>,
+    /// `token_usage_record` only: the request's usage, as `last_token_usage` records it.
+    usage: Option<CodexUsage>,
 }
 
 #[derive(Deserialize)]
@@ -703,6 +713,61 @@ impl CodexUsage {
         ]
         .map(|n| n.unwrap_or(0))
     }
+
+    /// The counts of one request: input without cached and cache write, cached as cache read,
+    /// cache write (at most the input without cached), output, reasoning (R20).
+    fn tokens(&self) -> Tokens {
+        let [input, cached, output, reasoning, _] = self.numbers();
+        // What was read from the cache and what was written to it are both part of
+        // `input_tokens` (R20).
+        let uncached = input.saturating_sub(cached);
+        let write = self.cache_write_input_tokens.unwrap_or(0).min(uncached);
+        Tokens {
+            input: uncached - write,
+            cache_read: cached,
+            cache_write_5m: write,
+            cache_write_1h: 0,
+            output,
+            reasoning,
+        }
+    }
+}
+
+/// Whether `line` holds `"token_count"`, `"turn_context"` or `"token_usage_record"`, the record
+/// types [`Counter::codex`] reads: in one pass over the line, as most lines hold none of them.
+fn mentions_codex_counts(line: &[u8]) -> bool {
+    const TYPES: [&[u8]; 3] = [
+        b"\"token_count\"",
+        b"\"turn_context\"",
+        b"\"token_usage_record\"",
+    ];
+    line.iter()
+        .enumerate()
+        .any(|(i, &b)| b == b'"' && TYPES.iter().any(|t| line[i..].starts_with(t)))
+}
+
+/// Whether `line` is a JSON object whose `type` is `token_usage_record`, whatever the rest of it
+/// holds (R20). Not an array or a scalar, which the derived [`CodexRecord`] would read too.
+fn is_usage_record(line: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Kind {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+    }
+    is_object(line)
+        && serde_json::from_slice::<Kind>(line)
+            .is_ok_and(|k| k.kind.as_deref() == Some("token_usage_record"))
+}
+
+/// Whether `line` is, if JSON at all, an object.
+fn is_object(line: &[u8]) -> bool {
+    line.trim_ascii_start().first() == Some(&b'{')
+}
+
+/// The key of a codex request counted from a `token_count` event: its cumulative total.
+fn codex_total_key(total: [u64; 5]) -> u64 {
+    let key = total.map(|n| n.to_string()).join(",");
+    fnv1a(&[b"codex:", key.as_bytes()])
 }
 
 /// A claude record's own `cwd`.
@@ -927,13 +992,27 @@ impl<'a> Counter<'a> {
         }
     }
 
-    /// A `turn_context` sets the model; a `token_count` event whose total changed counts its
-    /// latest request.
+    /// A `turn_context` sets the model; a `token_usage_record` counts its request, by its
+    /// `response_id`, and the `token_count` event that follows it is that request's; any other
+    /// `token_count` event whose total changed counts its latest request (R20).
     fn codex(&mut self, line: &[u8]) {
-        if !contains(line, b"\"token_count\"") && !contains(line, b"\"turn_context\"") {
+        if !mentions_codex_counts(line) {
             return;
         }
-        let Ok(record) = serde_json::from_slice::<CodexRecord>(line) else {
+        // A record is the next request's: the event of the request before it, if still awaited,
+        // is not coming, and the event that follows is this request's, counted or not. Told
+        // apart by its decoded `type` alone (a JSON escape spells it otherwise in the line), also
+        // when the rest of it cannot be read: then it is a record still, not counted.
+        let record = serde_json::from_slice::<CodexRecord>(line);
+        let usage_record = match &record {
+            // What `is_usage_record` reads, without reading the line again.
+            Ok(r) => is_object(line) && r.kind.as_deref() == Some("token_usage_record"),
+            Err(_) => is_usage_record(line),
+        };
+        if usage_record {
+            self.file.codex_record = None;
+        }
+        let Ok(record) = record else {
             return;
         };
         let Some(payload) = record.payload else {
@@ -956,11 +1035,40 @@ impl<'a> Counter<'a> {
                 }
                 self.file.codex_model = Some(model);
             }
+            Some("token_usage_record") if usage_record => {
+                // Without either, it is not counted, and its event counts the request.
+                let Some(id) = payload.response_id.filter(|id| !id.is_empty()) else {
+                    return;
+                };
+                let Some(usage) = payload.usage else {
+                    return;
+                };
+                let key = fnv1a(&[b"codex:resp:", id.as_bytes()]);
+                let model = match self.file.codex_model.clone() {
+                    Some(name) => self.model(&name),
+                    None => PENDING,
+                };
+                self.put(Row {
+                    key,
+                    ts: seconds(record.timestamp.as_deref()),
+                    model,
+                    copy: false,
+                    fast: false,
+                    geo_us: false,
+                    tokens: usage.tokens(),
+                });
+                self.file.codex_record = Some(key);
+            }
             Some("event_msg") if payload.kind.as_deref() == Some("token_count") => {
                 let Some(info) = payload.info else { return };
                 let Some(total) = info.total_token_usage.map(|u| u.numbers()) else {
                     return;
                 };
+                // The event of the request just counted from its record.
+                if self.file.codex_record.take().is_some() {
+                    self.file.codex_total = Some(total);
+                    return;
+                }
                 // A repeated event, or the context size recorded after compacting.
                 if self.file.codex_total == Some(total) {
                     return;
@@ -969,31 +1077,18 @@ impl<'a> Counter<'a> {
                 let Some(last) = info.last_token_usage else {
                     return;
                 };
-                let [input, cached, output, reasoning, _] = last.numbers();
-                // What was read from the cache and what was written to it are both part of
-                // `input_tokens` (R20).
-                let uncached = input.saturating_sub(cached);
-                let write = last.cache_write_input_tokens.unwrap_or(0).min(uncached);
                 let model = match self.file.codex_model.clone() {
                     Some(name) => self.model(&name),
                     None => PENDING,
                 };
-                let key = total.map(|n| n.to_string()).join(",");
                 self.put(Row {
-                    key: fnv1a(&[b"codex:", key.as_bytes()]),
+                    key: codex_total_key(total),
                     ts: seconds(record.timestamp.as_deref()),
                     model,
                     copy: false,
                     fast: false,
                     geo_us: false,
-                    tokens: Tokens {
-                        input: uncached - write,
-                        cache_read: cached,
-                        cache_write_5m: write,
-                        cache_write_1h: 0,
-                        output,
-                        reasoning,
-                    },
+                    tokens: last.tokens(),
                 });
             }
             _ => {}
@@ -2668,6 +2763,81 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
                 (f.cwd, f.codex_head, f.scanned_offset, f.models, f.rows)
             };
             assert_eq!(counted(&grown), counted(&whole), "{prefix:?}");
+        }
+    }
+
+    /// R20 **Codex**, **Cache**: a refresh that ends between a `token_usage_record` and its
+    /// `token_count` event leaves the event to be known as the record's in the cache: read on,
+    /// the rollout counts as read whole at once does. Each request is keyed by its
+    /// `response_id`, a compaction's too.
+    #[test]
+    fn a_records_event_read_in_a_later_refresh_is_still_its_own() {
+        let usage = |[input, cached, output]: [u64; 3]| {
+            format!(
+                "{{\"input_tokens\":{input},\"cached_input_tokens\":{cached},\
+                 \"cache_write_input_tokens\":0,\"output_tokens\":{output},\
+                 \"reasoning_output_tokens\":0,\"total_tokens\":{}}}",
+                input + output
+            )
+        };
+        let record = |id: &str, last: [u64; 3], thread: [u64; 3]| {
+            format!(
+                "{{\"timestamp\":\"2026-09-20T10:00:00Z\",\"type\":\"token_usage_record\",\
+                 \"payload\":{{\"response_id\":\"{id}\",\"usage\":{},\
+                 \"thread_token_usage\":{}}}}}\n",
+                usage(last),
+                usage(thread)
+            )
+        };
+        let event = |total: [u64; 3], last: [u64; 3]| {
+            format!(
+                "{{\"timestamp\":\"2026-09-20T10:00:00Z\",\"type\":\"event_msg\",\"payload\":\
+                 {{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{},\
+                 \"last_token_usage\":{}}}}}}}\n",
+                usage(total),
+                usage(last)
+            )
+        };
+        let turn = "{\"timestamp\":\"2026-09-20T10:00:00Z\",\"type\":\"turn_context\",\
+                    \"payload\":{\"model\":\"m\"}}\n";
+        let parts = [
+            [turn, &record("resp_1", [100, 50, 10], [100, 50, 10])].concat(),
+            [
+                event([100, 50, 10], [100, 50, 10]),
+                record("resp_c", [300, 0, 20], [400, 50, 30]),
+                "{\"type\":\"compacted\",\"payload\":{}}\n".to_string(),
+            ]
+            .concat(),
+            [
+                event([100, 50, 10], [60, 0, 0]),
+                record("resp_2", [150, 100, 20], [550, 150, 50]),
+            ]
+            .concat(),
+            event([250, 150, 30], [150, 100, 20]),
+        ];
+        let (whole, _) = counted(Provider::Codex, &parts.concat(), "");
+        assert_eq!(whole.rows.len(), 3);
+        let tokens: u64 = whole.rows.iter().map(|r| r.tokens.total()).sum();
+        assert_eq!(tokens, 110 + 320 + 170);
+        assert_eq!(whole.codex_record, None);
+        let key = |id: &str| fnv1a(&[b"codex:resp:", id.as_bytes()]);
+        assert_eq!(
+            whole.rows.iter().map(|r| r.key).collect::<Vec<_>>(),
+            [key("resp_1"), key("resp_c"), key("resp_2")]
+        );
+        assert_eq!(whole.codex_total, Some([250, 150, 30, 0, 280]));
+        for cut in 1..parts.len() {
+            let (before, grown) = counted(
+                Provider::Codex,
+                &parts[..cut].concat(),
+                &parts[cut..].concat(),
+            );
+            assert!(before.codex_record.is_some(), "cut {cut}");
+            assert_eq!(
+                (&grown.rows, grown.codex_total, grown.codex_record),
+                (&whole.rows, whole.codex_total, whole.codex_record),
+                "cut {cut}"
+            );
         }
     }
 

@@ -80,6 +80,16 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Changed
 
+- Codex statistics count each request by the `token_usage_record` codex writes for it from 0.153
+  on, keyed by its `response_id`, instead of by the `token_count` event that follows it (SPEC
+  R20). Two unrelated rollouts whose first requests had the same usage now count as two requests,
+  not one. Compactions are requests with their own usage, which the events never showed: they
+  now count (1.76% of the tokens in a sample of 856 rollouts). A request counts at the time its
+  response completed, which can be earlier than its event, written after the tool calls it asked
+  for. Rollouts written before codex 0.153 count as before. The statistics cache is at schema 6,
+  so the first `remuda stats` after upgrading reads every transcript whole again. A subagent
+  forked from a rollout in codex's legacy history mode, which replays its parent's events without
+  their records, counts the replayed requests a second time (a known limitation).
 - `remuda pick -- <args>` no longer needs `--run`: without it, the arguments go into the
   `command` shown, each word quoted for the shell where it needs it. Arguments that neither start
   a new session nor name one to resume (`-c`, `--resume` without an id) are refused with or

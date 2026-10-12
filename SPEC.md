@@ -1477,8 +1477,36 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   `<project>/<session id>/` (subagent transcripts, such as `subagents/agent-*.jsonl` and
   `subagents/workflows/<id>/agent-*.jsonl`), which belongs to that session. Sessions hidden from
   History (R8) count too.
-- **Codex** (verified on 0.155.1 against 106,795 `token_count` events in 1,464 rollouts): an
-  `event_msg` of type `token_count` with an `info` carries `total_token_usage`, the session's
+- **Codex** (records verified on 0.162.1 against the 856 rollouts of 2026-09 and 2026-10, of
+  which 757 have 38,441 records; events on 0.155.1 against 106,795 `token_count` events in 1,464
+  rollouts): from codex 0.153 on, a rollout has a `token_usage_record` record
+  (`"type": "token_usage_record"`) for each request, written before that request's `token_count`
+  event, with the request's id, `payload.response_id`, and its usage, `payload.usage`, which has
+  the counts of `last_token_usage` below. A record counts its request by its `response_id`, and
+  the next `token_count` event that has a `total_token_usage` is that request's and is not
+  counted. The request
+  counts at the record's time, when the response completed: codex writes the event once the
+  tool calls the response asked for have run (in the corpus within a second for 25,496 of the
+  38,441 pairs, after more than a minute for 64, at most 2.7 hours later). In the corpus
+  every record was followed by its event before the next record, no `response_id` occurred
+  twice, and every other event after a rollout's first record repeated the total before it. A
+  compaction is a request too: codex writes its record, while its event records the new context
+  size with an unchanged total; so compactions count from their records, where the events alone
+  never counted them (356 in the corpus: 84,473,039 of the records' 4,795,790,829 tokens, 1.76%).
+  The record's `thread_token_usage` is not read: it includes the compactions, which
+  `total_token_usage` does not (the two differed in 19,385 of the 38,441 record and event pairs).
+  The event after a record is always that record's request's, also after a request whose event
+  never came. A record is a line holding a JSON object whose `type` is `token_usage_record`
+  (not an array or a string that names it). A line is read only when it spells one of the three
+  type names, `"token_count"`, `"turn_context"` and `"token_usage_record"`, as written plainly; a
+  line that names its type only with JSON escapes (`"\u0074oken_usage_record"`) is not read, a
+  record no more than an event (codex does not write them so; a known limitation). A record
+  without `usage`, with an empty or no `response_id`, or whose payload cannot be read is not
+  counted, and the event after it counts as below. Events count the requests no record counts:
+  in a rollout written before codex 0.153, and before a rollout's first record (in the corpus,
+  the 26 events there each recorded the context size of a rollout that starts compacted, with
+  no request's usage, and the rollouts of codex 0.153 or later without a record had no event).
+  An `event_msg` of type `token_count` with an `info` carries `total_token_usage`, the session's
   cumulative usage, and `last_token_usage`, the latest request's; each has `input_tokens` (cached
   and cache write included), `cached_input_tokens`, `output_tokens`, `reasoning_output_tokens`
   (part of output), and `total_tokens`, and from a later codex `cache_write_input_tokens`, a
@@ -1486,9 +1514,10 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   same rollout is skipped: codex repeats events (16,750 in the corpus), and after compacting it
   records the new context size with an unchanged total (673). Every other event counts its
   `last_token_usage`: input without cached and cache write, cached as cache read, cache write
-  (at most the input without cached), output, reasoning. An event
-  belongs to the model of the last `turn_context` before it (`payload.model`); events before the
-  first `turn_context` take the model of the first one after them, else `unknown`. Rollouts:
+  (at most the input without cached), output, reasoning; a record's `usage` is counted the same
+  way. A record or an event belongs to the model of the last `turn_context` before it
+  (`payload.model`); those before the first `turn_context` take the model of the first one after
+  them, else `unknown`; each counts at its own timestamp. Rollouts:
   `sessions/**/rollout-*.jsonl` and `archived_sessions/rollout-*.jsonl` of every codex home,
   including those hidden from History (R17).
 - **Codex cache write** (verified on 0.160.0 against 120,903 `token_count` events in 1,888
@@ -1500,20 +1529,37 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   `parses_cache_write_token_usage`: input 100 = cached 40 + cache write 60, total 110). OpenAI's
   prompt-caching guide: an input token is priced at the uncached-input, the cached-input, or the
   cache-write price. So the cache write is part of `input_tokens`, and each input token is
-  counted once: as input, as cache read, or as cache write. The deduplication key below stays the
-  five other counts of `total_token_usage`: the cache write is part of its `input_tokens`.
+  counted once: as input, as cache read, or as cache write. A request counted from an event is
+  keyed (below) by the five other counts of `total_token_usage`: the cache write is part of its
+  `input_tokens`.
 - **Copies count once.** A fork holds its parent's history: claude copies the parent's records
-  with their `message.id` and timestamp and marks them `forkedFrom`; a codex fork may replay the
-  parent's `token_count` events with the fork's timestamps and the parent's cumulative totals; a
-  transcript may also have been copied whole into another store by hand. So each claude message
-  is counted once across all stores by its `message.id`, and each codex request once across all rollouts by its
-  `total_token_usage`. In the corpus, 2,360 of the 2,362 totals found in more than one rollout
-  came from forks; the other two were the first requests of unrelated `codex exec` runs with
-  identical usage, which are counted once (a known limitation). The copy that counts is, in
+  with their `message.id` and timestamp and marks them `forkedFrom`. Codex 0.162.1 (in its
+  source at `rust-v0.162.1`, commit `092d3acd`) writes nothing of the parent into a fork of a
+  rollout in its paginated history mode, the mode of every rollout in the corpus (the fork refers
+  to the parent's history instead, `core/src/session/mod.rs`); copies a rollout in its legacy
+  history mode into a fork, its records and events with the rest (`core/src/thread_manager.rs`,
+  `rollout/src/policy.rs`); and replays into a subagent forked from a legacy rollout the parent's
+  `token_count` events without its records (`core/src/agent/control/spawn.rs`). An earlier
+  codex fork may replay the parent's `token_count` events with the fork's timestamps and the
+  parent's cumulative totals. A transcript may also have been copied whole into another store by
+  hand. So each claude message is counted once across all stores by its `message.id`, and each
+  codex request once across all rollouts by its `response_id`, or, counted from an event, by its
+  `total_token_usage`. In the corpus of 2026-09 and 2026-10 (856 rollouts, 757 with records),
+  none of the 38,441 `response_id`s (13,642 of them in 2026-10) occurred twice, and 1 total
+  occurred in more than one rollout: the first requests of two unrelated `codex exec` runs
+  started in the same second with identical usage, which their different `response_id`s count as
+  two. Known limitations: a request counted from its record in one rollout and from a copy of its
+  event alone in another is counted twice, once at each copy's time, model, directory, and
+  accounts; this happens to a subagent forked from a rollout in the legacy history mode that
+  codex 0.153 or later ran, for each of the parent's requests it replays. And requests counted
+  from events alone with
+  the same total are counted once: in an earlier corpus, 2,360 of the 2,362 totals found in more
+  than one rollout came from forks, the other two were the first requests of unrelated
+  `codex exec` runs with identical usage. The copy that counts is, in
   order: one not known to be a copy (a `forkedFrom` record), the one with the earliest timestamp,
   the one whose path sorts first. A claude message counts the largest value of each count among
   its copies. A codex request counts the usage of the copy that counts, whole, and within a
-  rollout the first usage recorded with its total: two requests with the same total can split
+  rollout the first usage recorded with its key: two requests with the same total can split
   their input differently between input and cache write, and the largest of each would count
   tokens that neither request had.
 - **Accounts.** A message counts for the session of the transcript whose copy counts. A claude
@@ -1630,15 +1676,18 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   atomically, deletable at any time (R3). For each transcript it holds what was counted from it (a
   64-bit FNV-1a hash of each request's key, its timestamp, model, counts with the cache write by
   lifetime, and whether it used fast mode or US-only inference), its project directory, how far the
-  transcript was read, and, for codex, the last total and model and whether the first record was
-  read. Beside the transcripts it holds the real path each store and `archived_sessions` last
+  transcript was read, and, for codex, the last total and model, whether the first record was
+  read, and whether the event of the request last counted from a record is still to be read.
+  Beside the transcripts it holds the real path each store and `archived_sessions` last
   resolved to (R8), which a cache written before that was kept lacks and is read without.
   Transcripts are read like the index (R8): an unchanged file is not read again, a grown one only
   from its last complete line, any other one whole; only complete lines are parsed. Records of one
   message read in two refreshes merge by their key. The first computation reads every transcript
   whole (measured: 20,895 files, 17.2 GB), and so does the first one after the schema version
   changes (version 2 added the cache lifetimes and pricing flags, version 3 codex's cache write,
-  version 5 the project directory: a transcript read on from where it was would never get one).
+  version 5 the project directory: a transcript read on from where it was would never get one;
+  version 6 keyed codex requests by their response id: a rollout read on from where it was would
+  hold requests keyed both ways, and its copies would not match).
 - **Command**: `remuda stats [<account>] [--period today|7d|30d|all] [--by account|project]`
   prints one period (default `all`) with sections by account (the default) or by project, and
   a COST column, then a line saying the cost is ≈ API list price and the prices' date, and a

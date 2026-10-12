@@ -226,3 +226,26 @@ pub fn fork_meta(id: &str, parent: &str, cwd: &str, ts: &str) -> String {
 pub fn compacted(ts: &str) -> String {
     record("compacted", ts, json!({"message": "summary"}))
 }
+
+/// A `token_usage_record` (codex 0.153 on, shape of 0.162.1): one request's `usage` by its
+/// `response_id`, and the thread's cumulative `thread_token_usage`; written before that
+/// request's `token_count` event.
+pub fn usage_record(id: &str, response_id: &str, usage: Value, thread: Value, ts: &str) -> String {
+    record(
+        "token_usage_record",
+        ts,
+        json!({"thread_id": id, "turn_id": "t1", "session_id": id, "root_turn_id": "t1",
+               "response_id": response_id, "usage": usage, "turn_token_usage": usage,
+               "thread_token_usage": thread}),
+    )
+}
+
+/// A request as codex 0.153 on writes it: its `token_usage_record` (`last` as its usage, the
+/// cumulative `total` as the thread's), then its `token_count` event.
+pub fn request(id: &str, response_id: &str, total: [u64; 4], last: [u64; 4], ts: &str) -> String {
+    [
+        usage_record(id, response_id, usage(last), usage(total), ts),
+        tokens(total, last, ts),
+    ]
+    .concat()
+}
