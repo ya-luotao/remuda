@@ -58,11 +58,19 @@ impl Provider {
         }
     }
 
+    /// The native login's directory under `$HOME`: `.claude` or `.codex`.
+    pub fn native_dir(self) -> &'static str {
+        match self {
+            Provider::Claude => ".claude",
+            Provider::Codex => ".codex",
+        }
+    }
+
     /// The native login's directory: `$HOME/.claude` or `$HOME/.codex`.
     pub fn native_home(self, env: &Env) -> Option<PathBuf> {
         match self {
             Provider::Claude => paths::native_claude_home(env),
-            Provider::Codex => paths::user_home(env).map(|h| h.join(".codex")),
+            Provider::Codex => paths::user_home(env).map(|h| h.join(self.native_dir())),
         }
     }
 

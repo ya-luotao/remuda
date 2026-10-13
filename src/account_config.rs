@@ -167,6 +167,9 @@ pub struct Plugin {
     /// The install a session loads; `None`: not installed here.
     pub path: Option<PathBuf>,
     pub contents: Option<PluginContents>,
+    /// The project's settings set it to `false`: enabled by the home, its install found,
+    /// loaded by nothing launched here.
+    pub off: bool,
 }
 
 /// What an installed plugin adds.
@@ -453,6 +456,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
                 installs: 0,
                 path: None,
                 contents: None,
+                off: false,
             });
             continue;
         }
@@ -476,6 +480,9 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
             installs: installs.count(&name),
             contents: path.as_deref().map(plugin_contents),
             path,
+            // The highest layer that sets the key decides (R18): the project's `false`
+            // over the home's `true`.
+            off: share::turned_off(&name, &own, &layers),
             name,
         });
     }
@@ -495,6 +502,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
                 installs: source_installs.count(&p.name),
                 path: Some(dir.path.clone()),
                 contents: Some(plugin_contents(&dir.path)),
+                off: false,
             },
             Err(Skip::OwnInstall) if view.plugins.iter().any(|own| own.name == p.name) => {
                 continue;
@@ -513,6 +521,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
                 installs: 0,
                 path: None,
                 contents: None,
+                off: false,
             },
         };
         view.plugins.push(plugin);
@@ -2236,14 +2245,24 @@ mod tests {
             })
             .to_string(),
         );
+        // The member's own install of `g`, which the project turns off.
+        let own_cache = max.join("plugins/cache/g");
+        fs::create_dir_all(&own_cache).unwrap();
         write(
-            &max.join("settings.json"),
-            &json!({"enabledPlugins": {"c@m": false, "e@builtin": true, "f@builtin": true}})
+            &max.join("plugins/installed_plugins.json"),
+            &json!({"version": 2, "plugins": {"g@m": [{"scope": "user", "installPath": own_cache}]}})
                 .to_string(),
         );
         write(
+            &max.join("settings.json"),
+            &json!({"enabledPlugins": {"c@m": false, "e@builtin": true, "f@builtin": true,
+                                       "g@m": true}})
+            .to_string(),
+        );
+        write(
             &work.join(".claude/settings.json"),
-            &json!({"enabledPlugins": {"e@builtin": false, "f@builtin": false}}).to_string(),
+            &json!({"enabledPlugins": {"e@builtin": false, "f@builtin": false, "g@m": false}})
+                .to_string(),
         );
         // The local settings sit above the project's: `e` is on again.
         write(
@@ -2288,6 +2307,13 @@ mod tests {
         };
         assert_eq!(bundled("e@builtin"), Origin::NotShared(Skip::Builtin));
         assert_eq!(bundled("f@builtin"), Origin::NotShared(Skip::TurnedOff));
+        // The home's own plugin the project turns off: its install is shown, marked off.
+        let g = view.plugins.iter().find(|p| p.name == "g@m").unwrap();
+        assert_eq!(
+            (g.origin, g.path.as_deref(), g.off),
+            (Origin::Own, Some(own_cache.as_path()), true)
+        );
+        assert!(view.plugins.iter().filter(|p| p.off).count() == 1);
 
         let file = shared
             .args

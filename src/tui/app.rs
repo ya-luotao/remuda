@@ -630,6 +630,11 @@ impl ListState {
 pub struct History {
     /// Transcript paths shown, in display order.
     pub rows: Vec<PathBuf>,
+    /// How many entries each account (`provider:name`) has under the noise filter as
+    /// toggled, before any search (R17): the account card's count (R22), kept here so a
+    /// frame does not walk the index. Recounted with the rows, and when the attribution or
+    /// the stores change.
+    pub by_account: HashMap<String, usize>,
     pub list: ListState,
     /// Also show teammate and SDK sessions.
     pub show_all: bool,
@@ -669,14 +674,16 @@ impl Default for Preview {
     }
 }
 
-/// The Configuration pane of the accounts view (R22).
+/// The account card of the accounts view (R22): what the view knows of the account above its
+/// configuration.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConfigPane {
-    /// `p`: beside or below the view.
+    /// `p`: the card is open over the view; the movement keys scroll the configuration.
     pub open: bool,
-    /// `p` again: the whole view; the movement keys scroll it.
-    pub expanded: bool,
-    /// First line shown.
+    /// `d`: descriptions, an agent's details, and the items of a member that are already the
+    /// source's. Kept while the card is closed.
+    pub details: bool,
+    /// First line of the configuration shown.
     pub scroll: usize,
     /// The account shown: the selection's when last requested.
     pub account: Option<Account>,
@@ -760,6 +767,12 @@ pub struct App {
     /// The launch log and the `history.jsonl` files have been read once: a session attributed
     /// to no account now is attributed to none.
     pub attribution_loaded: bool,
+    /// The account list changed since the attribution was read: of an account added since,
+    /// it knows nothing, so the account card waits for the read that follows (R22).
+    pub attribution_stale: bool,
+    /// The same for the stores, which come with the index. (The checks need no mark: they
+    /// run again on the change, and the card says so while they run.)
+    pub stores_stale: bool,
     pub attribution: Attribution,
 
     pub live: Vec<LiveSession>,
@@ -770,6 +783,9 @@ pub struct App {
     pub live_list: ListState,
     pub logs: Option<Logs>,
     pub live_loaded: bool,
+    /// The account list changed since the running sessions were collected: a collection
+    /// from before could not see an account added since (R22).
+    pub live_stale: bool,
     /// When the last collection finished.
     pub live_updated: Option<Timestamp>,
 
@@ -823,6 +839,8 @@ impl App {
             by_session: HashMap::new(),
             attribution_base: Attribution::default(),
             attribution_loaded: false,
+            attribution_stale: false,
+            stores_stale: false,
             attribution: Attribution::default(),
             live: Vec::new(),
             live_rows: Vec::new(),
@@ -830,6 +848,7 @@ impl App {
             live_list: ListState::default(),
             logs: None,
             live_loaded: false,
+            live_stale: false,
             live_updated: None,
             history: History::default(),
             preview: Preview::default(),
@@ -903,7 +922,7 @@ impl App {
     }
 
     /// Shown in History: not noise, unless "show all" (R8).
-    fn in_history(&self, entry: &Entry) -> bool {
+    pub(super) fn in_history(&self, entry: &Entry) -> bool {
         self.history.show_all || !is_noise(entry)
     }
 
@@ -1193,7 +1212,7 @@ impl App {
         true
     }
 
-    /// Points the Configuration pane at the selected account, reading its configuration when
+    /// Points the account card at the selected account, reading its configuration when
     /// the account changed (R22).
     fn retarget_config(&mut self, fx: &mut Vec<Effect>) {
         if !self.config.open || self.mode != Mode::Browse {
@@ -1245,46 +1264,100 @@ impl App {
         }
     }
 
-    /// `p` in Accounts: open, expanded, closed (R22).
-    fn cycle_config(&mut self, fx: &mut Vec<Effect>) {
-        if !self.config.open {
+    /// `p` in Accounts: opens the account card, or closes it (R22).
+    fn toggle_config(&mut self, fx: &mut Vec<Effect>) {
+        if self.config.open {
+            self.close_config();
+        } else {
             self.config.open = true;
             self.retarget_config(fx);
-        } else if !self.config.expanded {
-            self.config.expanded = true;
-            self.config.scroll = 0;
-        } else {
-            self.close_config();
         }
     }
 
-    /// A read that is out is given up: its answer is for no pane. A pane opened again for
+    /// A read that is out is given up: its answer is for no card. A card opened again for
     /// that account before it answers waits for it and reads once more, not twice at once.
     fn close_config(&mut self) {
         self.config.work.cancel();
         self.config = ConfigPane {
             work: std::mem::take(&mut self.config.work),
+            details: self.config.details,
             ..ConfigPane::default()
         };
+    }
+
+    /// Keys while the account card is open (R22): the movement keys scroll the configuration,
+    /// the rest act on the account shown. `r` and `u` are matched before this.
+    fn on_account_card_key(&mut self, key: Key, fx: &mut Vec<Effect>) {
+        match key {
+            Key::Esc => self.close_config(),
+            Key::Char('[') => {
+                self.navigate(Key::Char('k'));
+            }
+            Key::Char(']') => {
+                self.navigate(Key::Char('j'));
+            }
+            Key::Char('n') => self.open_new_session(),
+            Key::Char('D') => self.confirm_remove(),
+            Key::Char('d') => {
+                self.config.details = !self.config.details;
+                self.config.scroll = self.config.scroll.min(self.config_max_scroll());
+            }
+            Key::Char('y') => self.copy_home(fx),
+            other => {
+                self.scroll_config(other);
+            }
+        }
+    }
+
+    /// `y` in the account card: the account's home directory to the clipboard (R22, R16).
+    fn copy_home(&mut self, fx: &mut Vec<Effect>) {
+        let Some(account) = self.config.account.clone() else {
+            return;
+        };
+        match self.home_path(&account) {
+            Some(home) => {
+                fx.push(Effect::Copy(home));
+                self.notify(Level::Info, format!("copied the home of {}", account.name));
+            }
+            None => self.notify(
+                Level::Warn,
+                format!("the home of {} is unknown: HOME is not set", account.name),
+            ),
+        }
+    }
+
+    /// An account's home directory: as registered, or the provider's native one under `$HOME`
+    /// for `default` (R2).
+    pub fn home_path(&self, account: &Account) -> Option<String> {
+        match &account.home {
+            Home::Path(p) => Some(p.clone()),
+            // Joined, not glued: a `HOME` ending in `/` (the root's, one set so) gives
+            // `/.claude`, not `//.claude`.
+            Home::Default => self.home.as_ref().map(|h| {
+                Path::new(h)
+                    .join(account.provider.native_dir())
+                    .display()
+                    .to_string()
+            }),
+        }
     }
 
     fn config_max_scroll(&self) -> usize {
         render::config_line_count(self).saturating_sub(render::config_height(self))
     }
 
-    /// `PgUp` / `PgDn` scroll the pane; while it is expanded, the movement keys too.
+    /// The movement keys scroll the card's configuration.
     fn scroll_config(&mut self, key: Key) -> bool {
         let page = render::config_height(self).max(1);
         let max = self.config_max_scroll();
         let scroll = self.config.scroll.min(max);
-        let expanded = self.config.expanded;
         self.config.scroll = match key {
             Key::PageDown => scroll + page,
             Key::PageUp => scroll.saturating_sub(page),
-            Key::Char('j') | Key::Down if expanded => scroll + 1,
-            Key::Char('k') | Key::Up if expanded => scroll.saturating_sub(1),
-            Key::Char('g') | Key::Home if expanded => 0,
-            Key::Char('G') | Key::End if expanded => max,
+            Key::Char('j') | Key::Down => scroll + 1,
+            Key::Char('k') | Key::Up => scroll.saturating_sub(1),
+            Key::Char('g') | Key::Home => 0,
+            Key::Char('G') | Key::End => max,
             _ => return false,
         }
         .min(max);
@@ -1295,7 +1368,9 @@ impl App {
         self.view = view;
         self.preview.expanded = false;
         self.preview.scroll = 0;
-        self.config.expanded = false;
+        if self.config.open {
+            self.close_config();
+        }
         // Computed the first time the view opens, then on `r` (R20).
         if view == View::Stats && !self.stats.requested {
             self.request_stats(fx);
@@ -1378,20 +1453,9 @@ impl App {
                 self.preview.expanded = !self.preview.expanded;
                 self.preview.scroll = 0;
             }
-            Key::Char('p' | ' ') if self.view == View::Accounts => self.cycle_config(fx),
-            Key::Esc if self.view == View::Accounts && self.config.expanded => {
-                self.config.expanded = false;
-                self.config.scroll = 0;
-            }
-            Key::Esc if self.view == View::Accounts && self.config.open => self.close_config(),
-            Key::PageUp | Key::PageDown
-                if self.view == View::Accounts && self.config.open && !self.config.expanded =>
-            {
-                self.scroll_config(key);
-            }
-            // The whole view is the pane's: the other keys of Accounts wait.
-            _ if self.view == View::Accounts && self.config.expanded => {
-                self.scroll_config(key);
+            Key::Char('p' | ' ') if self.view == View::Accounts => self.toggle_config(fx),
+            _ if self.view == View::Accounts && self.config.open => {
+                self.on_account_card_key(key, fx);
             }
             _ if self.preview.expanded => self.on_card_key(key, fx),
             Key::Char('n') if self.view == View::Accounts => self.open_new_session(),
@@ -1993,6 +2057,11 @@ impl App {
         self.ask_again(Query::CachedUsage, fx);
         self.rerun(Work::Checks, fx);
         if self.mode == Mode::Browse {
+            // What the attribution, the stores and the collection of running sessions say
+            // of the accounts is from before.
+            self.attribution_stale = true;
+            self.stores_stale = true;
+            self.live_stale = true;
             self.refresh_sessions(fx);
         }
         // The statistics are per account too (R20). A computation that is running is not
@@ -2688,13 +2757,27 @@ impl App {
         {
             self.history.list.selected = i;
         }
+        self.recount_history();
         self.clamp_lists();
+    }
+
+    /// Counts the History entries of each account (R17, R22), as the noise filter leaves
+    /// them.
+    fn recount_history(&mut self) {
+        let mut by_account: HashMap<String, usize> = HashMap::new();
+        for entry in self.index.entries.values().filter(|e| self.in_history(e)) {
+            for account in self.entry_accounts(entry) {
+                *by_account.entry(account.to_string()).or_default() += 1;
+            }
+        }
+        self.history.by_account = by_account;
     }
 
     fn merge_attribution(&mut self) {
         let mut merged = self.attribution_base.clone();
         merged.add_live(&self.live);
         self.attribution = merged;
+        self.recount_history();
     }
 
     /// Points the preview at the current selection.
@@ -2863,6 +2946,11 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             app.reindex_sessions();
             app.rebuild_history();
             app.ran(Work::Index, &mut fx);
+            // The stores came with this read's start; one begun before the account list
+            // changed runs once more.
+            if !app.work.index.is_running() {
+                app.stores_stale = false;
+            }
         }
         // A result for an account that is no longer listed is dropped.
         Event::Identity { account, identity } => {
@@ -2911,6 +2999,10 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             // Started before something changed (e.g. a launch ended): collected again, and
             // stale until then if a foreground child has run.
             app.ran(Work::Live, &mut fx);
+            // A collection begun after the account list changed has answered.
+            if !app.work.live.is_running() {
+                app.live_stale = false;
+            }
         }
         Event::Attribution(base) => {
             // Names first seen here are numbered by name (R21).
@@ -2926,6 +3018,11 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 app.rebuild_history();
             }
             app.ran(Work::Attribution, &mut fx);
+            // The read begun after the account list changed has answered: not one from
+            // before, which runs once more.
+            if !app.work.attribution.is_running() {
+                app.attribution_stale = false;
+            }
         }
         Event::Checks(checks) => {
             // Asked again since they started (the account list changed): these are the checks
@@ -2958,7 +3055,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             // The read waited for, by its number: the account shown.
             let claim = app.config.work.claim(request, &account);
             let shown = app.config.account.as_ref() == Some(&account);
-            // Asked again since this read began (`r`, the pane opened or the selection came
+            // Asked again since this read began (`r`, the card opened or the selection came
             // back, the account list changed): what it read may be from before, so the
             // account is read once more.
             if let Some(request) = claim.next() {
@@ -2987,6 +3084,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 app.aliases.note(name);
             }
             app.stores = Some(stores);
+            app.recount_history();
             // Codex rows' accounts come from the stores, and are searched.
             if !app.history.query.is_empty() {
                 app.rebuild_history();

@@ -319,10 +319,10 @@ an `Event`.
   the selection left) stays out until it reports, and its target asked for again waits for it.
 - Results that can arrive late are matched by what they carry, never by position: the account
   they belong to (identities, usage), or the target they are for (the transcript of a preview,
-  the account's session of the logs, the account of the Configuration pane, the launch of a
+  the account's session of the logs, the account of the account card, the launch of a
   pre-launch check). The slot then says whether that target's round is the one waited for, so
   an answer to a request that was given up is ignored. Since a target has one round out, the
-  target is enough to find the round; the Configuration pane and pre-launch checks carry the
+  target is enough to find the round; the account card and pre-launch checks carry the
   round's number as well, a second check that an answer is the one asked for (R16).
 - A launch that resumes a session in place is preceded by `CheckLaunch`, which queries every
   account's running sessions again right before starting (R16).
@@ -346,7 +346,7 @@ an `Event`.
   how private mode shows it (R21).
 - A message remuda puts together for the screen is a `privacy::Marked`, made where the message
   is made: a notice or a form's error (`tui::app`), a check (`checks`), a problem of the
-  Configuration pane (`account_config`), the error of a cache (`tui::workers`), the line of
+  account card (`account_config`), the error of a cache (`tui::workers`), the line of
   an incomplete refresh (`tracking`), why the registry cannot be read or a launch is refused
   (`tui::accounts`: `Reading::unreadable`, `Reading::refusal`). It reads as one
   string and keeps its pieces: remuda's own words (`.words()`), each path (`.path()`), each
@@ -359,7 +359,7 @@ an `Event`.
   where a context would go): it prints as the same string, so the command line does not change,
   and `Marked::from_error` gives the TUI the pieces of every message in the chain, the causes
   nobody marked staying one text. `share::read_settings` tells its errors this way, which is
-  how a settings problem of the Configuration pane keeps its reason in private mode.
+  how a settings problem of the account card keeps its reason in private mode.
 
 ## Shared configuration
 
@@ -410,7 +410,7 @@ What a home holds, and what a member's home has of the source's, is answered in 
    membership       Alone │ Source │ OptedOut │ SourceMissing │ Member
         │
         ├─► share::plan       what is linked is not injected; Plan.items keeps the table
-        │        └─► account_config::read   origins in the Configuration pane (R22)
+        │        └─► account_config::read   origins in the account card (R22)
         ├─► checks::sharing   what is not linked, in words (R11)
         └─► setup             share_links and its notes (R18)
 ```
@@ -425,7 +425,7 @@ catalog knows only which items the one `--add-dir` carries, as links or as copie
 
 Injection is the fallback for what a member's home does not link. `share::plan` decides, for
 one account, one directory and one argument list, what the source's configuration adds;
-`share::apply` makes it real. The Configuration pane (R22) calls `plan` only, which is why the
+`share::apply` makes it real. The account card (R22) calls `plan` only, which is why the
 pane cannot disagree with a launch.
 
 ```text

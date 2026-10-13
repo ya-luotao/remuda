@@ -1,6 +1,6 @@
 //! Private mode (SPEC R21): what the TUI shows while it is on. [`redacted`] makes a copy of
 //! the [`App`] with account names aliased and emails, organizations, paths, session content
-//! and the descriptions of the configuration pane (R22) masked, and the screen is drawn from
+//! and the descriptions of the account card (R22) masked, and the screen is drawn from
 //! that copy only. Every struct and enum it
 //! copies is destructured without `..`: a field added later does not compile until it is
 //! decided how private mode shows it.
@@ -349,6 +349,8 @@ pub fn redacted(app: &App) -> App {
         by_session,
         attribution_base,
         attribution_loaded,
+        attribution_stale,
+        stores_stale,
         attribution,
         live,
         live_rows,
@@ -356,6 +358,7 @@ pub fn redacted(app: &App) -> App {
         live_list,
         logs,
         live_loaded,
+        live_stale,
         live_updated,
         history,
         preview,
@@ -396,6 +399,8 @@ pub fn redacted(app: &App) -> App {
             .collect::<HashMap<_, _>>(),
         attribution_base: attribution_base.redacted(|q| r.alias(q)),
         attribution_loaded: *attribution_loaded,
+        attribution_stale: *attribution_stale,
+        stores_stale: *stores_stale,
         attribution: attribution.redacted(|q| r.alias(q)),
         live: live.iter().map(|s| r.live_session(s)).collect(),
         live_rows: live_rows.clone(),
@@ -403,6 +408,7 @@ pub fn redacted(app: &App) -> App {
         live_list: *live_list,
         logs: logs.as_ref().map(|l| r.logs(l)),
         live_loaded: *live_loaded,
+        live_stale: *live_stale,
         live_updated: *live_updated,
         history: r.history(history),
         preview: r.preview(preview),
@@ -659,6 +665,7 @@ impl Redactor<'_> {
     fn history(&self, history: &History) -> History {
         let History {
             rows,
+            by_account,
             list,
             show_all,
             query,
@@ -666,6 +673,10 @@ impl Redactor<'_> {
         } = history;
         History {
             rows: rows.iter().map(|p| key_path(p)).collect(),
+            by_account: by_account
+                .iter()
+                .map(|(q, n)| (self.alias(q), *n))
+                .collect(),
             list: *list,
             show_all: *show_all,
             query: if query.is_empty() {
@@ -878,11 +889,11 @@ impl Redactor<'_> {
         }
     }
 
-    /// The Configuration pane (R22): names stay, descriptions are masked, paths too.
+    /// The account card's configuration (R22): names stay, descriptions are masked, paths too.
     fn config_pane(&self, pane: &ConfigPane) -> ConfigPane {
         let ConfigPane {
             open,
-            expanded,
+            details,
             scroll,
             account,
             loaded,
@@ -890,7 +901,7 @@ impl Redactor<'_> {
         } = pane;
         ConfigPane {
             open: *open,
-            expanded: *expanded,
+            details: *details,
             scroll: *scroll,
             account: account.as_ref().map(|a| self.account(a)),
             loaded: loaded
@@ -1025,6 +1036,7 @@ impl Redactor<'_> {
             installs,
             path,
             contents,
+            off,
         } = plugin;
         Plugin {
             name: name.clone(),
@@ -1032,6 +1044,7 @@ impl Redactor<'_> {
             version: version.clone(),
             scope: scope.clone(),
             installs: *installs,
+            off: *off,
             path: path.as_deref().map(|p| self.path_buf(p)),
             contents: contents.as_ref().map(|c| {
                 let PluginContents {

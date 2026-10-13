@@ -28,7 +28,7 @@ use super::app::{
 use super::{privacy, timeline};
 use crate::live::Control;
 use crate::provider::Provider;
-use crate::registry::Account;
+use crate::registry::{Account, Home};
 use crate::share::Skip;
 
 /// From this width on, the preview sits beside the list instead of below it.
@@ -217,6 +217,9 @@ fn draw(app: &App, f: &mut Frame) {
     if app.preview.expanded && matches!(app.view, View::Live | View::History) {
         card(app, f);
     }
+    if app.view == View::Accounts && app.config.open && app.mode == Mode::Browse {
+        account_card(app, f);
+    }
     f.render_widget(Paragraph::new(status_line(app)), areas.status);
     f.render_widget(Paragraph::new(Line::styled(hints(app), DIM)), areas.hints);
     match &app.overlay {
@@ -369,14 +372,12 @@ fn hints(app: &App) -> String {
         "type to filter · ↑/↓: move · enter: keep filter · esc: clear"
     } else if app.preview.expanded && app.view != View::Accounts {
         return format!(" {}", card_hints(app));
-    } else if app.view == View::Accounts && app.config.expanded {
-        "j/k/pgup/pgdn: scroll · p: close · esc: back · r: refresh"
     } else if app.view == View::Accounts && app.config.open {
-        "p: expand · esc: close · pgup/pgdn: scroll · j/k: account · n: new session · r: refresh"
+        "n: new session · u: usage · d: details · y: copy home · D: rm · [ ]: account"
     } else {
         match app.view {
             View::Accounts => {
-                "n: new session · p: config · s: set up · D: remove · u: live usage · r: refresh"
+                "n: new session · p: account · s: set up · D: remove · u: live usage · r: refresh"
             }
             View::Live => {
                 "enter: attach · f: fork · p: session · l: logs · x: stop · D: rm · a: stopped"
@@ -599,67 +600,28 @@ fn accounts_view(app: &App, f: &mut Frame, mut area: Rect) {
     if let Some(checks_area) = a.checks {
         checks_view(app, f, checks_area);
     }
-    if let Some(config) = a.config {
-        config_pane(app, f, config);
-    }
 }
 
-/// The accounts view's parts; the Configuration pane (R22) beside them from [`WIDE`] columns
-/// on, below the table otherwise, or over the whole body when expanded.
+/// The accounts view's parts: the table, the timeline, the checks. The account card (R22)
+/// draws over them.
 struct AccountsAreas {
     table: Option<Rect>,
     timeline: Option<Rect>,
     checks: Option<Rect>,
-    config: Option<Rect>,
 }
 
 fn accounts_areas(app: &App, area: Rect) -> AccountsAreas {
     let n = app.accounts.len() as u16;
-    let stacked = |area: Rect| {
-        let [table, timeline, checks] = Layout::vertical([
-            Constraint::Length(n + 2),
-            Constraint::Length(n + 3),
-            Constraint::Fill(1),
-        ])
-        .areas(area);
-        AccountsAreas {
-            table: Some(table),
-            timeline: Some(timeline),
-            checks: Some(checks),
-            config: None,
-        }
-    };
-    if !app.config.open || app.mode != Mode::Browse {
-        return stacked(area);
-    }
-    if app.config.expanded {
-        return AccountsAreas {
-            table: None,
-            timeline: None,
-            checks: None,
-            config: Some(area),
-        };
-    }
-    if area.width >= WIDE {
-        let [left, _, right] = Layout::horizontal([
-            Constraint::Percentage(58),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ])
-        .areas(area);
-        return AccountsAreas {
-            config: Some(right),
-            ..stacked(left)
-        };
-    }
-    // The selected row stays in sight: the timeline and the checks give way.
-    let [table, config] =
-        Layout::vertical([Constraint::Length(n + 2), Constraint::Fill(1)]).areas(area);
+    let [table, timeline, checks] = Layout::vertical([
+        Constraint::Length(n + 2),
+        Constraint::Length(n + 3),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
     AccountsAreas {
         table: Some(table),
-        timeline: None,
-        checks: None,
-        config: Some(config),
+        timeline: Some(timeline),
+        checks: Some(checks),
     }
 }
 
@@ -901,62 +863,91 @@ fn checks_view(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-// ---- Configuration (R22) -------------------------------------------------------------
+// ---- Account card (R22) ----------------------------------------------------------------
 
-/// The Configuration pane's text area (below its title line); empty when it is not shown.
-fn config_text_area(app: &App) -> Rect {
-    let body = frame_areas(screen(app)).body;
-    match accounts_areas(app, body).config {
-        Some(area) => Rect {
-            y: area.y + 1,
-            height: area.height.saturating_sub(1),
-            ..area
-        },
-        None => Rect::default(),
-    }
+/// The account the card is for: the selection's state.
+fn card_account(app: &App) -> Option<&AccountState> {
+    app.accounts.get(app.accounts_list.selected)
 }
 
-/// Lines the Configuration pane shows at once.
+/// Inside the account card's border: the facts, the configuration's title line, the
+/// configuration.
+fn account_card_layout(app: &App) -> CardLayout {
+    let inner = Block::new().borders(Borders::ALL).inner(card_area(app));
+    let facts = account_card_facts(app, inner.width as usize).len();
+    card_layout_with(inner, facts)
+}
+
+/// The configuration's text area in the account card; empty when the card is not shown.
+fn config_text_area(app: &App) -> Rect {
+    if app.view != View::Accounts || !app.config.open || app.mode != Mode::Browse {
+        return Rect::default();
+    }
+    account_card_layout(app).preview
+}
+
+/// Lines the configuration shows at once.
 pub fn config_height(app: &App) -> usize {
     config_text_area(app).height as usize
 }
 
-/// Lines the Configuration pane scrolls over at its current width.
+/// Lines the configuration scrolls over at its current width.
 pub fn config_line_count(app: &App) -> usize {
     config_lines(app, config_text_area(app).width as usize).len()
 }
 
-fn config_title(app: &App) -> String {
-    let Some(account) = &app.config.account else {
-        return "Configuration".to_string();
-    };
-    let mut title = format!("Configuration · {}", short(&account.qualified()));
-    if let Some(cwd) = &app.cwd {
-        title.push_str(&format!(
-            " · for {}",
-            tilde(app, &cwd.display().to_string())
-        ));
+fn account_card_title(app: &App) -> String {
+    match card_account(app) {
+        Some(a) => format!("Account · {}", short(&a.account.qualified())),
+        None => "Account".to_string(),
     }
-    if app.config.expanded {
-        title.push_str(" (esc: back)");
-    }
-    title
 }
 
-fn config_pane(app: &App, f: &mut Frame, area: Rect) {
-    let title = config_title(app);
-    f.render_widget(
-        Paragraph::new(section(
-            &text::truncate(&title, area.width as usize),
-            area.width,
-        )),
-        Rect { height: 1, ..area },
-    );
-    let text_area = Rect {
-        y: area.y + 1,
-        height: area.height.saturating_sub(1),
-        ..area
-    };
+/// The configuration's title line in the card: the directory it describes (R22).
+fn config_title(app: &App) -> String {
+    let claude = card_account(app).is_some_and(|a| a.account.provider == Provider::Claude);
+    match &app.cwd {
+        Some(cwd) if claude => format!(
+            "Configuration · for {}",
+            tilde(app, &cwd.display().to_string())
+        ),
+        _ => "Configuration".to_string(),
+    }
+}
+
+/// The card's bottom edge: how to read it.
+const ACCOUNT_CARD_EDGE: &str = "j/k: scroll · d: details · r: refresh · esc: close";
+
+fn account_card(app: &App, f: &mut Frame) {
+    let area = card_area(app);
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    let fits = |s: &str| text::truncate(s, area.width.saturating_sub(4) as usize);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(DIM)
+        .title(Line::styled(
+            format!(" {} ", fits(&account_card_title(app))),
+            BOLD,
+        ))
+        .title_bottom(Line::styled(format!(" {} ", fits(ACCOUNT_CARD_EDGE)), DIM));
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    let layout = account_card_layout(app);
+    let mut facts = account_card_facts(app, layout.facts.width as usize);
+    facts.truncate(layout.facts.height as usize);
+    f.render_widget(Paragraph::new(facts), layout.facts);
+    if layout.title.height > 0 {
+        f.render_widget(
+            Paragraph::new(section(
+                &text::truncate(&config_title(app), layout.title.width as usize),
+                layout.title.width,
+            )),
+            layout.title,
+        );
+    }
+    let text_area = layout.preview;
     let lines = config_lines(app, text_area.width as usize);
     let height = text_area.height as usize;
     let scroll = app.config.scroll.min(lines.len().saturating_sub(height));
@@ -964,22 +955,252 @@ fn config_pane(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(shown), text_area);
 }
 
-/// The Configuration pane's lines at `width`: every line fits (lists wrap with a hanging
-/// indent, anything else is truncated).
+/// A window's name in the usage fact: `session`, `week`, `<model> week`, `<model> 5h`.
+fn window_name(label: &str) -> String {
+    match label {
+        "Session" => "session".to_string(),
+        "Week (all models)" => "week".to_string(),
+        other => match scope(other) {
+            Some(("Week", model)) => format!("{model} week"),
+            Some((_, model)) => format!("{model} 5h"),
+            None => other.to_string(),
+        },
+    }
+}
+
+/// The problems the checks list for one account (R11), the machine-wide ones with them (an
+/// environment override or a shared store's cleanup concerns this account too), and what the
+/// view adds: not logged in, a failed live query.
+fn account_problems(app: &App, a: &AccountState) -> Vec<String> {
+    let qualified = a.account.qualified();
+    let mut problems: Vec<String> = app
+        .checks
+        .iter()
+        .flatten()
+        .filter(|c| c.account.is_none() || c.account.as_deref() == Some(qualified.as_str()))
+        .map(|c| c.message.to_string())
+        .collect();
+    if a.identity == Some(Identity::NotLoggedIn) {
+        problems.push("not logged in".to_string());
+    }
+    if let Some(Err(e)) = &a.live {
+        problems.push(format!("live usage failed: {e}"));
+    }
+    problems
+}
+
+/// What the view knows of the account, above its configuration (R22): never none or zero for
+/// what is not read yet.
+fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
+    let Some(a) = card_account(app) else {
+        return Vec::new();
+    };
+    let value_w = width.saturating_sub(FACT_LABEL);
+    let qualified = a.account.qualified();
+    let claude = a.account.provider == Provider::Claude;
+    let mut facts = Vec::new();
+
+    let home = match &a.account.home {
+        Home::Path(p) => tilde(app, p),
+        Home::Default => format!("~/{}", a.account.provider.native_dir()),
+    };
+    let name_style = match a.account.provider {
+        Provider::Claude => BOLD,
+        Provider::Codex => BOLD.patch(CODEX_STYLE),
+    };
+    facts.extend(facts_packed(
+        "Account",
+        vec![
+            vec![Span::styled(qualified.clone(), name_style)],
+            vec![Span::styled("home ", DIM), Span::raw(home)],
+        ],
+        value_w,
+    ));
+
+    let login = match &a.identity {
+        None => vec![vec![Span::styled("reading login…", DIM)]],
+        Some(
+            identity @ Identity::LoggedIn {
+                org, plan, cached, ..
+            },
+        ) => {
+            let mut parts = vec![vec![Span::raw(identity.who())]];
+            for part in [org, plan].into_iter().flatten() {
+                parts.push(vec![Span::raw(part.clone())]);
+            }
+            if *cached {
+                parts.push(vec![Span::styled("from the cache", DIM)]);
+            }
+            parts
+        }
+        Some(Identity::NotLoggedIn) => vec![vec![Span::styled("not logged in", WARN)]],
+        Some(Identity::Unknown) => vec![vec![Span::styled("unknown", DIM)]],
+    };
+    facts.extend(facts_packed("Login", login, value_w));
+
+    let reading = a.usage_at(app.now);
+    let windows = reading.as_ref().map_or(&[][..], |u| &u.windows);
+    let mut usage: Vec<Vec<Span<'static>>> = Vec::new();
+    for w in windows {
+        let mut part = vec![Span::styled(format!("{} ", window_name(&w.label)), DIM)];
+        match w.used() {
+            Some(used) => {
+                part.push(Span::styled(usage::format_percent(used), severity_style(w)));
+                if let Some(t) = w.resets_at() {
+                    part.push(Span::styled(
+                        format!(" ({})", timeline::until(app.now, t)),
+                        DIM,
+                    ));
+                }
+            }
+            None => part.push(Span::styled(RESET, DIM)),
+        }
+        usage.push(part);
+    }
+    usage.extend(usage_source(a, app.now));
+    facts.extend(facts_packed("Usage", usage, value_w));
+
+    // The index and the attribution (the stores, for codex) answer who owns what; until both
+    // have, the count would be a floor. Of an account added since they were read they know
+    // nothing: the count waits for the read that follows the change.
+    let attributed = if claude {
+        app.attribution_loaded && !app.attribution_stale
+    } else {
+        app.stores.is_some() && !app.stores_stale
+    };
+    let history = if !app.index_loaded {
+        Span::styled("reading the index…", DIM)
+    } else if !attributed {
+        Span::styled("reading the attribution…", DIM)
+    } else {
+        // As History counts them: under the noise filter as toggled (R8).
+        match app.history.by_account.get(&qualified).copied().unwrap_or(0) {
+            0 => Span::styled("none in History", DIM),
+            1 => Span::raw("1 in History"),
+            n => Span::raw(format!("{n} in History")),
+        }
+    };
+    let mut sessions = vec![vec![history]];
+    if claude {
+        sessions.push(vec![if !app.live_loaded || app.live_stale {
+            Span::styled("reading the running ones…", DIM)
+        } else {
+            let running = app
+                .live
+                .iter()
+                .filter(|s| s.account == qualified && !s.is_inactive())
+                .count();
+            match running {
+                0 => Span::styled("none running", DIM),
+                1 => Span::styled("1 running", OK),
+                n => Span::styled(format!("{n} running"), OK),
+            }
+        }]);
+    }
+    facts.extend(facts_packed("Sessions", sessions, value_w));
+
+    // `checking…` first while the checks run (the first time, on `r`, and after the account
+    // list changed: an account added since was never checked), and what is known already
+    // (the last run's problems, not logged in, a failed live query) under it, not hidden until
+    // they answer. `✓` only for a run that has answered and is not being repeated.
+    let problems = account_problems(app, a);
+    let mut checks: Vec<Vec<Span<'static>>> = Vec::new();
+    if app.checks.is_none() || app.work.checks.is_running() {
+        checks.push(vec![Span::styled("checking…", DIM)]);
+    } else if problems.is_empty() {
+        checks.push(vec![Span::styled("✓ no problems found", OK)]);
+    }
+    for p in &problems {
+        for (j, l) in text::wrap(p, value_w.saturating_sub(2).max(1))
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = if j == 0 { "! " } else { "  " };
+            checks.push(vec![Span::styled(format!("{prefix}{l}"), WARN)]);
+        }
+    }
+    for (i, line) in checks.into_iter().enumerate() {
+        facts.push(fact(if i == 0 { "Checks" } else { "" }, line));
+    }
+
+    let shares = if !claude {
+        vec![Span::styled("shared configuration is Claude-only", DIM)]
+    } else {
+        match &app.config.loaded {
+            None => vec![Span::styled("reading configuration…", DIM)],
+            Some(Err(_)) => vec![Span::styled("cannot read configuration", CRIT)],
+            Some(Ok(view)) => {
+                let (role, style) = role_text(view);
+                vec![Span::styled(role, style)]
+            }
+        }
+    };
+    facts.extend(facts_packed("Shares", vec![shares], value_w));
+    facts
+}
+
+/// The end of the card's Usage row: where the reading shown comes from and how old it is
+/// (the cache's age when the cache is shown, whatever a live query does), then `live…` while
+/// one is out. A failed one is among the Checks.
+fn usage_source(a: &AccountState, now: Timestamp) -> Vec<Vec<Span<'static>>> {
+    let running = a.work.live.is_running();
+    let source = match a.usage_at(now).map(|u| (u.source, u.age_text())) {
+        Some((Source::Live, Some(age))) => Span::styled(format!("live {age}"), OK),
+        Some((Source::Cached, Some(age))) => Span::styled(format!("cached {age}"), DIM),
+        Some((source, None)) => Span::styled(source.name(), DIM),
+        None if running => return vec![vec![Span::styled("live…", WARN)]],
+        None => match (&a.live, &a.cached) {
+            (_, Some(Err(_))) => Span::styled("no cache", DIM),
+            (Some(Err(_)), _) => Span::styled("live failed", CRIT),
+            _ => Span::styled("reading usage…", DIM),
+        },
+    };
+    let mut parts = vec![vec![source]];
+    if running {
+        parts.push(vec![Span::styled("live…", WARN)]);
+    }
+    parts
+}
+
+/// The account's part in sharing (R18), as the card says it.
+fn role_text(v: &ConfigView) -> (String, Style) {
+    let src_short = v.role.source().map(short).unwrap_or_default();
+    match &v.role {
+        ConfigRole::Alone => (
+            "no shared configuration ([share.claude] is not set)".to_string(),
+            DIM,
+        ),
+        ConfigRole::Source => (
+            "the source: other Claude accounts get this at launch".to_string(),
+            Style::new(),
+        ),
+        ConfigRole::OptedOut { .. } => {
+            (format!("share = false: gets nothing from {src_short}"), DIM)
+        }
+        ConfigRole::SourceMissing { .. } => (
+            format!("{src_short}'s home does not exist: nothing is shared"),
+            WARN,
+        ),
+        ConfigRole::Member { .. } => (
+            format!("gets {src_short}'s configuration at launch"),
+            Style::new(),
+        ),
+    }
+}
+
+/// The configuration's lines at `width`: every line fits (lists wrap with a hanging indent,
+/// anything else is truncated). The entries of an item flow by name; `d` lists them with their
+/// details, and those of a member's items that are already the source's.
 pub fn config_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let mut out = ConfigLines {
         lines: Vec::new(),
         width,
+        details: app.config.details,
     };
     if width == 0 {
         return out.lines;
     }
-    if app
-        .config
-        .account
-        .as_ref()
-        .is_some_and(|a| a.provider != Provider::Claude)
-    {
+    if card_account(app).is_some_and(|a| a.account.provider != Provider::Claude) {
         out.line("configuration listing is Claude-only", DIM);
         return out.lines;
     }
@@ -991,16 +1212,20 @@ pub fn config_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     out.lines
 }
 
-/// Lines of the pane, each made to fit `width`.
+/// Lines of the configuration, each made to fit `width`.
 struct ConfigLines {
     lines: Vec<Line<'static>>,
     width: usize,
+    details: bool,
 }
 
 impl ConfigLines {
+    /// A line of the configuration. Wider than the pane, it goes on, the next lines
+    /// indented as far as its text: nothing is cut (R22).
     fn line(&mut self, text: &str, style: Style) {
-        self.lines
-            .push(Line::styled(text::truncate(text, self.width), style));
+        let indent = text.len() - text.trim_start_matches(' ').len();
+        let (lead, rest) = text.split_at(indent);
+        self.wrapped(lead, rest, style);
     }
 
     /// `text` wrapped after `prefix`, the next lines indented as far.
@@ -1013,48 +1238,68 @@ impl ConfigLines {
             } else {
                 " ".repeat(indent)
             };
-            self.line(&format!("{lead}{l}"), style);
+            self.lines.push(Line::styled(format!("{lead}{l}"), style));
         }
     }
 
     fn heading(&mut self, title: &str) {
-        self.lines.push(Line::raw(""));
+        if !self.lines.is_empty() {
+            self.lines.push(Line::raw(""));
+        }
         self.line(title, BOLD);
+    }
+
+    /// The entries of an item: by name on wrapped lines, those turned off marked; one per
+    /// line with its details when asked.
+    fn entries(&mut self, entries: &[ConfigEntry], agents: bool) {
+        if self.details {
+            for e in entries {
+                entry_lines(e, agents, "    ", self);
+            }
+            return;
+        }
+        let names = entry_names(entries);
+        if !names.is_empty() {
+            self.wrapped("    ", &names.join(", "), Style::new());
+        }
+    }
+}
+
+/// The entries by name, those turned off or broken marked.
+fn entry_names(entries: &[ConfigEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|e| match (e.broken, e.off) {
+            (true, _) => format!("{} (broken link)", e.name),
+            (false, true) => format!("{} (off)", e.name),
+            (false, false) => e.name.clone(),
+        })
+        .collect()
+}
+
+/// `54`, `54 (31 off)`: how many entries an item has, and how many are turned off.
+fn entry_count(entries: &[ConfigEntry]) -> String {
+    let off = entries.iter().filter(|e| e.off).count();
+    match off {
+        0 => entries.len().to_string(),
+        off => format!("{} ({off} off)", entries.len()),
     }
 }
 
 fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
     let src = v.role.source();
-    let src_short = src.map(short).unwrap_or_default();
-    let (role, style) = match &v.role {
-        ConfigRole::Alone => (
-            "no shared configuration ([share.claude] is not set)".to_string(),
-            DIM,
-        ),
-        ConfigRole::Source => (
-            "the shared-configuration source: other Claude accounts get this at launch".to_string(),
-            DIM,
-        ),
-        ConfigRole::OptedOut { .. } => {
-            (format!("share = false: gets nothing from {src_short}"), DIM)
-        }
-        ConfigRole::SourceMissing { .. } => (
-            format!("{src_short}'s home does not exist: nothing is shared"),
-            WARN,
-        ),
-        ConfigRole::Member { .. } => (format!("gets {src_short}'s configuration at launch"), DIM),
+    let link = |l: &Option<std::path::PathBuf>| {
+        l.as_ref().map_or(String::new(), |t| {
+            format!(" -> {}", tilde(app, &t.display().to_string()))
+        })
     };
-    out.wrapped("", &role, style);
+    // What could not be read, first: the listing below is short of it (R22).
     for p in &v.problems {
         out.wrapped("! ", p, WARN);
     }
 
     // Instructions.
     out.heading("Instructions");
-    let link = |l: &Option<std::path::PathBuf>| {
-        l.as_ref()
-            .map_or(String::new(), |t| format!(" -> {}", t.display()))
-    };
     for item in &v.instructions {
         let origin = origin_label(&item.origin, src);
         match &item.content {
@@ -1076,14 +1321,14 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
                     &format!(
                         "  {} · {origin} · {}{}",
                         item.name,
-                        entries.len(),
+                        entry_count(entries),
                         link(&item.link)
                     ),
                     Style::new(),
                 );
-                let agents = item.name == "agents";
-                for e in entries {
-                    entry_lines(e, agents, out);
+                // The source's items are listed once, in the source's own card.
+                if item.origin != Origin::AlreadySource || out.details {
+                    out.entries(entries, item.name == "agents");
                 }
             }
         }
@@ -1092,12 +1337,10 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
         Synced::None => {}
         Synced::Skills { skills, others } => {
             out.line(
-                &format!("  synced skills (claude.ai) · {}", skills.len()),
+                &format!("  synced skills (claude.ai) · {}", entry_count(skills)),
                 Style::new(),
             );
-            for e in skills {
-                entry_lines(e, false, out);
-            }
+            out.entries(skills, false);
             if *others > 0 {
                 out.line(&format!("  {others} synced buckets of other accounts"), DIM);
             }
@@ -1122,8 +1365,25 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
         out.line("  none", DIM);
     }
 
-    // Plugins.
-    out.heading("Plugins");
+    // Plugins: the heading counts what loads here (an install the project does not turn off,
+    // the source's or the home's own, or bundled and not turned off); each other row says why
+    // it does not.
+    let enabled = v
+        .plugins
+        .iter()
+        .filter(|p| {
+            (p.path.is_some() && !p.off)
+                || matches!(
+                    p.origin,
+                    Origin::NotShared(Skip::Builtin | Skip::OwnInstall)
+                )
+        })
+        .count();
+    let mut plugins = format!("Plugins · {enabled} enabled");
+    if v.disabled_plugins > 0 {
+        plugins.push_str(&format!(" · {} disabled", v.disabled_plugins));
+    }
+    out.heading(&plugins);
     for p in &v.plugins {
         let origin = origin_label(&p.origin, src);
         match (&p.path, p.origin) {
@@ -1136,7 +1396,10 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
                 if p.installs > 1 {
                     line.push_str(&format!(" · {} installs", p.installs));
                 }
-                out.line(&line, Style::new());
+                if p.off {
+                    line.push_str(" · turned off here");
+                }
+                out.line(&line, if p.off { DIM } else { Style::new() });
             }
             (None, Origin::NotShared(Skip::Builtin)) => {
                 out.line(&format!("  {} · {origin}", p.name), Style::new());
@@ -1149,12 +1412,11 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
                 WARN,
             ),
         }
-        if let Some(c) = &p.contents {
+        if let Some(c) = &p.contents
+            && (p.origin != Origin::AlreadySource || out.details)
+        {
             plugin_content_lines(c, out);
         }
-    }
-    if v.disabled_plugins > 0 {
-        out.line(&format!("  {} disabled", v.disabled_plugins), DIM);
     }
     if v.plugins.is_empty() && v.disabled_plugins == 0 {
         out.line("  none", DIM);
@@ -1246,18 +1508,19 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
 }
 
 /// An agent, skill or command under its item.
-fn entry_lines(e: &ConfigEntry, agent: bool, out: &mut ConfigLines) {
+fn entry_lines(e: &ConfigEntry, agent: bool, indent: &str, out: &mut ConfigLines) {
     let link = e
         .link
         .as_ref()
         .map_or(String::new(), |t| format!(" -> {}", t.display()));
+    // Wrapped, not cut: the details are what `d` asks for.
     if e.broken {
-        out.line(&format!("    {} · broken link{link}", e.name), WARN);
+        out.wrapped(indent, &format!("{} · broken link{link}", e.name), WARN);
         return;
     }
     let off = if e.off { " (off)" } else { "" };
     if agent {
-        let mut line = format!("    {}", e.name);
+        let mut line = e.name.clone();
         if let Some(model) = &e.model {
             line.push_str(&format!(" · {model}"));
         }
@@ -1267,9 +1530,9 @@ fn entry_lines(e: &ConfigEntry, agent: bool, out: &mut ConfigLines) {
         if let Some(tools) = &e.tools {
             line.push_str(&format!(" · tools {tools}"));
         }
-        out.line(&format!("{line}{off}{link}"), Style::new());
+        out.wrapped(indent, &format!("{line}{off}{link}"), Style::new());
         if let Some(d) = &e.description {
-            out.wrapped("      ", d, DIM);
+            out.wrapped(&format!("{indent}  "), d, DIM);
         }
         return;
     }
@@ -1277,13 +1540,15 @@ fn entry_lines(e: &ConfigEntry, agent: bool, out: &mut ConfigLines) {
         .description
         .as_ref()
         .map_or(String::new(), |d| format!(" — {d}"));
-    out.line(
-        &format!("    {}{off}{description}{link}", e.name),
+    out.wrapped(
+        indent,
+        &format!("{}{off}{description}{link}", e.name),
         Style::new(),
     );
 }
 
-/// What an installed plugin adds: counts, then the names.
+/// What an installed plugin adds: counts, then the names; with the details, each entry as
+/// the items list theirs.
 fn plugin_content_lines(c: &PluginContents, out: &mut ConfigLines) {
     let hooks: usize = c.hooks.iter().map(|(_, n)| n).sum();
     let off = c.skills.iter().filter(|s| s.off).count();
@@ -1308,35 +1573,45 @@ fn plugin_content_lines(c: &PluginContents, out: &mut ConfigLines) {
         return;
     }
     out.line(&format!("    {}", counts.join(" · ")), DIM);
-    let named = |entries: &[ConfigEntry], agents: bool| {
-        entries
-            .iter()
-            .map(|e| {
-                let mut name = e.name.clone();
-                if agents && let Some(model) = &e.model {
-                    name.push_str(&format!(" ({model})"));
-                }
-                if e.off {
-                    name.push_str(" (off)");
-                }
-                name
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     let hooks = c
         .hooks
         .iter()
         .map(|(event, n)| format!("{event} {n}"))
         .collect::<Vec<_>>()
         .join(" · ");
-    for (prefix, list) in [
-        ("    agents: ", named(&c.agents, true)),
-        ("    skills: ", named(&c.skills, false)),
-        ("    commands: ", named(&c.commands, false)),
+    let rest = [
         ("    hooks: ", hooks),
         ("    mcp: ", c.mcp_servers.join(", ")),
-    ] {
+    ];
+    if out.details {
+        for (what, entries, agents) in [
+            ("agents", &c.agents, true),
+            ("skills", &c.skills, false),
+            ("commands", &c.commands, false),
+        ] {
+            if entries.is_empty() {
+                continue;
+            }
+            out.line(&format!("    {what}:"), DIM);
+            for e in entries {
+                entry_lines(e, agents, "      ", out);
+            }
+        }
+        for (prefix, list) in rest {
+            if !list.is_empty() {
+                out.wrapped(prefix, &list, DIM);
+            }
+        }
+        return;
+    }
+    for (prefix, list) in [
+        ("    agents: ", entry_names(&c.agents).join(", ")),
+        ("    skills: ", entry_names(&c.skills).join(", ")),
+        ("    commands: ", entry_names(&c.commands).join(", ")),
+    ]
+    .into_iter()
+    .chain(rest)
+    {
         if !list.is_empty() {
             out.wrapped(prefix, &list, DIM);
         }
@@ -1379,7 +1654,7 @@ fn summary_lines(s: &Summary, out: &mut ConfigLines) {
     }
 }
 
-/// Where an item comes from, for the pane; `src` is the source account.
+/// Where an item comes from, for the card; `src` is the source account.
 fn origin_label(origin: &Origin, src: Option<&str>) -> String {
     let src = src.map(short).unwrap_or("the source");
     match origin {
@@ -1768,8 +2043,15 @@ struct CardLayout {
 
 fn card_layout(app: &App) -> CardLayout {
     let inner = Block::new().borders(Borders::ALL).inner(card_area(app));
+    let facts = card_facts(app, inner.width as usize).len();
+    card_layout_with(inner, facts)
+}
+
+/// `inner` split for `facts` lines of facts: the preview keeps [`CARD_MIN_PREVIEW`] lines,
+/// the last facts give way to it.
+fn card_layout_with(inner: Rect, facts: usize) -> CardLayout {
     let room = inner.height.saturating_sub(1 + CARD_MIN_PREVIEW) as usize;
-    let facts = card_facts(app, inner.width as usize).len().min(room) as u16;
+    let facts = facts.min(room) as u16;
     let title = u16::from(inner.height > facts);
     CardLayout {
         facts: Rect {
@@ -1822,6 +2104,81 @@ fn fact(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
 
 fn sep() -> Span<'static> {
     Span::styled(" · ", DIM)
+}
+
+/// A fact whose value is `parts` joined by ` · `, packed onto lines `width` wide: a part
+/// moves whole to the next line when it does not fit, and is cut at the width when it is
+/// wider than a line by itself; the lines after the first carry no label. Nothing is clipped
+/// at the card's edge (R22).
+fn facts_packed(label: &str, parts: Vec<Vec<Span<'static>>>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    let flush = |current: &mut Vec<Span<'static>>, lines: &mut Vec<Line<'static>>| {
+        let label = if lines.is_empty() { label } else { "" };
+        lines.push(fact(label, std::mem::take(current)));
+    };
+    for part in parts {
+        let w: usize = part.iter().map(Span::width).sum();
+        if !current.is_empty() && used + 3 + w > width {
+            flush(&mut current, &mut lines);
+            used = 0;
+        }
+        if !current.is_empty() {
+            current.push(sep());
+            used += 3;
+        }
+        if w > width {
+            // Wider than a line: cut at the width, each piece a line of its own but the last.
+            let mut pieces = cut_spans(part, width).into_iter().peekable();
+            while let Some(piece) = pieces.next() {
+                used = piece.iter().map(Span::width).sum();
+                current.extend(piece);
+                if pieces.peek().is_some() {
+                    flush(&mut current, &mut lines);
+                    used = 0;
+                }
+            }
+            continue;
+        }
+        current.extend(part);
+        used += w;
+    }
+    if !current.is_empty() || lines.is_empty() {
+        flush(&mut current, &mut lines);
+    }
+    lines
+}
+
+/// `spans` in pieces at most `width` wide, each span's style kept on the pieces of it.
+fn cut_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+    use unicode_width::UnicodeWidthChar;
+    let mut pieces: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let mut text = String::new();
+        for c in span.content.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > width && !(current.is_empty() && text.is_empty()) {
+                if !text.is_empty() {
+                    current.push(Span::styled(std::mem::take(&mut text), span.style));
+                }
+                pieces.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            text.push(c);
+            used += w;
+        }
+        if !text.is_empty() {
+            current.push(Span::styled(text, span.style));
+        }
+    }
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    pieces
 }
 
 /// A moment in the local time zone, with how long ago it was; on the same day as `after`, the
@@ -2121,13 +2478,14 @@ pub const KEYS: &[(&str, &str)] = &[
     (
         "p / space",
         "live, history: open / close the session card (what remuda knows of the session, and \
-         its preview) · accounts: show the account's configuration, then expand it",
+         its preview) · accounts: the account card (login, usage, sessions, checks, sharing, \
+         and its configuration)",
     ),
     (
-        "R F · y Y · m · [ ]",
+        "R F · y Y · m · d · [ ]",
         "session card: resume / fork choosing the account · copy the session id / the \
-         transcript path (OSC 52) · more of the transcript (100, 500, all) · previous / next \
-         session",
+         transcript path (OSC 52) · more of the transcript (100, 500, all) · account card: \
+         y copies the home, d shows the details · [ ]: previous / next row behind either card",
     ),
     (
         "n",
@@ -2147,7 +2505,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ),
     (
         "esc",
-        "back / close the card or the logs / clear the search / cancel (a form, a launch \
+        "back / close a card or the logs / clear the search / cancel (a form, a launch \
          check)",
     ),
     ("/", "search history (fuzzy: title, cwd, accounts)"),
