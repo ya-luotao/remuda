@@ -18,8 +18,9 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   what is not read yet says so instead of showing none or zero. The configuration lists entries
   by name on wrapped lines, those turned off marked, with counts in the headings; an item or
   plugin a member gets through a link to the source is one line naming the target. In the card,
-  `d` shows the details (descriptions, an agent's model, effort and tools, link targets, and the
-  linked items' entries); `y` copies the home directory to the clipboard (OSC 52); `[` and `]`
+  `d` shows the details (descriptions, an agent's model, effort and tools, link targets, the
+  linked items' entries, and a plugin's); `y` copies the home directory to the clipboard (OSC
+  52); `[` and `]`
   move to the previous or next account; `n`, `u`, `D` and `r` work as in the view; the movement
   keys scroll the configuration; `Esc`, `p` or Space closes it (SPEC R22).
 

@@ -630,6 +630,11 @@ impl ListState {
 pub struct History {
     /// Transcript paths shown, in display order.
     pub rows: Vec<PathBuf>,
+    /// How many entries each account (`provider:name`) has under the noise filter as
+    /// toggled, before any search (R17): the account card's count (R22), kept here so a
+    /// frame does not walk the index. Recounted with the rows, and when the attribution or
+    /// the stores change.
+    pub by_account: HashMap<String, usize>,
     pub list: ListState,
     /// Also show teammate and SDK sessions.
     pub show_all: bool,
@@ -2731,13 +2736,27 @@ impl App {
         {
             self.history.list.selected = i;
         }
+        self.recount_history();
         self.clamp_lists();
+    }
+
+    /// Counts the History entries of each account (R17, R22), as the noise filter leaves
+    /// them.
+    fn recount_history(&mut self) {
+        let mut by_account: HashMap<String, usize> = HashMap::new();
+        for entry in self.index.entries.values().filter(|e| self.in_history(e)) {
+            for account in self.entry_accounts(entry) {
+                *by_account.entry(account.to_string()).or_default() += 1;
+            }
+        }
+        self.history.by_account = by_account;
     }
 
     fn merge_attribution(&mut self) {
         let mut merged = self.attribution_base.clone();
         merged.add_live(&self.live);
         self.attribution = merged;
+        self.recount_history();
     }
 
     /// Points the preview at the current selection.
@@ -3030,6 +3049,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 app.aliases.note(name);
             }
             app.stores = Some(stores);
+            app.recount_history();
             // Codex rows' accounts come from the stores, and are searched.
             if !app.history.query.is_empty() {
                 app.rebuild_history();

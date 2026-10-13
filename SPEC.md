@@ -1907,8 +1907,8 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   not turned off, and those set to `false`). An item or plugin of a member that is already
   the source's is one
   line, naming the target, without its entries. `d` lists the entries one per line with their
-  details, and those of the source's items too. A card too short for everything keeps the
-  configuration's room and drops the last facts first.
+  details, those of the source's items and of the installed plugins too. A card too short for
+  everything keeps the configuration's room and drops the last facts first.
 - **When it is read.** In the background, never while drawing: when the card opens, when the
   selected account changes while it is open, on `r`, and when the account list is read again
   (after a setup or a removal). Asked for again while a read of that account has not answered

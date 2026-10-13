@@ -1087,13 +1087,7 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
         vec![Span::styled("reading the attribution…", DIM)]
     } else {
         // As History counts them: under the noise filter as toggled (R8).
-        let n = app
-            .index
-            .entries
-            .values()
-            .filter(|e| app.in_history(e) && app.entry_accounts(e).contains(&qualified.as_str()))
-            .count();
-        match n {
+        match app.history.by_account.get(&qualified).copied().unwrap_or(0) {
             0 => vec![Span::styled("none in History", DIM)],
             1 => vec![Span::raw("1 in History")],
             n => vec![Span::raw(format!("{n} in History"))],
@@ -1247,22 +1241,27 @@ impl ConfigLines {
     fn entries(&mut self, entries: &[ConfigEntry], agents: bool) {
         if self.details {
             for e in entries {
-                entry_lines(e, agents, self);
+                entry_lines(e, agents, "    ", self);
             }
             return;
         }
-        let names: Vec<String> = entries
-            .iter()
-            .map(|e| match (e.broken, e.off) {
-                (true, _) => format!("{} (broken link)", e.name),
-                (false, true) => format!("{} (off)", e.name),
-                (false, false) => e.name.clone(),
-            })
-            .collect();
+        let names = entry_names(entries);
         if !names.is_empty() {
             self.wrapped("    ", &names.join(", "), Style::new());
         }
     }
+}
+
+/// The entries by name, those turned off or broken marked.
+fn entry_names(entries: &[ConfigEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|e| match (e.broken, e.off) {
+            (true, _) => format!("{} (broken link)", e.name),
+            (false, true) => format!("{} (off)", e.name),
+            (false, false) => e.name.clone(),
+        })
+        .collect()
 }
 
 /// `54`, `54 (31 off)`: how many entries an item has, and how many are turned off.
@@ -1492,18 +1491,18 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
 }
 
 /// An agent, skill or command under its item.
-fn entry_lines(e: &ConfigEntry, agent: bool, out: &mut ConfigLines) {
+fn entry_lines(e: &ConfigEntry, agent: bool, indent: &str, out: &mut ConfigLines) {
     let link = e
         .link
         .as_ref()
         .map_or(String::new(), |t| format!(" -> {}", t.display()));
     if e.broken {
-        out.line(&format!("    {} · broken link{link}", e.name), WARN);
+        out.line(&format!("{indent}{} · broken link{link}", e.name), WARN);
         return;
     }
     let off = if e.off { " (off)" } else { "" };
     if agent {
-        let mut line = format!("    {}", e.name);
+        let mut line = format!("{indent}{}", e.name);
         if let Some(model) = &e.model {
             line.push_str(&format!(" · {model}"));
         }
@@ -1515,7 +1514,7 @@ fn entry_lines(e: &ConfigEntry, agent: bool, out: &mut ConfigLines) {
         }
         out.line(&format!("{line}{off}{link}"), Style::new());
         if let Some(d) = &e.description {
-            out.wrapped("      ", d, DIM);
+            out.wrapped(&format!("{indent}  "), d, DIM);
         }
         return;
     }
@@ -1524,12 +1523,13 @@ fn entry_lines(e: &ConfigEntry, agent: bool, out: &mut ConfigLines) {
         .as_ref()
         .map_or(String::new(), |d| format!(" — {d}"));
     out.line(
-        &format!("    {}{off}{description}{link}", e.name),
+        &format!("{indent}{}{off}{description}{link}", e.name),
         Style::new(),
     );
 }
 
-/// What an installed plugin adds: counts, then the names.
+/// What an installed plugin adds: counts, then the names; with the details, each entry as
+/// the items list theirs.
 fn plugin_content_lines(c: &PluginContents, out: &mut ConfigLines) {
     let hooks: usize = c.hooks.iter().map(|(_, n)| n).sum();
     let off = c.skills.iter().filter(|s| s.off).count();
@@ -1554,35 +1554,45 @@ fn plugin_content_lines(c: &PluginContents, out: &mut ConfigLines) {
         return;
     }
     out.line(&format!("    {}", counts.join(" · ")), DIM);
-    let named = |entries: &[ConfigEntry], agents: bool| {
-        entries
-            .iter()
-            .map(|e| {
-                let mut name = e.name.clone();
-                if agents && let Some(model) = &e.model {
-                    name.push_str(&format!(" ({model})"));
-                }
-                if e.off {
-                    name.push_str(" (off)");
-                }
-                name
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
     let hooks = c
         .hooks
         .iter()
         .map(|(event, n)| format!("{event} {n}"))
         .collect::<Vec<_>>()
         .join(" · ");
-    for (prefix, list) in [
-        ("    agents: ", named(&c.agents, true)),
-        ("    skills: ", named(&c.skills, false)),
-        ("    commands: ", named(&c.commands, false)),
+    let rest = [
         ("    hooks: ", hooks),
         ("    mcp: ", c.mcp_servers.join(", ")),
-    ] {
+    ];
+    if out.details {
+        for (what, entries, agents) in [
+            ("agents", &c.agents, true),
+            ("skills", &c.skills, false),
+            ("commands", &c.commands, false),
+        ] {
+            if entries.is_empty() {
+                continue;
+            }
+            out.line(&format!("    {what}:"), DIM);
+            for e in entries {
+                entry_lines(e, agents, "      ", out);
+            }
+        }
+        for (prefix, list) in rest {
+            if !list.is_empty() {
+                out.wrapped(prefix, &list, DIM);
+            }
+        }
+        return;
+    }
+    for (prefix, list) in [
+        ("    agents: ", entry_names(&c.agents).join(", ")),
+        ("    skills: ", entry_names(&c.skills).join(", ")),
+        ("    commands: ", entry_names(&c.commands).join(", ")),
+    ]
+    .into_iter()
+    .chain(rest)
+    {
         if !list.is_empty() {
             out.wrapped(prefix, &list, DIM);
         }

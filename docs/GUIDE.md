@@ -214,11 +214,11 @@ reason. What is shared comes from the same step that prepares a launch, so the c
 always agree. Settings are shown by key names and counts only; no values. Synced claude.ai skills
 are shown for the account's own login only.
 
-Entries are listed by name; `d` lists them with their details (descriptions, an agent's model,
-effort and tools, link targets), and lists the entries of items a member gets through a link to
-the source, which are one line otherwise. `[` and `]` move to the previous or next account, `y`
-copies the home directory to the clipboard, and `n`, `u`, `D` and `r` work as in the view. `Esc`
-or `p` closes the card.
+Entries are listed by name, an installed plugin's too; `d` lists them with their details
+(descriptions, an agent's model, effort and tools, link targets), and lists the entries of items a
+member gets through a link to the source, which are one line otherwise. `[` and `]` move to the
+previous or next account, `y` copies the home directory to the clipboard, and `n`, `u`, `D` and
+`r` work as in the view. `Esc` or `p` closes the card.
 
 ## Recommendations
 

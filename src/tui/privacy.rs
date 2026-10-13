@@ -659,6 +659,7 @@ impl Redactor<'_> {
     fn history(&self, history: &History) -> History {
         let History {
             rows,
+            by_account,
             list,
             show_all,
             query,
@@ -666,6 +667,10 @@ impl Redactor<'_> {
         } = history;
         History {
             rows: rows.iter().map(|p| key_path(p)).collect(),
+            by_account: by_account
+                .iter()
+                .map(|(q, n)| (self.alias(q), *n))
+                .collect(),
             list: *list,
             show_all: *show_all,
             query: if query.is_empty() {

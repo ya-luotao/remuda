@@ -8107,6 +8107,54 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     );
     let (_, sessions) = line_with(&lines, "Sessions   ");
     assert!(sessions.contains("2 in History · 1 running"), "{sessions}");
+    // Private mode keeps the count under the alias.
+    app.private = true;
+    let lines = screen(&app);
+    let (_, sessions) = line_with(&lines, "Sessions   ");
+    assert!(sessions.contains("2 in History · 1 running"), "{sessions}");
+    app.private = false;
+    // Under the noise filter as toggled (R8): a teammate's session counts once `a` shows all.
+    update(&mut app, Event::Resize(120, 40));
+    let mut attribution = Attribution::default();
+    for id in [A, B, C] {
+        attribution.add(id, "claude:default");
+    }
+    update(&mut app, Event::Attribution(attribution));
+    update(
+        &mut app,
+        Event::IndexLoaded(vec![
+            entry(A, "a", 1),
+            entry(B, "b", 2),
+            entry(C, "<teammate-message from=\"x\">hi", 3),
+        ]),
+    );
+    let lines = screen(&app);
+    let (_, sessions) = line_with(&lines, "Sessions   ");
+    assert!(sessions.contains("2 in History · 1 running"), "{sessions}");
+    keys(
+        &mut app,
+        &[
+            Key::Char('3'),
+            Key::Char('a'),
+            Key::Char('1'),
+            Key::Char('p'),
+        ],
+    );
+    answer_config(&mut app, "default", config_view());
+    let lines = screen(&app);
+    let (_, sessions) = line_with(&lines, "Sessions   ");
+    assert!(sessions.contains("3 in History · 1 running"), "{sessions}");
+    keys(
+        &mut app,
+        &[
+            Key::Char('3'),
+            Key::Char('a'),
+            Key::Char('1'),
+            Key::Char('p'),
+        ],
+    );
+    answer_config(&mut app, "default", config_view());
+    let lines = screen(&app);
     // The fixture's machine-wide check concerns this account too; another account's does not.
     let (_, checks) = line_with(&lines, "Checks     ");
     assert!(checks.contains("! ANTHROPIC_API_KEY is set"), "{checks}");
@@ -8242,15 +8290,32 @@ fn d_in_the_account_card_shows_the_details() {
             ..Entry::default()
         });
     }
+    // An installed plugin's entries are listed the same way.
+    if let Some(c) = &mut view.plugins[0].contents {
+        c.agents.push(Entry {
+            name: "tidy".into(),
+            model: Some("haiku".into()),
+            description: Some("tidies up".into()),
+            ..Entry::default()
+        });
+    }
     answer_config(&mut app, "max", view);
     let body = config_text(&app, 200);
     for shown in [
         "  agents · own · 1\n    reviewer\n",
         "  skills · already default's · 2 (1 off) -> /h/default/skills\n  CLAUDE.md",
+        "    agents 1 · hooks 2 · mcp 1\n    agents: tidy\n    hooks: PreToolUse 2\n",
     ] {
         assert!(body.contains(shown), "{shown}:\n{body}");
     }
-    for hidden in ["sonnet", "reviews diffs", "pdf", "qa (off)"] {
+    for hidden in [
+        "sonnet",
+        "reviews diffs",
+        "pdf",
+        "qa (off)",
+        "haiku",
+        "tidies up",
+    ] {
         assert!(!body.contains(hidden), "{hidden}:\n{body}");
     }
     keys(&mut app, &[Key::Char('d')]);
@@ -8259,6 +8324,7 @@ fn d_in_the_account_card_shows_the_details() {
     for shown in [
         "    reviewer · sonnet · effort low · tools Read, Grep\n      reviews diffs\n",
         "    pdf -> ../../lib/skills/pdf\n    qa (off)\n",
+        "    agents:\n      tidy · haiku\n        tidies up\n    hooks: PreToolUse 2\n",
     ] {
         assert!(body.contains(shown), "{shown}:\n{body}");
     }
