@@ -8370,7 +8370,14 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
             crate::tui::tests::account("new"),
         ]),
     );
-    assert!(!app.attribution_stale && !app.checks_stale);
+    assert!(!app.attribution_stale && !app.work.checks.is_running());
+    // `r` runs the checks again: `checking…` over the last run's problems until they answer.
+    keys(&mut app, &[Key::Char('r')]);
+    assert!(app.work.checks.is_running());
+    let lines = screen(&app);
+    let (first, _) = line_with(&lines, "Checks     checking…");
+    let (next, _) = line_with(&lines, "           ! ANTHROPIC_API_KEY is set");
+    assert_eq!(next, first + 1, "{}", lines.join("\n"));
 }
 
 /// R22: the Plugins heading counts what loads here, the source's plugin the home installed
