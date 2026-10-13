@@ -8114,6 +8114,33 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     assert!(!usage.contains("Fable"), "{usage}");
     let (next, _) = line_with(&lines, "           Fable week 100% (2d00h) · cached 5m ago");
     assert_eq!(next, first + 1, "{}", lines.join("\n"));
+    // A part wider than a line by itself is cut at the width, not clipped.
+    let i = app
+        .accounts
+        .iter()
+        .position(|a| a.account.name == "default")
+        .unwrap();
+    let identity = app.accounts[i].identity.clone();
+    let org: String = "Organization ".repeat(6).trim_end().to_string();
+    app.accounts[i].identity = Some(Identity::LoggedIn {
+        email: Some("me@example.com".into()),
+        org: Some(org.clone()),
+        plan: Some("max".into()),
+        method: None,
+        cached: false,
+    });
+    let lines = screen(&app);
+    let (first, login) = line_with(&lines, "Login      me@example.com");
+    assert!(!login.contains("Organization"), "{login}");
+    let (next, line) = line_with(&lines, "           Organization Organization");
+    assert_eq!(next, first + 1, "{}", lines.join("\n"));
+    // The row's text inside the card: after the label's room, before the edge.
+    let inside = line.find("           ").unwrap() + 11;
+    let shown = line[inside..].split('│').next().unwrap().trim_end();
+    assert!(org.starts_with(shown) && shown.len() < org.len(), "{line}");
+    let (last, _) = line_with(&lines, " · max");
+    assert_eq!(last, next + 1, "{}", lines.join("\n"));
+    app.accounts[i].identity = identity;
     update(&mut app, Event::Resize(120, 40));
     // Private mode keeps the count under the alias.
     app.private = true;

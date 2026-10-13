@@ -1909,8 +1909,8 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   line, naming the target, without its entries. `d` lists the entries one per line with their
   details, those of the source's items and of the installed plugins too. A fact wider than the
   card goes on as many lines as it needs, its parts (a usage window, the login's organization)
-  kept whole, none clipped. A card too short for everything keeps the configuration's room and
-  drops the last facts first.
+  kept whole when they fit on a line and cut at the width when not, none clipped. A card too
+  short for everything keeps the configuration's room and drops the last facts first.
 - **When it is read.** In the background, never while drawing: when the card opens, when the
   selected account changes while it is open, on `r`, and when the account list is read again
   (after a setup or a removal). Asked for again while a read of that account has not answered

@@ -2078,32 +2078,79 @@ fn sep() -> Span<'static> {
     Span::styled(" · ", DIM)
 }
 
-/// A fact whose value is `parts` joined by ` · `, packed onto lines `width` wide: a part is
-/// never split, and the lines after the first carry no label, so that nothing is clipped at
-/// the card's edge (R22).
+/// A fact whose value is `parts` joined by ` · `, packed onto lines `width` wide: a part
+/// moves whole to the next line when it does not fit, and is cut at the width when it is
+/// wider than a line by itself; the lines after the first carry no label. Nothing is clipped
+/// at the card's edge (R22).
 fn facts_packed(label: &str, parts: Vec<Vec<Span<'static>>>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
     let mut lines = Vec::new();
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut used = 0;
+    let flush = |current: &mut Vec<Span<'static>>, lines: &mut Vec<Line<'static>>| {
+        let label = if lines.is_empty() { label } else { "" };
+        lines.push(fact(label, std::mem::take(current)));
+    };
     for part in parts {
         let w: usize = part.iter().map(Span::width).sum();
         if !current.is_empty() && used + 3 + w > width {
-            let label = if lines.is_empty() { label } else { "" };
-            lines.push(fact(label, std::mem::take(&mut current)));
+            flush(&mut current, &mut lines);
             used = 0;
         }
         if !current.is_empty() {
             current.push(sep());
             used += 3;
         }
+        if w > width {
+            // Wider than a line: cut at the width, each piece a line of its own but the last.
+            let mut pieces = cut_spans(part, width).into_iter().peekable();
+            while let Some(piece) = pieces.next() {
+                used = piece.iter().map(Span::width).sum();
+                current.extend(piece);
+                if pieces.peek().is_some() {
+                    flush(&mut current, &mut lines);
+                    used = 0;
+                }
+            }
+            continue;
+        }
         current.extend(part);
         used += w;
     }
     if !current.is_empty() || lines.is_empty() {
-        let label = if lines.is_empty() { label } else { "" };
-        lines.push(fact(label, current));
+        flush(&mut current, &mut lines);
     }
     lines
+}
+
+/// `spans` in pieces at most `width` wide, each span's style kept on the pieces of it.
+fn cut_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Vec<Span<'static>>> {
+    use unicode_width::UnicodeWidthChar;
+    let mut pieces: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let mut text = String::new();
+        for c in span.content.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > width && !(current.is_empty() && text.is_empty()) {
+                if !text.is_empty() {
+                    current.push(Span::styled(std::mem::take(&mut text), span.style));
+                }
+                pieces.push(std::mem::take(&mut current));
+                used = 0;
+            }
+            text.push(c);
+            used += w;
+        }
+        if !text.is_empty() {
+            current.push(Span::styled(text, span.style));
+        }
+    }
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    pieces
 }
 
 /// A moment in the local time zone, with how long ago it was; on the same day as `after`, the
