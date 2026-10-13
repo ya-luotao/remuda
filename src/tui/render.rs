@@ -1098,28 +1098,26 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
     }
     facts.extend(facts_packed("Sessions", sessions, value_w));
 
+    // As the view's Checks: `checking…` first while the checks run, and what is known
+    // already (not logged in, a failed live query) under it, not hidden until they answer.
     let problems = account_problems(app, a);
+    let mut checks: Vec<Vec<Span<'static>>> = Vec::new();
     if app.checks.is_none() {
-        facts.push(fact("Checks", vec![Span::styled("checking…", DIM)]));
+        checks.push(vec![Span::styled("checking…", DIM)]);
     } else if problems.is_empty() {
-        facts.push(fact(
-            "Checks",
-            vec![Span::styled("✓ no problems found", OK)],
-        ));
-    } else {
-        for (i, p) in problems.iter().enumerate() {
-            for (j, l) in text::wrap(p, value_w.saturating_sub(2).max(1))
-                .into_iter()
-                .enumerate()
-            {
-                let label = if i == 0 && j == 0 { "Checks" } else { "" };
-                let prefix = if j == 0 { "! " } else { "  " };
-                facts.push(fact(
-                    label,
-                    vec![Span::styled(format!("{prefix}{l}"), WARN)],
-                ));
-            }
+        checks.push(vec![Span::styled("✓ no problems found", OK)]);
+    }
+    for p in &problems {
+        for (j, l) in text::wrap(p, value_w.saturating_sub(2).max(1))
+            .into_iter()
+            .enumerate()
+        {
+            let prefix = if j == 0 { "! " } else { "  " };
+            checks.push(vec![Span::styled(format!("{prefix}{l}"), WARN)]);
         }
+    }
+    for (i, line) in checks.into_iter().enumerate() {
+        facts.push(fact(if i == 0 { "Checks" } else { "" }, line));
     }
 
     let shares = if !claude {

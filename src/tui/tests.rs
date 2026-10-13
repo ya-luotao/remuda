@@ -8074,6 +8074,12 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
         !all.contains("ACCOUNT") && !all.contains("Resets · next 7 days"),
         "{all}"
     );
+    // What is known before the checks answer is not hidden behind `checking…`.
+    app.accounts[0].identity = Some(Identity::NotLoggedIn);
+    let lines = screen(&app);
+    let (first, _) = line_with(&lines, "Checks     checking…");
+    let (next, _) = line_with(&lines, "           ! not logged in");
+    assert_eq!(next, first + 1, "{}", lines.join("\n"));
 
     let mut app = populated_accounts();
     update(&mut app, Event::Resize(120, 40));
