@@ -1019,60 +1019,51 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
     ));
 
     let login = match &a.identity {
-        None => vec![Span::styled("reading login…", DIM)],
+        None => vec![vec![Span::styled("reading login…", DIM)]],
         Some(
             identity @ Identity::LoggedIn {
                 org, plan, cached, ..
             },
         ) => {
-            let mut spans = vec![Span::raw(identity.who())];
+            let mut parts = vec![vec![Span::raw(identity.who())]];
             for part in [org, plan].into_iter().flatten() {
-                spans.push(sep());
-                spans.push(Span::raw(part.clone()));
+                parts.push(vec![Span::raw(part.clone())]);
             }
             if *cached {
-                spans.push(sep());
-                spans.push(Span::styled("from the cache", DIM));
+                parts.push(vec![Span::styled("from the cache", DIM)]);
             }
-            spans
+            parts
         }
-        Some(Identity::NotLoggedIn) => vec![Span::styled("not logged in", WARN)],
-        Some(Identity::Unknown) => vec![Span::styled("unknown", DIM)],
+        Some(Identity::NotLoggedIn) => vec![vec![Span::styled("not logged in", WARN)]],
+        Some(Identity::Unknown) => vec![vec![Span::styled("unknown", DIM)]],
     };
-    facts.push(fact("Login", login));
+    facts.extend(facts_packed("Login", login, value_w));
 
     let reading = a.usage_at(app.now);
     let windows = reading.as_ref().map_or(&[][..], |u| &u.windows);
     let (source, source_style) = source_cell(a, app.now);
-    let mut usage = Vec::new();
+    let mut usage: Vec<Vec<Span<'static>>> = Vec::new();
     for w in windows {
-        if !usage.is_empty() {
-            usage.push(sep());
-        }
-        usage.push(Span::styled(format!("{} ", window_name(&w.label)), DIM));
+        let mut part = vec![Span::styled(format!("{} ", window_name(&w.label)), DIM)];
         match w.used() {
             Some(used) => {
-                usage.push(Span::styled(usage::format_percent(used), severity_style(w)));
+                part.push(Span::styled(usage::format_percent(used), severity_style(w)));
                 if let Some(t) = w.resets_at() {
-                    usage.push(Span::styled(
+                    part.push(Span::styled(
                         format!(" ({})", timeline::until(app.now, t)),
                         DIM,
                     ));
                 }
             }
-            None => usage.push(Span::styled(RESET, DIM)),
+            None => part.push(Span::styled(RESET, DIM)),
         }
+        usage.push(part);
     }
-    if usage.is_empty() {
-        usage.push(match source.as_str() {
-            "…" => Span::styled("reading usage…", DIM),
-            _ => Span::styled(source, source_style),
-        });
-    } else {
-        usage.push(sep());
-        usage.push(Span::styled(source, source_style));
-    }
-    facts.push(fact("Usage", usage));
+    usage.push(vec![match (usage.is_empty(), source.as_str()) {
+        (true, "…") => Span::styled("reading usage…", DIM),
+        _ => Span::styled(source, source_style),
+    }]);
+    facts.extend(facts_packed("Usage", usage, value_w));
 
     // The index and the attribution answer who owns what; until both have, the count would
     // be a floor.
@@ -1081,36 +1072,36 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
     } else {
         app.stores.is_some()
     };
-    let mut sessions = if !app.index_loaded {
-        vec![Span::styled("reading the index…", DIM)]
+    let history = if !app.index_loaded {
+        Span::styled("reading the index…", DIM)
     } else if !attributed {
-        vec![Span::styled("reading the attribution…", DIM)]
+        Span::styled("reading the attribution…", DIM)
     } else {
         // As History counts them: under the noise filter as toggled (R8).
         match app.history.by_account.get(&qualified).copied().unwrap_or(0) {
-            0 => vec![Span::styled("none in History", DIM)],
-            1 => vec![Span::raw("1 in History")],
-            n => vec![Span::raw(format!("{n} in History"))],
+            0 => Span::styled("none in History", DIM),
+            1 => Span::raw("1 in History"),
+            n => Span::raw(format!("{n} in History")),
         }
     };
+    let mut sessions = vec![vec![history]];
     if claude {
-        sessions.push(sep());
-        if !app.live_loaded {
-            sessions.push(Span::styled("reading the running ones…", DIM));
+        sessions.push(vec![if !app.live_loaded {
+            Span::styled("reading the running ones…", DIM)
         } else {
             let running = app
                 .live
                 .iter()
                 .filter(|s| s.account == qualified && !s.is_inactive())
                 .count();
-            sessions.push(match running {
+            match running {
                 0 => Span::styled("none running", DIM),
                 1 => Span::styled("1 running", OK),
                 n => Span::styled(format!("{n} running"), OK),
-            });
-        }
+            }
+        }]);
     }
-    facts.push(fact("Sessions", sessions));
+    facts.extend(facts_packed("Sessions", sessions, value_w));
 
     let problems = account_problems(app, a);
     if app.checks.is_none() {
@@ -2085,6 +2076,34 @@ fn fact(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
 
 fn sep() -> Span<'static> {
     Span::styled(" · ", DIM)
+}
+
+/// A fact whose value is `parts` joined by ` · `, packed onto lines `width` wide: a part is
+/// never split, and the lines after the first carry no label, so that nothing is clipped at
+/// the card's edge (R22).
+fn facts_packed(label: &str, parts: Vec<Vec<Span<'static>>>, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for part in parts {
+        let w: usize = part.iter().map(Span::width).sum();
+        if !current.is_empty() && used + 3 + w > width {
+            let label = if lines.is_empty() { label } else { "" };
+            lines.push(fact(label, std::mem::take(&mut current)));
+            used = 0;
+        }
+        if !current.is_empty() {
+            current.push(sep());
+            used += 3;
+        }
+        current.extend(part);
+        used += w;
+    }
+    if !current.is_empty() || lines.is_empty() {
+        let label = if lines.is_empty() { label } else { "" };
+        lines.push(fact(label, current));
+    }
+    lines
 }
 
 /// A moment in the local time zone, with how long ago it was; on the same day as `after`, the

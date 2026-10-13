@@ -8107,6 +8107,14 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     );
     let (_, sessions) = line_with(&lines, "Sessions   ");
     assert!(sessions.contains("2 in History · 1 running"), "{sessions}");
+    // At 80 columns the usage goes on, a window kept whole, nothing clipped.
+    update(&mut app, Event::Resize(80, 24));
+    let lines = screen(&app);
+    let (first, usage) = line_with(&lines, "Usage      session 34% (2h00m) · week 77% (3d00h)");
+    assert!(!usage.contains("Fable"), "{usage}");
+    let (next, _) = line_with(&lines, "           Fable week 100% (2d00h) · cached 5m ago");
+    assert_eq!(next, first + 1, "{}", lines.join("\n"));
+    update(&mut app, Event::Resize(120, 40));
     // Private mode keeps the count under the alias.
     app.private = true;
     let lines = screen(&app);
