@@ -1319,10 +1319,14 @@ impl App {
     pub fn home_path(&self, account: &Account) -> Option<String> {
         match &account.home {
             Home::Path(p) => Some(p.clone()),
-            Home::Default => self
-                .home
-                .as_ref()
-                .map(|h| format!("{h}/{}", account.provider.native_dir())),
+            // Joined, not glued: a `HOME` ending in `/` (the root's, one set so) gives
+            // `/.claude`, not `//.claude`.
+            Home::Default => self.home.as_ref().map(|h| {
+                Path::new(h)
+                    .join(account.provider.native_dir())
+                    .display()
+                    .to_string()
+            }),
         }
     }
 

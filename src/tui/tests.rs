@@ -8451,6 +8451,20 @@ fn the_account_card_acts_on_the_account() {
     keys(&mut app, &[Key::Esc]);
     assert!(app.overlay.is_none() && app.config.open);
 
+    // A HOME ending in `/` is joined, not glued.
+    let mut app = crate::tui::tests::app();
+    app.home = Some("/Users/you/".into());
+    keys(&mut app, &[Key::Char('p')]);
+    assert_eq!(
+        keys(&mut app, &[Key::Char('y')]),
+        [Effect::Copy("/Users/you/.claude".into())]
+    );
+    app.home = Some("/".into());
+    assert_eq!(
+        keys(&mut app, &[Key::Char('y')]),
+        [Effect::Copy("/.claude".into())]
+    );
+
     // Without HOME the native home is unknown: said, not copied.
     let mut app = crate::tui::tests::app();
     app.home = None;
