@@ -1099,11 +1099,12 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
     }
     facts.extend(facts_packed("Sessions", sessions, value_w));
 
-    // As the view's Checks: `checking…` first while the checks run, and what is known
+    // As the view's Checks: `checking…` first while the checks run (and again after the
+    // account list changed: an account added since was never checked), and what is known
     // already (not logged in, a failed live query) under it, not hidden until they answer.
     let problems = account_problems(app, a);
     let mut checks: Vec<Vec<Span<'static>>> = Vec::new();
-    if app.checks.is_none() {
+    if app.checks.is_none() || app.checks_stale {
         checks.push(vec![Span::styled("checking…", DIM)]);
     } else if problems.is_empty() {
         checks.push(vec![Span::styled("✓ no problems found", OK)]);

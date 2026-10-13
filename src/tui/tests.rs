@@ -8345,6 +8345,20 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     let lines = screen(&app);
     let (_, sessions) = line_with(&lines, "Sessions   ");
     assert!(sessions.contains("2 in History · 1 running"), "{sessions}");
+    // The checks from before are not an account's that was never checked: `checking…` over
+    // what is known, until the checks of the list as it is answer.
+    line_with(&lines, "Checks     checking…");
+    while app.work.checks.is_running() {
+        update(
+            &mut app,
+            Event::Checks(vec![Check {
+                account: None,
+                message: "ANTHROPIC_API_KEY is set: it overrides every account's /login".into(),
+            }]),
+        );
+    }
+    let lines = screen(&app);
+    line_with(&lines, "Checks     ! ANTHROPIC_API_KEY is set");
     // The same list again changes nothing.
     update(
         &mut app,
@@ -8355,7 +8369,7 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
             crate::tui::tests::account("new"),
         ]),
     );
-    assert!(!app.attribution_stale);
+    assert!(!app.attribution_stale && !app.checks_stale);
 }
 
 /// R22: the Plugins heading counts what loads here, the source's plugin the home installed

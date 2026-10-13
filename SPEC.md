@@ -1897,7 +1897,8 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   sessions (how many History lists as its, under R8's noise filter as toggled, R17, and how
   many run, R7), its checks (R11: those naming it and the machine-wide ones, which concern
   every account; and not logged in or a failed live query as the view lists them, shown under
-  `checking…` while the checks run), and its part in
+  `checking…` while the checks run, and again after the account list changed until they
+  answer: an account added since was never checked), and its part in
   sharing (R18: alone, the source, a member of which source, opted out, or a source whose home
   is missing). What is not read yet says so and is never shown as none or zero: the login,
   the usage, the sessions (until the index and the attribution are loaded, and again after

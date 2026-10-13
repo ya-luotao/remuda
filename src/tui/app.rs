@@ -772,6 +772,8 @@ pub struct App {
     pub attribution_stale: bool,
     /// The same for the stores, which come with the index.
     pub stores_stale: bool,
+    /// The same for the checks: an account added since was never checked.
+    pub checks_stale: bool,
     pub attribution: Attribution,
 
     pub live: Vec<LiveSession>,
@@ -837,6 +839,7 @@ impl App {
             attribution_loaded: false,
             attribution_stale: false,
             stores_stale: false,
+            checks_stale: false,
             attribution: Attribution::default(),
             live: Vec::new(),
             live_rows: Vec::new(),
@@ -2051,6 +2054,7 @@ impl App {
         self.ask_again(Query::Identity, fx);
         self.ask_again(Query::CachedUsage, fx);
         self.rerun(Work::Checks, fx);
+        self.checks_stale = true;
         if self.mode == Mode::Browse {
             // What the attribution and the stores say of the accounts is from before.
             self.attribution_stale = true;
@@ -3022,6 +3026,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                     app.aliases.note(name);
                 }
                 app.checks = Some(checks);
+                app.checks_stale = false;
             }
         }
         // The reading waited for is that of the transcript wanted, and the only one out for it.
