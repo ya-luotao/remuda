@@ -8167,6 +8167,20 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     let (last, _) = line_with(&lines, " · max");
     assert_eq!(last, next + 1, "{}", lines.join("\n"));
     app.accounts[i].identity = identity;
+    // So is a home path: whole, over the lines it needs.
+    let home = app.accounts[i].account.home.clone();
+    let long = format!("/h/{}", "x".repeat(70));
+    app.accounts[i].account.home = Home::Path(long.clone());
+    let lines = screen(&app);
+    let (first, row) = line_with(&lines, "Account    claude:default");
+    assert!(!row.contains("home"), "{row}");
+    let (next, row) = line_with(&lines, "           home /h/xxx");
+    assert_eq!(next, first + 1, "{}", lines.join("\n"));
+    let inside = row.find("           home ").unwrap() + 16;
+    let head = row[inside..].split('│').next().unwrap().trim_end();
+    let (last, row) = line_with(&lines, &format!("           {}", &long[head.len()..]));
+    assert_eq!(last, next + 1, "{row}");
+    app.accounts[i].account.home = home;
     update(&mut app, Event::Resize(120, 40));
     // Private mode keeps the count under the alias.
     app.private = true;

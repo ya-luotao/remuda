@@ -1008,14 +1008,13 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
         Provider::Claude => BOLD,
         Provider::Codex => BOLD.patch(CODEX_STYLE),
     };
-    facts.push(fact(
+    facts.extend(facts_packed(
         "Account",
         vec![
-            Span::styled(qualified.clone(), name_style),
-            sep(),
-            Span::styled("home ", DIM),
-            Span::raw(tail(&home, value_w.saturating_sub(qualified.len() + 8))),
+            vec![Span::styled(qualified.clone(), name_style)],
+            vec![Span::styled("home ", DIM), Span::raw(home)],
         ],
+        value_w,
     ));
 
     let login = match &a.identity {
