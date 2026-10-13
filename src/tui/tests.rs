@@ -8334,7 +8334,7 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     let lines = screen(&app);
     let (_, sessions) = line_with(&lines, "Sessions   ");
     assert!(
-        sessions.contains("reading the attribution… · 1 running"),
+        sessions.contains("reading the attribution… · reading the running ones…"),
         "{sessions}"
     );
     while app.work.attribution.is_running() {
@@ -8342,6 +8342,12 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
         attribution.add(A, "claude:default");
         attribution.add(B, "claude:default");
         update(&mut app, Event::Attribution(attribution));
+    }
+    while app.work.live.is_running() {
+        update(
+            &mut app,
+            Event::Live(vec![live("claude:default", 4242, Some(A))]),
+        );
     }
     let lines = screen(&app);
     let (_, sessions) = line_with(&lines, "Sessions   ");
@@ -8370,7 +8376,7 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
             crate::tui::tests::account("new"),
         ]),
     );
-    assert!(!app.attribution_stale && !app.work.checks.is_running());
+    assert!(!app.attribution_stale && !app.live_stale && !app.work.checks.is_running());
     // `r` runs the checks again: `checking…` over the last run's problems until they answer.
     keys(&mut app, &[Key::Char('r')]);
     assert!(app.work.checks.is_running());

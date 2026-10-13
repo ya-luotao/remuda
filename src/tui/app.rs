@@ -783,6 +783,9 @@ pub struct App {
     pub live_list: ListState,
     pub logs: Option<Logs>,
     pub live_loaded: bool,
+    /// The account list changed since the running sessions were collected: a collection
+    /// from before could not see an account added since (R22).
+    pub live_stale: bool,
     /// When the last collection finished.
     pub live_updated: Option<Timestamp>,
 
@@ -845,6 +848,7 @@ impl App {
             live_list: ListState::default(),
             logs: None,
             live_loaded: false,
+            live_stale: false,
             live_updated: None,
             history: History::default(),
             preview: Preview::default(),
@@ -2053,9 +2057,11 @@ impl App {
         self.ask_again(Query::CachedUsage, fx);
         self.rerun(Work::Checks, fx);
         if self.mode == Mode::Browse {
-            // What the attribution and the stores say of the accounts is from before.
+            // What the attribution, the stores and the collection of running sessions say
+            // of the accounts is from before.
             self.attribution_stale = true;
             self.stores_stale = true;
+            self.live_stale = true;
             self.refresh_sessions(fx);
         }
         // The statistics are per account too (R20). A computation that is running is not
@@ -2993,6 +2999,10 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             // Started before something changed (e.g. a launch ended): collected again, and
             // stale until then if a foreground child has run.
             app.ran(Work::Live, &mut fx);
+            // A collection begun after the account list changed has answered.
+            if !app.work.live.is_running() {
+                app.live_stale = false;
+            }
         }
         Event::Attribution(base) => {
             // Names first seen here are numbered by name (R21).

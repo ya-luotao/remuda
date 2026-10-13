@@ -1082,7 +1082,7 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
     };
     let mut sessions = vec![vec![history]];
     if claude {
-        sessions.push(vec![if !app.live_loaded {
+        sessions.push(vec![if !app.live_loaded || app.live_stale {
             Span::styled("reading the running ones…", DIM)
         } else {
             let running = app
