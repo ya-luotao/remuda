@@ -1900,8 +1900,10 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   `checking…` while the checks run), and its part in
   sharing (R18: alone, the source, a member of which source, opted out, or a source whose home
   is missing). What is not read yet says so and is never shown as none or zero: the login,
-  the usage, the sessions (until the index and the attribution are loaded), the checks, the
-  configuration. Then the configuration, under a title naming the directory it describes, its
+  the usage, the sessions (until the index and the attribution are loaded, and again after
+  the account list changed, until they are read once more: of an account added since, they
+  knew nothing), the checks, the configuration. Then the configuration, under a title naming
+  the directory it describes, its
   problems first. The configuration lists by name: the entries of an item
   (agents, skills, commands, rules, synced skills) flow on wrapped lines, those turned off marked
   so, and the headings carry the counts (an item's entries and how many are off; the plugins

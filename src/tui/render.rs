@@ -1060,12 +1060,13 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
     usage.extend(usage_source(a, app.now));
     facts.extend(facts_packed("Usage", usage, value_w));
 
-    // The index and the attribution answer who owns what; until both have, the count would
-    // be a floor.
+    // The index and the attribution (the stores, for codex) answer who owns what; until both
+    // have, the count would be a floor. Of an account added since they were read they know
+    // nothing: the count waits for the read that follows the change.
     let attributed = if claude {
-        app.attribution_loaded
+        app.attribution_loaded && !app.attribution_stale
     } else {
-        app.stores.is_some()
+        app.stores.is_some() && !app.stores_stale
     };
     let history = if !app.index_loaded {
         Span::styled("reading the index…", DIM)

@@ -8312,6 +8312,50 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
         !body.contains("gets default's configuration at launch"),
         "{body}"
     );
+
+    // The account list changed: of an account added since, the attribution read before knows
+    // nothing, so the count waits for the read that follows (an answer from before does not
+    // count: that read runs once more).
+    keys(&mut app, &[Key::Char('3'), Key::Char('1'), Key::Char('p')]);
+    let fx = update(
+        &mut app,
+        Event::Accounts(vec![
+            crate::tui::tests::account("default"),
+            crate::tui::tests::account("max"),
+            crate::tui::tests::account("team"),
+            crate::tui::tests::account("new"),
+        ]),
+    );
+    assert!(
+        fx.contains(&Effect::Attribution) || app.work.attribution.is_running(),
+        "{fx:?}"
+    );
+    let lines = screen(&app);
+    let (_, sessions) = line_with(&lines, "Sessions   ");
+    assert!(
+        sessions.contains("reading the attribution… · 1 running"),
+        "{sessions}"
+    );
+    while app.work.attribution.is_running() {
+        let mut attribution = Attribution::default();
+        attribution.add(A, "claude:default");
+        attribution.add(B, "claude:default");
+        update(&mut app, Event::Attribution(attribution));
+    }
+    let lines = screen(&app);
+    let (_, sessions) = line_with(&lines, "Sessions   ");
+    assert!(sessions.contains("2 in History · 1 running"), "{sessions}");
+    // The same list again changes nothing.
+    update(
+        &mut app,
+        Event::Accounts(vec![
+            crate::tui::tests::account("default"),
+            crate::tui::tests::account("max"),
+            crate::tui::tests::account("team"),
+            crate::tui::tests::account("new"),
+        ]),
+    );
+    assert!(!app.attribution_stale);
 }
 
 /// R22: the Plugins heading counts what loads here, the source's plugin the home installed

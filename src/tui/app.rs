@@ -767,6 +767,11 @@ pub struct App {
     /// The launch log and the `history.jsonl` files have been read once: a session attributed
     /// to no account now is attributed to none.
     pub attribution_loaded: bool,
+    /// The account list changed since the attribution was read: of an account added since,
+    /// it knows nothing, so the account card waits for the read that follows (R22).
+    pub attribution_stale: bool,
+    /// The same for the stores, which come with the index.
+    pub stores_stale: bool,
     pub attribution: Attribution,
 
     pub live: Vec<LiveSession>,
@@ -830,6 +835,8 @@ impl App {
             by_session: HashMap::new(),
             attribution_base: Attribution::default(),
             attribution_loaded: false,
+            attribution_stale: false,
+            stores_stale: false,
             attribution: Attribution::default(),
             live: Vec::new(),
             live_rows: Vec::new(),
@@ -2045,6 +2052,9 @@ impl App {
         self.ask_again(Query::CachedUsage, fx);
         self.rerun(Work::Checks, fx);
         if self.mode == Mode::Browse {
+            // What the attribution and the stores say of the accounts is from before.
+            self.attribution_stale = true;
+            self.stores_stale = true;
             self.refresh_sessions(fx);
         }
         // The statistics are per account too (R20). A computation that is running is not
@@ -2929,6 +2939,11 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             app.reindex_sessions();
             app.rebuild_history();
             app.ran(Work::Index, &mut fx);
+            // The stores came with this read's start; one begun before the account list
+            // changed runs once more.
+            if !app.work.index.is_running() {
+                app.stores_stale = false;
+            }
         }
         // A result for an account that is no longer listed is dropped.
         Event::Identity { account, identity } => {
@@ -2992,6 +3007,11 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
                 app.rebuild_history();
             }
             app.ran(Work::Attribution, &mut fx);
+            // The read begun after the account list changed has answered: not one from
+            // before, which runs once more.
+            if !app.work.attribution.is_running() {
+                app.attribution_stale = false;
+            }
         }
         Event::Checks(checks) => {
             // Asked again since they started (the account list changed): these are the checks
