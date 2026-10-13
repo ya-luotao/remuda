@@ -1220,9 +1220,12 @@ struct ConfigLines {
 }
 
 impl ConfigLines {
+    /// A line of the configuration. Wider than the pane, it goes on, the next lines
+    /// indented as far as its text: nothing is cut (R22).
     fn line(&mut self, text: &str, style: Style) {
-        self.lines
-            .push(Line::styled(text::truncate(text, self.width), style));
+        let indent = text.len() - text.trim_start_matches(' ').len();
+        let (lead, rest) = text.split_at(indent);
+        self.wrapped(lead, rest, style);
     }
 
     /// `text` wrapped after `prefix`, the next lines indented as far.
@@ -1235,7 +1238,7 @@ impl ConfigLines {
             } else {
                 " ".repeat(indent)
             };
-            self.line(&format!("{lead}{l}"), style);
+            self.lines.push(Line::styled(format!("{lead}{l}"), style));
         }
     }
 
@@ -1510,13 +1513,14 @@ fn entry_lines(e: &ConfigEntry, agent: bool, indent: &str, out: &mut ConfigLines
         .link
         .as_ref()
         .map_or(String::new(), |t| format!(" -> {}", t.display()));
+    // Wrapped, not cut: the details are what `d` asks for.
     if e.broken {
-        out.line(&format!("{indent}{} · broken link{link}", e.name), WARN);
+        out.wrapped(indent, &format!("{} · broken link{link}", e.name), WARN);
         return;
     }
     let off = if e.off { " (off)" } else { "" };
     if agent {
-        let mut line = format!("{indent}{}", e.name);
+        let mut line = e.name.clone();
         if let Some(model) = &e.model {
             line.push_str(&format!(" · {model}"));
         }
@@ -1526,7 +1530,7 @@ fn entry_lines(e: &ConfigEntry, agent: bool, indent: &str, out: &mut ConfigLines
         if let Some(tools) = &e.tools {
             line.push_str(&format!(" · tools {tools}"));
         }
-        out.line(&format!("{line}{off}{link}"), Style::new());
+        out.wrapped(indent, &format!("{line}{off}{link}"), Style::new());
         if let Some(d) = &e.description {
             out.wrapped(&format!("{indent}  "), d, DIM);
         }
@@ -1536,8 +1540,9 @@ fn entry_lines(e: &ConfigEntry, agent: bool, indent: &str, out: &mut ConfigLines
         .description
         .as_ref()
         .map_or(String::new(), |d| format!(" — {d}"));
-    out.line(
-        &format!("{indent}{}{off}{description}{link}", e.name),
+    out.wrapped(
+        indent,
+        &format!("{}{off}{description}{link}", e.name),
         Style::new(),
     );
 }

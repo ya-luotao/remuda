@@ -8489,6 +8489,17 @@ fn d_in_the_account_card_shows_the_details() {
     ] {
         assert!(body.contains(shown), "{shown}:\n{body}");
     }
+    // Narrow, the lines go on to the next, as far indented, and nothing is cut.
+    let body = config_text(&app, 40);
+    assert!(!body.contains('…'), "{body}");
+    for shown in [
+        "    reviewer · sonnet · effort low ·\n    tools Read, Grep\n      reviews diffs\n",
+        "    pdf -> ../../lib/skills/pdf\n",
+        "  skills · already default's · 2 (1 off)\n  -> /h/default/skills\n",
+        "  ctx7@market · 1.2.0 · user · shared\n  from default\n",
+    ] {
+        assert!(body.contains(shown), "{shown}:\n{body}");
+    }
     keys(&mut app, &[Key::Char('p'), Key::Char('p')]);
     assert!(app.config.open && app.config.details);
     keys(&mut app, &[Key::Char('d')]);
