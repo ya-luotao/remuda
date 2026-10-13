@@ -1361,13 +1361,14 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
         out.line("  none", DIM);
     }
 
-    // Plugins: the heading counts what loads here (an install, the source's or the home's own,
-    // or bundled and not turned off); each other row says why it does not.
+    // Plugins: the heading counts what loads here (an install the project does not turn off,
+    // the source's or the home's own, or bundled and not turned off); each other row says why
+    // it does not.
     let enabled = v
         .plugins
         .iter()
         .filter(|p| {
-            p.path.is_some()
+            (p.path.is_some() && !p.off)
                 || matches!(
                     p.origin,
                     Origin::NotShared(Skip::Builtin | Skip::OwnInstall)
@@ -1391,7 +1392,10 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
                 if p.installs > 1 {
                     line.push_str(&format!(" · {} installs", p.installs));
                 }
-                out.line(&line, Style::new());
+                if p.off {
+                    line.push_str(" · turned off here");
+                }
+                out.line(&line, if p.off { DIM } else { Style::new() });
             }
             (None, Origin::NotShared(Skip::Builtin)) => {
                 out.line(&format!("  {} · {origin}", p.name), Style::new());

@@ -1036,6 +1036,7 @@ impl Redactor<'_> {
             installs,
             path,
             contents,
+            off,
         } = plugin;
         Plugin {
             name: name.clone(),
@@ -1043,6 +1044,7 @@ impl Redactor<'_> {
             version: version.clone(),
             scope: scope.clone(),
             installs: *installs,
+            off: *off,
             path: path.as_deref().map(|p| self.path_buf(p)),
             contents: contents.as_ref().map(|c| {
                 let PluginContents {

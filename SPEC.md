@@ -1964,11 +1964,13 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
 - **Plugins.** The home's enabled plugins (`enabledPlugins` `true` or an array), each with the
   install claude loads for that directory (R18's load rule; when several do, one made for the
   directory, `local` then `project`, before `user` then `managed`, else the first in the file),
-  its version and scope, and the number of install records; or marked not installed; or, for
-  one of the `builtin` marketplace, marked bundled with claude (turned off, when the project's
-  settings set it to `false`), and listed once when the source enables it too. Plugins set
-  to `false` are counted, not listed. Then the source's enabled plugins, injected or not with the
-  reason. For each installed plugin: its agents, skills, and commands (as above, in its install
+  its version and scope, and the number of install records, marked turned off here when the
+  project's settings set it to `false` (the highest layer decides, R18); or marked not
+  installed; or, for one of the `builtin` marketplace, marked bundled with claude (turned off,
+  when the project's settings set it to `false`), and listed once when the source enables it
+  too. Plugins set to `false` are counted, not listed. Then the source's enabled plugins,
+  injected or not with the reason. For each installed plugin: its agents, skills, and
+  commands (as above, in its install
   directory), its hook events with counts (`hooks/hooks.json`, or `hooks` in
   `.claude-plugin/plugin.json`), and the names of its MCP servers (`.mcp.json`, or `mcpServers`
   in `.claude-plugin/plugin.json`).

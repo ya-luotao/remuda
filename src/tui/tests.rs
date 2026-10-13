@@ -7770,6 +7770,7 @@ fn config_view() -> crate::account_config::ConfigView {
                 mcp_servers: vec!["ctx".into()],
                 ..PluginContents::default()
             }),
+            off: false,
         }],
         own_settings: Summary {
             model: Some("opus".into()),
@@ -8373,8 +8374,9 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
 }
 
 /// R22: the Plugins heading counts what loads here, the source's plugin the home installed
-/// itself among them; a bundled plugin the project turns off and an enabled one with no install
-/// are rows, not part of the count; those set to `false` are counted apart.
+/// itself among them; a bundled plugin the project turns off, an enabled one with no install
+/// and an installed one the project turns off are rows, not part of the count; those set to
+/// `false` are counted apart.
 #[test]
 fn the_plugins_heading_counts_what_loads() {
     use crate::account_config::{Origin, Plugin};
@@ -8391,12 +8393,18 @@ fn the_plugins_heading_counts_what_loads() {
         installs: 0,
         path: None,
         contents: None,
+        off: false,
     };
     view.plugins
         .push(row("f@builtin", Origin::NotShared(Skip::TurnedOff)));
     view.plugins.push(row("gone@market", Origin::Own));
     view.plugins
         .push(row("mine@market", Origin::NotShared(Skip::OwnInstall)));
+    view.plugins.push(Plugin {
+        path: Some(PathBuf::from("/h/plugins/cache/proj")),
+        off: true,
+        ..row("proj@market", Origin::Own)
+    });
     view.disabled_plugins = 2;
     answer_config(&mut app, "default", view);
     let body = config_text(&app, 200);
@@ -8405,6 +8413,7 @@ fn the_plugins_heading_counts_what_loads() {
         "  f@builtin · not shared: turned off here",
         "  gone@market · own · not installed here",
         "  mine@market · not shared: installed by this home",
+        "  proj@market · own · turned off here",
     ] {
         assert!(body.contains(shown), "{shown}:\n{body}");
     }
