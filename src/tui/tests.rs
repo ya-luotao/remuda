@@ -6370,10 +6370,21 @@ fn secret_states() -> Vec<SecretState> {
             |app| drop(keys(app, &[Key::Char('1')])),
             "zqplugin@zqmarket",
         ),
+        state("accounts card", open_zq_config, "Account · zqalpha"),
         state(
-            "accounts configuration",
+            "accounts card: the home",
             open_zq_config,
-            "Configuration · zqalpha",
+            "home ~/.zqhomes/zqalpha",
+        ),
+        state(
+            "accounts card: a description",
+            |app| {
+                open_zq_config(app);
+                keys(app, &[Key::Char('d')]);
+                // Past the problems: the first agent's description is in sight at 80x24.
+                app.config.scroll = 6;
+            },
+            "zqdesc agent",
         ),
         state(
             "accounts configuration problems: a path",
@@ -6383,7 +6394,7 @@ fn secret_states() -> Vec<SecretState> {
         state(
             "accounts configuration problems: the system's error",
             open_zq_config,
-            "zqalpha: cannot read",
+            "zqalpha/settings.json",
         ),
         state(
             "accounts configuration problems: a path first",
@@ -6965,13 +6976,7 @@ fn zq_incomplete() -> Marked {
 
 /// The Configuration pane of zqalpha, expanded (all of it shows at 80×24) and loaded.
 fn open_zq_config(app: &mut App) {
-    let keys_ = [
-        Key::Char('1'),
-        Key::Char('j'),
-        Key::Char('p'),
-        Key::Char('p'),
-    ];
-    keys(app, &keys_);
+    keys(app, &[Key::Char('1'), Key::Char('j'), Key::Char('p')]);
     let request = app.config.work.round();
     update(
         app,
@@ -7886,22 +7891,20 @@ fn config_text(app: &App, width: usize) -> String {
         .join("\n")
 }
 
-/// R22: `p` (or Space) opens the pane and reads the selected account's configuration, again
-/// gives it the whole view, again closes it; `Esc` steps back one; a pending launch is
-/// cancelled first.
+/// R22: `p` (or Space) opens the account card and reads the selected account's
+/// configuration; `p`, Space or `Esc` closes it, and so does switching views; a pending launch
+/// is cancelled first.
 #[test]
-fn p_cycles_the_configuration_pane_and_esc_steps_back() {
+fn p_opens_the_account_card_and_esc_closes_it() {
     let mut app = app();
     assert_eq!(
         keys(&mut app, &[Key::Char('p')]),
         [config_effect(1, "default")]
     );
-    assert!(app.config.open && !app.config.expanded && app.config.work.is_running());
+    assert!(app.config.open && app.config.work.is_running());
     assert_eq!(keys(&mut app, &[Key::Char('p')]), []);
-    assert!(app.config.open && app.config.expanded);
-    assert_eq!(keys(&mut app, &[Key::Char('p')]), []);
-    assert!(!app.config.open && !app.config.expanded);
-    // The read that was out when it closed answers to no pane.
+    assert!(!app.config.open);
+    // The read that was out when it closed answers to no card.
     answer_config(&mut app, "default", config_view());
     assert_eq!(app.config.loaded, None);
 
@@ -7909,10 +7912,7 @@ fn p_cycles_the_configuration_pane_and_esc_steps_back() {
         keys(&mut app, &[Key::Char(' ')]),
         [config_effect(2, "default")]
     );
-    keys(&mut app, &[Key::Char(' ')]);
-    assert!(app.config.expanded);
-    keys(&mut app, &[Key::Esc]);
-    assert!(app.config.open && !app.config.expanded);
+    assert!(app.config.open);
     keys(&mut app, &[Key::Esc]);
     assert!(!app.config.open);
 
@@ -7925,20 +7925,23 @@ fn p_cycles_the_configuration_pane_and_esc_steps_back() {
     assert_eq!(app.work.launch.running(), None);
     assert!(app.config.open);
 
-    // Other views keep their own `p`; switching away leaves the pane open, not expanded.
-    keys(&mut app, &[Key::Char('p'), Key::Char('2')]);
-    assert!(app.config.open && !app.config.expanded);
+    // Switching views closes it (the read out answers to no card); the other views keep
+    // their own `p`.
+    keys(&mut app, &[Key::Char('2')]);
+    assert!(!app.config.open);
+    answer_config(&mut app, "default", config_view());
+    assert_eq!(app.config.loaded, None);
     keys(&mut app, &[Key::Char('p')]);
-    assert!(app.preview.expanded && app.config.open);
+    assert!(app.preview.expanded && !app.config.open);
 }
 
-/// R22: while the pane is open it follows the selection, and only the answer to the last
-/// request is kept.
+/// R22: while the card is open it follows the selection (`]` / `[` move it), and only the
+/// answer to the last request is kept.
 #[test]
 fn the_pane_follows_the_selection_and_drops_stale_answers() {
     let mut app = app();
     keys(&mut app, &[Key::Char('p')]);
-    assert_eq!(keys(&mut app, &[Key::Char('j')]), [config_effect(2, "max")]);
+    assert_eq!(keys(&mut app, &[Key::Char(']')]), [config_effect(2, "max")]);
     update(
         &mut app,
         Event::Config {
@@ -7953,7 +7956,7 @@ fn the_pane_follows_the_selection_and_drops_stale_answers() {
     assert_eq!(app.config.loaded, Some(Ok(config_view())));
     assert!(!app.config.work.is_running());
     // A late answer after closing is dropped too.
-    keys(&mut app, &[Key::Char('p'), Key::Char('p')]);
+    keys(&mut app, &[Key::Char('p')]);
     answer_config(&mut app, "max", config_view());
     assert_eq!(app.config.loaded, None);
 }
@@ -8002,7 +8005,8 @@ fn r_and_a_new_account_list_read_the_configuration_again() {
     assert_eq!(fx, [config_effect(7, "default")]);
     assert_eq!(app.config.loaded, Some(Ok(config_with_model("first"))));
 
-    keys(&mut app, &[Key::Char('p'), Key::Char('p')]);
+    keys(&mut app, &[Key::Char('p')]);
+    assert!(!app.config.open);
     let fx = keys(&mut app, &[Key::Char('r')]);
     assert_eq!(config_effects(&fx), Vec::<&Effect>::new());
 }
@@ -8018,55 +8022,251 @@ fn codex_accounts_have_no_configuration_listing() {
     );
     let fx = keys(&mut app, &[Key::Char('p')]);
     assert_eq!(config_effects(&fx), Vec::<&Effect>::new());
-    let all = text(&app);
+    let lines = screen(&app);
+    line_with(&lines, "configuration listing is Claude-only");
+    line_with(&lines, "Account · codex:default");
+    let (_, account) = line_with(&lines, "Account    ");
     assert!(
-        all.contains("configuration listing is Claude-only"),
-        "{all}"
+        account.contains("codex:default · home ~/.codex"),
+        "{account}"
     );
+    let (_, shares) = line_with(&lines, "Shares     ");
+    assert!(
+        shares.contains("shared configuration is Claude-only"),
+        "{shares}"
+    );
+    // Running sessions are claude's (R7): the card does not count them for codex.
+    let (_, sessions) = line_with(&lines, "Sessions   ");
+    assert!(!sessions.contains("running"), "{sessions}");
+    assert_eq!(keys(&mut app, &[Key::Char(']')]), []);
+    let lines = screen(&app);
+    let (_, account) = line_with(&lines, "Account    ");
+    assert!(account.contains("codex:work · home /c/work"), "{account}");
 }
 
-/// R22: below the table on a narrow terminal (the timeline and checks give way), beside the
-/// view from 120 columns on, over the whole view when expanded.
+/// R22: the card draws over the view, the account's facts above the configuration, which
+/// names the directory it describes; what is not read yet says so, never none or zero.
 #[test]
-fn the_pane_sits_below_the_table_or_beside_the_view() {
+fn the_account_card_shows_the_facts_above_the_configuration() {
+    let mut app = app();
+    keys(&mut app, &[Key::Char('p')]);
+    let lines = screen(&app);
+    line_with(&lines, "Account · default");
+    let (_, account) = line_with(&lines, "Account    ");
+    assert!(
+        account.contains("claude:default · home ~/.claude"),
+        "{account}"
+    );
+    for waiting in [
+        "Login      reading login…",
+        "Usage      reading usage…",
+        "Sessions   reading the index… · reading the running ones…",
+        "Checks     checking…",
+        "Shares     reading configuration…",
+        "Configuration · for ~/space/remuda",
+        "reading configuration…",
+    ] {
+        line_with(&lines, waiting);
+    }
+    // The table and the timeline are under it.
+    let all = lines.join("\n");
+    assert!(
+        !all.contains("ACCOUNT") && !all.contains("Resets · next 7 days"),
+        "{all}"
+    );
+
     let mut app = populated_accounts();
+    update(&mut app, Event::Resize(120, 40));
+    update(
+        &mut app,
+        Event::IndexLoaded(vec![entry(A, "a", 1), entry(B, "b", 2)]),
+    );
+    update(&mut app, Event::Stores(stores()));
+    let mut attribution = Attribution::default();
+    attribution.add(A, "claude:default");
+    attribution.add(B, "claude:default");
+    update(&mut app, Event::Attribution(attribution));
+    update(
+        &mut app,
+        Event::Live(vec![live("claude:default", 4242, Some(A))]),
+    );
     keys(&mut app, &[Key::Char('p')]);
     answer_config(&mut app, "default", config_view());
     let lines = screen(&app);
-    let (max_row, _) = line_with(&lines, "max ");
-    let (title, _) = line_with(&lines, "Configuration · default · for ~/space/remuda");
-    assert!(title > max_row, "{}", lines.join("\n"));
-    assert!(!lines.join("\n").contains("Resets · next 7 days"));
+    let (_, login) = line_with(&lines, "Login      ");
+    assert!(
+        login.contains("Login      me@example.com · Org · max  "),
+        "{login}"
+    );
+    let (_, usage) = line_with(&lines, "Usage      ");
+    assert!(
+        usage.contains(
+            "session 34% (2h00m) · week 77% (3d00h) · Fable week 100% (2d00h) · cached 5m ago"
+        ),
+        "{usage}"
+    );
+    let (_, sessions) = line_with(&lines, "Sessions   ");
+    assert!(sessions.contains("2 in History · 1 running"), "{sessions}");
+    let (_, checks) = line_with(&lines, "Checks     ");
+    assert!(checks.contains("✓ no problems found"), "{checks}");
+    let (_, shares) = line_with(&lines, "Shares     ");
+    assert!(
+        shares.contains("gets default's configuration at launch"),
+        "{shares}"
+    );
 
-    update(&mut app, Event::Resize(160, 40));
+    // team: not logged in, no usage recorded, no sessions, and the checks say so.
+    keys(&mut app, &[Key::Char(']'), Key::Char(']')]);
     let lines = screen(&app);
-    line_with(&lines, "Resets · next 7 days");
-    let (_, top) = line_with(&lines, "Accounts ─");
-    assert!(top.contains("Configuration ·"), "{top}");
+    line_with(&lines, "Account · team");
+    let (_, account) = line_with(&lines, "Account    ");
+    assert!(account.contains("claude:team · home /h/team"), "{account}");
+    let (_, login) = line_with(&lines, "Login      ");
+    assert!(login.contains("not logged in"), "{login}");
+    let (_, usage) = line_with(&lines, "Usage      ");
+    assert!(usage.contains("no cache"), "{usage}");
+    let (_, sessions) = line_with(&lines, "Sessions   ");
+    assert!(
+        sessions.contains("none in History · none running"),
+        "{sessions}"
+    );
+    let (_, checks) = line_with(&lines, "Checks     ");
+    assert!(checks.contains("! not logged in"), "{checks}");
 
-    update(&mut app, Event::Resize(80, 24));
-    keys(&mut app, &[Key::Char('p')]);
-    let all = text(&app);
-    assert!(!all.contains("ACCOUNT"), "{all}");
-    assert!(all.contains("(esc: back)"), "{all}");
+    // The problems of the configuration open it.
+    let mut view = config_view();
+    view.problems
+        .push("zqinst.json is not in a recognized format".into());
+    answer_config(&mut app, "team", view);
+    let lines = screen(&app);
+    let (title, _) = line_with(&lines, "Configuration · for ~/space/remuda");
+    let (problem, _) = line_with(&lines, "! zqinst.json is not in a recognized format");
+    let (first, _) = line_with(&lines, "Instructions");
+    assert!(title < problem && problem < first, "{}", lines.join("\n"));
 
+    // Short on height, the configuration keeps its room: the last facts give way.
+    update(&mut app, Event::Resize(80, 16));
+    let lines = screen(&app);
+    line_with(&lines, "Account    ");
+    line_with(&lines, "Configuration · for ~/space/remuda");
+    assert!(render::config_height(&app) >= 6, "{}", lines.join("\n"));
+
+    // The body, in full.
+    update(&mut app, Event::Resize(120, 40));
+    keys(&mut app, &[Key::Char('['), Key::Char('[')]);
+    answer_config(&mut app, "default", config_view());
     let body = config_text(&app, 200);
     for shown in [
-        "reviewer · sonnet · effort low · tools Read, Grep",
-        "      reviews diffs",
-        "pdf -> ../../lib/skills/pdf",
+        "Instructions\n  agents · own · 1\n    reviewer\n  skills · own · 1\n    pdf\n",
         "CLAUDE.md · shared from default · 20 lines · 812 B",
-        "ctx7@market · 1.2.0 · user · shared from default",
+        "Plugins · 1 enabled\n  ctx7@market · 1.2.0 · user · shared from default",
         "    hooks: PreToolUse 2",
         "    mcp: ctx",
-        "shared from default",
         "not shared (authentication): env.ANTHROPIC_API_KEY",
         "~/.claude/projects/-Users-you-space-remuda/memory · shared from default · 3 files",
         "  user: github",
-        "gets default's configuration at launch",
     ] {
         assert!(body.contains(shown), "{shown}:\n{body}");
     }
+    assert!(
+        !body.contains("gets default's configuration at launch"),
+        "{body}"
+    );
+}
+
+/// R22: entries flow by name, those turned off marked; `d` lists them one per line with their
+/// details (an agent's model, effort and tools; descriptions; link targets), and the entries
+/// of a member's items that are already the source's, which are one line otherwise. The
+/// choice is kept while the card is closed.
+#[test]
+fn d_in_the_account_card_shows_the_details() {
+    use crate::account_config::{Content, Entry, Origin};
+    let mut app = app();
+    keys(&mut app, &[Key::Char('j'), Key::Char('p')]);
+    let mut view = config_view();
+    view.instructions[1].origin = Origin::AlreadySource;
+    view.instructions[1].link = Some(PathBuf::from("/h/default/skills"));
+    if let Content::Entries(entries) = &mut view.instructions[1].content {
+        entries.push(Entry {
+            name: "qa".into(),
+            off: true,
+            ..Entry::default()
+        });
+    }
+    answer_config(&mut app, "max", view);
+    let body = config_text(&app, 200);
+    for shown in [
+        "  agents · own · 1\n    reviewer\n",
+        "  skills · already default's · 2 (1 off) -> /h/default/skills\n  CLAUDE.md",
+    ] {
+        assert!(body.contains(shown), "{shown}:\n{body}");
+    }
+    for hidden in ["sonnet", "reviews diffs", "pdf", "qa (off)"] {
+        assert!(!body.contains(hidden), "{hidden}:\n{body}");
+    }
+    keys(&mut app, &[Key::Char('d')]);
+    assert!(app.config.details);
+    let body = config_text(&app, 200);
+    for shown in [
+        "    reviewer · sonnet · effort low · tools Read, Grep\n      reviews diffs\n",
+        "    pdf -> ../../lib/skills/pdf\n    qa (off)\n",
+    ] {
+        assert!(body.contains(shown), "{shown}:\n{body}");
+    }
+    keys(&mut app, &[Key::Char('p'), Key::Char('p')]);
+    assert!(app.config.open && app.config.details);
+    keys(&mut app, &[Key::Char('d')]);
+    assert!(!app.config.details);
+}
+
+/// R22: `n` and `D` in the card act on the account (the form and the question open over it);
+/// `y` copies its home directory (the provider's native one for `default`).
+#[test]
+fn the_account_card_acts_on_the_account() {
+    let mut app = app();
+    keys(&mut app, &[Key::Char('p')]);
+    assert_eq!(
+        keys(&mut app, &[Key::Char('y')]),
+        [Effect::Copy("/Users/you/.claude".into())]
+    );
+    assert_eq!(
+        app.notice.as_ref().map(|n| n.text.to_string()),
+        Some("copied the home of default".into())
+    );
+    assert_eq!(
+        keys(&mut app, &[Key::Char(']'), Key::Char('y')]),
+        [config_effect(2, "max"), Effect::Copy("/h/max".into())]
+    );
+    keys(&mut app, &[Key::Char('n')]);
+    assert!(
+        matches!(app.overlay, Some(Overlay::Form(_))),
+        "{:?}",
+        app.overlay
+    );
+    line_with(&screen(&app), "Account · max");
+    keys(&mut app, &[Key::Esc]);
+    assert!(app.overlay.is_none() && app.config.open);
+    keys(&mut app, &[Key::Char('D')]);
+    assert!(
+        matches!(app.overlay, Some(Overlay::RemoveAccount(_))),
+        "{:?}",
+        app.overlay
+    );
+    keys(&mut app, &[Key::Esc]);
+    assert!(app.overlay.is_none() && app.config.open);
+
+    // Without HOME the native home is unknown: said, not copied.
+    let mut app = crate::tui::tests::app();
+    app.home = None;
+    keys(&mut app, &[Key::Char('p')]);
+    assert_eq!(keys(&mut app, &[Key::Char('y')]), []);
+    assert!(
+        app.notice
+            .as_ref()
+            .is_some_and(|n| n.text.contains("is unknown")),
+        "{:?}",
+        app.notice
+    );
 }
 
 /// R18, R22: the source's authentication settings are "not shared" only where settings are
@@ -8103,53 +8303,58 @@ fn the_pane_says_who_reads_the_sources_authentication() {
     );
 }
 
-/// R22: `PgUp` / `PgDn` scroll the open pane while `j` / `k` move the selection (the pane then
-/// starts at the top); expanded, the movement keys scroll it.
+/// R22: the movement keys scroll the configuration; `[` / `]` move to the previous / next
+/// account, and the card follows (its configuration from the top).
 #[test]
-fn the_pane_scrolls() {
+fn the_account_card_scrolls_and_follows_the_brackets() {
     let mut app = app();
     keys(&mut app, &[Key::Char('p')]);
     answer_config(&mut app, "default", config_view());
     let height = render::config_height(&app);
     let max = render::config_line_count(&app) - height;
     assert!(height > 0 && max > 0, "{height} {max}");
+    keys(&mut app, &[Key::Char('j')]);
+    assert_eq!((app.accounts_list.selected, app.config.scroll), (0, 1));
     keys(&mut app, &[Key::PageDown]);
-    assert_eq!(app.config.scroll, height.min(max));
+    assert_eq!(app.config.scroll, (1 + height).min(max));
     keys(&mut app, &[Key::PageDown, Key::PageDown, Key::PageDown]);
     assert_eq!(app.config.scroll, max);
     keys(&mut app, &[Key::PageUp]);
     assert_eq!(app.config.scroll, max.saturating_sub(height));
-    keys(&mut app, &[Key::Char('j')]);
-    assert_eq!((app.accounts_list.selected, app.config.scroll), (1, 0));
-
-    answer_config(&mut app, "max", config_view());
-    keys(&mut app, &[Key::Char('p')]);
-    let max = render::config_line_count(&app) - render::config_height(&app);
-    keys(&mut app, &[Key::Char('j')]);
-    assert_eq!((app.accounts_list.selected, app.config.scroll), (1, 1));
     keys(&mut app, &[Key::Char('G')]);
     assert_eq!(app.config.scroll, max);
+    keys(&mut app, &[Key::Char('k')]);
+    assert_eq!(app.config.scroll, max - 1);
     keys(&mut app, &[Key::Char('g')]);
     assert_eq!(app.config.scroll, 0);
-    // Accounts keys wait while it is expanded.
-    assert_eq!(keys(&mut app, &[Key::Char('n'), Key::Char('D')]), []);
-    assert_eq!(app.overlay, None);
+
+    keys(&mut app, &[Key::Char('G')]);
+    assert_eq!(keys(&mut app, &[Key::Char(']')]), [config_effect(2, "max")]);
+    assert_eq!((app.accounts_list.selected, app.config.scroll), (1, 0));
+    line_with(&screen(&app), "Account · max");
+    assert_eq!(
+        keys(&mut app, &[Key::Char('[')]),
+        [config_effect(3, "default")]
+    );
+    assert_eq!(app.accounts_list.selected, 0);
+    assert_eq!(keys(&mut app, &[Key::Char('[')]), []);
+    assert_eq!(app.accounts_list.selected, 0);
 }
 
-/// R22: the hint line names the pane's keys in each state.
+/// R22: the hint line names the card, then its keys.
 #[test]
-fn accounts_hints_name_the_configuration() {
+fn accounts_hints_name_the_account_card() {
     let mut app = app();
     let lines = screen(&app);
     let (_, hints) = line_with(&lines, "n: new session");
     assert!(
-        hints.contains("p: config") && hints.contains("u: live usage"),
+        hints.contains("p: account") && hints.contains("u: live usage"),
         "{hints}"
     );
     keys(&mut app, &[Key::Char('p')]);
-    line_with(&screen(&app), "pgup/pgdn: scroll");
-    keys(&mut app, &[Key::Char('p')]);
-    line_with(&screen(&app), "esc: back · r: refresh");
+    let lines = screen(&app);
+    line_with(&lines, "d: details · y: copy home · D: rm · [ ]: account");
+    line_with(&lines, "j/k: scroll · d: details · r: refresh · esc: close");
 }
 
 #[test]
@@ -8169,17 +8374,26 @@ fn the_pane_on_a_tiny_terminal_does_not_panic() {
     }
 }
 
-/// R21, R22: in private mode the pane keeps names, models and tools, and masks descriptions
-/// and paths.
+/// R21, R22: in private mode the card keeps names, models and tools, and masks descriptions,
+/// paths and the login.
 #[test]
 fn private_mode_keeps_configuration_names_and_masks_the_rest() {
     let mut app = populated_accounts();
     update(&mut app, Event::Resize(160, 40));
-    keys(&mut app, &[Key::Char('p'), Key::Char('p')]);
-    answer_config(&mut app, "default", config_view());
+    keys(&mut app, &[Key::Char('j'), Key::Char('p'), Key::Char('d')]);
+    answer_config(&mut app, "max", config_view());
     app.private = true;
-    let all = text(&app);
+    // The screen, and the configuration past what the card shows of it, as private mode
+    // draws them.
+    let all = format!(
+        "{}\n{}",
+        text(&app),
+        config_text(&super::privacy::redacted(&app), 200)
+    );
     for shown in [
+        "Account · account-1",
+        "claude:account-1 · home /•••/•••",
+        "Login      •••@•••",
         "reviewer",
         "sonnet",
         "Read, Grep",
@@ -8199,6 +8413,8 @@ fn private_mode_keeps_configuration_names_and_masks_the_rest() {
         "lib/skills",
         "-Users-you-space-remuda",
         "space/remuda",
+        "max@example.com",
+        "/h/max",
     ] {
         assert!(!all.contains(hidden), "{hidden}:\n{all}");
     }
@@ -8459,9 +8675,9 @@ fn the_pane_moved_away_and_back_waits_for_the_read_that_is_out() {
         keys(&mut app, &[Key::Char('p')]),
         [config_effect(1, "default")]
     );
-    assert_eq!(keys(&mut app, &[Key::Char('j')]), [config_effect(2, "max")]);
+    assert_eq!(keys(&mut app, &[Key::Char(']')]), [config_effect(2, "max")]);
     // Back on `default` while its first read is out: no second one beside it.
-    assert_eq!(keys(&mut app, &[Key::Char('k')]), []);
+    assert_eq!(keys(&mut app, &[Key::Char('[')]), []);
     assert_eq!(answer(&mut app, 2, "max", "of max"), []);
     assert_eq!(app.config.loaded, None);
     assert_eq!(
@@ -8503,11 +8719,11 @@ fn a_read_from_before_a_new_account_list_stays_hidden_whatever_answers_in_betwee
     let fx = update(&mut app, Event::Accounts(accounts));
     assert_eq!(config_effects(&fx), Vec::<&Effect>::new());
     // Another account, read after the list changed: shown.
-    assert_eq!(keys(&mut app, &[Key::Char('j')]), [config_effect(2, "max")]);
+    assert_eq!(keys(&mut app, &[Key::Char(']')]), [config_effect(2, "max")]);
     assert_eq!(answer(&mut app, 2, "max", "of max"), []);
     assert_eq!(app.config.loaded, Some(Ok(config_with_model("of max"))));
     // Back on `default`, whose read from before the change is still out.
-    assert_eq!(keys(&mut app, &[Key::Char('k')]), []);
+    assert_eq!(keys(&mut app, &[Key::Char('[')]), []);
     assert_eq!(
         answer(&mut app, 1, "default", "before the change"),
         [config_effect(3, "default")]

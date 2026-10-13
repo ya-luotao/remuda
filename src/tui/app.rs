@@ -669,14 +669,16 @@ impl Default for Preview {
     }
 }
 
-/// The Configuration pane of the accounts view (R22).
+/// The account card of the accounts view (R22): what the view knows of the account above its
+/// configuration.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConfigPane {
-    /// `p`: beside or below the view.
+    /// `p`: the card is open over the view; the movement keys scroll the configuration.
     pub open: bool,
-    /// `p` again: the whole view; the movement keys scroll it.
-    pub expanded: bool,
-    /// First line shown.
+    /// `d`: descriptions, an agent's details, and the items of a member that are already the
+    /// source's. Kept while the card is closed.
+    pub details: bool,
+    /// First line of the configuration shown.
     pub scroll: usize,
     /// The account shown: the selection's when last requested.
     pub account: Option<Account>,
@@ -903,7 +905,7 @@ impl App {
     }
 
     /// Shown in History: not noise, unless "show all" (R8).
-    fn in_history(&self, entry: &Entry) -> bool {
+    pub(super) fn in_history(&self, entry: &Entry) -> bool {
         self.history.show_all || !is_noise(entry)
     }
 
@@ -1193,7 +1195,7 @@ impl App {
         true
     }
 
-    /// Points the Configuration pane at the selected account, reading its configuration when
+    /// Points the account card at the selected account, reading its configuration when
     /// the account changed (R22).
     fn retarget_config(&mut self, fx: &mut Vec<Effect>) {
         if !self.config.open || self.mode != Mode::Browse {
@@ -1245,46 +1247,96 @@ impl App {
         }
     }
 
-    /// `p` in Accounts: open, expanded, closed (R22).
-    fn cycle_config(&mut self, fx: &mut Vec<Effect>) {
-        if !self.config.open {
+    /// `p` in Accounts: opens the account card, or closes it (R22).
+    fn toggle_config(&mut self, fx: &mut Vec<Effect>) {
+        if self.config.open {
+            self.close_config();
+        } else {
             self.config.open = true;
             self.retarget_config(fx);
-        } else if !self.config.expanded {
-            self.config.expanded = true;
-            self.config.scroll = 0;
-        } else {
-            self.close_config();
         }
     }
 
-    /// A read that is out is given up: its answer is for no pane. A pane opened again for
+    /// A read that is out is given up: its answer is for no card. A card opened again for
     /// that account before it answers waits for it and reads once more, not twice at once.
     fn close_config(&mut self) {
         self.config.work.cancel();
         self.config = ConfigPane {
             work: std::mem::take(&mut self.config.work),
+            details: self.config.details,
             ..ConfigPane::default()
         };
+    }
+
+    /// Keys while the account card is open (R22): the movement keys scroll the configuration,
+    /// the rest act on the account shown. `r` and `u` are matched before this.
+    fn on_account_card_key(&mut self, key: Key, fx: &mut Vec<Effect>) {
+        match key {
+            Key::Esc => self.close_config(),
+            Key::Char('[') => {
+                self.navigate(Key::Char('k'));
+            }
+            Key::Char(']') => {
+                self.navigate(Key::Char('j'));
+            }
+            Key::Char('n') => self.open_new_session(),
+            Key::Char('D') => self.confirm_remove(),
+            Key::Char('d') => {
+                self.config.details = !self.config.details;
+                self.config.scroll = self.config.scroll.min(self.config_max_scroll());
+            }
+            Key::Char('y') => self.copy_home(fx),
+            other => {
+                self.scroll_config(other);
+            }
+        }
+    }
+
+    /// `y` in the account card: the account's home directory to the clipboard (R22, R16).
+    fn copy_home(&mut self, fx: &mut Vec<Effect>) {
+        let Some(account) = self.config.account.clone() else {
+            return;
+        };
+        match self.home_path(&account) {
+            Some(home) => {
+                fx.push(Effect::Copy(home));
+                self.notify(Level::Info, format!("copied the home of {}", account.name));
+            }
+            None => self.notify(
+                Level::Warn,
+                format!("the home of {} is unknown: HOME is not set", account.name),
+            ),
+        }
+    }
+
+    /// An account's home directory: as registered, or the provider's native one under `$HOME`
+    /// for `default` (R2).
+    pub fn home_path(&self, account: &Account) -> Option<String> {
+        match &account.home {
+            Home::Path(p) => Some(p.clone()),
+            Home::Default => self
+                .home
+                .as_ref()
+                .map(|h| format!("{h}/{}", account.provider.native_dir())),
+        }
     }
 
     fn config_max_scroll(&self) -> usize {
         render::config_line_count(self).saturating_sub(render::config_height(self))
     }
 
-    /// `PgUp` / `PgDn` scroll the pane; while it is expanded, the movement keys too.
+    /// The movement keys scroll the card's configuration.
     fn scroll_config(&mut self, key: Key) -> bool {
         let page = render::config_height(self).max(1);
         let max = self.config_max_scroll();
         let scroll = self.config.scroll.min(max);
-        let expanded = self.config.expanded;
         self.config.scroll = match key {
             Key::PageDown => scroll + page,
             Key::PageUp => scroll.saturating_sub(page),
-            Key::Char('j') | Key::Down if expanded => scroll + 1,
-            Key::Char('k') | Key::Up if expanded => scroll.saturating_sub(1),
-            Key::Char('g') | Key::Home if expanded => 0,
-            Key::Char('G') | Key::End if expanded => max,
+            Key::Char('j') | Key::Down => scroll + 1,
+            Key::Char('k') | Key::Up => scroll.saturating_sub(1),
+            Key::Char('g') | Key::Home => 0,
+            Key::Char('G') | Key::End => max,
             _ => return false,
         }
         .min(max);
@@ -1295,7 +1347,9 @@ impl App {
         self.view = view;
         self.preview.expanded = false;
         self.preview.scroll = 0;
-        self.config.expanded = false;
+        if self.config.open {
+            self.close_config();
+        }
         // Computed the first time the view opens, then on `r` (R20).
         if view == View::Stats && !self.stats.requested {
             self.request_stats(fx);
@@ -1378,20 +1432,9 @@ impl App {
                 self.preview.expanded = !self.preview.expanded;
                 self.preview.scroll = 0;
             }
-            Key::Char('p' | ' ') if self.view == View::Accounts => self.cycle_config(fx),
-            Key::Esc if self.view == View::Accounts && self.config.expanded => {
-                self.config.expanded = false;
-                self.config.scroll = 0;
-            }
-            Key::Esc if self.view == View::Accounts && self.config.open => self.close_config(),
-            Key::PageUp | Key::PageDown
-                if self.view == View::Accounts && self.config.open && !self.config.expanded =>
-            {
-                self.scroll_config(key);
-            }
-            // The whole view is the pane's: the other keys of Accounts wait.
-            _ if self.view == View::Accounts && self.config.expanded => {
-                self.scroll_config(key);
+            Key::Char('p' | ' ') if self.view == View::Accounts => self.toggle_config(fx),
+            _ if self.view == View::Accounts && self.config.open => {
+                self.on_account_card_key(key, fx);
             }
             _ if self.preview.expanded => self.on_card_key(key, fx),
             Key::Char('n') if self.view == View::Accounts => self.open_new_session(),
@@ -2958,7 +3001,7 @@ pub fn update(app: &mut App, event: Event) -> Vec<Effect> {
             // The read waited for, by its number: the account shown.
             let claim = app.config.work.claim(request, &account);
             let shown = app.config.account.as_ref() == Some(&account);
-            // Asked again since this read began (`r`, the pane opened or the selection came
+            // Asked again since this read began (`r`, the card opened or the selection came
             // back, the account list changed): what it read may be from before, so the
             // account is read once more.
             if let Some(request) = claim.next() {

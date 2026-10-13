@@ -10,6 +10,19 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Added
 
+- The account card: `p` (or Space) in the TUI's Accounts view now opens a card over the view,
+  like the session card, with what Remuda knows of the selected account above its configuration:
+  its home directory, its login (and whether it came from the cache), its usage (each window's
+  percentage and the time to its reset, with the reading's source and age), its sessions (how
+  many History lists as its, how many run), its checks, and its part in sharing;
+  what is not read yet says so instead of showing none or zero. The configuration lists entries
+  by name on wrapped lines, those turned off marked, with counts in the headings; an item or
+  plugin a member gets through a link to the source is one line naming the target. In the card,
+  `d` shows the details (descriptions, an agent's model, effort and tools, link targets, and the
+  linked items' entries); `y` copies the home directory to the clipboard (OSC 52); `[` and `]`
+  move to the previous or next account; `n`, `u`, `D` and `r` work as in the view; the movement
+  keys scroll the configuration; `Esc`, `p` or Space closes it (SPEC R22).
+
 - The session card: `p` (or Space) in the TUI's Live and History views now opens a card over the
   view instead of expanding the preview pane, with what Remuda knows of the selected session
   above the preview: its id, provider and entry point, its accounts and whether it runs (as what,
@@ -25,6 +38,12 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   selection reads its last 4 MB at most. Live's `l`, `x`, `D` and `a` work in the card too. In
   private mode the card masks what the lists mask, and shows neither the transcript nor the
   store path (SPEC R16, R21).
+
+### Changed
+
+- The configuration pane of the Accounts view (beside the view from 120 columns, below the table
+  otherwise, then the whole view on a second `p`) is replaced by the account card above; `Esc`
+  closes the card in one step, and switching views closes it too (SPEC R22).
 
 ## [0.3.0] - 2026-10-13
 

@@ -58,9 +58,9 @@ starts and is not saved. While it is on, the TUI shows:
 - emails as `•••@•••`, and organizations, session titles, first messages, session names, message
   previews, background session logs, search text and typed form values as `•••`;
 - paths with every component masked, and `$HOME` as `~` (`~/•••/•••`);
-- in the configuration pane, the names of agents, skills, commands, plugins, hooks, settings,
+- in the account card, the names of agents, skills, commands, plugins, hooks, settings,
   `env` variables and MCP servers stay visible; descriptions are masked;
-- notices, errors, check messages and the problems of the configuration pane with the above
+- notices, errors, check messages and the problems of the account card with the above
   replaced. A path remuda puts there itself is masked whole, and what the message says around
   it stays readable (the reason, what to do, a `/login` or `/rewind` it names). In text from
   elsewhere (an agent's output, a system error, a name read from a file) nothing says where a
@@ -198,18 +198,27 @@ servers and project trust in its `.claude.json`. `share` applies to Claude
 accounts only, and `from` must name a Claude account; anything else is a load error. The Accounts
 view warns about problems such as a missing source home or a plugin whose install is gone.
 
-## Account configuration
+## Account card
 
-`p` in the Accounts view shows what the selected Claude account's sessions load, for a new
-session in the directory remuda was started in: its `CLAUDE.md`, agents (with their model,
-effort and tools), skills (with those turned off by `skillOverrides`, and overrides that name
-no skill), commands, rules (those limited to paths marked), plugins with what each adds (agents,
-skills, commands, hooks, MCP servers), a summary of its settings, its auto-memory directory, the
-directory for the memory of user-scope subagents, and the names of its MCP servers. Each item is marked as the account's own, shared from the source of `[share.claude]`,
-already the source's (a symlink), or not shared, with the reason. What is shared comes from the
-same step that prepares a launch, so the pane and a launch always agree. Settings are shown by
-key names and counts only; no values. Synced claude.ai skills are shown for the account's own
-login only. Press `p` again to give the pane the whole screen, and `Esc` to step back.
+`p` in the Accounts view opens a card over the view with what remuda knows of the selected
+account: its home directory, its login, its usage (each window's percentage and the time to its
+reset, and how old the reading is), its sessions (how many History lists as its, how many run),
+its checks, and its part in sharing. Below, for a Claude account, what its sessions load, for a
+new session in the directory remuda was started in: its `CLAUDE.md`, agents, skills (with those
+turned off by `skillOverrides`, and overrides that name no skill), commands, rules (those limited
+to paths marked), plugins with what each adds (agents, skills, commands, hooks, MCP servers), a
+summary of its settings, its auto-memory directory, the directory for the memory of user-scope
+subagents, and the names of its MCP servers. Each item is marked as the account's own, shared
+from the source of `[share.claude]`, already the source's (a symlink), or not shared, with the
+reason. What is shared comes from the same step that prepares a launch, so the card and a launch
+always agree. Settings are shown by key names and counts only; no values. Synced claude.ai skills
+are shown for the account's own login only.
+
+Entries are listed by name; `d` lists them with their details (descriptions, an agent's model,
+effort and tools, link targets), and lists the entries of items a member gets through a link to
+the source, which are one line otherwise. `[` and `]` move to the previous or next account, `y`
+copies the home directory to the clipboard, and `n`, `u`, `D` and `r` work as in the view. `Esc`
+or `p` closes the card.
 
 ## Recommendations
 

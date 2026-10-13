@@ -211,8 +211,8 @@ Account names match `[A-Za-z0-9_-]+`. Because `run` forwards `-h` and `--help` t
 ## TUI
 
 Four views, Accounts, Live, History and Stats, with a preview pane for the selected session in
-Live and History (and `p` for a card with everything Remuda knows of it, and what to do with it)
-and a configuration pane for the selected account in Accounts. Press `?` for the key reference.
+Live and History, and `p` for a card with everything Remuda knows of the selected session, or of
+the selected account, and what to do with it. Press `?` for the key reference.
 
 The Accounts view, with every account's limits and their resets on one timeline:
 
@@ -243,7 +243,7 @@ Checks ────────────────────────�
 | `g` `G`, `Home` `End`, `PgUp` `PgDn` | First / last row, page up / down |
 | `Enter` | History: resume the selected session (Codex asks for confirmation first). Live: attach to a background session |
 | `f` | Fork the selected session into a new session; the original is left unchanged |
-| `p`, `Space` | Live and History: open or close the session card: the session's id, provider and entry point, accounts and whether it runs, when it started and was last active, directory, transcript and store, above the preview, which `j` `k` `PgUp` `PgDn` scroll. In it, `Enter` and `f` resume and fork as below; `R` `F` resume or fork choosing the account; `n` starts a new session in the session's directory as its account; `y` `Y` copy the session id or the transcript path to the clipboard (OSC 52, through the terminal); `m` reads more of the transcript (100, 500, all messages); `[` `]` move to the previous or next session. Accounts: show the selected account's configuration (instructions, plugins, settings, memory, MCP servers, and where each comes from); press again to expand it, again to close it. `PgUp` `PgDn` scroll it |
+| `p`, `Space` | Live and History: open or close the session card: the session's id, provider and entry point, accounts and whether it runs, when it started and was last active, directory, transcript and store, above the preview, which `j` `k` `PgUp` `PgDn` scroll. In it, `Enter` and `f` resume and fork as below; `R` `F` resume or fork choosing the account; `n` starts a new session in the session's directory as its account; `y` `Y` copy the session id or the transcript path to the clipboard (OSC 52, through the terminal); `m` reads more of the transcript (100, 500, all messages); `[` `]` move to the previous or next session. Accounts: open or close the account card: the account's home, login, usage (each window with its reset), sessions (in History, running), checks and part in sharing, above its configuration (instructions, plugins, settings, memory, MCP servers, and where each comes from), which the movement keys scroll. In it, `n` `u` `D` `r` work as in the view; `d` shows the details (descriptions, an agent's model, effort and tools, the items a member gets through a link); `y` copies the home directory; `[` `]` move to the previous or next account |
 | `n` | Accounts: start a new session with the selected account. Session card: one in the session's directory as its account |
 | `s` | Accounts: set up a new Claude or Codex account, as `remuda setup` does |
 | `l` | Live: show a background session's logs in the preview |
@@ -255,7 +255,7 @@ Checks ────────────────────────�
 | `b` | Stats: sections by account or by project (the directory each session started in) |
 | `u` | Query live usage for every account |
 | `r` | Refresh the index, identities, live sessions and checks, and the statistics once the Stats view has been opened |
-| `Esc` | Go back: close the session card or the configuration pane, close logs, clear the search, or cancel a form or pending launch check |
+| `Esc` | Go back: close the session card or the account card, close logs, clear the search, or cancel a form or pending launch check |
 | `Ctrl-P` | Turn private mode on or off, anywhere |
 | `?` · `q`, `Ctrl-C` | Show the key reference (any key but `Ctrl-P` closes it) · Quit |
 

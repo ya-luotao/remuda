@@ -1333,7 +1333,7 @@ mod tests {
         );
     }
 
-    /// R22: the configuration asked for again (`r`, or the pane closed and opened) while a read
+    /// R22: the configuration asked for again (`r`, or the card closed and opened) while a read
     /// of it is out. That read may have seen the files before they changed, and its answer
     /// may only reach the app after the key: the files are read once more when it answers,
     /// and what changed is shown.
@@ -1341,7 +1341,7 @@ mod tests {
     fn configuration_asked_again_during_a_read_shows_what_changed_meanwhile() {
         use crate::tui::app::{App, Key, update};
         let p = Key::Char('p');
-        for again in [&[Key::Char('r')][..], &[p, p, p][..]] {
+        for again in [&[Key::Char('r')][..], &[p, p][..]] {
             let dir = tempfile::tempdir().unwrap();
             let deps = deps(dir.path());
             let max = max(&deps);

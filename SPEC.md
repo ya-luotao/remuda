@@ -33,7 +33,8 @@ How the entries map onto the code is described in [docs/ARCHITECTURE.md](docs/AR
 
 - **Provider**: an agent CLI. `claude` is fully supported. `codex` supports accounts, identity,
   usage, the session index, token statistics, launch, resume, and fork; running sessions (R7),
-  shared configuration (R18), and the configuration pane (R22) are claude-only (R4, R17).
+  shared configuration (R18), and the account card's configuration (R22) are claude-only (R4,
+  R17).
 - **Account**: `(provider, name, home)`. `home` is the provider's isolation directory, or the
   special value `default`.
 - `name` matches `[A-Za-z0-9_-]+` and is unique within a provider. On the command line an account
@@ -1017,7 +1018,8 @@ or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `
   that another `remuda` removed while the picker was open, or registered again with another
   home (R2), is not launched, and remuda exits with an error that says so. A provider's
   `default` is implicit (R1) and cannot have been removed.
-- **Configuration** (`p` or Space in Accounts): the selected account's configuration (R22).
+- **Account card** (`p` or Space in Accounts): what the view knows of the selected account, and
+  its configuration (R22).
 - **Usage readings are recorded** (R24): the cached usage the Accounts view reads (when it
   starts, on a refresh, for an account the registry adds) and every answer of `u`'s live
   queries, as `remuda usage` records them, once they are shown: the cached usage of every
@@ -1822,10 +1824,10 @@ status and hint lines, notices, the help box) shows:
   directories of the Stats view, form values):
   each component is shown as `•••`, and a leading `$HOME` as `~` (`~/•••/•••`).
 - **Session content**: titles, first messages, session names, preview messages, background
-  session logs, search text, and the descriptions in the configuration pane (R22) are shown as
+  session logs, search text, and the descriptions in the account card (R22) are shown as
   `•••`.
-- **Messages and free text** (notices, errors, check messages, the problems of the configuration
-  pane, the description of a pending launch): account names are replaced by their aliases, as
+- **Messages and free text** (notices, errors, check messages, the problems of the account
+  card's configuration, the description of a pending launch): account names are replaced by their aliases, as
   whole words (ASCII letters, digits, `_`, and `-` make a word, so a name right next to CJK text
   or full-width punctuation is replaced too); emails, organization names, live session names,
   the search text, and the values typed in the open form (as typed, without the blanks around
@@ -1834,7 +1836,7 @@ status and hint lines, notices, the help box) shows:
   - A message remuda puts together says which of its parts are paths, which are its own words,
     and which came from elsewhere. So it is with a notice and a form's error (a launch
     directory, a store, a home), a check message (R11: a home, a link and its target, a store,
-    a file), a problem of the configuration pane (R22: a home, a file, the registry, a
+    a file), a problem of the account card's configuration (R22: a home, a file, the registry, a
     settings file that cannot be read or is not a JSON object), the status line's notice of a
     refresh that is incomplete (R8, R20: the directory that could not be read, with the
     system's error after it as text from elsewhere), and the reason a launch is refused before
@@ -1862,9 +1864,9 @@ status and hint lines, notices, the help box) shows:
     the index or of the statistics could not do names each thing that failed in remuda's
     words (`incomplete: cannot read …`, `index cache: …`, `stats cache: …`, `prices: …`) and
     gives the system's error for it, each masked by itself. Why the registry cannot be read is
-    one such error wherever it is told (a problem of the configuration pane, the prices of the
-    statistics, a resume that cannot be confirmed, R16): the words remuda puts around it stay,
-    and the error is masked from the file it names on.
+    one such error wherever it is told (a problem of the account card's configuration, the
+    prices of the statistics, a resume that cannot be confirmed, R16): the words remuda puts
+    around it stay, and the error is masked from the file it names on.
 
 Numbers (usage percentages, reset times, token counts, costs, and the Stats chart), model names,
 plans, login methods, providers, session IDs, pids, and times stay visible, and so do the names
@@ -1879,27 +1881,47 @@ For the selected claude account, the accounts view shows what its sessions load 
 part comes from. It only reads: nothing is written (R13), no agent command runs, and credentials
 (`.credentials.json`, the Keychain, `*.key`) are never opened.
 
-- **Keys.** `p` or Space in Accounts opens the Configuration pane (beside the view from 120
-  columns on, below the account table otherwise); pressed again, the pane takes the whole view;
-  again, it closes. `Esc` steps back one of these. While the pane is beside or below, the
-  selection moves as usual and the pane follows it, and `PgUp` / `PgDn` scroll the pane; while it
-  takes the whole view, the movement keys scroll it. The account picker of `remuda run` (R5) has
-  no pane.
-- **When it is read.** In the background, never while drawing: when the pane opens, when the
+- **Keys.** `p` or Space in Accounts opens the account card over the view; `p`, Space or `Esc`
+  closes it, and so does switching views. `[` / `]` move the selection to the previous / next
+  account behind it and the card follows. The movement keys scroll the configuration. In the
+  card, `n`, `u`, `D` and `r` work as in the view (a new session with the account, live usage,
+  its removal, a refresh); `d` shows or hides the details (descriptions; an agent's model,
+  effort and tools; the items of a member that are already the source's); `y` copies the
+  account's home directory to the clipboard (OSC 52, R16). The account picker of `remuda run`
+  (R5) has no card.
+- **The card.** Above the configuration, what the view knows of the account: its `provider:name`
+  and home directory (`~/.claude` or `~/.codex` for `default`); its login (email, organization,
+  plan, and whether it was read from the cache; or not logged in), its usage (each window's
+  percentage, `reset` once the reset has passed, R10, and the reading's source and age), its
+  sessions (how many History lists as its, under R8's noise filter as toggled, R17, and how
+  many run, R7), its checks
+  (R11, and not logged in or a failed live query as the view lists them), and its part in
+  sharing (R18: alone, the source, a member of which source, opted out, or a source whose home
+  is missing). What is not read yet says so and is never shown as none or zero: the login,
+  the usage, the sessions (until the index and the attribution are loaded), the checks, the
+  configuration. Then the configuration, under a title naming the directory it describes, its
+  problems first. The configuration lists by name: the entries of an item
+  (agents, skills, commands, rules, synced skills) flow on wrapped lines, those turned off marked
+  so, and the headings carry the counts (an item's entries and how many are off, the plugins
+  enabled and disabled). An item or plugin of a member that is already the source's is one
+  line, naming the target, without its entries. `d` lists the entries one per line with their
+  details, and those of the source's items too. A card too short for everything keeps the
+  configuration's room and drops the last facts first.
+- **When it is read.** In the background, never while drawing: when the card opens, when the
   selected account changes while it is open, on `r`, and when the account list is read again
   (after a setup or a removal). Asked for again while a read of that account has not answered
-  yet (a held `r` or `p`, the pane closed and opened, the selection moved away and back, the
+  yet (a held `r` or `p`, the card closed and opened, the selection moved away and back, the
   account list read again), no second read starts: the configuration is read once more when
   that one answers, so that what changed in between is shown. What was read before the account
-  list was read again is not shown. For a codex account the pane says that configuration
+  list was read again is not shown. For a codex account the card says that configuration
   listing is Claude-only.
 - **For a directory.** What a session loads depends on where it starts (project settings,
-  plugins installed for a project, the auto-memory project, project MCP servers). The pane
+  plugins installed for a project, the auto-memory project, project MCP servers). The card
   describes a new session started in the directory remuda was started in (the default of R16's
   new session), and its title names both: `Configuration · <account> · for <directory>`.
 - **The same plan as a launch.** What shared configuration adds (R18) is decided by the very
   step that decides a launch's injection for a new session in that directory, without the
-  launch's writes (the `.claude` item links and the settings file), so the pane cannot disagree
+  launch's writes (the `.claude` item links and the settings file), so the card cannot disagree
   with a launch. A settings file that would fail the launch (not a JSON object) is shown as a
   problem, in the words of the launch's own error (R18); private mode masks the file in it and
   keeps the rest (R21).
@@ -1921,13 +1943,13 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   Symlinks are followed; only regular files are opened; frontmatter is read from a file's first 8
   KB; at most 500 entries are listed per directory.
 - **Synced skills.** `skills/synced/<organization>_<account>/` holds the claude.ai skills of one
-  login, and a `skills` directory shared by several homes holds every login's buckets. The pane
+  login, and a `skills` directory shared by several homes holds every login's buckets. The card
   lists only the bucket named by `oauthAccount.organizationUuid` and `accountUuid` in the
   account's own `.claude.json`, as synced skills, with the number of other buckets; without those
   ids it says that the bucket cannot be matched. `synced` is never listed as a skill, and bucket
   names are never shown.
 - **Skill overrides.** A skill set to `"off"` in `skillOverrides` of the settings a session gets
-  (the home's, the project's, the injected) is shown as off; an override naming no skill the pane
+  (the home's, the project's, the injected) is shown as off; an override naming no skill the card
   lists (own, shared, synced, or a plugin's, as `<skill>` or `<plugin>:<skill>`) is listed as
   stale.
 - **Plugins.** The home's enabled plugins (`enabledPlugins` `true` or an array), each with the

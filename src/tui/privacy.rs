@@ -1,6 +1,6 @@
 //! Private mode (SPEC R21): what the TUI shows while it is on. [`redacted`] makes a copy of
 //! the [`App`] with account names aliased and emails, organizations, paths, session content
-//! and the descriptions of the configuration pane (R22) masked, and the screen is drawn from
+//! and the descriptions of the account card (R22) masked, and the screen is drawn from
 //! that copy only. Every struct and enum it
 //! copies is destructured without `..`: a field added later does not compile until it is
 //! decided how private mode shows it.
@@ -878,11 +878,11 @@ impl Redactor<'_> {
         }
     }
 
-    /// The Configuration pane (R22): names stay, descriptions are masked, paths too.
+    /// The account card's configuration (R22): names stay, descriptions are masked, paths too.
     fn config_pane(&self, pane: &ConfigPane) -> ConfigPane {
         let ConfigPane {
             open,
-            expanded,
+            details,
             scroll,
             account,
             loaded,
@@ -890,7 +890,7 @@ impl Redactor<'_> {
         } = pane;
         ConfigPane {
             open: *open,
-            expanded: *expanded,
+            details: *details,
             scroll: *scroll,
             account: account.as_ref().map(|a| self.account(a)),
             loaded: loaded

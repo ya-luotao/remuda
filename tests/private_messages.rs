@@ -93,9 +93,7 @@ impl Homes {
     fn with_config(&self, sharing: &Sharing) -> (App, ConfigView) {
         let view = account_config::read(&self.member, sharing, None, &self.env);
         let mut app = self.app(self.accounts());
-        for key in [Key::Char('p'), Key::Char('p')] {
-            update(&mut app, Event::Key(key));
-        }
+        update(&mut app, Event::Key(Key::Char('p')));
         let request = app.config.work.round();
         update(
             &mut app,
@@ -169,12 +167,10 @@ fn a_settings_problem_keeps_its_reason_in_private_mode() {
             source_settings.display()
         )]
     );
-    // With private mode off the file shows (the line is wrapped at this width).
+    // With private mode off the file shows (the line is wrapped at the card's width, the
+    // path kept whole).
     let open = screen(&app);
-    assert!(
-        open.contains(".claude/settings.json is not a JSON"),
-        "{open}"
-    );
+    assert!(open.contains(".claude/settings.json"), "{open}");
     app.private = true;
     assert_eq!(
         private_problems(&app),
