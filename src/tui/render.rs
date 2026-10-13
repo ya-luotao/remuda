@@ -1041,7 +1041,6 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
 
     let reading = a.usage_at(app.now);
     let windows = reading.as_ref().map_or(&[][..], |u| &u.windows);
-    let (source, source_style) = source_cell(a, app.now);
     let mut usage: Vec<Vec<Span<'static>>> = Vec::new();
     for w in windows {
         let mut part = vec![Span::styled(format!("{} ", window_name(&w.label)), DIM)];
@@ -1059,10 +1058,7 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
         }
         usage.push(part);
     }
-    usage.push(vec![match (usage.is_empty(), source.as_str()) {
-        (true, "…") => Span::styled("reading usage…", DIM),
-        _ => Span::styled(source, source_style),
-    }]);
+    usage.extend(usage_source(a, app.now));
     facts.extend(facts_packed("Usage", usage, value_w));
 
     // The index and the attribution answer who owns what; until both have, the count would
@@ -1139,8 +1135,31 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
             }
         }
     };
-    facts.push(fact("Shares", shares));
+    facts.extend(facts_packed("Shares", vec![shares], value_w));
     facts
+}
+
+/// The end of the card's Usage row: where the reading shown comes from and how old it is
+/// (the cache's age when the cache is shown, whatever a live query does), then `live…` while
+/// one is out. A failed one is among the Checks.
+fn usage_source(a: &AccountState, now: Timestamp) -> Vec<Vec<Span<'static>>> {
+    let running = a.work.live.is_running();
+    let source = match a.usage_at(now).map(|u| (u.source, u.age_text())) {
+        Some((Source::Live, Some(age))) => Span::styled(format!("live {age}"), OK),
+        Some((Source::Cached, Some(age))) => Span::styled(format!("cached {age}"), DIM),
+        Some((source, None)) => Span::styled(source.name(), DIM),
+        None if running => return vec![vec![Span::styled("live…", WARN)]],
+        None => match (&a.live, &a.cached) {
+            (_, Some(Err(_))) => Span::styled("no cache", DIM),
+            (Some(Err(_)), _) => Span::styled("live failed", CRIT),
+            _ => Span::styled("reading usage…", DIM),
+        },
+    };
+    let mut parts = vec![vec![source]];
+    if running {
+        parts.push(vec![Span::styled("live…", WARN)]);
+    }
+    parts
 }
 
 /// The account's part in sharing (R18), as the card says it.

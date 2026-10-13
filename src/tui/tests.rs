@@ -8107,6 +8107,32 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     );
     let (_, sessions) = line_with(&lines, "Sessions   ");
     assert!(sessions.contains("2 in History · 1 running"), "{sessions}");
+    // A live query out: the cache shown keeps its age, `live…` beside it; one that failed
+    // is among the checks, the usage row keeps to what it shows.
+    keys(&mut app, &[Key::Char('u')]);
+    let lines = screen(&app);
+    let (_, usage) = line_with(&lines, "Usage      ");
+    assert!(usage.contains("· cached 5m ago · live…"), "{usage}");
+    for name in ["default", "max", "team"] {
+        update(
+            &mut app,
+            Event::LiveUsage {
+                account: crate::tui::tests::account(name),
+                answered_at: ts(NOW),
+                result: Err("boom".into()),
+            },
+        );
+    }
+    let lines = screen(&app);
+    let (_, usage) = line_with(&lines, "Usage      ");
+    assert!(
+        usage.contains("· cached 5m ago") && !usage.contains("live"),
+        "{usage}"
+    );
+    line_with(&lines, "! live usage failed: boom");
+    for a in &mut app.accounts {
+        a.live = None;
+    }
     // At 80 columns the usage goes on, a window kept whole, nothing clipped.
     update(&mut app, Event::Resize(80, 24));
     let lines = screen(&app);

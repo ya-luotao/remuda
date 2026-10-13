@@ -1892,7 +1892,8 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
 - **The card.** Above the configuration, what the view knows of the account: its `provider:name`
   and home directory (`~/.claude` or `~/.codex` for `default`); its login (email, organization,
   plan, and whether it was read from the cache; or not logged in), its usage (each window's
-  percentage, `reset` once the reset has passed, R10, and the reading's source and age), its
+  percentage, `reset` once the reset has passed, R10, and the reading's source and age, with
+  `live…` beside them while a live query is out; a failed one is among its checks), its
   sessions (how many History lists as its, under R8's noise filter as toggled, R17, and how
   many run, R7), its checks (R11: those naming it and the machine-wide ones, which concern
   every account; and not logged in or a failed live query as the view lists them), and its part in
