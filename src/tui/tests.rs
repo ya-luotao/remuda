@@ -8185,9 +8185,9 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     );
 }
 
-/// R22: the Plugins heading counts what loads here: a bundled plugin the project turns off and
-/// an enabled one with no install are rows, not part of the count; those set to `false` are
-/// counted apart.
+/// R22: the Plugins heading counts what loads here, the source's plugin the home installed
+/// itself among them; a bundled plugin the project turns off and an enabled one with no install
+/// are rows, not part of the count; those set to `false` are counted apart.
 #[test]
 fn the_plugins_heading_counts_what_loads() {
     use crate::account_config::{Origin, Plugin};
@@ -8208,13 +8208,16 @@ fn the_plugins_heading_counts_what_loads() {
     view.plugins
         .push(row("f@builtin", Origin::NotShared(Skip::TurnedOff)));
     view.plugins.push(row("gone@market", Origin::Own));
+    view.plugins
+        .push(row("mine@market", Origin::NotShared(Skip::OwnInstall)));
     view.disabled_plugins = 2;
     answer_config(&mut app, "default", view);
     let body = config_text(&app, 200);
     for shown in [
-        "Plugins · 1 enabled · 2 disabled\n  ctx7@market · 1.2.0 · user · shared from default",
+        "Plugins · 2 enabled · 2 disabled\n  ctx7@market · 1.2.0 · user · shared from default",
         "  f@builtin · not shared: turned off here",
         "  gone@market · own · not installed here",
+        "  mine@market · not shared: installed by this home",
     ] {
         assert!(body.contains(shown), "{shown}:\n{body}");
     }

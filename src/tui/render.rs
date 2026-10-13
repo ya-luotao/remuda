@@ -1353,12 +1353,18 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
         out.line("  none", DIM);
     }
 
-    // Plugins: the heading counts what loads here (installed, or bundled and not turned off);
-    // each other row says why it does not.
+    // Plugins: the heading counts what loads here (an install, the source's or the home's own,
+    // or bundled and not turned off); each other row says why it does not.
     let enabled = v
         .plugins
         .iter()
-        .filter(|p| p.path.is_some() || p.origin == Origin::NotShared(Skip::Builtin))
+        .filter(|p| {
+            p.path.is_some()
+                || matches!(
+                    p.origin,
+                    Origin::NotShared(Skip::Builtin | Skip::OwnInstall)
+                )
+        })
         .count();
     let mut plugins = format!("Plugins · {enabled} enabled");
     if v.disabled_plugins > 0 {

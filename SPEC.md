@@ -1903,8 +1903,9 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   problems first. The configuration lists by name: the entries of an item
   (agents, skills, commands, rules, synced skills) flow on wrapped lines, those turned off marked
   so, and the headings carry the counts (an item's entries and how many are off; the plugins
-  that load here, installed or bundled and not turned off, and those set to `false`). An item
-  or plugin of a member that is already the source's is one
+  that load here, installed by the source's injection or by the home itself, or bundled and
+  not turned off, and those set to `false`). An item or plugin of a member that is already
+  the source's is one
   line, naming the target, without its entries. `d` lists the entries one per line with their
   details, and those of the source's items too. A card too short for everything keeps the
   configuration's room and drops the last facts first.
