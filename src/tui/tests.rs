@@ -8107,8 +8107,18 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     );
     let (_, sessions) = line_with(&lines, "Sessions   ");
     assert!(sessions.contains("2 in History · 1 running"), "{sessions}");
+    // The fixture's machine-wide check concerns this account too; another account's does not.
+    let (_, checks) = line_with(&lines, "Checks     ");
+    assert!(checks.contains("! ANTHROPIC_API_KEY is set"), "{checks}");
+    app.checks = Some(vec![Check {
+        account: Some("claude:team".into()),
+        message: "home /h/team does not exist".into(),
+    }]);
+    let lines = screen(&app);
     let (_, checks) = line_with(&lines, "Checks     ");
     assert!(checks.contains("✓ no problems found"), "{checks}");
+    let all = lines.join("\n");
+    assert!(!all.contains("does not exist"), "{all}");
     let (_, shares) = line_with(&lines, "Shares     ");
     assert!(
         shares.contains("gets default's configuration at launch"),
@@ -8131,7 +8141,8 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
         "{sessions}"
     );
     let (_, checks) = line_with(&lines, "Checks     ");
-    assert!(checks.contains("! not logged in"), "{checks}");
+    assert!(checks.contains("! home /h/team does not exist"), "{checks}");
+    line_with(&lines, "! not logged in");
 
     // The problems of the configuration open it.
     let mut view = config_view();
@@ -8172,6 +8183,41 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
         !body.contains("gets default's configuration at launch"),
         "{body}"
     );
+}
+
+/// R22: the Plugins heading counts what loads here: a bundled plugin the project turns off and
+/// an enabled one with no install are rows, not part of the count; those set to `false` are
+/// counted apart.
+#[test]
+fn the_plugins_heading_counts_what_loads() {
+    use crate::account_config::{Origin, Plugin};
+    use crate::share::Skip;
+    let mut app = app();
+    update(&mut app, Event::Resize(120, 40));
+    keys(&mut app, &[Key::Char('p')]);
+    let mut view = config_view();
+    let row = |name: &str, origin| Plugin {
+        name: name.into(),
+        origin,
+        version: None,
+        scope: None,
+        installs: 0,
+        path: None,
+        contents: None,
+    };
+    view.plugins
+        .push(row("f@builtin", Origin::NotShared(Skip::TurnedOff)));
+    view.plugins.push(row("gone@market", Origin::Own));
+    view.disabled_plugins = 2;
+    answer_config(&mut app, "default", view);
+    let body = config_text(&app, 200);
+    for shown in [
+        "Plugins · 1 enabled · 2 disabled\n  ctx7@market · 1.2.0 · user · shared from default",
+        "  f@builtin · not shared: turned off here",
+        "  gone@market · own · not installed here",
+    ] {
+        assert!(body.contains(shown), "{shown}:\n{body}");
+    }
 }
 
 /// R22: entries flow by name, those turned off marked; `d` lists them one per line with their

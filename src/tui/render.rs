@@ -968,15 +968,16 @@ fn window_name(label: &str) -> String {
     }
 }
 
-/// The problems the checks list for one account (R11), and what the view adds to them: not
-/// logged in, a failed live query.
+/// The problems the checks list for one account (R11), the machine-wide ones with them (an
+/// environment override or a shared store's cleanup concerns this account too), and what the
+/// view adds: not logged in, a failed live query.
 fn account_problems(app: &App, a: &AccountState) -> Vec<String> {
     let qualified = a.account.qualified();
     let mut problems: Vec<String> = app
         .checks
         .iter()
         .flatten()
-        .filter(|c| c.account.as_deref() == Some(qualified.as_str()))
+        .filter(|c| c.account.is_none() || c.account.as_deref() == Some(qualified.as_str()))
         .map(|c| c.message.to_string())
         .collect();
     if a.identity == Some(Identity::NotLoggedIn) {
@@ -1352,8 +1353,13 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
         out.line("  none", DIM);
     }
 
-    // Plugins.
-    let enabled = v.plugins.len();
+    // Plugins: the heading counts what loads here (installed, or bundled and not turned off);
+    // each other row says why it does not.
+    let enabled = v
+        .plugins
+        .iter()
+        .filter(|p| p.path.is_some() || p.origin == Origin::NotShared(Skip::Builtin))
+        .count();
     let mut plugins = format!("Plugins · {enabled} enabled");
     if v.disabled_plugins > 0 {
         plugins.push_str(&format!(" · {} disabled", v.disabled_plugins));

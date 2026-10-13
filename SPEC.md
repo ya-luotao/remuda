@@ -1894,16 +1894,17 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   plan, and whether it was read from the cache; or not logged in), its usage (each window's
   percentage, `reset` once the reset has passed, R10, and the reading's source and age), its
   sessions (how many History lists as its, under R8's noise filter as toggled, R17, and how
-  many run, R7), its checks
-  (R11, and not logged in or a failed live query as the view lists them), and its part in
+  many run, R7), its checks (R11: those naming it and the machine-wide ones, which concern
+  every account; and not logged in or a failed live query as the view lists them), and its part in
   sharing (R18: alone, the source, a member of which source, opted out, or a source whose home
   is missing). What is not read yet says so and is never shown as none or zero: the login,
   the usage, the sessions (until the index and the attribution are loaded), the checks, the
   configuration. Then the configuration, under a title naming the directory it describes, its
   problems first. The configuration lists by name: the entries of an item
   (agents, skills, commands, rules, synced skills) flow on wrapped lines, those turned off marked
-  so, and the headings carry the counts (an item's entries and how many are off, the plugins
-  enabled and disabled). An item or plugin of a member that is already the source's is one
+  so, and the headings carry the counts (an item's entries and how many are off; the plugins
+  that load here, installed or bundled and not turned off, and those set to `false`). An item
+  or plugin of a member that is already the source's is one
   line, naming the target, without its entries. `d` lists the entries one per line with their
   details, and those of the source's items too. A card too short for everything keeps the
   configuration's room and drops the last facts first.
