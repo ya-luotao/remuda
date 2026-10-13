@@ -16,7 +16,8 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   percentage and the time to its reset, with the reading's source and age), its sessions (how
   many History lists as its, how many run), its checks, and its part in sharing;
   what is not read yet says so instead of showing none or zero. The configuration lists entries
-  by name on wrapped lines, those turned off marked, with counts in the headings; an item or
+  by name on wrapped lines, those turned off marked (a home's installed plugin the project's
+  settings turn off too), with counts in the headings; an item or
   plugin a member gets through a link to the source is one line naming the target. In the card,
   `d` shows the details (descriptions, an agent's model, effort and tools, link targets, the
   linked items' entries, and a plugin's); `y` copies the home directory to the clipboard (OSC
