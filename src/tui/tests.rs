@@ -3335,27 +3335,75 @@ fn accounts_view_loading() {
     assert!(all.contains("u: live usage"), "{all}");
 }
 
-/// A tall terminal draws the mark around the line of views; a shorter one keeps the one-line
-/// header, and the body starts right below it.
+/// A tall terminal wraps one-line navigation in the mark's tracks, with the wordmark and
+/// private badge in the upper rail. A shorter one keeps the one-line header.
 #[test]
-fn header_shows_the_mark_when_tall() {
+fn header_wraps_navigation_in_the_mark_tracks_when_tall() {
     let mut app = app();
     update(&mut app, Event::Resize(80, render::TALL));
     let lines = screen(&app);
-    assert_eq!(lines[0], " ╭─────");
+    assert!(lines[0].starts_with(" ╭─ remuda ─"), "{}", lines[0]);
     assert!(
-        lines[1].starts_with(" │╭──── remuda  1 Accounts  2 Live"),
+        lines[1].starts_with(" ││ 1 Accounts  2 Live  3 History  4 Stats"),
         "{}",
         lines[1]
     );
     assert!(lines[1].ends_with("?: help · q: quit"), "{}", lines[1]);
-    assert_eq!(lines[2], " ││");
+    assert!(lines[2].starts_with(" │╰───"), "{}", lines[2]);
+    assert_eq!(lines[0].chars().count(), 43);
+    assert_eq!(lines[2].chars().count(), 43);
     assert!(lines[3].starts_with("Accounts"), "{}", lines[3]);
 
+    for width in [43, 60, 61, 80] {
+        update(&mut app, Event::Resize(width, render::TALL));
+        for view in ['1', '2', '3', '4'] {
+            keys(&mut app, &[Key::Char(view)]);
+            let mut public_selection = Vec::new();
+            for private in [false, true] {
+                app.private = private;
+                let lines = screen(&app);
+                assert_eq!(lines[0].contains("PRIVATE"), private);
+                assert!(!lines[1].contains("PRIVATE"));
+                assert!(lines[1].contains("4 Stats"), "{}", lines[1]);
+                assert_eq!(lines[1].contains("?: help"), width >= 61);
+                let mut terminal = Terminal::new(TestBackend::new(width, render::TALL)).unwrap();
+                terminal.draw(|f| render::render(&app, f)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let selected = |y| {
+                    (0..width)
+                        .filter(|&x| {
+                            buffer[(x, y)]
+                                .modifier
+                                .contains(ratatui::style::Modifier::REVERSED)
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let middle = selected(1);
+                assert!(!middle.is_empty(), "view {view}, private {private}");
+                assert!(selected(0).is_empty());
+                assert!(selected(2).is_empty());
+                if private {
+                    assert_eq!(middle, public_selection, "private mode must not move tabs");
+                } else {
+                    public_selection = middle;
+                }
+            }
+        }
+    }
+    app.private = false;
+    keys(&mut app, &[Key::Char('1')]);
     update(&mut app, Event::Resize(80, render::TALL - 1));
     let lines = screen(&app);
     assert!(lines[0].starts_with(" remuda  1 Accounts"), "{}", lines[0]);
     assert!(lines[1].starts_with("Accounts"), "{}", lines[1]);
+
+    app.mode = Mode::PickForRun;
+    app.private = true;
+    update(&mut app, Event::Resize(80, render::TALL));
+    let lines = screen(&app);
+    assert!(lines[0].contains("remuda") && lines[0].contains("PRIVATE"));
+    assert!(lines[1].starts_with(" ││ run: pick an account "));
+    assert!(!lines[1].contains("1 Accounts"));
 }
 
 #[test]
@@ -5266,7 +5314,7 @@ fn stats_view_computes_on_first_visit_then_on_r() {
 
 /// R20: every section, bold totals, models with `…` when too long, `-` for counts a provider
 /// does not record and for a cost not priced (codex records cache write: 0 here), `no tokens`
-/// for an empty account, then Overall and the models not priced. At 80 columns REASONING gives
+/// for an empty account, after Overall and the models not priced. At 80 columns REASONING gives
 /// way.
 #[test]
 fn stats_view_shows_sections_models_and_totals() {
@@ -5275,6 +5323,12 @@ fn stats_view_shows_sections_models_and_totals() {
     let rows: Vec<String> = lines[2..].iter().map(|l| squeezed(l)).collect();
     let expected = [
         "ACCOUNT / MODEL INPUT CACHE READ CACHE WRITE OUTPUT TOTAL COST SHARE",
+        "Overall 1.6K 1.2M 160 139 1.2M $12.34+",
+        "claude-test 22 1.2M 160 104 1.2M -",
+        "gpt-test 1.5K 200 0 30 1.7K -",
+        "claude-haiku-4… 30 0 0 5 35 $12.34",
+        "not priced: claude-test, gpt-test",
+        "",
         "default 38 1.2M 160 95 1.2M $12.34+ ██████",
         "claude-test 8 1.2M 160 90 1.2M -",
         "claude-haiku-4… 30 0 0 5 35 $12.34",
@@ -5286,12 +5340,6 @@ fn stats_view_shows_sections_models_and_totals() {
         "claude-test 5 0 0 5 10 -",
         "unattributed 9 0 0 9 18 -",
         "claude-test 9 0 0 9 18 -",
-        "",
-        "Overall 1.6K 1.2M 160 139 1.2M $12.34+",
-        "claude-test 22 1.2M 160 104 1.2M -",
-        "gpt-test 1.5K 200 0 30 1.7K -",
-        "claude-haiku-4… 30 0 0 5 35 $12.34",
-        "not priced: claude-test, gpt-test",
     ];
     assert_eq!(rows[..expected.len()], expected, "{}", lines.join("\n"));
     // The numbers line up under their headers.
@@ -5370,8 +5418,10 @@ fn stats_columns_align_in_every_row() {
         let share = header.find("SHARE").map(|at| header[..at].chars().count());
         let rows: Vec<String> = lines[3..]
             .iter()
-            .filter(|l| !l.trim().is_empty() && !l.contains("no tokens"))
-            .take_while(|l| !l.starts_with(" computed") && !l.contains("not priced"))
+            .take_while(|l| !l.starts_with(" computed"))
+            .filter(|l| {
+                !l.trim().is_empty() && !l.contains("no tokens") && !l.contains("not priced")
+            })
             .map(|l| l.chars().take(share.unwrap_or(usize::MAX)).collect())
             .collect();
         assert_eq!(rows.len(), 16, "{width}: {rows:?}");
@@ -5422,7 +5472,8 @@ fn stats_view_degrades_on_narrow_terminals() {
     }
     update(&mut app, Event::Resize(160, 40));
     let lines = screen(&app);
-    assert!(lines[2].trim_end().len() < 100, "{}", lines[2]);
+    let (_, header) = line_with(&lines, "ACCOUNT / MODEL");
+    assert!(header.chars().count() < 100, "{header}");
     let (_, haiku) = line_with(&lines, "claude-haiku-4-5-20251001 ");
     assert!(haiku.contains("35"), "not cut: {haiku}");
 }
@@ -5494,13 +5545,10 @@ fn stats_scrolls() {
     let count = render::stats_line_count(&app);
     assert_eq!((height, count), (8, 18));
     let first_row = |app: &App| squeezed(&screen(app)[3]);
-    assert_eq!(
-        first_row(&app),
-        "default 38 1.2M 160 95 1.2M $12.34+ ██████"
-    );
+    assert_eq!(first_row(&app), "Overall 1.6K 1.2M 160 139 1.2M $12.34+");
     keys(&mut app, &[Key::Char('j'), Key::Down]);
     assert_eq!(app.stats.scroll, 2);
-    assert_eq!(first_row(&app), "claude-haiku-4… 30 0 0 5 35 $12.34");
+    assert_eq!(first_row(&app), "gpt-test 1.5K 200 0 30 1.7K -");
     let lines = screen(&app);
     line_with(&lines, "Tokens · all time");
     assert!(lines[2].starts_with("ACCOUNT / MODEL"), "{}", lines[2]);
@@ -5509,7 +5557,8 @@ fn stats_scrolls() {
     keys(&mut app, &[Key::Char('G')]);
     assert_eq!(app.stats.scroll, count - height);
     let lines = screen(&app);
-    line_with(&lines, "Overall");
+    line_with(&lines, "unattributed");
+    assert!(!lines.iter().any(|l| l.starts_with("Overall")));
     keys(&mut app, &[Key::Char('j'), Key::PageDown]);
     assert_eq!(app.stats.scroll, count - height, "bounded");
     keys(&mut app, &[Key::PageUp]);
@@ -5535,10 +5584,10 @@ fn stats_scrolls() {
 /// R20: by project (`b`), the sections are the report's projects in its order, each titled by
 /// its directory as recorded (one too wide keeps its end, after `…`, as History's directories
 /// do), `(no directory)` for the sessions that record none, under `PROJECT / MODEL`; a
-/// project's share is of the period's total, as an account's is; then the same Overall as by
+/// project's share is of the period's total, as an account's is; after the same Overall as by
 /// account.
 #[test]
-fn stats_view_by_project_shows_the_projects_then_the_same_overall() {
+fn stats_view_by_project_shows_the_same_overall_before_projects() {
     let mut app = stats_app();
     let by_account = screen(&app);
     keys(&mut app, &[Key::Char('b')]);
@@ -5546,6 +5595,12 @@ fn stats_view_by_project_shows_the_projects_then_the_same_overall() {
     let rows: Vec<String> = lines[2..].iter().map(|l| squeezed(l)).collect();
     let expected = [
         "PROJECT / MODEL INPUT CACHE READ CACHE WRITE OUTPUT TOTAL COST SHARE",
+        "Overall 1.6K 1.2M 160 139 1.2M $12.34+",
+        "claude-test 22 1.2M 160 104 1.2M -",
+        "gpt-test 1.5K 200 0 30 1.7K -",
+        "claude-haiku-4… 30 0 0 5 35 $12.34",
+        "not priced: claude-test, gpt-test",
+        "",
         "/Users/me/src/app 38 1.2M 160 95 1.2M $12.34+ ██████",
         "claude-test 8 1.2M 160 90 1.2M -",
         "claude-haiku-4… 30 0 0 5 35 $12.34",
@@ -5557,7 +5612,6 @@ fn stats_view_by_project_shows_the_projects_then_the_same_overall() {
         "claude-test 4 0 0 5 9 -",
         "(no directory) 5 0 0 4 9 -",
         "claude-test 5 0 0 4 9 -",
-        "",
     ];
     assert_eq!(rows[..expected.len()], expected, "{}", lines.join("\n"));
     // Cut from the left to the name column, which `/Users/me/src/app` fills.
@@ -5690,7 +5744,9 @@ fn b_switches_the_sections_and_t_and_r_keep_them() {
     assert_eq!(keys(&mut app, &[Key::Char('b')]), []);
     assert_eq!((app.stats.by, app.stats.scroll), (By::Project, 0));
     assert_eq!(shows(&app), by_project);
-    assert!(screen(&app)[3].starts_with("/Users/me/src/app "));
+    let lines = screen(&app);
+    assert!(lines[3].starts_with("Overall "));
+    assert!(line_with(&lines, "/Users/me/src/app ").0 > 3);
     keys(&mut app, &[Key::Char('G')]);
     assert!(app.stats.scroll > 0);
     keys(&mut app, &[Key::Char('b')]);
@@ -5771,8 +5827,8 @@ fn private_mode_masks_the_project_directories_as_paths() {
 
     app.private = true;
     let lines = screen(&app);
-    let (header, _) = line_with(&lines, "PROJECT / MODEL");
-    let titles: Vec<String> = lines[header + 1..]
+    let (first_project, _) = line_with(&lines, "~/•••/•••/•••");
+    let titles: Vec<String> = lines[first_project..]
         .iter()
         .step_by(2)
         .take(dirs.len() + 1)
@@ -5909,12 +5965,15 @@ fn stats_view_shows_cost_share_and_unpriced_models() {
     // Model rows and Overall have no bar.
     let (overall_at, overall) = line_with(&lines, "Overall");
     assert_eq!(squeezed(overall), "Overall 1.5K 200 0 44 1.8K $40.00+");
-    for i in [at, at + 1, at + 4, at + 6, overall_at, overall_at + 1] {
-        assert!(!lines[i].contains(['█', '▌']), "{}", lines[i]);
+    for line in lines
+        .iter()
+        .filter(|l| l.starts_with("  ") || l.starts_with("Overall"))
+    {
+        assert!(!line.contains(['█', '▌']), "{line}");
     }
     let (note, text) = line_with(&lines, "not priced:");
     assert_eq!(text.trim(), "not priced: claude-test");
-    assert_eq!(note, overall_at + 4, "last, after Overall");
+    assert_eq!(note, overall_at + 4, "after Overall, before the breakdown");
 }
 
 /// R20: above the table, the period's cost over time: a bar per bucket, scaled to the largest
@@ -6044,7 +6103,7 @@ fn stats_header_stays_when_scrolled_past_the_chart() {
     let lines = screen(&app);
     assert!(lines[2].starts_with("ACCOUNT / MODEL"), "{}", lines[2]);
     assert_eq!(squeezed(&lines[3]), body[12]);
-    assert_eq!(body[12], "claude-test 8 1.2M 160 90 1.2M -");
+    assert_eq!(body[12], "claude-test 22 1.2M 160 104 1.2M -");
 }
 
 // ---- Private mode (R21) --------------------------------------------------------------------

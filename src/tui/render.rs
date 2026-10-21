@@ -43,12 +43,8 @@ const OK: Style = Style::new().fg(Color::Green);
 const USER: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 const CODEX_STYLE: Style = Style::new().fg(Color::Magenta);
 
-/// From this height on, the header is three lines tall and shows the mark.
+/// From this height on, the header wraps navigation in a three-row track frame.
 pub const TALL: u16 = 40;
-
-/// The mark (docs/VI.md) in box-drawing characters: two parallel tracks that turn the same way
-/// into an `r`. Their right and bottom ends line up, as in the SVG.
-const MARK: [&str; 3] = [" ╭─────", " │╭────", " ││"];
 
 /// Header, body, status and hints.
 struct Frame4 {
@@ -59,11 +55,7 @@ struct Frame4 {
 }
 
 fn frame_areas(area: Rect) -> Frame4 {
-    let header = if area.height >= TALL {
-        MARK.len() as u16
-    } else {
-        1
-    };
+    let header = if area.height >= TALL { 3 } else { 1 };
     let [header, body, status, hints] = Layout::vertical([
         Constraint::Length(header),
         Constraint::Fill(1),
@@ -168,29 +160,7 @@ pub fn render_with(app: &App, snapshot: &mut privacy::Snapshot, f: &mut Frame) {
 
 fn draw(app: &App, f: &mut Frame) {
     let areas = frame_areas(f.area());
-    let mut header = header(app);
-    // A tall header draws the mark around the line of views, which takes its middle row.
-    let mut line = areas.header;
-    if areas.header.height > 1 {
-        for (i, row) in MARK.iter().enumerate() {
-            if i == 1 {
-                header.spans.insert(0, Span::styled(*row, BOLD));
-            } else {
-                f.render_widget(
-                    Line::styled(*row, BOLD),
-                    Rect::new(line.x, line.y + i as u16, line.width, 1),
-                );
-            }
-        }
-        line = Rect::new(line.x, line.y + 1, line.width, 1);
-    }
-    let keys = Line::styled("?: help · q: quit ", DIM);
-    // The views come first where both do not fit (the logo and `PRIVATE` take room).
-    let room = header.width() + keys.width() <= line.width as usize;
-    f.render_widget(header, line);
-    if room {
-        f.render_widget(Paragraph::new(keys).alignment(Alignment::Right), line);
-    }
+    header(app, f, areas.header);
     match app.view {
         View::Accounts => accounts_view(app, f, areas.body),
         // The pane stays blank under the card, which is the preview then.
@@ -241,25 +211,55 @@ const PRIVATE: Style = Style::new()
     .bg(Color::Yellow)
     .add_modifier(Modifier::BOLD);
 
-fn header(app: &App) -> Line<'static> {
-    let mut spans = vec![Span::styled(" remuda ", BOLD)];
+fn header(app: &App, f: &mut Frame, area: Rect) {
+    let mut brand = Line::from(Span::styled(" remuda ", BOLD));
     if app.private {
-        spans.push(Span::styled(" PRIVATE ", PRIVATE));
-        spans.push(Span::raw(" "));
+        brand.spans.push(Span::styled(" PRIVATE ", PRIVATE));
+        brand.spans.push(Span::raw(" "));
     }
+    let mut nav = Line::default();
     if app.mode == Mode::PickForRun {
-        spans.push(Span::raw(" run: pick an account "));
-        return Line::from(spans);
+        nav.spans.push(Span::raw(" run: pick an account "));
+    } else {
+        for (i, view) in View::ALL.iter().enumerate() {
+            let label = format!(" {} {} ", i + 1, view.title());
+            nav.spans.push(if *view == app.view {
+                Span::styled(label, SELECTED)
+            } else {
+                Span::raw(label)
+            });
+        }
     }
-    for (i, view) in View::ALL.iter().enumerate() {
-        let label = format!(" {} {} ", i + 1, view.title());
-        spans.push(if *view == app.view {
-            Span::styled(label, SELECTED)
-        } else {
-            Span::raw(label)
-        });
+
+    let mut line = area;
+    if area.height > 1 {
+        // The mark's two tracks become an open frame, not a taller navigation block.
+        // Keep the frame content-sized; the help hints sit outside it.
+        let width = nav
+            .width()
+            .max(brand.width())
+            .min(area.width.saturating_sub(3) as usize);
+        let tail = "─".repeat(width.saturating_sub(brand.width()));
+        brand.spans.insert(0, Span::styled(" ╭─", DIM));
+        brand.spans.push(Span::styled(tail, DIM));
+        f.render_widget(brand, Rect::new(area.x, area.y, area.width, 1));
+        f.render_widget(
+            Line::styled(format!(" │╰{}", "─".repeat(width)), DIM),
+            Rect::new(area.x, area.y + 2, area.width, 1),
+        );
+        nav.spans.insert(0, Span::styled(" ││", DIM));
+        line = Rect::new(area.x, area.y + 1, area.width, 1);
+    } else {
+        brand.spans.extend(nav.spans);
+        nav = brand;
     }
-    Line::from(spans)
+    let keys = Line::styled("?: help · q: quit ", DIM);
+    // Navigation wins when there is not enough room for the hints too.
+    let room = nav.width() + keys.width() <= line.width as usize;
+    f.render_widget(nav, line);
+    if room {
+        f.render_widget(Paragraph::new(keys).alignment(Alignment::Right), line);
+    }
 }
 
 fn index_status(app: &App) -> Span<'static> {
@@ -2853,8 +2853,8 @@ fn stats_chart(app: &App, table: &Table, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-/// The scrolled part of the Stats view: the chart, the column header, every section of the
-/// period, then Overall, and the models not priced; while the first report is computed, what
+/// The scrolled part of the Stats view: the chart, the column header, Overall and the models
+/// not priced, then every section of the period; while the first report is computed, what
 /// is being done. Also the index of the column header's line (none while computing). Reads only
 /// `app.stats` (R20).
 pub fn stats_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Option<usize>) {
@@ -2876,6 +2876,13 @@ pub fn stats_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Option<usize>)
         DIM,
         &columns,
     ));
+    stats_block("Overall", &table.overall, &columns, None, &mut lines);
+    let unpriced = stats::unpriced_models(&table.overall);
+    if !unpriced.is_empty() {
+        let note = format!("  not priced: {}", unpriced.join(", "));
+        lines.push(Line::styled(text::truncate(&note, width as usize), DIM));
+    }
+    lines.push(Line::raw(""));
     let by_cost = stats_measure(table);
     let (total, cost, _) = stats::sum(&table.overall);
     let base = measure(by_cost, &total, &cost);
@@ -2886,13 +2893,6 @@ pub fn stats_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Option<usize>)
             By::Project => tail(&name, columns.0),
         };
         stats_block(&name, models, &columns, Some((by_cost, base)), &mut lines);
-    }
-    lines.push(Line::raw(""));
-    stats_block("Overall", &table.overall, &columns, None, &mut lines);
-    let unpriced = stats::unpriced_models(&table.overall);
-    if !unpriced.is_empty() {
-        let note = format!("  not priced: {}", unpriced.join(", "));
-        lines.push(Line::styled(text::truncate(&note, width as usize), DIM));
     }
     (lines, Some(header_at))
 }

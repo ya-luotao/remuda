@@ -2884,6 +2884,102 @@ fn costs_add_up_and_unpriced_requests_are_counted() {
     assert!(stats::unpriced_models(&table.overall).is_empty());
 }
 
+/// R20: refreshed model prices apply to each request, including both sides of Haiku 5.5's
+/// 100K prompt threshold. Cache reads and both write lifetimes count toward it, output does
+/// not; a later small request must not inherit a larger request's rate.
+#[test]
+fn refreshed_prices_apply_per_request() {
+    let mut f = Fixture::new();
+    let haiku = "claude-haiku-5-5-20261015";
+    let usages = [
+        // 100K prompt, even with a large output: base prices.
+        cl::usage_split(10_000, 100_001, 20_000, 30_000, 40_000),
+        cl::usage_split(10_001, 7, 20_000, 30_000, 40_000),
+        cl::usage_split(0, 3, 0, 0, 100_001),
+        cl::usage_split(0, 5, 100_001, 0, 0),
+        cl::usage_split(0, 11, 0, 100_001, 0),
+        cl::with_flags(cl::usage_split(100_001, 13, 0, 0, 0), "standard", "us"),
+        cl::usage_split(19, 17, 0, 0, 0),
+    ];
+    let mut transcript: String = usages
+        .into_iter()
+        .enumerate()
+        .map(|(i, usage)| {
+            cl::assistant_usage(S_A, &format!("msg_haiku_{i}"), haiku, usage, &cl::ts(1))
+        })
+        .collect();
+    transcript.push_str(&cl::assistant_usage(
+        S_A,
+        "msg_sonnet",
+        "claude-sonnet-5-5",
+        cl::usage_split(11, 13, 17, 19, 23),
+        &cl::ts(2),
+    ));
+    f.write(&format!("{S_A}.jsonl"), &transcript);
+    let table = f.all();
+    let haiku_cost = table
+        .overall
+        .iter()
+        .find(|m| m.model == haiku)
+        .unwrap()
+        .cost;
+    // Independent picodollar arithmetic from the published price table.
+    let expected = 10_000 * 100_000u128
+        + 100_001 * 500_000
+        + 20_000 * 125_000
+        + 30_000 * 200_000
+        + 40_000 * 10_000
+        + 10_001 * 500_000
+        + 7 * 2_500_000
+        + 20_000 * 625_000
+        + 30_000 * 1_000_000
+        + 40_000 * 50_000
+        + 100_001 * 50_000
+        + 3 * 2_500_000
+        + 100_001 * 625_000
+        + 5 * 2_500_000
+        + 100_001 * 1_000_000
+        + 11 * 2_500_000
+        + 100_001 * 550_000
+        + 13 * 2_750_000
+        + 19 * 100_000
+        + 17 * 500_000;
+    assert_eq!(
+        (haiku_cost.pico_usd, haiku_cost.unpriced_tokens),
+        (expected, 0)
+    );
+    let sonnet = table
+        .overall
+        .iter()
+        .find(|m| m.model == "claude-sonnet-5-5")
+        .unwrap();
+    assert_eq!(sonnet.cost.unpriced_tokens, 0);
+    assert_eq!(
+        sonnet.cost.pico_usd,
+        11 * 2_000_000 + 13 * 10_000_000 + 17 * 2_500_000 + 19 * 4_000_000 + 23 * 100_000
+    );
+
+    // Config supplies base prices, preserving the model's prompt tier and missing counts.
+    f.prices = Prices::from_document(
+        &format!("[prices.\"{haiku}\"]\ninput = 1\noutput = 2\n")
+            .parse()
+            .unwrap(),
+    )
+    .unwrap();
+    let report = f.report();
+    let overridden = report
+        .table(Period::All)
+        .overall
+        .iter()
+        .find(|m| m.model == haiku)
+        .unwrap();
+    assert_eq!(
+        overridden.cost.pico_usd,
+        100_001 * 5_500_000 + 13 * 11_000_000 + 19 * 1_000_000 + 17 * 2_000_000
+    );
+    assert!(overridden.cost.unpriced_tokens > 0);
+}
+
 /// R20: the chart's buckets: today by local hour, 7 and 30 days by local day from the period's
 /// start, all by local day from the first request; a request without a timestamp is counted but
 /// not charted.

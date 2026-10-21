@@ -5,8 +5,10 @@ Details behind the overview in the [README](../README.md). The normative behavio
 
 ## TUI interaction
 
-In a terminal at least 40 rows tall, the header is three rows and shows the remuda mark beside
-the views; a shorter terminal keeps the one-line header, leaving the rows to the views.
+In a terminal at least 40 rows tall, the header uses the mark's two tracks as a three-row frame,
+open on the right, around single-line navigation. The wordmark and private badge sit in the upper
+rail; the selected tab stays one row tall. A shorter terminal keeps the compact one-line header,
+leaving the rows to the views.
 
 In an expanded preview, the movement keys scroll the preview instead of the list. In forms, `Tab`
 or `↓` moves to the next field, `Shift-Tab` or `↑` to the previous one, `Enter` submits and `Esc`
@@ -41,10 +43,12 @@ says which `projects` to link.
 The Stats view computes the statistics in the background the first time it opens, with the
 reading progress in the status line, and again on each `r`; the first computation reads every
 transcript whole. Above the table, a chart shows the period's cost (or tokens, when nothing is
-priced) per hour, day, week or month, and each account's row shows its share. `b` switches the
+priced) per hour, day, week or month. Overall and any models not priced come first in the table,
+followed by the breakdown; each account's row shows its share. `b` switches the
 sections between accounts and projects, as `remuda stats --by project` divides them: one per
 directory a session started in, most tokens first, `(no directory)` for sessions that record
-none, then the same Overall. A directory too long for its column keeps its end (`…/src/app`).
+none, with the same Overall above them. A directory too long for its column keeps its end
+(`…/src/app`).
 The view starts by account; `t` and `r` keep the choice. In private mode each directory is masked
 as a path (`~/•••/•••`), so two projects may read the same.
 
@@ -330,11 +334,14 @@ models = ["gpt-6-astra"]
 ## Cost estimates
 
 The statistics price each request at the provider's public API list price, built into remuda (as
-of 2026-10-07). Claude's 5-minute and 1-hour cache writes are priced separately, as are fast mode
+of 2026-10-21). Claude's 5-minute and 1-hour cache writes are priced separately, as are fast mode
 (twice the price on the models that offer it) and US-only inference (1.1 times the price on the
-models from 4.6 on), as the transcripts record them. Codex's cache writes are priced at 1.25
-times the input price from GPT-5.6 on, and at the input price before. A Codex request with more
-than 272K input tokens is priced at the long-context price on the models that have one.
+models from 4.6 on), as the transcripts record them. Haiku 5.5 uses five times its base prices
+when a request's prompt exceeds 100K tokens, including cache reads and both cache writes.
+Codex's cache writes use the default 30-minute rate: 1.25 times the input price from GPT-5.6
+on, and the input price before; rollouts do not record the lifetime needed to price 12-hour
+writes. A Codex request with more than 272K input tokens is priced at the long-context price
+on the models that have one. These thresholds apply per request, not to the period's total.
 
 To price a model remuda does not know, or to use another price, add a `[prices."<model>"]` table
 to `config.toml`, in USD per million tokens:
@@ -352,9 +359,12 @@ cache_write_1h = 10
 `cache_write_5m` (for Codex, the cache-write price) and `cache_write_1h` are optional, and a count whose price is left out is not
 priced. The table applies to the model id as recorded, or to it without a trailing date
 (`claude-haiku-4-5` also prices `claude-haiku-4-5-20251001`).
+Overrides set base prices; the built-in model's fast-mode, US-only and long-context multipliers
+still apply.
 
 A cost followed by `+` (`$12.34+`) leaves out requests that could not be priced, and `-` means
-nothing could be; the models concerned are named below the table. Not modelled: the long-context
+nothing could be; the models concerned are named below the command-line table or after Overall
+in the TUI. Not modelled: the long-context
 premium of Claude Sonnet 4.5 and 4, batch and priority processing, and server tools such as web
 search.
 
@@ -445,7 +455,7 @@ Accounts with `share = false` and the source itself are not checked.
 - **Token statistics** are counted from the agents' own transcripts. Each request counts once,
   even when a message is written in several records, a session is forked, or a store is shared
   by several accounts. Each request is also priced at the provider's public API list
-  price (built in, as of 2026-10-07), which estimates what the usage would cost on the API; for
+  price (built in, as of 2026-10-21), which estimates what the usage would cost on the API; for
   subscription logins it is not a bill. No agent is run and nothing is fetched.
 - **Recommendations** (`remuda pick`) read the same usage and `[pick]` and select locally;
   remuda makes no network requests of its own (see
