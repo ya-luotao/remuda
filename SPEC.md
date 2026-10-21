@@ -1709,7 +1709,7 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   - A request is not priced when its model has no price (`unknown` included) or a nonzero count
     of it has none; its tokens are still counted. A cost that leaves such requests out is shown
     followed by `+` (`$12.34+`), one with nothing priced as `-`, and the models with such
-    requests are named below the table.
+    requests are named below the command-line table or after Overall in the TUI.
   - Not modelled (known limitations): the long-context premium of `claude-sonnet-4-5` and
     `claude-sonnet-4` (input beyond 200K tokens; the 4.6 and later models have none), batch and
     priority processing, codex's fast and priority processing (rollouts do not record it),
@@ -1724,8 +1724,9 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   per model over everything. By project, the sections are the projects instead, titled by the
   directory as recorded, most tokens first, ties by directory (byte order) with
   `(no directory)` last, and only those with tokens in the period; then the same overall
-  section. Counts below 1,000 are shown whole, others in K, M, B, or T, with
-  one decimal below 100 (`1.2M`, `93.3B`, `118K`).
+  section. In the TUI, Overall and the models not priced come before the account or project
+  sections; the command-line report keeps the order above. Counts below 1,000 are shown whole,
+  others in K, M, B, or T, with one decimal below 100 (`1.2M`, `93.3B`, `118K`).
 - **Only transcripts that exist count**: tokens of transcripts deleted since (claude deletes those
   older than `cleanupPeriodDays`) are no longer counted. A transcript below a directory that
   exists but cannot be read (R8) is not known to be deleted: its counts stay in the cache and in

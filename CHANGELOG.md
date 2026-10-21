@@ -43,6 +43,12 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Changed
 
+- The TUI's tall header gives the active navigation tab the same three-row height as the
+  remuda mark, with centered labels and more space between the mark and wordmark; short
+  terminals keep the compact one-line header.
+- The TUI's Stats view shows Overall and the models not priced before the account or project
+  breakdown. The chart, shares, scrolling and command-line report order stay the same (SPEC R20).
+
 - The configuration pane of the Accounts view (beside the view from 120 columns, below the table
   otherwise, then the whole view on a second `p`) is replaced by the account card above; `Esc`
   closes the card in one step, and switching views closes it too (SPEC R22).

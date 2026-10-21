@@ -168,28 +168,36 @@ pub fn render_with(app: &App, snapshot: &mut privacy::Snapshot, f: &mut Frame) {
 
 fn draw(app: &App, f: &mut Frame) {
     let areas = frame_areas(f.area());
-    let mut header = header(app);
-    // A tall header draws the mark around the line of views, which takes its middle row.
-    let mut line = areas.header;
-    if areas.header.height > 1 {
-        for (i, row) in MARK.iter().enumerate() {
-            if i == 1 {
-                header.spans.insert(0, Span::styled(*row, BOLD));
-            } else {
-                f.render_widget(
-                    Line::styled(*row, BOLD),
-                    Rect::new(line.x, line.y + i as u16, line.width, 1),
-                );
-            }
-        }
-        line = Rect::new(line.x, line.y + 1, line.width, 1);
-    }
+    let header = header(app);
+    let area = areas.header;
+    let tall = area.height > 1;
+    let mark_width = if tall { text::width(MARK[0]) + 1 } else { 0 };
     let keys = Line::styled("?: help · q: quit ", DIM);
     // The views come first where both do not fit (the logo and `PRIVATE` take room).
-    let room = header.width() + keys.width() <= line.width as usize;
-    f.render_widget(header, line);
-    if room {
-        f.render_widget(Paragraph::new(keys).alignment(Alignment::Right), line);
+    let room = mark_width + header.width() + keys.width() <= area.width as usize;
+    for row in 0..area.height {
+        let middle = row == area.height / 2;
+        let mut line = header.clone();
+        if !middle {
+            // Keep the tab's styling on its padding rows so it matches the mark's height.
+            for span in &mut line.spans {
+                span.content = " ".repeat(span.width()).into();
+            }
+        }
+        if tall {
+            line.spans.insert(
+                0,
+                Span::styled(text::pad(MARK[row as usize], mark_width), BOLD),
+            );
+        }
+        let area = Rect::new(area.x, area.y + row, area.width, 1);
+        f.render_widget(line, area);
+        if middle && room {
+            f.render_widget(
+                Paragraph::new(keys.clone()).alignment(Alignment::Right),
+                area,
+            );
+        }
     }
     match app.view {
         View::Accounts => accounts_view(app, f, areas.body),
@@ -2853,8 +2861,8 @@ fn stats_chart(app: &App, table: &Table, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-/// The scrolled part of the Stats view: the chart, the column header, every section of the
-/// period, then Overall, and the models not priced; while the first report is computed, what
+/// The scrolled part of the Stats view: the chart, the column header, Overall and the models
+/// not priced, then every section of the period; while the first report is computed, what
 /// is being done. Also the index of the column header's line (none while computing). Reads only
 /// `app.stats` (R20).
 pub fn stats_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Option<usize>) {
@@ -2876,6 +2884,13 @@ pub fn stats_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Option<usize>)
         DIM,
         &columns,
     ));
+    stats_block("Overall", &table.overall, &columns, None, &mut lines);
+    let unpriced = stats::unpriced_models(&table.overall);
+    if !unpriced.is_empty() {
+        let note = format!("  not priced: {}", unpriced.join(", "));
+        lines.push(Line::styled(text::truncate(&note, width as usize), DIM));
+    }
+    lines.push(Line::raw(""));
     let by_cost = stats_measure(table);
     let (total, cost, _) = stats::sum(&table.overall);
     let base = measure(by_cost, &total, &cost);
@@ -2886,13 +2901,6 @@ pub fn stats_lines(app: &App, width: u16) -> (Vec<Line<'static>>, Option<usize>)
             By::Project => tail(&name, columns.0),
         };
         stats_block(&name, models, &columns, Some((by_cost, base)), &mut lines);
-    }
-    lines.push(Line::raw(""));
-    stats_block("Overall", &table.overall, &columns, None, &mut lines);
-    let unpriced = stats::unpriced_models(&table.overall);
-    if !unpriced.is_empty() {
-        let note = format!("  not priced: {}", unpriced.join(", "));
-        lines.push(Line::styled(text::truncate(&note, width as usize), DIM));
     }
     (lines, Some(header_at))
 }

@@ -5,8 +5,9 @@ Details behind the overview in the [README](../README.md). The normative behavio
 
 ## TUI interaction
 
-In a terminal at least 40 rows tall, the header is three rows and shows the remuda mark beside
-the views; a shorter terminal keeps the one-line header, leaving the rows to the views.
+In a terminal at least 40 rows tall, the header is three rows: the remuda mark and the active
+navigation tab have the same height, with the labels centered vertically. A shorter terminal
+keeps the one-line header, leaving the rows to the views.
 
 In an expanded preview, the movement keys scroll the preview instead of the list. In forms, `Tab`
 or `↓` moves to the next field, `Shift-Tab` or `↑` to the previous one, `Enter` submits and `Esc`
@@ -41,10 +42,12 @@ says which `projects` to link.
 The Stats view computes the statistics in the background the first time it opens, with the
 reading progress in the status line, and again on each `r`; the first computation reads every
 transcript whole. Above the table, a chart shows the period's cost (or tokens, when nothing is
-priced) per hour, day, week or month, and each account's row shows its share. `b` switches the
+priced) per hour, day, week or month. Overall and any models not priced come first in the table,
+followed by the breakdown; each account's row shows its share. `b` switches the
 sections between accounts and projects, as `remuda stats --by project` divides them: one per
 directory a session started in, most tokens first, `(no directory)` for sessions that record
-none, then the same Overall. A directory too long for its column keeps its end (`…/src/app`).
+none, with the same Overall above them. A directory too long for its column keeps its end
+(`…/src/app`).
 The view starts by account; `t` and `r` keep the choice. In private mode each directory is masked
 as a path (`~/•••/•••`), so two projects may read the same.
 
@@ -364,7 +367,8 @@ priced. The table applies to the model id as recorded, or to it without a traili
 (`claude-haiku-4-5` also prices `claude-haiku-4-5-20251001`).
 
 A cost followed by `+` (`$12.34+`) leaves out requests that could not be priced, and `-` means
-nothing could be; the models concerned are named below the table. Not modelled: the long-context
+nothing could be; the models concerned are named below the command-line table or after Overall
+in the TUI. Not modelled: the long-context
 premium of Claude Sonnet 4.5 and 4, batch and priority processing, and server tools such as web
 search.
 
