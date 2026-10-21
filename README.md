@@ -13,9 +13,8 @@ them side by side: see which account has usage left, launch as it, and start, re
 sessions in any directory, from one TUI or CLI. The accounts can share one configuration and one
 memory, while each keeps its own sessions.
 
-Remuda never touches credentials. Its only network request of its own is optional: `remuda pick`
-asks TypeSafe's Jev model for a recommendation when `TYPESAFE_API_KEY` is set and you have written
-notes for it.
+Remuda never touches credentials and makes no network requests of its own. Recommendations
+are deterministic and local; live usage is queried by the agents only when you ask for it.
 
 ## Is remuda for you?
 
@@ -81,8 +80,8 @@ agent with the home selected.
   counted from the agents' own transcripts, with an estimated cost at API list prices and a chart
   over time.
 - **Which account now.** `remuda pick` recommends the account, model and effort to launch, from
-  every account's limits and your `[pick]` rules; with a TypeSafe key and notes, Jev chooses among
-  what the rules allow. `--run` launches it.
+  every account's limits and your `[pick]` rules. The first ranked feasible candidate and its
+  provider's `default_effort` are selected. `--run` launches it.
 - **Built for screenshots.** `Ctrl-P` switches the TUI into a private mode that hides names,
   emails, paths and session titles.
 - **Out of your way.** Remuda does not take over your shell: typing `claude` still uses your
@@ -109,8 +108,7 @@ confirmation first. ² The login method only; the email and plan appear after a 
 ## Installation
 
 Requires macOS or Linux with `ps` on `PATH`, Rust 1.88 or later, and the `claude` CLI on `PATH`
-(plus `codex` for Codex accounts). `remuda pick` also needs `curl` on `PATH` to ask Jev when a key
-is set; without it, the rules decide.
+(plus `codex` for Codex accounts). No HTTP transport or API key is needed by remuda.
 
 ```sh
 cargo install --git https://github.com/ya-luotao/remuda
@@ -179,7 +177,7 @@ session store and one configuration between your Claude accounts, the
   session store and configuration the other accounts link or receive at launch; the login stays
   per account ([shared configuration](docs/GUIDE.md#shared-configuration)).
 - **Pick.** The recommendation of account, model and effort, from rules over every window's
-  headroom (or its pace to the reset) and, with a key, Jev's choice among what the rules allow
+  headroom (or its pace to the reset), always taking the first ranked feasible candidate
   ([recommendations](docs/GUIDE.md#recommendations)).
 - **Private mode.** `Ctrl-P` in the TUI: names, emails, paths and session content masked, numbers
   kept, for screenshots ([private mode](docs/GUIDE.md#private-mode)).
@@ -202,7 +200,7 @@ the bare name means `claude:default`, and the Codex one is `codex:default`.
 | `remuda add [--provider <claude\|codex>] <name> <path>` | Register an existing home directory as an account. The provider defaults to `claude`. |
 | `remuda setup [--provider <claude\|codex>] <name> [--email <EMAIL>]` | Create a new home under `$REMUDA_HOME/homes/<provider>/<name>`, register it, and run the agent's login (`claude auth login` or `codex login`). With `[share.claude]`, a new Claude home is first linked to the source's session store and configuration. `--email` prefills the Claude login. |
 | `remuda remove <account>` | Unregister an account. Its home and everything in it are left in place, and its path is printed so `remuda add` can register it again. `default` and the source of `[share.claude]` cannot be removed. |
-| `remuda pick [--provider <P>] [--live] [--timeout <SECONDS>] [--offline] [--json\|--print-request] [--wait [--max-wait <SECONDS>]] [--run] [-- <args>...]` | Recommend the account, model and effort to launch now; with `-- --resume <id>` (or codex `-- resume <id>`), the account to resume that session as, preferring the one that ran it lately (its prompt cache is warm). Rules keep only what has at least `min_headroom` percent left on every window that applies (default 10) and rank it; with `TYPESAFE_API_KEY` set and `[pick] notes`, Jev chooses among those options. `--print-request` shows what would be sent, `--offline` never sends, `--run` launches the choice as `remuda run` does. `--timeout` applies to each `--live` query (default 90). Exits 1 when nothing is feasible; with `--wait`, waits until something is (it never queries live by itself), and `--max-wait` gives up when the next check would come later. See [Recommendations](docs/GUIDE.md#recommendations). |
+| `remuda pick [--provider <P>] [--live] [--timeout <SECONDS>] [--json] [--wait [--max-wait <SECONDS>]] [--run] [-- <args>...]` | Recommend the account, model and effort to launch now; with `-- --resume <id>` (or codex `-- resume <id>`), the account to resume that session as, preferring the one that ran it lately (its prompt cache is warm). Rules keep only what has at least `min_headroom` percent left on every window that applies (default 10), rank it, and select the first candidate with its provider's `default_effort` (no effort on resume). `--run` launches the choice as `remuda run` does. `--timeout` applies to each `--live` query (default 90). Exits 1 when nothing is feasible; with `--wait`, waits until something is (it never queries live by itself), and `--max-wait` gives up when the next check would come later. See [Recommendations](docs/GUIDE.md#recommendations). |
 | `remuda help [<command>]` | Show help for remuda or a command. |
 
 Account names match `[A-Za-z0-9_-]+`. Because `run` forwards `-h` and `--help` to the agent, use
@@ -318,17 +316,18 @@ cache_write_1h = 10
 exclude = ["codex:research"]
 affinity_minutes = 60        # resuming a session: how long its last account stays preferred
 strategy = "headroom"        # or "pace": rank by what a reset would waste first
-notes = "Keep claude:work for long refactors."   # sent to Jev, with account names aliased
 
 [pick.claude]
 models = ["claude-opus-5-5", "claude-sonnet-5"]  # in order of preference
-efforts = ["medium", "high", "max"]
 default_effort = "high"
 ```
 
 Homes must be absolute paths. The file is validated strictly on load: invalid or duplicate names,
 a registered `default`, or a relative home are reported as errors naming the file. Everything under
-`state/` is rebuilt on the next run.
+`state/` is rebuilt on the next run. `default_effort` must be nonempty lowercase ASCII letters
+(`[a-z]+`); for Claude, it must not be a Claude subcommand. Remove legacy `[pick] notes`
+and `[pick.<provider>] efforts` keys by hand: they are rejected, not ignored or automatically
+rewritten.
 
 Costs in the statistics use prices built into remuda (as of 2026-10-07); `[prices."<model>"]`
 overrides a model's price or prices one remuda does not know (for Codex, `cache_read` is the
@@ -375,17 +374,13 @@ the specification ([SPEC.md](SPEC.md), R2 and R13):
   (`claude auth status --json`, `codex login status`, `claude -p /usage`, `codex app-server`) and
   non-secret local metadata (the usage cache in `.claude.json`, the rate limits in Codex
   rollouts). Remuda does not read the Keychain, Codex `auth.json` or session `*.key` files.
-- **Network requests of its own: only `remuda pick`, only with a key.** Live usage is queried by
+- **No network requests of its own.** Live usage is queried by
   the agent itself, with the account's own login, and only when you ask for it (`remuda usage
   --live`, `u` in the TUI). A live query starts the agent: `codex app-server` behaves like
   launching Codex, so it may refresh the account's login token and writes Codex's own state into
-  the home. Cost estimates use prices built into remuda; nothing is fetched. `remuda pick` sends
-  one request to TypeSafe (`api.typesafe.ai`) when `TYPESAFE_API_KEY` is set and `[pick] notes`
-  are written: each account's usage under an alias (`claude:account-1`), the models, and your
-  notes as written (write accounts in them as `provider:name` so they are aliased too). It never
-  sends credentials, emails, organizations, paths or session content. `--print-request` shows the
-  request without sending it, `--offline` never sends, and without a key the local rules
-  decide.
+  the home. Cost estimates use prices built into remuda; nothing is fetched. `remuda pick`
+  selects locally from usage and configuration; `pick --live` explicitly asks the agents for
+  usage too. No recommendation data is sent to a model service.
 
 ## Troubleshooting
 
@@ -423,7 +418,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings   # with the test
 ```
 
 - **The test suite is sealed.** Every test runs with a fresh `HOME` and `REMUDA_HOME` in a
-  temporary directory, a cleared environment, and fake `claude`, `codex` and `curl` scripts
+  temporary directory, a cleared environment, and fake `claude` and `codex` scripts
   first on `PATH`, so it never reaches your logins, Keychain, homes, sessions or the network
   ([hermetic tests](CONTRIBUTING.md#hermetic-tests)). It takes a few minutes: two tests wait a
   real minute to check `--wait`. Run it as a regular user, not root.

@@ -1,8 +1,7 @@
 //! `remuda pick` (SPEC R23): which account and model to launch now, and at what effort. Rules
 //! decide what is feasible (headroom on every window that applies, exclusions, logins) and rank
-//! it; with a key and notes, Jev chooses among the feasible options ([`crate::jev`]), and its
-//! answer is taken only when it is confident enough. What a usage window holds now is
-//! [`crate::usage::snapshot`]'s to say.
+//! it; the first pair is chosen with its provider's default effort. What a usage window holds
+//! now is [`crate::usage::snapshot`]'s to say.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -33,16 +32,6 @@ pub const DEFAULT_STALE_AFTER: u32 = 120;
 pub const DEFAULT_AFFINITY_MINUTES: u32 = 60;
 /// The longest `[pick] affinity_minutes`: a day.
 pub const MAX_AFFINITY_MINUTES: u32 = 1440;
-/// The longest `[pick] notes`, in characters (R3).
-pub const MAX_NOTES: usize = 4000;
-/// Jev's pair is taken from this confidence on (R23).
-pub const PAIR_CONFIDENCE: f64 = 0.50;
-/// ... else its most probable account, when the probabilities of its pairs add up to this (R23).
-pub const ACCOUNT_PROBABILITY: f64 = 0.70;
-/// Jev's effort is taken from this confidence on (R23).
-pub const EFFORT_CONFIDENCE: f64 = 0.50;
-/// The most options one Choice may offer (R23).
-pub const MAX_OPTIONS: usize = 255;
 /// Why an account whose store does not hold the session resumed is not feasible (R23).
 pub const NOT_SEEN: &str = "cannot see this session (its store is not this account's)";
 /// How long `codex login status` may take (R4: about 0.05 s), as for `remuda list`.
@@ -118,8 +107,6 @@ pub struct Config {
     pub affinity_minutes: u32,
     /// How the rules rank the feasible pairs.
     pub strategy: Strategy,
-    /// Free text sent to Jev; empty: none.
-    pub notes: String,
     pub claude: Choices,
     pub codex: Choices,
 }
@@ -133,20 +120,17 @@ impl Default for Config {
             stale_after: DEFAULT_STALE_AFTER,
             affinity_minutes: DEFAULT_AFFINITY_MINUTES,
             strategy: Strategy::default(),
-            notes: String::new(),
             claude: Choices::default(),
             codex: Choices::default(),
         }
     }
 }
 
-/// `[pick.<provider>]`: what may be injected at launch. Empty lists: the agent's own default.
+/// `[pick.<provider>]`: what may be injected at launch; unset: the agent's own default.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Choices {
     /// In order of preference; the first is the default.
     pub models: Vec<String>,
-    /// From low to high.
-    pub efforts: Vec<String>,
     pub default_effort: Option<String>,
 }
 
@@ -170,18 +154,17 @@ impl Strategy {
     }
 }
 
-const KEYS: [&str; 9] = [
+const KEYS: [&str; 8] = [
     "exclude",
     "prefer",
     "min_headroom",
     "stale_after",
     "affinity_minutes",
     "strategy",
-    "notes",
     "claude",
     "codex",
 ];
-const PROVIDER_KEYS: [&str; 3] = ["models", "efforts", "default_effort"];
+const PROVIDER_KEYS: [&str; 2] = ["models", "default_effort"];
 
 impl Config {
     /// `[pick]` of `doc` (R3); without it, the defaults. Account names resolve against
@@ -237,15 +220,6 @@ impl Config {
                     Some("pace") => config.strategy = Strategy::Pace,
                     _ => bail!("[pick]: `strategy` must be \"headroom\" or \"pace\""),
                 },
-                "notes" => {
-                    let Some(notes) = value.as_str() else {
-                        bail!("[pick]: `notes` must be a string");
-                    };
-                    if notes.chars().count() > MAX_NOTES {
-                        bail!("[pick]: `notes` is longer than {MAX_NOTES} characters");
-                    }
-                    config.notes = notes.trim().to_string();
-                }
                 "claude" => config.claude = choices(value, Provider::Claude)?,
                 "codex" => config.codex = choices(value, Provider::Codex)?,
                 other => bail!("[pick]: unknown key `{other}` (known: {})", KEYS.join(", ")),
@@ -262,8 +236,7 @@ impl Config {
     }
 
     /// This configuration for resuming or forking a session (R23): the session's model is the
-    /// session's, and nothing is injected, so neither `models` nor `efforts` nor
-    /// `default_effort` has a say.
+    /// session's, and nothing is injected, so neither `models` nor `default_effort` has a say.
     pub fn for_resume(&self) -> Config {
         Config {
             claude: Choices::default(),
@@ -307,25 +280,14 @@ fn choices(item: &toml_edit::Item, provider: Provider) -> Result<Choices> {
                 }
                 out.models = models;
             }
-            "efforts" => {
-                let Some(efforts) = strings(value) else {
-                    bail!("{t}: `efforts` must be an array of effort levels");
-                };
-                for effort in &efforts {
-                    if effort.is_empty() || !effort.bytes().all(|b| b.is_ascii_lowercase()) {
-                        bail!("{t}: invalid effort {effort:?}: must match [a-z]+");
-                    }
-                    check_not_subcommand(&t, provider, effort)?;
-                }
-                if let Some(dup) = duplicate(&efforts) {
-                    bail!("{t}: effort {dup:?} is listed twice");
-                }
-                out.efforts = efforts;
-            }
             "default_effort" => {
                 let Some(effort) = value.as_str() else {
                     bail!("{t}: `default_effort` must be a string");
                 };
+                if effort.is_empty() || !effort.bytes().all(|b| b.is_ascii_lowercase()) {
+                    bail!("{t}: invalid effort {effort:?}: must match [a-z]+");
+                }
+                check_not_subcommand(&t, provider, effort)?;
                 out.default_effort = Some(effort.to_string());
             }
             other => bail!(
@@ -333,11 +295,6 @@ fn choices(item: &toml_edit::Item, provider: Provider) -> Result<Choices> {
                 PROVIDER_KEYS.join(", ")
             ),
         }
-    }
-    if let Some(effort) = &out.default_effort
-        && !out.efforts.contains(effort)
-    {
-        bail!("{t}: default_effort = {effort:?} is not one of `efforts`");
     }
     Ok(out)
 }
@@ -1091,227 +1048,23 @@ pub fn format_in(at: Timestamp, now: Timestamp) -> String {
     }
 }
 
-/// Why the rules decided (R23).
-#[derive(Debug, Clone, PartialEq)]
-pub enum Reason {
-    NoKey,
-    Offline,
-    NoNotes,
-    SingleOption,
-    JevError(String),
-    LowConfidence,
-}
-
-impl Reason {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Reason::NoKey => "no_key",
-            Reason::Offline => "offline",
-            Reason::NoNotes => "no_notes",
-            Reason::SingleOption => "single_option",
-            Reason::JevError(_) => "jev_error",
-            Reason::LowConfidence => "low_confidence",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DecidedBy {
-    /// Jev's pair, confident enough.
-    Jev,
-    /// Jev's most probable account, with that account's most probable model.
-    JevAccount,
-    Rules,
-}
-
-impl DecidedBy {
-    pub fn name(self) -> &'static str {
-        match self {
-            DecidedBy::Jev => "jev",
-            DecidedBy::JevAccount => "jev_account",
-            DecidedBy::Rules => "rules",
-        }
-    }
-}
-
-/// What Jev answered, as far as it was usable.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct JevReport {
-    /// The model that answered (`jev-1.13.0`).
-    pub model: Option<String>,
-    pub confidence: Option<f64>,
-    /// The probability of the chosen account's pairs together, for `jev (account)`.
-    pub account_probability: Option<f64>,
-    pub effort_confidence: Option<f64>,
-    /// Why the chosen provider's effort answer was not usable; the rest of the answer was.
-    pub effort_error: Option<String>,
-    pub error: Option<String>,
-    /// By candidate index.
-    pub probabilities: BTreeMap<usize, f64>,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
     /// Index of the chosen candidate.
     pub chosen: usize,
     pub effort: Option<String>,
-    /// The effort is Jev's (else `default_effort`, or none).
-    pub effort_by_jev: bool,
-    pub decided_by: DecidedBy,
-    pub reason: Option<Reason>,
-    /// `None` when Jev was not asked.
-    pub jev: Option<JevReport>,
     /// How the rules ranked the pairs.
     pub strategy: Strategy,
 }
 
-/// Jev's answers, mapped onto the candidates.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Answers {
-    pub model: Option<String>,
-    /// The chosen candidate and the confidence; `None` when `launch` was not asked (one
-    /// option, R23).
-    pub launch: Option<(usize, f64)>,
-    /// By candidate index; offered options only.
-    pub probabilities: BTreeMap<usize, f64>,
-    /// Per provider asked: the score (an index into its `efforts`) and its confidence, or why
-    /// the answer is not usable.
-    pub efforts: BTreeMap<Provider, Result<(f64, f64), String>>,
-}
-
-/// What asking Jev came to.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Asked {
-    /// Not asked, and why.
-    Skipped(Reason),
-    Failed(String),
-    Answered(Answers),
-}
-
-/// The decision (R23): Jev's pair from [`PAIR_CONFIDENCE`]; else its most probable account from
-/// [`ACCOUNT_PROBABILITY`], with that account's most probable model; else the rules' first (and
-/// only it, when `launch` was not asked). The effort is Jev's score for the chosen provider from
-/// [`EFFORT_CONFIDENCE`], else `default_effort`; an unusable effort answer costs only the
-/// effort. `None` when nothing is feasible.
-pub fn decide(
-    candidates: &[Candidate],
-    entries: &[Entry],
-    config: &Config,
-    asked: Asked,
-) -> Option<Decision> {
-    let rules = *ranked(candidates).first()?;
-    let effort_default = |c: usize| {
-        config
-            .choices(entries[candidates[c].entry].account.provider)
-            .default_effort
-            .clone()
-    };
-    let answers = match asked {
-        Asked::Skipped(reason) => {
-            return Some(Decision {
-                chosen: rules,
-                effort: effort_default(rules),
-                effort_by_jev: false,
-                decided_by: DecidedBy::Rules,
-                reason: Some(reason),
-                jev: None,
-                strategy: config.strategy,
-            });
-        }
-        Asked::Failed(error) => {
-            return Some(Decision {
-                chosen: rules,
-                effort: effort_default(rules),
-                effort_by_jev: false,
-                decided_by: DecidedBy::Rules,
-                reason: Some(Reason::JevError(error.clone())),
-                jev: Some(JevReport {
-                    error: Some(error),
-                    ..JevReport::default()
-                }),
-                strategy: config.strategy,
-            });
-        }
-        Asked::Answered(answers) => answers,
-    };
-    let mut report = JevReport {
-        model: answers.model.clone(),
-        confidence: answers.launch.map(|(_, confidence)| confidence),
-        probabilities: answers.probabilities.clone(),
-        ..JevReport::default()
-    };
-    let offered = |c: usize| candidates.get(c).is_some_and(Candidate::feasible);
-    let (chosen, decided_by, reason) = match answers.launch {
-        // One option: Jev was asked only the effort.
-        None => (rules, DecidedBy::Rules, Some(Reason::SingleOption)),
-        Some((choice, confidence)) if offered(choice) && confidence >= PAIR_CONFIDENCE => {
-            (choice, DecidedBy::Jev, None)
-        }
-        Some(_) => {
-            let mut by_account: BTreeMap<usize, f64> = BTreeMap::new();
-            for (&c, &p) in &answers.probabilities {
-                *by_account.entry(candidates[c].entry).or_default() += p;
-            }
-            // Of equal sums, the account whose best pair the rules rank higher.
-            let best_rank = |e: usize| {
-                candidates
-                    .iter()
-                    .filter(|c| c.entry == e)
-                    .filter_map(|c| c.rules_rank)
-                    .min()
-                    .unwrap_or(usize::MAX)
-            };
-            let top = by_account.iter().max_by(|a, b| {
-                a.1.total_cmp(b.1)
-                    .then_with(|| best_rank(*b.0).cmp(&best_rank(*a.0)))
-            });
-            match top {
-                Some((&entry, &p)) if p >= ACCOUNT_PROBABILITY => {
-                    report.account_probability = Some(p);
-                    let model = answers
-                        .probabilities
-                        .iter()
-                        .filter(|(c, _)| candidates[**c].entry == entry)
-                        .max_by(|a, b| {
-                            a.1.total_cmp(b.1).then_with(|| {
-                                candidates[*b.0]
-                                    .rules_rank
-                                    .cmp(&candidates[*a.0].rules_rank)
-                            })
-                        })
-                        .map(|(c, _)| *c)
-                        .expect("the account has a probability");
-                    (model, DecidedBy::JevAccount, None)
-                }
-                _ => (rules, DecidedBy::Rules, Some(Reason::LowConfidence)),
-            }
-        }
-    };
+/// The decision (R23): the first feasible pair in the rules' ranking, with its provider's
+/// `default_effort` (or none). `None` when nothing is feasible.
+pub fn decide(candidates: &[Candidate], entries: &[Entry], config: &Config) -> Option<Decision> {
+    let chosen = *ranked(candidates).first()?;
     let provider = entries[candidates[chosen].entry].account.provider;
-    let efforts = &config.choices(provider).efforts;
-    let (effort, effort_by_jev) = match answers.efforts.get(&provider) {
-        Some(Ok((score, confidence))) => {
-            report.effort_confidence = Some(*confidence);
-            if *confidence >= EFFORT_CONFIDENCE && !efforts.is_empty() {
-                let i = (score.round().max(0.0) as usize).min(efforts.len() - 1);
-                (Some(efforts[i].clone()), true)
-            } else {
-                (effort_default(chosen), false)
-            }
-        }
-        Some(Err(e)) => {
-            report.effort_error = Some(e.clone());
-            (effort_default(chosen), false)
-        }
-        None => (effort_default(chosen), false),
-    };
     Some(Decision {
         chosen,
-        effort,
-        effort_by_jev,
-        decided_by,
-        reason,
-        jev: Some(report),
+        effort: config.choices(provider).default_effort.clone(),
         strategy: config.strategy,
     })
 }
@@ -1725,27 +1478,6 @@ pub fn live_hint(entry: &Entry, c: &Candidate) -> Option<String> {
     })
 }
 
-/// The effort of the text report, with where it came from when Jev answered.
-fn effort_text(decision: &Decision) -> String {
-    let effort = decision
-        .effort
-        .clone()
-        .unwrap_or_else(|| "agent default".to_string());
-    let Some(jev) = &decision.jev else {
-        return effort;
-    };
-    match (
-        decision.effort_by_jev,
-        &jev.effort_error,
-        jev.effort_confidence,
-    ) {
-        (true, _, Some(c)) => format!("{effort} (jev, confidence {c:.2})"),
-        (false, Some(e), _) => format!("{effort} (jev's effort answer is unusable: {e})"),
-        (false, None, Some(c)) => format!("{effort} (jev's effort confidence {c:.2} is too low)"),
-        _ => effort,
-    }
-}
-
 /// `12m ago`: the time from `at` to `now`.
 fn ago(at: Timestamp, now: Timestamp) -> String {
     format!("{} ago", format_in(now, at))
@@ -1822,16 +1554,8 @@ pub fn session_rows(
     }
     if let (Some(w), Some(last)) = (warm_candidate, &session.last)
         && chosen.is_none_or(|c| candidates[c].entry != candidates[w].entry)
+        && let Some(but) = &candidates[w].why_not
     {
-        // Feasible, the warm account is the rules' first: only Jev chooses another.
-        let but = match (&candidates[w].why_not, chosen) {
-            (Some(why), _) => why.clone(),
-            (None, Some(c)) => format!(
-                "jev chose {}",
-                entries[candidates[c].entry].account.qualified()
-            ),
-            (None, None) => "nothing was chosen".to_string(),
-        };
         rows.push((
             "",
             format!(
@@ -1878,19 +1602,15 @@ pub fn format_text(
     let mut rows: Vec<(&str, String)> = vec![
         ("account", entry.account.qualified()),
         ("model", model),
-        ("effort", effort_text(decision)),
-        ("decided by", decided_text(decision, candidates, entries)),
+        (
+            "effort",
+            decision
+                .effort
+                .clone()
+                .unwrap_or_else(|| "agent default".to_string()),
+        ),
+        ("decided by", rules_text(decision)),
     ];
-    let rules = ranked(candidates)[0];
-    if rules != decision.chosen {
-        rows.push((
-            "rules",
-            format!(
-                "would choose {}",
-                pair_label(&entries[candidates[rules].entry], &candidates[rules])
-            ),
-        ));
-    }
     if let Some(session) = session {
         rows.extend(session_rows(
             session,
@@ -1949,7 +1669,7 @@ pub fn format_text(
     out
 }
 
-/// `claude:max / claude-opus-5-5, effort high; decided by jev (confidence 0.90)`; resuming,
+/// `claude:max / claude-opus-5-5, effort high; decided by rules`; resuming,
 /// `; resume <id> (its prompt cache is warm)`, or who ran it last.
 pub fn summary(
     entries: &[Entry],
@@ -1976,52 +1696,9 @@ pub fn summary(
     format!(
         "{}, effort {effort}; decided by {}{}",
         pair_label(&entries[c.entry], c),
-        decided_text(decision, candidates, entries),
+        rules_text(decision),
         resuming.unwrap_or_default()
     )
-}
-
-/// `decided by` of the text report.
-fn decided_text(decision: &Decision, candidates: &[Candidate], entries: &[Entry]) -> String {
-    let jev = decision.jev.as_ref();
-    let confidence = jev
-        .and_then(|j| j.confidence)
-        .map(|c| format!("confidence {c:.2}"));
-    match (decision.decided_by, &decision.reason) {
-        (DecidedBy::Jev, _) => format!("jev ({})", confidence.unwrap_or_default()),
-        (DecidedBy::JevAccount, _) => format!(
-            "jev (account, probability {:.2}; {})",
-            jev.and_then(|j| j.account_probability).unwrap_or_default(),
-            confidence.unwrap_or_default()
-        ),
-        (DecidedBy::Rules, Some(reason)) => {
-            let why = match reason {
-                Reason::NoKey => "TYPESAFE_API_KEY is not set".to_string(),
-                Reason::Offline => "--offline".to_string(),
-                Reason::NoNotes => "no [pick] notes".to_string(),
-                Reason::SingleOption if jev.is_some() => {
-                    "only one option; jev was asked only the effort".to_string()
-                }
-                Reason::SingleOption => "only one option".to_string(),
-                Reason::JevError(e) => e.clone(),
-                Reason::LowConfidence => {
-                    let top = jev
-                        .and_then(|j| {
-                            let (c, p) =
-                                j.probabilities.iter().max_by(|a, b| a.1.total_cmp(b.1))?;
-                            Some(format!(
-                                "; it leaned to {} at {p:.2}",
-                                pair_label(&entries[candidates[*c].entry], &candidates[*c])
-                            ))
-                        })
-                        .unwrap_or_default();
-                    format!("jev {}{top}", confidence.unwrap_or_default())
-                }
-            };
-            format!("{} ({}: {why})", rules_text(decision), reason.name())
-        }
-        (DecidedBy::Rules, None) => rules_text(decision),
-    }
 }
 
 /// `rules`, with the strategy when it is not the default: `rules, strategy pace`.
@@ -2085,8 +1762,7 @@ pub fn to_json(
     });
     let list: Vec<Value> = candidates
         .iter()
-        .enumerate()
-        .map(|(i, c)| {
+        .map(|c| {
             let entry = &entries[c.entry];
             let usage = entry.usage.as_ref();
             json!({
@@ -2112,16 +1788,13 @@ pub fn to_json(
                 })).collect::<Vec<_>>(),
                 "rules_rank": c.rules_rank,
                 "affine": c.affine,
-                "jev_probability": decision
-                    .and_then(|d| d.jev.as_ref())
-                    .and_then(|j| j.probabilities.get(&i).copied()),
             })
         })
         .collect();
     let Some(d) = decision else {
         return json!({
             "account": null, "provider": null, "model": null, "effort": null,
-            "effort_by": null, "decided_by": null, "reason": null, "jev": null, "command": [],
+            "effort_by": null, "decided_by": null, "command": [],
             "session": session, "strategy": config.strategy.name(), "candidates": list,
         });
     };
@@ -2132,16 +1805,8 @@ pub fn to_json(
         "provider": entry.account.provider.name(),
         "model": c.model,
         "effort": d.effort,
-        "effort_by": d.effort.as_ref().map(|_| if d.effort_by_jev { "jev" } else { "rules" }),
-        "decided_by": d.decided_by.name(),
-        "reason": d.reason.as_ref().map(Reason::name),
-        "jev": d.jev.as_ref().map(|j| json!({
-            "model": j.model,
-            "confidence": j.confidence,
-            "effort_confidence": j.effort_confidence,
-            "effort_error": j.effort_error,
-            "error": j.error,
-        })),
+        "effort_by": d.effort.as_ref().map(|_| "rules"),
+        "decided_by": "rules",
         "command": command(entry, c, d.effort.as_deref(), args),
         "session": session,
         "strategy": config.strategy.name(),
@@ -2168,9 +1833,9 @@ mod tests {
     fn parses_the_pick_table() {
         let config = parse(&format!(
             "{ACCOUNTS}[pick]\nexclude = [\"work\"]\nprefer = [\"max\", \"claude:max\"]\n\
-             min_headroom = 25\nstale_after = 30\naffinity_minutes = 0\nstrategy = \"pace\"\nnotes = \"\"\"\n  Keep max for refactors.\n\"\"\"\n\n\
+             min_headroom = 25\nstale_after = 30\naffinity_minutes = 0\nstrategy = \"pace\"\n\n\
              [pick.claude]\nmodels = [\"claude-opus-5-5\", \"fable\"]\n\
-             efforts = [\"high\", \"max\"]\ndefault_effort = \"high\"\n"
+             default_effort = \"high\"\n"
         ))
         .unwrap();
         assert_eq!(config.exclude, ["codex:work"]);
@@ -2178,7 +1843,6 @@ mod tests {
         assert_eq!((config.min_headroom, config.stale_after), (25, 30));
         assert_eq!(config.affinity_minutes, 0);
         assert_eq!(config.strategy, Strategy::Pace);
-        assert_eq!(config.notes, "Keep max for refactors.");
         assert_eq!(config.claude.models, ["claude-opus-5-5", "fable"]);
         assert_eq!(config.claude.default_effort.as_deref(), Some("high"));
         assert_eq!(config.codex, Choices::default());
@@ -2398,7 +2062,6 @@ mod tests {
     /// R3: an invalid `[pick]` fails loading, naming the table.
     #[test]
     fn rejects_invalid_pick_tables() {
-        let long = "x".repeat(MAX_NOTES + 1);
         let cases = [
             (
                 "[pick]\nexculde = []\n".to_string(),
@@ -2442,8 +2105,8 @@ mod tests {
                 "integer from 0 to 1440",
             ),
             (
-                format!("[pick]\nnotes = \"{long}\"\n"),
-                "longer than 4000 characters",
+                "[pick]\nnotes = \"keep max for refactors\"\n".to_string(),
+                "[pick]: unknown key `notes`",
             ),
             (
                 "[pick.claude]\nmodel = []\n".to_string(),
@@ -2462,16 +2125,32 @@ mod tests {
                 "listed twice",
             ),
             (
-                "[pick.claude]\nefforts = [\"High\"]\n".to_string(),
+                "[pick.claude]\nefforts = [\"high\"]\n".to_string(),
+                "[pick.claude]: unknown key `efforts`",
+            ),
+            (
+                "[pick.codex]\nefforts = [\"high\"]\n".to_string(),
+                "[pick.codex]: unknown key `efforts`",
+            ),
+            (
+                "[pick.claude]\ndefault_effort = \"High\"\n".to_string(),
                 "must match [a-z]+",
             ),
             (
-                "[pick.claude]\nefforts = [\"high\"]\ndefault_effort = \"max\"\n".to_string(),
-                "default_effort = \"max\" is not one of `efforts`",
+                "[pick.codex]\ndefault_effort = \"\"\n".to_string(),
+                "must match [a-z]+",
             ),
             (
-                "[pick.claude]\ndefault_effort = \"max\"\n".to_string(),
-                "is not one of",
+                "[pick.codex]\ndefault_effort = \"high-low\"\n".to_string(),
+                "must match [a-z]+",
+            ),
+            (
+                "[pick.claude]\ndefault_effort = 1\n".to_string(),
+                "`default_effort` must be a string",
+            ),
+            (
+                "[pick.claude]\ndefault_effort = \"update\"\n".to_string(),
+                "\"update\" is a claude subcommand",
             ),
             (
                 "[pick]\nclaude = 1\n".to_string(),
@@ -2645,7 +2324,7 @@ mod tests {
         );
         assert_eq!(c[0].rules_rank, Some(1));
 
-        let decision = decide(&c, &entries, &config, Asked::Skipped(Reason::NoKey)).unwrap();
+        let decision = decide(&c, &entries, &config).unwrap();
         let text = format_text(&entries, &c, &decision, &config, now, &[], None);
         for line in [
             "limit       unknown\n",
@@ -2959,7 +2638,7 @@ mod tests {
         assert!(
             err.contains(
                 "unknown key `strategi` (known: exclude, prefer, min_headroom, stale_after, \
-                 affinity_minutes, strategy, notes, claude, codex)"
+                 affinity_minutes, strategy, claude, codex)"
             ),
             "{err}"
         );
@@ -3526,91 +3205,29 @@ mod tests {
         );
     }
 
-    fn two_accounts() -> (Vec<Entry>, Vec<Candidate>, Config) {
+    /// R23: choose the first ranked feasible pair, with that provider's default effort.
+    #[test]
+    fn decides_by_rules_with_the_providers_default_effort() {
         let week = |pct: f64| [row("Week (all models)", pct, Some("2026-09-30T00:00:00Z"))];
-        let entries = vec![
-            entry(Provider::Claude, "max", 5, &week(20.0)),
-            entry(Provider::Claude, "team", 5, &week(50.0)),
+        let mut entries = vec![
+            entry(Provider::Claude, "max", 5, &week(70.0)),
+            entry(Provider::Codex, "work", 5, &week(40.0)),
         ];
-        let mut config = with_models(&["claude-opus-5-5", "claude-sonnet-5"], &[]);
-        config.claude.efforts = vec!["medium".into(), "high".into(), "max".into()];
+        let mut config = with_models(&["claude-opus-5-5", "claude-sonnet-5"], &["gpt-6-astra"]);
         config.claude.default_effort = Some("high".into());
+        config.codex.default_effort = Some("low".into());
         let c = candidates(&entries, &config, ts(NOW), None);
-        (entries, c, config)
-    }
+        assert_eq!(ranked(&c), [2, 0, 1]);
+        let d = decide(&c, &entries, &config).unwrap();
+        assert_eq!((d.chosen, d.effort.as_deref()), (2, Some("low")));
 
-    fn answered(choice: usize, confidence: f64, probs: &[(usize, f64)]) -> Asked {
-        Asked::Answered(Answers {
-            model: Some("jev-1.13.0".into()),
-            launch: Some((choice, confidence)),
-            probabilities: probs.iter().copied().collect(),
-            efforts: BTreeMap::new(),
-        })
-    }
+        config.codex.default_effort = None;
+        assert_eq!(decide(&c, &entries, &config).unwrap().effort, None);
 
-    /// R23: every branch of the combination.
-    #[test]
-    fn combine_takes_jev_only_when_confident() {
-        let (entries, c, config) = two_accounts();
-        // Candidates: 0 max/opus, 1 max/sonnet, 2 team/opus, 3 team/sonnet; rules: 0 first.
-        assert_eq!(ranked(&c), [0, 2, 1, 3]);
-        let d = decide(&c, &entries, &config, Asked::Skipped(Reason::NoKey)).unwrap();
-        assert_eq!(
-            (d.chosen, d.decided_by, d.reason),
-            (0, DecidedBy::Rules, Some(Reason::NoKey))
-        );
-        assert_eq!(d.effort.as_deref(), Some("high"));
-        assert_eq!(d.jev, None);
-
-        let d = decide(
-            &c,
-            &entries,
-            &config,
-            answered(2, 0.9, &[(2, 0.95), (0, 0.05)]),
-        )
-        .unwrap();
-        assert_eq!(
-            (d.chosen, d.decided_by, d.reason),
-            (2, DecidedBy::Jev, None)
-        );
-
-        // Unsure of the pair, sure of the account: its most probable model.
-        let probs = [(0, 0.1), (1, 0.1), (2, 0.25), (3, 0.55)];
-        let d = decide(&c, &entries, &config, answered(3, 0.3, &probs)).unwrap();
-        assert_eq!((d.chosen, d.decided_by), (3, DecidedBy::JevAccount));
-        let p = d.jev.unwrap().account_probability.unwrap();
-        assert!((p - 0.8).abs() < 1e-9, "{p}");
-
-        let probs = [(0, 0.3), (1, 0.2), (2, 0.3), (3, 0.2)];
-        let d = decide(&c, &entries, &config, answered(0, 0.3, &probs)).unwrap();
-        assert_eq!(
-            (d.chosen, d.decided_by, d.reason),
-            (0, DecidedBy::Rules, Some(Reason::LowConfidence))
-        );
-        assert_eq!(d.jev.unwrap().confidence, Some(0.3));
-
-        let d = decide(&c, &entries, &config, Asked::Failed("HTTP 401".into())).unwrap();
-        assert_eq!(d.reason, Some(Reason::JevError("HTTP 401".into())));
-        assert_eq!(d.jev.unwrap().error.as_deref(), Some("HTTP 401"));
-    }
-
-    /// R23: Jev's effort from 0.50 confidence on, its score rounded to a level; else the default.
-    #[test]
-    fn combine_effort_rounds_the_score() {
-        let (entries, c, config) = two_accounts();
-        let with_effort = |score: f64, confidence: f64| {
-            let Asked::Answered(mut a) = answered(0, 0.9, &[(0, 1.0)]) else {
-                unreachable!()
-            };
-            a.efforts.insert(Provider::Claude, Ok((score, confidence)));
-            decide(&c, &entries, &config, Asked::Answered(a)).unwrap()
-        };
-        assert_eq!(with_effort(1.6, 0.8).effort.as_deref(), Some("max"));
-        assert_eq!(with_effort(0.4, 0.8).effort.as_deref(), Some("medium"));
-        assert_eq!(with_effort(9.0, 0.8).effort.as_deref(), Some("max"));
-        let low = with_effort(0.0, 0.4);
-        assert_eq!(low.effort.as_deref(), Some("high"));
-        assert_eq!(low.jev.unwrap().effort_confidence, Some(0.4));
+        entries[1].blocked = Some("excluded ([pick] exclude)".into());
+        let c = candidates(&entries, &config, ts(NOW), None);
+        let d = decide(&c, &entries, &config).unwrap();
+        assert_eq!((d.chosen, d.effort.as_deref()), (0, Some("high")));
     }
 
     #[test]
@@ -3620,15 +3237,7 @@ mod tests {
             ..entry(Provider::Claude, "max", 5, &[])
         }];
         let c = candidates(&entries, &Config::default(), ts(NOW), None);
-        assert!(
-            decide(
-                &c,
-                &entries,
-                &Config::default(),
-                Asked::Skipped(Reason::NoKey)
-            )
-            .is_none()
-        );
+        assert!(decide(&c, &entries, &Config::default()).is_none());
         assert!(format_not_feasible(&entries, &c).contains("claude:max  excluded"));
     }
 
@@ -3875,7 +3484,7 @@ mod tests {
         assert!(!c[1].feasible());
         assert_eq!(c[1].rules_rank, None);
         assert_eq!(ranked(&c), [0]);
-        let d = decide(&c, &entries, &config, Asked::Skipped(Reason::NoKey)).unwrap();
+        let d = decide(&c, &entries, &config).unwrap();
         assert_eq!((d.chosen, d.effort.as_deref()), (0, None));
         let text = format_text(&entries, &c, &d, &config, ts(NOW), &[], Some(&session));
         assert!(
@@ -3908,7 +3517,7 @@ mod tests {
         let c = candidates(&blocked, &config, ts(NOW), Some(&session));
         assert!(c[1].affine && !c[1].feasible());
         assert_eq!(ranked(&c), [0]);
-        let d = decide(&c, &blocked, &config, Asked::Skipped(Reason::NoKey)).unwrap();
+        let d = decide(&c, &blocked, &config).unwrap();
         let v = to_json(
             &blocked,
             &c,

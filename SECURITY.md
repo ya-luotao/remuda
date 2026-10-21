@@ -43,10 +43,8 @@ with one of those directories selected. By design ([SPEC.md](SPEC.md), R2, R13 a
   endpoint or organization settings, and secret-like `env` entries) into a launch, and does not
   link a `settings.json` that sets them at the moment `remuda setup` creates a home;
 - never moves, renames or deletes a home directory;
-- makes no network requests of its own, except the one request of `remuda pick` to TypeSafe
-  (`api.typesafe.ai`), made only when `TYPESAFE_API_KEY` is set and `[pick] notes` are written. That
-  request carries aliased usage, the configured models and the notes; the key travels on `curl`'s
-  standard input, never in its arguments.
+- makes no network requests of its own: `remuda pick` selects locally. Network use by agent
+  commands, including live usage queries, is the agent's own (R10, R13).
 
 One thing these guarantees do not cover, by design: a linked `settings.json` is the source
 account's file, shared whole. Authentication settings added to it after `remuda setup` are
@@ -64,9 +62,7 @@ settings into a launch or linking a `settings.json` that sets them when a home i
 warning above that shows a setting's value, launching an agent with a different account's
 home than the one requested,
 passing untrusted data (such as a session ID from a file) to an agent in a way that is interpreted
-as an option or command, a `remuda pick` request that carries more than SPEC R23 allows (a
-credential, an email, an organization, a path, session content, or an account name the notes
-wrote as `provider:name`), or the key showing in a process list, an error message or the output.
+as an option or command, or making a network request of remuda's own.
 
 Vulnerabilities in Claude Code or Codex themselves are out of scope; report them to their
 respective maintainers.

@@ -45,6 +45,11 @@ and planned work.
 | 2026-10-03 | A linked `settings.json` is shared whole, authentication settings included; remuda warns instead of enforcing | The credentials of a login are in the Keychain (or the home's `.credentials.json`), not in `settings.json`; authentication settings there are ones the user wrote. So `setup` does not link a `settings.json` that has them when it creates a home, and later ones are reported in the Accounts view and at every launch of an account that reads them through the link, by name. The alternatives raised in review, no raw link to the source's `settings.json` but filtered injection or a sanitized copy, were not taken: the linked layout stays as it is. remuda no longer says that authentication is never shared, only that it is never injected (R11, R18) |
 | 2026-10-04 | A linked `projects` gets `CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>` at launch; the R11 check for an `agent-memory` link next to it fires only where a settings file chooses `autoMemoryDirectory` | claude grants its auto-memory directory by the literal path and then checks the resolved one, which through the link is under the source's `.claude/` and outside the working directories: every memory write asked for permission, in every mode, past any allow rule or `additionalDirectories` (2.1.288). The variable names the same directory by the source's path. It moves agent memory too, which a shared store wants anyway; the user's own `--settings`, variable or `autoMemoryDirectory` still win (R18) |
 
+The 2026-09-27 Jev and network decisions above are historical and superseded in Unreleased:
+Jev will not be used. `pick` now selects the first ranked feasible candidate locally, with its
+provider's `default_effort` (none on resume or fork). Headroom/pace ranking, session affinity,
+`--live`, `--wait`, and `--run` remain (R3, R23).
+
 ## Technology
 
 - `ratatui` + `crossterm`: TUI
@@ -56,8 +61,7 @@ and planned work.
 - `unicode-normalization`: NFC for home paths and project names (R2, R18); `unicode-width`:
   display columns; `sha2`: settings file names (R18); `uuid`: pre-assigned session IDs (R6);
   `libc`: terminal modes and process groups
-- `curl` (the system's, found on PATH): the one request of `remuda pick` (R23); no HTTP client
-  is linked in
+- No HTTP transport or API key: recommendations are local; live usage goes through the agents
 - The index and statistics caches are single files under `state/`; move to SQLite only if data
   volume requires it
 - A single crate (lib + bin); the modules and how data flows between them are described in
@@ -124,8 +128,6 @@ in 0.2.0.
 - Interact with running sessions through `messagingSocketPath`.
 - Relocate homes using `CLAUDE_SECURESTORAGE_CONFIG_DIR` (R2).
 - `--private` for command-line output (R21 covers the TUI only).
-- Task text in `remuda pick` (the state has a `task` slot for it), so the recommendation can
-  weigh what the session is for.
 - A TUI key for `pick`: the recommendation in the Accounts view, and a launch from it.
 - Share user-scope MCP servers (`mcpServers` in the source's `.claude.json`) through
   `--mcp-config`, with R18's withholding rules applied to their `env` and `headers`. Not done

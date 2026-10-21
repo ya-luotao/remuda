@@ -13,7 +13,6 @@ pub mod home_items;
 pub mod identity;
 pub mod index;
 pub mod interrupt;
-pub mod jev;
 pub mod launch;
 pub mod live;
 pub mod owned;

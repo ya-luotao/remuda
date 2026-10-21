@@ -1,7 +1,7 @@
 //! A usage snapshot read at an instant (SPEC R10, R23). A [`UsageRow`] is what an agent said at
 //! some time; what it means now depends on when it was said and on whether the window has reset
-//! since. [`Snapshot::at`] answers that once, for `remuda usage`, `remuda pick`, the request to
-//! Jev and the TUI alike: each window's reset as an instant, whether it has passed, the
+//! since. [`Snapshot::at`] answers that once, for `remuda usage`, `remuda pick` and the TUI
+//! alike: each window's reset as an instant, whether it has passed, the
 //! percentage (unknown once it has), and the snapshot's age and staleness.
 
 use jiff::Timestamp;

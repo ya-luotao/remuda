@@ -102,11 +102,9 @@ switching to a different, logged-out account.
                             # resuming it (R23); 0: never
   strategy = "headroom"     # how the rules rank (R23): "headroom", or "pace" to use first
                             # what a reset would waste
-  notes = "Keep claude:personal for long refactors."   # sent to Jev (R23)
 
   [pick.claude]             # also [pick.codex]
   models = ["claude-opus-5-5", "claude-fable-5-1"]     # in order of preference
-  efforts = ["medium", "high", "xhigh", "max"]         # from low to high
   default_effort = "high"
   ```
 - Homes created by `setup` live at `$REMUDA_HOME/homes/<provider>/<name>`; homes registered with
@@ -153,11 +151,15 @@ switching to a different, logged-out account.
   than those above, an `exclude` or `prefer` entry that does not resolve as in R1, a
   `min_headroom` that is not an integer from 0 to 100, a `stale_after` that is not a positive
   integer, an `affinity_minutes` that is not an integer from 0 to 1440, a `strategy` other
-  than `"headroom"` or `"pace"`, `notes` longer than 4000 characters, a model not matching `[A-Za-z0-9._:-]+` or starting with `-`, an effort not matching `[a-z]+`, a duplicate model or effort, a claude model
-  or effort that is a claude subcommand, or a `default_effort` not among `efforts`, and similar
+  than `"headroom"` or `"pace"`, a model not matching `[A-Za-z0-9._:-]+` or starting with `-`,
+  a duplicate model, a claude model that is a claude subcommand, or a `default_effort` that
+  is empty, does not match `[a-z]+`, or, for claude, is a claude subcommand, and similar
   problems are all reported as errors naming the file; remuda neither guesses nor skips. A bare
   name in `[pick]` resolves as in R1, so it becomes an error once another provider has an account
   of that name: `add` and `setup` refuse such an account (R14), and `provider:name` avoids it.
+  The removed `[pick] notes` and `[pick.<provider>] efforts` keys are errors too: users must
+  remove them by hand; no configuration is automatically rewritten. `default_effort` is
+  validated independently, without an effort list.
 - Runtime state (index cache, statistics cache, launch log, usage history of R24) lives in
   `$REMUDA_HOME/state/` and may be deleted and rebuilt at any time.
 - Runtime state is the user's alone: the launch log holds the arguments of every launch, prompts
@@ -226,7 +228,7 @@ the UI, not reported as an error:
   - remuda calls only `initialize`, `account/rateLimits/read`, and `account/read`, never a method
     that changes anything (such as `account/rateLimitResetCredit/consume` or `account/logout`).
 - Every command remuda runs for its output (the identity, usage, and running-session commands
-  above, `claude logs`, `stop`, and `rm`, and likewise `ps` and `curl`) gets a timeout and a
+  above, `claude logs`, `stop`, and `rm`, and likewise `ps`) gets a timeout and a
   process group of its own. At most 1024 of them run at a time: there is one per account, and
   in R7's fallback one `ps` per file of a `sessions/` directory, and nothing else limits
   either, so one more waits for another to be over, its timeout counting from its own start.
@@ -279,7 +281,7 @@ remuda setup [--provider P] <name> [--email E]     create a new home, link it to
 remuda remove <account>                            unregister an account; its home is left in
                                                    place (R14a)
 remuda pick [--provider P] [--live] [--timeout S]  recommend the account, model and effort to
-       [--offline] [--json | --print-request]      launch now; with --run, launch it; with
+       [--json]                                  launch now; with --run, launch it; with
        [--wait [--max-wait S]] [--run [-- <args>]] --wait, once a pair is feasible (R23)
 remuda help [<command>]                            help for remuda or a command
 ```
@@ -665,7 +667,7 @@ appeared in no `history.jsonl`.
 - Codex credits, reset credits, spend control, and upsell data are not shown (R4).
 - A live query does **not** refresh the local cache (verified for claude: `fetchedAtMs` is
   unchanged after consecutive runs); the two sources are displayed separately.
-- remuda makes no network requests of its own, except the one request of `remuda pick` (R23), and
+- remuda makes no network requests of its own, and
   never reads credentials to call the agent's usage endpoint directly.
 - The cache formats are undocumented and parsed on a best-effort basis, and parsing never
   crashes; a cache that is not recognized is no cached usage. Claude's `limits` list is read
@@ -879,9 +881,7 @@ remuda never writes credentials, `.claude.json`, the Keychain, transcripts, `his
 `*.key` files, and never writes into any home directory: not into a home registered with `add`,
 not into the native login's, and not into a home `setup` created, apart from those links at
 that one moment. It never
-makes network requests of its own (live usage is queried by the agent itself; see R10), except the
-one request of `remuda pick` to TypeSafe, made only with `TYPESAFE_API_KEY` set and `[pick]
-notes` written (R23). Network use
+makes network requests of its own (live usage is queried by the agent itself; see R10). Network use
 and writes into a home by an
 agent are the agent's own, and happen only in live queries (`claude -p /usage`, `codex app-server`;
 R4, R10) or in the other agent commands remuda runs in an account's environment (`claude auth
@@ -929,11 +929,8 @@ that prints its own environment and arguments and returns fixtures for `agents -
 the same, answers `login status`, and acts as `app-server`: it reads JSON-RPC lines from stdin,
 records them, answers `initialize`, `account/read`, and `account/rateLimits/read` from fixtures
 with a notification before each answer, and exits when stdin closes; tests never touch real logins
-or sessions. A fake `curl` is always first on PATH (`/usr/bin/curl` exists on macOS and Linux):
-it records its arguments and standard input and answers from fixtures (a response body and
-status, or a forced exit such as 28 for a timeout), so tests never reach the network, and
-`TYPESAFE_API_KEY` is set only by tests that use a sentinel key and check it never shows in output
-or in curl's arguments. Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jsonl`, and
+or sessions. No fake HTTP transport is needed: remuda makes no network requests of its own.
+Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jsonl`, and
 `.claude.json` are derived from real structures and anonymized. In library-level tests where
 `FAKE_CLAUDE_OUT` / `HOME` are not set, the fake claude defaults to paths inside the sandbox.
 
@@ -2005,7 +2002,8 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
 ## R23. Recommendation (`pick`)
 
 `remuda pick` recommends which account and model to launch now, and at what effort. Rules decide
-what is feasible and rank it; with a key, TypeSafe's Jev model chooses among the feasible options.
+what is feasible and rank it; selection always takes the first ranked feasible candidate and
+its provider's `default_effort`, or no effort when unset or when resuming or forking a session.
 It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4) or, with
 `--live`, R10's live queries, and writes nothing except, with `--run`, the launch log (R6): the
 usage it reads is not recorded in the usage history (R24). Given a session to resume or fork, it
@@ -2030,8 +2028,7 @@ holds it (**Resuming**, below).
   (`claude-<family>-…`; a bare alias is its own family) and to the codex model with that id,
   ignoring case; one that matches no configured model is ignored. Without `models`, the agent's
   default model is unknown: the `default` pair shows its account's per-model windows (in the
-  output, in `--json` as `default_model_windows`, and in the request, marked as applying only if
-  that model is of their family) but is never made infeasible by them. A window that has reset
+  output and in `--json` as `default_model_windows`) but is never made infeasible by them. A window that has reset
   since its usage was cached (R10) is of unknown usage: after its reset remuda knows nothing
   about it, and 0% used is only a lower bound. It is named (`reset since cached`), never counted,
   and never makes a pair infeasible: `min_headroom` is checked against known percentages only,
@@ -2044,11 +2041,11 @@ holds it (**Resuming**, below).
 - **The instant.** A recommendation reads every account's usage at one instant: the time once
   all of it is gathered, logins checked and live queries answered or failed. It is not the time
   remuda started: a live query may take as long as its timeout, and a window that resets while
-  it runs has reset. Feasibility, headroom, staleness, and every time in the output and in the
-  request (the time to a reset, the data's age) count from that instant. A live answer is
+  it runs has reset. Feasibility, headroom, staleness, and every time in the output
+  (the time to a reset, the data's age) count from that instant. A live answer is
   recorded when it arrives; when another account's slower query outlasts a reset it named, that
   window has reset since it was asked (`reset since asked`, without the hint to `--live`). The
-  round trip to Jev (at most 10 s) and the launch come after that instant and do not move it.
+  launch comes after that instant and does not move it.
 - **Staleness.** Cached usage older than `stale_after` minutes (default 120), or of unknown age,
   is stale; it is marked, and breaks ties (below). Staleness never makes a window feasible: a used
   percentage only grows until its reset. Staleness and a reset since are independent: staleness
@@ -2095,46 +2092,10 @@ holds it (**Resuming**, below).
   paces equal so are equal whatever their reset times. The pace shown (`%/h`, and `pace` in
   `--json`) is the quotient, for reading only. The
   pace only orders: feasibility, the binding window, and `--wait` are as above.
-- **When Jev is asked.** Only with `TYPESAFE_API_KEY` in remuda's environment, without
-  `--offline`, with `notes`, and with a choice to make (two feasible pairs, or a provider with two
-  or more `efforts` and a feasible pair). Otherwise the rules decide, and the reason is `offline`,
-  `no_key`, `no_notes`, or `single_option`.
-- **The request.** One POST to `https://api.typesafe.ai/v1/systemone` with model `jev-latest`,
-  through `curl` from PATH: `curl -q -sS --proto =https --max-time 10 -X POST -H "Content-Type:
-  application/json" -o - -w "\n%{http_code}" -K - <endpoint>`. The authorization header and the
-  body go in the configuration curl reads on its standard input, never in its arguments; a key
-  holding a quote, a backslash, or a control character is not sent.
-  - Questions: `launch`, a Choice over the feasible pairs (the rules' best 255 when there are
-    more), named `<alias> / <model>` (`default` for the agent's default) and described by the
-    binding window, the windows that have reset since (of unknown usage), and the data's
-    age, asked only when there are two or more; and
-    `effort_<provider>`, a Score over `efforts`, for each provider with at least two and a
-    feasible pair. The criteria are a JSON object, so their order carries no meaning.
-  - State: plain text with the local weekday and time (no time zone), the rules already applied
-    (and, with `strategy = "pace"`, one sentence saying that they rank by pace), each account with a feasible pair under its alias (`<provider>:account-<n>`, numbered per
-    provider in registry order as in R21; `default` stays `default`), its usage (source, age,
-    staleness, and each window that applies with its percentage and time to reset, or as
-    `usage unknown (reset since cached)`), the models,
-    the notes, and an empty task. In the notes, each qualified name is replaced by its alias: a
-    provider, `:`, and the longest run of name characters (`[A-Za-z0-9_-]`) after it, wherever
-    the character before it is not an ASCII letter or digit (so also right after CJK text, `-`,
-    or `_`, and before full-width punctuation). A name that is not registered gets the next
-    alias of its provider, in the order the notes name them; `claude:max2` and `claude:max_` are
-    such names, not `claude:max`. The rest, bare names included, is sent as written. No email,
-    organization, plan, path, working directory, or session content is sent.
-- **Combination.** Jev's pair when its confidence is at least 0.50 (`jev`); else, when the
-  probabilities of one account's pairs add up to at least 0.70, that account with its most
-  probable model (`jev_account`); else the rules' first (`low_confidence`). With one option,
-  `launch` is not asked: the rules keep it (`single_option`) and Jev decides only the effort. The
-  effort is the chosen provider's Score rounded to a level when its confidence is at least 0.50,
-  else `default_effort`; an effort answer that is missing or not a score within its levels costs
-  only the effort (`default_effort`, the problem in `jev.effort_error` and the output). No `curl`,
-  a curl failure or its timeout (10 s), an HTTP status other than 2xx, a response that is not
-  JSON, or a `launch` answer that is missing or names an option not offered: the rules decide
-  (`jev_error`), and the message holds at most 200 characters of the response and never the key.
-- **Output.** The account, model, and effort (and whether the effort is Jev's); what decided and
-  why, with Jev's confidence (the rules, with `strategy = "pace"`, as `rules, strategy pace`);
-  the rules' choice when Jev's differs; the binding window and its
+- **Local selection.** No recommendation request is made and no API key or HTTP transport is
+  used. The deterministic rules above decide both the candidate and its configured effort.
+- **Output.** The account, model, and effort; `decided by` as `rules`, or
+  `rules, strategy pace` with `strategy = "pace"`; the binding window and its
   reset (`unknown` when no window that applies is known); with `strategy = "pace"`, the pace,
   the window that gives it, and its reset (`unknown` when the pace is unknown); the windows that have reset since,
   with the hint to `--live` when the usage is cached; the data's age; the exclusions; the
@@ -2142,21 +2103,22 @@ holds it (**Resuming**, below).
   quoted for a POSIX shell where it needs it (so that the line, run by a shell, gives the agent
   the same words; `--json` has them as an array); resuming,
   the session's facts (**Resuming**); and every pair that is not feasible,
-  with its reason. `--json` prints `account`, `provider`, `model`, `effort`, `decided_by` (`jev`,
-  `jev_account`, `rules`), `reason`, `effort_by` (`jev`, `rules`; null without an effort), `jev`
-  (`model`, `confidence`, `effort_confidence`, `effort_error`, `error`; null when not asked),
+  with its reason. `--json` prints `account`, `provider`, `model`, `effort`,
+  `decided_by` (`rules`; null with nothing feasible), `effort_by` (`rules`; null without an
+  effort, including with nothing feasible),
   `strategy` (`headroom`, `pace`; also with nothing feasible), `command`, `session` (null without a session resumed or forked, nothing feasible included;
   else `id`, `kind` (`resume`, `fork`), `last_account`, `last_active_at`, `age_seconds`,
   `affine`, `model`, `indexed`), and `candidates` (`account`, `model`, `feasible`, `why_not`,
   `headroom`, `binding`, `resets_at`, `pace`, `pace_window`, `reset_passed`,
   `default_model_windows`, `source`, `fetched_at`, `age_seconds`, `stale`, `rules_rank`,
-  `affine`, `jev_probability`). `headroom` and `binding` are null when the headroom
+  `affine`). There is no top-level `reason` or `jev`, nor candidate `jev_probability`.
+  `headroom` and `binding` are null when the headroom
   is unknown; `pace` (percent per hour) and `pace_window` (the label of the window that gives
   it) are null when the pace is unknown, and are given whatever the strategy; `resets_at` is the binding window's reset, null unless it is ahead: never an
   instant in the past; `reset_passed` is true when a window that applies has reset since.
   Each of `default_model_windows` has `label`, `percent`, `resets_at`, and `reset_passed`, with
-  `percent` and `resets_at` null when its reset has passed. `--print-request` prints the body a
-  send would use and sends nothing (no key needed). With nothing feasible: the reasons, exit 1.
+  `percent` and `resets_at` null when its reset has passed. With nothing feasible: the reasons,
+  exit 1.
 - **`--run`.** Launches the recommendation exactly as `remuda run <account> <options> <args>`
   (R6, R17, R18), `<args>` being those after `--`: claude gets `--model <m> --effort <e>`, codex
   `-m <m> -c model_reasoning_effort=<e>` (verified: codex 0.156.1 accepts both before a
@@ -2170,15 +2132,14 @@ holds it (**Resuming**, below).
   record, codex's `resume <id>` without a `-C` of remuda's; like `run`, `pick --run` does not
   check that the session is running elsewhere (R16's check is the TUI's). Other arguments that
   do not start a new session (R6's classification for claude; `resume` or `fork` without an id,
-  or with `--last`, first for codex) are refused before anything is sent, with `--run` or
+  or with `--last`, first for codex) are refused before selection or launch, with `--run` or
   without (the command shown is one remuda would launch), and when no pair is feasible as
   well as when one is. With a feasible pair they are checked for the providers of the feasible
   pairs, as the launch would read them; with none, for each provider with an account that
   nothing permanent blocks (not excluded, of `--provider` or of the session's provider, logged
   in, `codex` on PATH, able to see the session resumed), before saying that nothing is
   feasible. Arguments after `--` need no `--run`;
-  without it they are only shown in the command. `--json` and `--print-request` do not combine
-  with `--run`.
+  without it they are only shown in the command. `--json` does not combine with `--run`.
 - **Resuming.** Prompt caches are per account (verified on claude 2.1.292: a session begun as
   one account and resumed as another read only the prefix the second had cached itself and
   wrote the rest of the conversation again, 9,817 tokens; resumed as the first again, it read
@@ -2194,7 +2155,7 @@ holds it (**Resuming**, below).
     `resume <id>` or `fork <id>` first (R17). Only that provider's accounts are candidates (a conflicting
     `--provider` is an error, and arguments that name a session for both readings are refused
     as ambiguous). Each account is one candidate, with nothing injected: neither `models` nor
-    `efforts` nor `default_effort` applies, and Jev is not asked an effort.
+    `default_effort` applies.
   - The account that ran it last: of the launch log's records (R6) whose `session_id` is the id
     or whose `fork_of` is (a fork reads the whole session it copies, into its account's cache),
     the latest, with the home it was launched with. That account is the one registered under
@@ -2224,13 +2185,8 @@ holds it (**Resuming**, below).
     last `turn_context` (codex), found through the session index; unknown otherwise. The
     windows of that model apply (**Windows**); unknown, the pair is as `default`'s: its
     per-model windows are shown, never counted. The model is the transcript's text, unchecked: it is matched
-    against the windows locally and shown on the user's terminal, and never sent to Jev. Nor
-    is a window's label, which may name it (the agent's quota name for the session's model):
-    resuming or forking, the request names each window by its kind only (`session window`,
-    `weekly window`, codex's `<N>h window` / `<N>d window`, else `window`; a per-model one `… of
-    the session's model`, or `… of one model` when the session's model is unknown), with what
-    it holds and when it resets. The text report and `--json` keep the labels; a request that
-    resumes nothing is as before.
+    against the windows locally and shown on the user's terminal. The text report and
+    `--json` keep the window labels.
   - Which accounts can see it: those whose store holds the transcript the index has. A session
     the index does not have holds no account back, and the output says so.
   - Nothing is read but the launch log, `state/index.json`, and the end of the session's
@@ -2240,14 +2196,9 @@ holds it (**Resuming**, below).
     registered, registered again with another home, never launched through remuda), and the
     model of the copy the recommended account would resume (with nothing recommended, the
     model every copy has, if they agree); when the warm account is not the one recommended, it
-    says why (its reason for not being feasible, or Jev's choice) and that resuming as another
+    says why (its reason for not being feasible) and that resuming as another
     account rewrites its prompt cache. These facts are in the text report whether or not a
-    pair is feasible, and, with `--run`, on stderr before the launch. The request to Jev says,
-    in one sentence, which account ran the session to be resumed and how long ago, by its
-    alias (an account no longer registered with that home is named as such), and whether its
-    cache is warm, has likely expired, or is not considered (`affinity_minutes = 0`); the warm
-    account's option says so too, also when its usage is unknown (`no usage data`). The
-    session's id, title, directory, and model are never sent.
+    pair is feasible, and, with `--run`, on stderr before the launch.
 - **`--wait`.** With nothing feasible, remuda does not stop: it tries again until a pair is
   feasible, then goes on as without `--wait` (the text, `--json`, or `--run`'s launch). With a
   feasible pair it changes nothing. Each attempt is the whole gathering, at an instant of its
@@ -2282,7 +2233,7 @@ holds it (**Resuming**, below).
     wait, is printed. `--json` prints once, at the
     end. Ctrl-C, Ctrl-\, a hangup, or SIGTERM ends remuda by that signal, whether it sleeps or
     an attempt is under way: a query under way, or being started, is told first (R4), and
-    none is left running. `--print-request` does not combine with `--wait`. The arguments after
+    none is left running. The arguments after
     `--` are checked at each attempt as without `--wait` (**`--run`**): when a pair is feasible,
     for the feasible pairs' providers; when remuda is about to wait, for each provider with an
     account that nothing permanent blocks, so they are refused before the wait instead of after
