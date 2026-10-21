@@ -24,7 +24,7 @@ commands, and launches them with the right environment and options.
    │  registry   launch · share           index · attribution       │
    │  paths      identity · usage · live  stats · pricing           │
    │  provider   checks · account_config  transcript · probe · text │
-   │  privacy    pick · jev · home_items  owned (every write)       │
+   │  privacy    pick · home_items        owned (every write)       │
    │  interrupt  account_command                                    │
    └──────────────────────┬─────────────────────────────────────────┘
           reads │         │ runs            │ writes (R13)
@@ -38,8 +38,6 @@ commands, and launches them with the right environment and options.
    │  rollouts,     │ │  exec on      │
    │  settings)     │ │  launch)      │
    └────────────────┘ └───────────────┘
-                      + curl → api.typesafe.ai:
-                        `pick` only, with a key (R23)
 ```
 
 Three rules shape the whole design and are worth knowing before reading any module:
@@ -72,7 +70,7 @@ Modules are layered: each layer uses the layers below it.
  │  launch · share · setup · home_items  accounts: identity · usage · live · │
  │                                                 checks · account_config   │
  │  sessions: attribution                tokens:   stats · pricing           │
- │  recommendation: pick · jev                                               │
+ │  recommendation: pick                                                     │
  ├─ reading agents' data ────────────────────────────────────────────────────┤
  │  index · transcript · provider::codex · provider::app_server · probe      │
  │  tracking · account_command                                               │
@@ -105,7 +103,7 @@ The exceptions, all for a type or a small helper:
 | `provider` | What differs between claude and codex: isolation variable, stores, launch arguments, login | R4 |
 | `provider::codex` | Rollout parsing: head/tail windows, titles from `session_index.jsonl`, preview, cached rate limits | R10, R17 |
 | `provider::app_server` | JSON-RPC client for `codex app-server` (`account/read`, `account/rateLimits/read`) | R4, R10 |
-| `probe` | Run a short command in its own process group with captured output and a timeout, taking its output once it exited and terminating the group when it times out; JSON-RPC over stdio on the same core, its group terminated on every way out; run many in parallel; run `curl` with its configuration on stdin | R4, R10, R23 |
+| `probe` | Run a short command in its own process group with captured output and a timeout, taking its output once it exited and terminating the group when it times out; JSON-RPC over stdio on the same core, its group terminated on every way out; run many in parallel | R4, R10, R23 |
 | `account_command` | Run an agent's command for an account: pick the provider's program, set or remove the home variable (and remove the variables a caller names), run it, and word the failure (`Runner`, `OnPath`); the shape of a parse that may be partial (`Parsed`) | R2, R4, R10, R10a |
 | `interrupt` | The terminal's signals and SIGTERM, owned in one place: Ctrl-C and Ctrl-\ sat out while a foreground child has the terminal, passed on to the process groups of running commands and of commands being started, before remuda ends by them; a place for each of at most 1024 commands at a time, which one more waits for | R4, R6 |
 | `launch` | Classify arguments, inject `--session-id`, set or unset the home variable, the launch record, `exec` and foreground runs | R2, R6, R16, R17 |
@@ -115,7 +113,7 @@ The exceptions, all for a type or a small helper:
 | `identity` | Parses `claude auth status --json`, `codex login status` and `account/read`; the `.claude.json` fallback | R10a |
 | `usage` | Cached and live usage for both providers as rows (what the agent said; a partly read answer is not used), window labels, the text of `remuda usage` | R10 |
 | `usage::history` | The usage history: the points of a reading, recorded under the lock of the directory of the file replaced (`owned::lock_state_file`; leaving out what is there, appending, or compacting), the window lengths (the minutes a point tells, else read from its label), each current window's pace, the text of `remuda usage --history` | R24 |
-| `usage::snapshot` | Rows read at an instant: each window's reset (ahead, passed since, unknown), its percentage and severity (unknown once it has reset since), the snapshot's age and staleness. The one place that compares a reset with now; `usage`, `pick`, `jev` and the TUI take it from here | R10, R23 |
+| `usage::snapshot` | Rows read at an instant: each window's reset (ahead, passed since, unknown), its percentage and severity (unknown once it has reset since), the snapshot's age and staleness. The one place that compares a reset with now; `usage`, `pick` and the TUI take it from here | R10, R23 |
 | `live` | Running claude sessions: parses `agents --json`, `sessions/*.json` fallback checked against `ps`; attach, logs, stop, rm | R7, R16 |
 | `checks` | Warnings for the Accounts view, among them what a member's home links and does not (the relations of `home_items`, put into words) | R11 |
 | `index` | The session index over claude transcripts and codex rollouts: its stores, how they are listed, the head and tail windows of one file, its cache | R8, R17 |
@@ -125,10 +123,9 @@ The exceptions, all for a type or a small helper:
 | `stats` | Token counting, deduplication across copies, periods, sections by account or project, chart buckets, text table, CSV; its sources, how they are listed, its cache | R20 |
 | `pricing` | Built-in prices and `[prices]` overrides; the cost of one request in picodollars | R20 |
 | `account_config` | What an account's sessions load and where each item comes from, on top of `share::plan` | R22 |
-| `pick` | `[pick]`; candidates, which windows apply to a model, and feasibility; the rules' ranking; combining Jev's answer; the report; `--run` options; the session the arguments resume or fork and what the launch log and the session index say of it (`session_args`, `read_session`); when `--wait` tries again (`next_attempt`) | R3, R23 |
+| `pick` | Strict `[pick]` validation; candidates, which windows apply to a model, and feasibility; deterministic headroom/pace ranking and selection of the first feasible candidate with its provider's `default_effort` (none on resume or fork); the report; `--run` options; the session the arguments resume or fork and what the launch log and the session index say of it (`session_args`, `read_session`); when `--wait` tries again (`next_attempt`) | R3, R23 |
 | `wait` | `--wait`: when to try again from the windows that block and their resets (`schedule`, its named constants), the loop of attempts with an injected clock and sleep (`until`), the status line | R10, R23 |
-| `jev` | The request to Jev (aliased state, Choice and Score questions), `curl` transport, response parsing | R23 |
-| `privacy` | `Marked`, a message in the pieces it was put together from (remuda's words, a path, text from elsewhere); account-name aliases, whole-word aliasing of names in free text, and aliasing of every `provider:name` in the `pick` notes | R21, R23 |
+| `privacy` | `Marked`, a message in the pieces it was put together from (remuda's words, a path, text from elsewhere); account-name aliases and whole-word aliasing of names in free text | R21 |
 | `text` | Terminal text measured in display columns | – |
 | `tui` | Terminal ownership, the event loop, foreground launches | R16 |
 | `tui::app` | All TUI state and the pure `update(app, event) -> effects` | R8, R16, R17, R20–R22 |
@@ -572,4 +569,4 @@ cargo run --release --example codex_timing -- [<codex home>]
 | Add a model price | SPEC R20 table and `pricing` |
 | Change what a usage window means once its reset has passed, or how old usage counts | SPEC R10 / R23, `usage::snapshot` (`Snapshot::at`); every surface reads it from there |
 | Record usage from another place, or change what the history keeps | SPEC R24, `usage::history` (`record`: its lock is what keeps concurrent writers from losing points); `pick` must stay out of it (R23) |
-| Change what `remuda pick` sends to Jev | SPEC R23, `jev::request` and `jev::state_text`; the privacy test in `tests/pick_cli.rs` |
+| Change recommendation ranking, selection or output | SPEC R3 / R23, `pick`; `tests/pick_cli.rs`. Selection stays local, with no API key or HTTP transport |

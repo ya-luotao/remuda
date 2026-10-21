@@ -233,13 +233,9 @@ min_headroom = 10              # percent left required on every window that appl
 stale_after = 120              # minutes after which cached usage is marked stale
 affinity_minutes = 60          # resuming a session: how long its last account stays preferred
 strategy = "headroom"          # how the rules rank: "headroom" (default) or "pace"
-notes = """
-Keep claude:max for long refactors. codex:work is the company's; weekdays only.
-"""
 
 [pick.claude]
 models = ["claude-opus-5-5", "claude-fable-5-1"]   # in order of preference; the first is the default
-efforts = ["medium", "high", "xhigh", "max"]       # from low to high
 default_effort = "high"
 
 [pick.codex]
@@ -270,24 +266,19 @@ models = ["gpt-6-astra"]
   those with one. Feasibility and `--wait` do not change, and the text report adds a `pace` line; `--json`
   shows each pair's `pace` and `pace_window` under either strategy, so you can compare before
   switching. The default stays `"headroom"`.
-- **Jev, when asked.** With `TYPESAFE_API_KEY` set and `notes` written, and something to choose
-  (two options, or an effort to score), remuda sends one request to TypeSafe's Jev model through `curl` (the key on curl's standard
-  input, never on its command line) and takes its choice when its confidence is at least 0.50,
-  or its most probable account when that account's options add up to 0.70; otherwise, or on any
-  error, the rules decide. With a single option only the effort is asked. The effort comes from
-  Jev's score when it is confident and usable, else from `default_effort`.
-- **What is sent.** Each feasible account under an alias (`claude:account-1`, as in private
-  mode; `default` stays `default`) with its usage windows, the local weekday and time, your models
-  and efforts, and your notes. In the notes, accounts written as `provider:name` are replaced by
-  their aliases, registered or not, whatever is written around them (CJK text, punctuation, `-`,
-  `_`); everything else is sent as written, so write accounts that way and keep secrets out of
-  the notes. Credentials, emails, organizations, paths and session content are never sent.
-  `remuda pick --print-request` prints the exact request without sending it; `--offline` never
-  sends.
-- **Output.** The account, model and effort, what decided (and the rules' choice when Jev chose
-  otherwise), the binding window and its reset, how old the data is, the `remuda run` command,
+- **Local selection.** Always the first ranked feasible candidate, with its provider's
+  `default_effort` (none when unset or when resuming or forking). No API key or HTTP transport
+  is used. `default_effort` is independently validated as nonempty `[a-z]+`; for Claude, it
+  must not be a Claude subcommand. Configuration remains strict: remove legacy
+  `[pick] notes` and `[pick.<provider>] efforts` by hand; remuda does not rewrite the file.
+- **Output.** The account, model and effort, `decided by` as `rules` (or
+  `rules, strategy pace`), the binding window and its reset, how old the data is, the `remuda run` command,
   and every pair that is not feasible with the reason. `--json` prints the same, with every
-  candidate. With nothing feasible, `pick` lists the reasons and exits 1.
+  candidate. JSON `decided_by` is `rules`; `effort_by` is `rules` when there is an effort,
+  otherwise null. Both are null with no feasible recommendation. Top-level `reason` and `jev`
+  and candidate `jev_probability` are removed; candidate `why_not` and the other fields remain
+  (the full schema is in [SPEC R23](../SPEC.md#r23-recommendation-pick)). With nothing feasible,
+  `pick` lists the reasons and exits 1.
 - **Launching.** `remuda pick --run [-- <args>...]` launches the recommendation as `remuda run`
   would: claude gets `--model` and `--effort`, codex `-m` and `-c model_reasoning_effort=`,
   before your arguments; an option your arguments already set is left alone. Without `--run`,
@@ -320,8 +311,7 @@ models = ["gpt-6-astra"]
 
   `--run` launches it exactly as `remuda run <account> --resume <id>` would, after saying on
   stderr who ran the session and, when that account is not the one launched, why; like `run`,
-  it does not check whether the session is running elsewhere. Jev is told which account (by
-  alias) ran the session and how long ago; never its id, title, directory or model.
+  it does not check whether the session is running elsewhere.
 - **Waiting.** `remuda pick --wait` does not give up when nothing is feasible: it checks again
   30 seconds after the earliest reset of a window that blocks (at least a minute apart; every 5
   minutes when no reset is known), and then prints, or with `--run` launches, as usual. Each
@@ -457,8 +447,8 @@ Accounts with `share = false` and the source itself are not checked.
   by several accounts. Each request is also priced at the provider's public API list
   price (built in, as of 2026-10-07), which estimates what the usage would cost on the API; for
   subscription logins it is not a bill. No agent is run and nothing is fetched.
-- **Recommendations** (`remuda pick`) read the same usage and `[pick]`; the only request remuda
-  makes itself goes to TypeSafe, and only with a key and notes (see
+- **Recommendations** (`remuda pick`) read the same usage and `[pick]` and select locally;
+  remuda makes no network requests of its own (see
   [Recommendations](#recommendations)).
 - **Attribution:** new Claude sessions get a pre-assigned `--session-id`, and every launch is
   recorded in `state/launches.jsonl`, so each session can be attributed to the account that

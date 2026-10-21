@@ -47,6 +47,23 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   otherwise, then the whole view on a second `p`) is replaced by the account card above; `Esc`
   closes the card in one step, and switching views closes it too (SPEC R22).
 
+### Removed
+
+- **Breaking:** Jev recommendations, TypeSafe API-key handling and the `curl` transport
+  (SPEC R3, R23). `pick` always selects the first ranked feasible candidate and its provider's
+  `default_effort` (none when unset or on resume/fork). Models, deterministic headroom/pace
+  ranking, session affinity, `--live`, `--wait`, and `--run` remain. Text `decided by` is `rules`
+  or `rules, strategy pace`. JSON keeps `decided_by = "rules"` and `effort_by = "rules"`
+  (null without an effort; both null with no feasible recommendation), removes top-level
+  `reason` and `jev` and candidate `jev_probability`, and retains the other fields.
+  **Migration:** remove `--offline` and `--print-request` from invocations and scripts; remove
+  `[pick] notes` and `[pick.<provider>] efforts` from `config.toml` by hand, and update JSON
+  consumers for the removed fields. Old config keys are errors, not ignored; remuda does not
+  automatically rewrite any configuration. Keep `models` and optional `default_effort`:
+  the latter is independently validated as nonempty `[a-z]+` and, for Claude, must not be a
+  Claude subcommand. `TYPESAFE_API_KEY` is no longer used by remuda and can be
+  removed from its setup. Tests no longer need a fake `curl` transport.
+
 ## [0.3.0] - 2026-10-13
 
 ### Added

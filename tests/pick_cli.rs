@@ -1,5 +1,4 @@
-//! R23, R24: `remuda pick` (which records no usage history). Every test runs with the fake curl first on PATH (R15); the key is a
-//! sentinel that must never show in output or in curl's arguments.
+//! R23, R24: rules-only `remuda pick` (which records no usage history).
 
 mod common;
 
@@ -7,8 +6,6 @@ use std::path::{Path, PathBuf};
 
 use common::Sandbox;
 use serde_json::{Value, json};
-
-const KEY: &str = "test-key-DO-NOT-LEAK";
 
 fn now() -> i64 {
     jiff::Timestamp::now().as_second()
@@ -54,13 +51,11 @@ fn claude_json(email: &str, age: i64, limits: &[Value]) -> String {
 
 const DAY: i64 = 86_400;
 
-/// A request body without the parts that follow the clock, so that two runs a moment apart
-/// compare equal: the local time, and the time left until each reset (`3d` becomes `2d23h` as
-/// soon as a second passes).
-fn without_clock(body: &str) -> String {
+/// Normalize reset countdowns when comparing reports from consecutive attempts.
+fn without_clock(report: &str) -> String {
     const RESETS: &str = "resets in ";
     let mut out = String::new();
-    let mut rest = body;
+    let mut rest = report;
     while let Some(i) = rest.find(RESETS) {
         out.push_str(&rest[..i + RESETS.len()]);
         rest = &rest[i + RESETS.len()..];
@@ -71,11 +66,6 @@ fn without_clock(body: &str) -> String {
         rest = &rest[end..];
     }
     out.push_str(rest);
-    const TIME: &str = "local time: ";
-    if let Some(i) = out.find(TIME) {
-        let end = out[i..].find("\\n").map_or(out.len(), |j| i + j);
-        out.replace_range(i + TIME.len()..end, "_");
-    }
     out
 }
 
@@ -93,7 +83,6 @@ fn configure(sb: &Sandbox, accounts: &[(&str, &str, &Path)], pick: &str) {
 }
 
 const MODELS: &str = "[pick.claude]\nmodels = [\"claude-opus-5-5\", \"claude-sonnet-5\"]\n";
-const NOTES: &str = "[pick]\nnotes = \"Keep claude:team for the big refactor.\"\n";
 
 /// `max` with 60% left on the week, `team` with 20%; `claude:default` has nothing (logged out).
 fn two_accounts(pick: &str) -> (Sandbox, PathBuf, PathBuf) {
@@ -130,31 +119,13 @@ struct Out {
     stderr: String,
 }
 
-fn pick(sb: &Sandbox, key: bool, args: &[&str]) -> Out {
-    let mut cmd = sb.remuda();
-    cmd.arg("pick").args(args);
-    if key {
-        cmd.env("TYPESAFE_API_KEY", KEY);
-    }
-    let out = cmd.output().unwrap();
-    let out = Out {
+fn pick(sb: &Sandbox, args: &[&str]) -> Out {
+    let out = sb.remuda().arg("pick").args(args).output().unwrap();
+    Out {
         code: out.status.code(),
         stdout: String::from_utf8(out.stdout).unwrap(),
         stderr: String::from_utf8(out.stderr).unwrap(),
-    };
-    assert!(
-        !out.stdout.contains(KEY) && !out.stderr.contains(KEY),
-        "the key leaked:\n{}\n{}",
-        out.stdout,
-        out.stderr
-    );
-    for argv in sb.curl_invocations() {
-        assert!(
-            !argv.iter().any(|a| a.contains(KEY) || a.contains("Bearer")),
-            "{argv:?}"
-        );
     }
-    out
 }
 
 /// The value of `key` in the text report (`key  value` lines).
@@ -166,31 +137,16 @@ fn field<'a>(out: &'a Out, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no `{key}` in:\n{}", out.stdout))
 }
 
-/// A Jev answer choosing `choice` with `confidence`.
-fn answer(choice: &str, confidence: f64, probabilities: &[(&str, f64)]) -> String {
-    let probabilities: serde_json::Map<String, Value> = probabilities
-        .iter()
-        .map(|(k, p)| (k.to_string(), json!(p)))
-        .collect();
-    json!({"model": "jev-1.13.0", "answers": {"launch": {"type": "choice", "choice": choice,
-           "confidence": confidence, "probabilities": probabilities}},
-           "usage": {"input_tokens": 400, "output_tokens": 30}})
-    .to_string()
-}
-
-/// Without a key the rules decide, and curl is never run.
+/// Rules deterministically choose the highest headroom and the first configured model.
 #[test]
-fn without_a_key_the_rules_decide() {
-    let (sb, _, _) = two_accounts(&format!("{NOTES}{MODELS}"));
-    let out = pick(&sb, false, &[]);
+fn the_rules_decide() {
+    let (sb, _, _) = two_accounts(MODELS);
+    let out = pick(&sb, &[]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert_eq!(field(&out, "account"), "claude:max");
     assert_eq!(field(&out, "model"), "claude-opus-5-5");
     assert_eq!(field(&out, "effort"), "agent default");
-    assert_eq!(
-        field(&out, "decided by"),
-        "rules (no_key: TYPESAFE_API_KEY is not set)"
-    );
+    assert_eq!(field(&out, "decided by"), "rules");
     assert!(field(&out, "limit").starts_with("Week (all models) 60% left, resets in "));
     assert_eq!(
         field(&out, "command"),
@@ -201,304 +157,37 @@ fn without_a_key_the_rules_decide() {
         "{}",
         out.stdout
     );
-    assert!(sb.curl_invocations().is_empty());
-}
-
-/// `--offline`, empty notes, or nothing to choose: no request even with a key.
-#[test]
-fn offline_no_notes_or_a_single_option_send_nothing() {
-    let (sb, _, _) = two_accounts(&format!("{NOTES}{MODELS}"));
-    let out = pick(&sb, true, &["--offline"]);
-    assert_eq!(field(&out, "decided by"), "rules (offline: --offline)");
-
-    let (sb, _, _) = two_accounts(MODELS);
-    let out = pick(&sb, true, &[]);
-    assert_eq!(
-        field(&out, "decided by"),
-        "rules (no_notes: no [pick] notes)"
-    );
-
-    // One account left, no models or efforts configured: one option.
-    let (sb, _, _) = two_accounts(&format!("{NOTES}exclude = [\"team\"]\n"));
-    let out = pick(&sb, true, &[]);
-    assert_eq!(
-        field(&out, "decided by"),
-        "rules (single_option: only one option)"
-    );
-    assert_eq!(field(&out, "model"), "agent default");
-    assert_eq!(field(&out, "command"), "remuda run claude:max");
-    assert_eq!(field(&out, "excluded"), "claude:team");
-    assert!(sb.curl_invocations().is_empty());
-}
-
-/// A confident Jev answer wins over the rules' first pair, and the report says both.
-#[test]
-fn a_confident_jev_answer_is_taken() {
-    let (sb, _, _) = two_accounts(&format!("{NOTES}{MODELS}"));
-    // Aliases in registry order: claude:max is account-1, claude:team account-2.
-    sb.set_jev_response(&answer(
-        "claude:account-2 / claude-opus-5-5",
-        0.9,
-        &[
-            ("claude:account-2 / claude-opus-5-5", 0.95),
-            ("claude:account-1 / claude-opus-5-5", 0.05),
-        ],
-    ));
-    let out = pick(&sb, true, &[]);
-    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
-    assert_eq!(field(&out, "account"), "claude:team");
-    assert_eq!(field(&out, "decided by"), "jev (confidence 0.90)");
-    assert_eq!(
-        field(&out, "rules"),
-        "would choose claude:max / claude-opus-5-5"
-    );
-    let calls = sb.curl_invocations();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0][0], "-q");
-    assert_eq!(
-        calls[0].last().map(String::as_str),
-        Some("https://api.typesafe.ai/v1/systemone")
-    );
-    assert!(
-        sb.curl_stdin()
-            .starts_with(&format!("header = \"Authorization: Bearer {KEY}\"\n"))
-    );
-}
-
-/// Unsure of the pair but sure of the account: that account with its most probable model.
-/// Spread out: the rules, and `--json` still shows Jev's confidence.
-#[test]
-fn a_probable_account_or_the_rules() {
-    let (sb, _, _) = two_accounts(&format!("{NOTES}{MODELS}"));
-    sb.set_jev_response(&answer(
-        "claude:account-2 / claude-sonnet-5",
-        0.3,
-        &[
-            ("claude:account-1 / claude-opus-5-5", 0.1),
-            ("claude:account-1 / claude-sonnet-5", 0.1),
-            ("claude:account-2 / claude-opus-5-5", 0.3),
-            ("claude:account-2 / claude-sonnet-5", 0.5),
-        ],
-    ));
-    let out = pick(&sb, true, &[]);
-    assert_eq!(field(&out, "account"), "claude:team");
-    assert_eq!(field(&out, "model"), "claude-sonnet-5");
-    assert_eq!(
-        field(&out, "decided by"),
-        "jev (account, probability 0.80; confidence 0.30)"
-    );
-
-    sb.set_jev_response(&answer(
-        "claude:account-2 / claude-sonnet-5",
-        0.3,
-        &[
-            ("claude:account-1 / claude-opus-5-5", 0.3),
-            ("claude:account-1 / claude-sonnet-5", 0.2),
-            ("claude:account-2 / claude-opus-5-5", 0.2),
-            ("claude:account-2 / claude-sonnet-5", 0.3),
-        ],
-    ));
-    let out = pick(&sb, true, &[]);
-    assert_eq!(field(&out, "account"), "claude:max");
-    assert!(
-        field(&out, "decided by").starts_with("rules (low_confidence: jev confidence 0.30"),
-        "{}",
-        out.stdout
-    );
-    let out = pick(&sb, true, &["--json"]);
-    let v: Value = serde_json::from_str(&out.stdout).unwrap();
+    let v: Value = serde_json::from_str(&pick(&sb, &["--json"]).stdout).unwrap();
     assert_eq!(v["decided_by"], "rules");
-    assert_eq!(v["reason"], "low_confidence");
-    assert_eq!(v["jev"]["confidence"], 0.3);
-    assert_eq!(v["jev"]["model"], "jev-1.13.0");
-}
+    assert_eq!(v["effort"], Value::Null);
+    assert_eq!(v["effort_by"], Value::Null);
 
-/// Every failure falls back to the rules with `jev_error`, and never shows the key.
-#[test]
-fn jev_errors_fall_back_to_the_rules() {
-    let (sb, _, _) = two_accounts(&format!("{NOTES}{MODELS}"));
-    let decided = |sb: &Sandbox| {
-        let out = pick(sb, true, &[]);
-        assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
-        assert_eq!(field(&out, "account"), "claude:max");
-        field(&out, "decided by").to_string()
-    };
-    sb.set_jev_response("{\"error\": \"invalid api key\"}");
-    sb.set_jev_status(401);
-    assert_eq!(
-        decided(&sb),
-        "rules (jev_error: HTTP 401: {\"error\": \"invalid api key\"})"
-    );
-    sb.set_jev_status(200);
-    sb.set_jev_response("<html>not json</html>");
-    assert!(decided(&sb).starts_with("rules (jev_error: not JSON in the response"));
-    sb.set_jev_response(&answer("claude:max / claude-opus-5-5", 1.0, &[]));
-    assert_eq!(
-        decided(&sb),
-        "rules (jev_error: Jev chose \"claude:max / claude-opus-5-5\", which is not an offered \
-         option)"
-    );
-    sb.set_curl_exit(28);
-    assert_eq!(decided(&sb), "rules (jev_error: timed out after 10s)");
-    assert_eq!(sb.curl_invocations().len(), 4);
-
-    // No curl on PATH. PATH is the sandbox's bin alone: `/usr/bin/curl` must not be found.
-    std::fs::remove_file(sb.bin().join("curl")).unwrap();
-    let out = sb
+    // A leftover credential cannot change either the recommendation or its provenance.
+    let keyed = sb
         .remuda()
-        .env("PATH", sb.bin())
-        .env("TYPESAFE_API_KEY", KEY)
-        .arg("pick")
+        .args(["pick", "--json"])
+        .env("TYPESAFE_API_KEY", "unused-removal-regression-sentinel")
         .output()
         .unwrap();
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(
-        stdout.contains("rules (jev_error: `curl` not found on PATH)"),
-        "{stdout}"
-    );
-    assert!(!stdout.contains(KEY));
-}
-
-/// The request carries no email, organization, path or working directory; qualified account
-/// names in the notes are aliased, bare ones are left as written; the key goes on stdin only.
-#[test]
-fn the_request_is_private() {
-    let sb = Sandbox::new();
-    let secret = sb.make_claude_home("h/secretname");
-    sb.write_claude_json(
-        Some(&secret),
-        &claude_json(
-            "secret.person@example.com",
-            600,
-            &[limit("weekly_all", 10.0, 3 * DAY)],
-        ),
-    );
-    let other = sb.make_claude_home("h/other");
-    sb.write_claude_json(
-        Some(&other),
-        &claude_json(
-            "other@example.com",
-            600,
-            &[limit("weekly_all", 30.0, 3 * DAY)],
-        ),
-    );
-    let notes = "Use claude:secretname for long refactors; secretname otherwise, as written.";
-    configure(
-        &sb,
-        &[
-            ("claude", "secretname", &secret),
-            ("claude", "other", &other),
-        ],
-        &format!("[pick]\nnotes = \"{notes}\"\n"),
-    );
-    sb.set_jev_response(&answer("claude:account-1 / default", 0.9, &[]));
-    let out = pick(&sb, true, &[]);
-    assert_eq!(field(&out, "account"), "claude:secretname");
-    let body = sb.jev_request_body();
-    for leak in [
-        "secret.person@example.com",
-        "other@example.com",
-        "Acme Secret Org",
-        "claude:secretname",
-        sb.root().to_str().unwrap(),
-        sb.home().to_str().unwrap(),
-        sb.work().to_str().unwrap(),
-        "h/secretname",
-        KEY,
-    ] {
-        assert!(!body.contains(leak), "{leak:?} in {body}");
-    }
-    let v: Value = serde_json::from_str(&body).unwrap();
-    let state = v["state"].as_str().unwrap();
-    assert!(
-        state
-            .contains("Use claude:account-1 for long refactors; secretname otherwise, as written."),
-        "{state}"
-    );
-    assert!(
-        state.contains("account claude:account-1 (claude)"),
-        "{state}"
-    );
-    assert_eq!(v["model"], "jev-latest");
-    assert!(
-        sb.curl_stdin()
-            .contains(&format!("Authorization: Bearer {KEY}"))
-    );
-}
-
-/// Every qualified name in the notes is aliased, however it is written: right after CJK text,
-/// before full-width punctuation, after `-` or `_`, and when the account is not registered (it
-/// gets the next alias, in the order the notes name them). A longer name is another account,
-/// and bare names stay as written. `--print-request` shows exactly what is sent.
-#[test]
-fn every_qualified_name_in_the_notes_is_aliased() {
-    let sb = Sandbox::new();
-    let secret = sb.make_claude_home("h/secretname");
-    sb.write_claude_json(
-        Some(&secret),
-        &claude_json("a@example.com", 600, &[limit("weekly_all", 10.0, 3 * DAY)]),
-    );
-    let other = sb.make_claude_home("h/other");
-    sb.write_claude_json(
-        Some(&other),
-        &claude_json("b@example.com", 600, &[limit("weekly_all", 30.0, 3 * DAY)]),
-    );
-    let notes = "把claude:secretname留给大重构。别用 claude:oldsecret（已移除的账号）；\
-                 -claude:secretname、_claude:secretname_ 和 codex:secretcodex 也一样。\
-                 claude:secretname2 不是它。max 照旧。";
-    configure(
-        &sb,
-        &[
-            ("claude", "secretname", &secret),
-            ("claude", "other", &other),
-        ],
-        &format!("[pick]\nnotes = \"{notes}\"\n"),
-    );
-    sb.set_jev_response(&answer("claude:account-1 / default", 0.9, &[]));
-    let out = pick(&sb, true, &[]);
-    assert_eq!(field(&out, "account"), "claude:secretname");
-    let body = sb.jev_request_body();
-    for leak in ["secretname", "oldsecret", "secretcodex"] {
-        assert!(!body.contains(leak), "{leak:?} in {body}");
-    }
-    let v: Value = serde_json::from_str(&body).unwrap();
-    let state = v["state"].as_str().unwrap();
-    assert!(
-        state.contains(
-            "把claude:account-1留给大重构。别用 claude:account-3（已移除的账号）；\
-             -claude:account-1、_claude:account-4 和 codex:account-1 也一样。\
-             claude:account-5 不是它。max 照旧。"
-        ),
-        "{state}"
-    );
-    let printed = pick(&sb, false, &["--print-request"]);
+    assert!(keyed.status.success());
     assert_eq!(
-        without_clock(printed.stdout.trim_end()),
-        without_clock(&body)
+        json_without_age(&String::from_utf8(keyed.stdout).unwrap()),
+        json_without_age(&pick(&sb, &["--json"]).stdout)
     );
 }
 
-/// `--print-request` prints the body a send uses, sends nothing, and needs no key.
+/// A single feasible account with no configured model still gets a complete recommendation.
 #[test]
-fn print_request_shows_the_body_without_sending() {
-    let (sb, _, _) = two_accounts(&format!("{NOTES}{MODELS}"));
-    let printed = pick(&sb, false, &["--print-request"]);
-    assert_eq!(printed.code, Some(0));
-    assert!(
-        printed.stderr.contains("would not be sent (no_key)"),
-        "{}",
-        printed.stderr
-    );
-    assert!(sb.curl_invocations().is_empty());
-    let body: Value = serde_json::from_str(printed.stdout.trim_end()).unwrap();
-    assert_eq!(body["questions"]["launch"]["type"], "choice");
-
-    sb.set_jev_response(&answer("claude:account-1 / claude-opus-5-5", 0.9, &[]));
-    pick(&sb, true, &[]);
-    assert_eq!(
-        without_clock(&sb.jev_request_body()),
-        without_clock(printed.stdout.trim_end())
-    );
+fn a_single_option_uses_agent_defaults() {
+    let (sb, _, _) = two_accounts("[pick]\nexclude = [\"team\"]\n");
+    let out = pick(&sb, &[]);
+    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
+    assert_eq!(field(&out, "account"), "claude:max");
+    assert_eq!(field(&out, "model"), "agent default");
+    assert_eq!(field(&out, "effort"), "agent default");
+    assert_eq!(field(&out, "decided by"), "rules");
+    assert_eq!(field(&out, "command"), "remuda run claude:max");
+    assert_eq!(field(&out, "excluded"), "claude:team");
 }
 
 /// Staleness is shown; a stale exhausted window stays exhausted until its reset. A window whose
@@ -534,7 +223,7 @@ fn stale_usage_and_passed_resets() {
         &[("claude", "old", &old), ("claude", "spent", &spent)],
         "",
     );
-    let out = pick(&sb, false, &[]);
+    let out = pick(&sb, &[]);
     assert_eq!(field(&out, "account"), "claude:old");
     assert_eq!(
         field(&out, "usage"),
@@ -551,20 +240,7 @@ fn stale_usage_and_passed_resets() {
         field(&out, "unknown"),
         "Session: reset since cached (--live asks the agent)"
     );
-    let body = pick(&sb, false, &["--print-request"]).stdout;
-    let v: Value = serde_json::from_str(body.trim_end()).unwrap();
-    let state = v["state"].as_str().unwrap();
-    assert!(
-        state.contains("usage: cached 5h ago (stale: may be higher now)"),
-        "{state}"
-    );
-    assert!(
-        state.contains("  Session: usage unknown (reset since cached)\n"),
-        "{state}"
-    );
-    assert!(!state.contains(": 0% used"), "{state}");
-
-    let v: Value = serde_json::from_str(&pick(&sb, false, &["--json"]).stdout).unwrap();
+    let v: Value = serde_json::from_str(&pick(&sb, &["--json"]).stdout).unwrap();
     let old = &v["candidates"][1];
     assert_eq!(
         (old["account"].as_str(), old["stale"].as_bool()),
@@ -610,12 +286,12 @@ fn usage_past_every_reset_ranks_after_known_headroom() {
         ("claude", "max", &max),
     ];
     configure(&sb, &accounts, "");
-    let out = pick(&sb, false, &[]);
+    let out = pick(&sb, &[]);
     assert_eq!(field(&out, "account"), "claude:max");
     assert!(field(&out, "limit").starts_with("Week (all models) 71% left, resets in "));
     assert!(!out.stdout.contains("--live"), "{}", out.stdout);
 
-    let v: Value = serde_json::from_str(&pick(&sb, false, &["--json"]).stdout).unwrap();
+    let v: Value = serde_json::from_str(&pick(&sb, &["--json"]).stdout).unwrap();
     assert_eq!(v["account"], "claude:max");
     let of = |account: &str| {
         v["candidates"]
@@ -643,7 +319,7 @@ fn usage_past_every_reset_ranks_after_known_headroom() {
     // Alone, it is recommended, as what it is; `--run` launches it and says so, without a live
     // query of its own.
     configure(&sb, &accounts, "[pick]\nexclude = [\"claude:max\"]\n");
-    let out = pick(&sb, false, &[]);
+    let out = pick(&sb, &[]);
     assert_eq!(field(&out, "account"), "claude:team-alt");
     assert_eq!(field(&out, "limit"), "unknown");
     assert_eq!(
@@ -654,12 +330,7 @@ fn usage_past_every_reset_ranks_after_known_headroom() {
         field(&out, "usage"),
         "cached 4d ago (stale: may be higher now)"
     );
-    let state = pick(&sb, false, &["--print-request"]).stdout;
-    assert!(
-        state.contains("Week (all models): usage unknown (reset since cached)"),
-        "{state}"
-    );
-    let out = pick(&sb, false, &["--run", "--", "-p", "hello"]);
+    let out = pick(&sb, &["--run", "--", "-p", "hello"]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert!(
         out.stderr.contains(
@@ -693,7 +364,7 @@ fn usage_is_read_once_gathered_not_when_pick_started() {
     // recognized, and the cache is used.
     sb.set_hang(Some(&slow), 3);
     configure(&sb, &[("claude", "slow", &slow)], "");
-    let out = pick(&sb, false, &["--live", "--json"]);
+    let out = pick(&sb, &["--live", "--json"]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["account"], "claude:slow");
@@ -791,33 +462,10 @@ fn a_live_answer_is_recorded_when_it_arrives() {
     assert_eq!(v["candidates"][0]["reset_passed"], true);
     assert_eq!(v["candidates"][0]["age_seconds"], 100);
 
-    // The answer's age, counted from the same instant, is in the text and in what Jev reads:
-    // a live answer that waited for the others is not "just now".
-    let asked = pick::Asked::Skipped(pick::Reason::Offline);
-    let decision = pick::decide(&candidates, &entries, &config, asked).unwrap();
+    // A live answer that waited for the others is not "just now".
+    let decision = pick::decide(&candidates, &entries, &config).unwrap();
     let text = pick::format_text(&entries, &candidates, &decision, &config, now, &[], None);
     assert!(text.contains("usage       live 1m ago\n"), "{text}");
-    let mut aliases = remuda::privacy::Aliases::default();
-    aliases.note("claude:max");
-    let tz = jiff::tz::TimeZone::UTC;
-    let request = remuda::jev::request(&entries, &candidates, &config, &aliases, now, &tz, None);
-    let state = request.body["state"].as_str().unwrap();
-    assert!(state.contains("  usage: live, 1m ago\n"), "{state}");
-    assert!(
-        state.contains("  Week (all models): usage unknown (reset since asked)\n"),
-        "{state}"
-    );
-    // One option: `launch` is not asked. With a second model it is, and each description
-    // carries the age.
-    let mut config = config;
-    config.claude.models = vec!["claude-opus-5-5".into(), "claude-sonnet-5".into()];
-    let candidates = pick::candidates(&entries, &config, now, None);
-    let request = remuda::jev::request(&entries, &candidates, &config, &aliases, now, &tz, None);
-    assert_eq!(
-        request.body["questions"]["launch"]["criteria"]["claude:account-1 / claude-opus-5-5"],
-        "tightest: Session 40% left; usage unknown: Week (all models): reset since asked; data \
-         live, 1m old"
-    );
 }
 
 /// Exclusions, `min_headroom`, and per-model windows; cached codex usage has no per-model
@@ -870,7 +518,7 @@ fn hard_rules() {
          [pick.claude]\nmodels = [\"claude-fable-5-1\", \"claude-opus-5-5\"]\n\n\
          [pick.codex]\nmodels = [\"gpt-6-astra\"]\n",
     );
-    let v: Value = serde_json::from_str(&pick(&sb, false, &["--json"]).stdout).unwrap();
+    let v: Value = serde_json::from_str(&pick(&sb, &["--json"]).stdout).unwrap();
     let why = |account: &str, model: Option<&str>| {
         v["candidates"]
             .as_array()
@@ -902,18 +550,12 @@ fn hard_rules() {
         v["command"],
         json!(["remuda", "run", "codex:work", "-m", "gpt-6-astra"])
     );
-    let out = pick(&sb, false, &[]);
+    let out = pick(&sb, &[]);
     assert!(
         out.stdout
             .contains("per-model limits unknown (codex reports them only live)"),
         "{}",
         out.stdout
-    );
-    let body = pick(&sb, false, &["--print-request"]).stdout;
-    assert!(body.contains("per-model limits: unknown (codex reports them only live)"));
-    assert!(
-        !body.contains("claude:gone") && !body.contains("account-3 ("),
-        "{body}"
     );
 }
 
@@ -929,7 +571,7 @@ fn nothing_feasible_exits_1_with_the_reasons() {
         &[("claude", "fresh", &fresh), ("codex", "cx", &cx)],
         "",
     );
-    let out = pick(&sb, true, &[]);
+    let out = pick(&sb, &[]);
     assert_eq!(out.code, Some(1));
     assert!(
         out.stderr.contains("nothing to recommend"),
@@ -942,13 +584,14 @@ fn nothing_feasible_exits_1_with_the_reasons() {
     ] {
         assert!(out.stdout.contains(line), "{line:?} in:\n{}", out.stdout);
     }
-    let out = pick(&sb, true, &["--json"]);
+    let out = pick(&sb, &["--json"]);
     assert_eq!(out.code, Some(1));
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["account"], Value::Null);
     // The schema holds with nothing feasible: `session` is there, null without a resume.
     assert_eq!(v.get("session"), Some(&Value::Null));
-    assert!(sb.curl_invocations().is_empty());
+    assert_eq!(v.get("decided_by"), Some(&Value::Null));
+    assert_eq!(v.get("effort_by"), Some(&Value::Null));
 }
 
 /// Why `account` is not feasible, from the `not feasible:` lines of the report.
@@ -992,7 +635,7 @@ fn live_asks_codex_once() {
         ],
         "[pick]\nexclude = [\"claude:default\", \"codex:default\"]\n",
     );
-    let out = pick(&sb, false, &["--live"]);
+    let out = pick(&sb, &["--live"]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert_eq!(field(&out, "account"), "codex:work");
     // Live, with the answer's age (R23).
@@ -1021,7 +664,7 @@ fn live_asks_codex_once() {
     );
     // Without `--live`, `codex login status` alone, as before.
     let before = sb.codex_invocations().len();
-    let out = pick(&sb, false, &[]);
+    let out = pick(&sb, &[]);
     assert_eq!(
         why_not(&out, "codex:out"),
         "not logged in (`codex login status`)"
@@ -1053,7 +696,7 @@ fn live_usage_first() {
                   Current week (all models): 95% used \u{b7} resets {resets}\n"
         ),
     );
-    let v: Value = serde_json::from_str(&pick(&sb, false, &["--live", "--json"]).stdout).unwrap();
+    let v: Value = serde_json::from_str(&pick(&sb, &["--live", "--json"]).stdout).unwrap();
     let max = v["candidates"]
         .as_array()
         .unwrap()
@@ -1071,7 +714,7 @@ fn live_usage_first() {
     );
     // team's live query fails (no fixture): its cache decides.
     assert_eq!(v["account"], "claude:team");
-    let out = pick(&sb, false, &["--live"]);
+    let out = pick(&sb, &["--live"]);
     assert!(
         out.stdout.contains(
             "live query failed (`claude -p /usage --no-session-persistence \
@@ -1101,7 +744,7 @@ fn a_live_answer_read_in_part_falls_back_to_the_cache() {
         Some(&max),
         "Current session: 5% used\nCurrent week (all models): limit reached\n",
     );
-    let out = pick(&sb, false, &["--live", "--json"]);
+    let out = pick(&sb, &["--live", "--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     let max = v["candidates"]
         .as_array()
@@ -1112,7 +755,7 @@ fn a_live_answer_read_in_part_falls_back_to_the_cache() {
     assert_eq!(max["source"], "cached");
     assert_eq!(max["binding"], "Week (all models)");
     assert_eq!(max["headroom"], 60.0);
-    let out = pick(&sb, false, &["--live"]);
+    let out = pick(&sb, &["--live"]);
     assert_eq!(field(&out, "account"), "claude:max");
     assert!(
         out.stdout
@@ -1141,7 +784,7 @@ fn a_live_answer_that_tells_no_usage_falls_back_with_its_reason() {
     ] {
         let (sb, max, _) = two_accounts("");
         sb.set_live_usage(Some(&max), said);
-        let out = pick(&sb, false, &["--live", "--json"]);
+        let out = pick(&sb, &["--live", "--json"]);
         let v: Value = serde_json::from_str(&out.stdout).unwrap();
         let max = v["candidates"]
             .as_array()
@@ -1152,7 +795,7 @@ fn a_live_answer_that_tells_no_usage_falls_back_with_its_reason() {
         assert_eq!(max["source"], "cached");
         assert_eq!(max["feasible"], true);
         assert_eq!(max["headroom"], 60.0);
-        let out = pick(&sb, false, &["--live"]);
+        let out = pick(&sb, &["--live"]);
         assert_eq!(field(&out, "account"), "claude:max");
         assert!(out.stdout.contains(note), "{note}:\n{}", out.stdout);
         assert!(!out.stdout.contains("not recognized"), "{}", out.stdout);
@@ -1163,23 +806,10 @@ fn a_live_answer_that_tells_no_usage_falls_back_with_its_reason() {
 #[test]
 fn json_report() {
     let (sb, _, _) = two_accounts(
-        "[pick]\nnotes = \"x\"\n\n[pick.claude]\nmodels = [\"claude-opus-5-5\"]\n\
-         efforts = [\"medium\", \"high\"]\ndefault_effort = \"medium\"\n",
+        "[pick]\n\n[pick.claude]\nmodels = [\"claude-opus-5-5\"]\n\
+         default_effort = \"medium\"\n",
     );
-    let mut response: Value = serde_json::from_str(&answer(
-        "claude:account-1 / claude-opus-5-5",
-        0.8,
-        &[
-            ("claude:account-1 / claude-opus-5-5", 0.85),
-            ("claude:account-2 / claude-opus-5-5", 0.15),
-        ],
-    ))
-    .unwrap();
-    response["answers"]["effort_claude"] = json!({"type": "score", "score": 1.0,
-        "confidence": 0.7, "legend": {"0": "medium", "1": "high"},
-        "probabilities": {"0": 0.2, "1": 0.8}});
-    sb.set_jev_response(&response.to_string());
-    let out = pick(&sb, true, &["--json"]);
+    let out = pick(&sb, &["--json"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
     assert_eq!(
@@ -1191,10 +821,8 @@ fn json_report() {
             "decided_by",
             "effort",
             "effort_by",
-            "jev",
             "model",
             "provider",
-            "reason",
             "session",
             "strategy"
         ]
@@ -1203,15 +831,9 @@ fn json_report() {
     assert_eq!(v["strategy"], "headroom");
     assert_eq!(v["account"], "claude:max");
     assert_eq!(v["provider"], "claude");
-    assert_eq!(v["effort"], "high");
-    assert_eq!(v["effort_by"], "jev");
-    assert_eq!(v["decided_by"], "jev");
-    assert_eq!(v["reason"], Value::Null);
-    assert_eq!(
-        v["jev"],
-        json!({"model": "jev-1.13.0", "confidence": 0.8, "effort_confidence": 0.7,
-               "effort_error": null, "error": null})
-    );
+    assert_eq!(v["effort"], "medium");
+    assert_eq!(v["effort_by"], "rules");
+    assert_eq!(v["decided_by"], "rules");
     assert_eq!(
         v["command"],
         json!([
@@ -1221,7 +843,7 @@ fn json_report() {
             "--model",
             "claude-opus-5-5",
             "--effort",
-            "high"
+            "medium"
         ])
     );
     let c = &v["candidates"][1];
@@ -1237,7 +859,6 @@ fn json_report() {
             "feasible",
             "fetched_at",
             "headroom",
-            "jev_probability",
             "model",
             "pace",
             "pace_window",
@@ -1256,7 +877,6 @@ fn json_report() {
     assert_eq!(c["source"], "cached");
     assert_eq!(c["reset_passed"], false);
     assert_eq!(c["rules_rank"], 1);
-    assert_eq!(c["jev_probability"], 0.85);
     assert_eq!(c["affine"], false);
     let age = c["age_seconds"].as_i64().unwrap();
     assert!((600..700).contains(&age), "{age}");
@@ -1270,17 +890,10 @@ fn json_report() {
     assert_eq!(v["candidates"][0]["pace_window"], Value::Null);
 }
 
-/// The sentence the request's state has with `strategy = "pace"`, as `--print-request` prints
-/// it (JSON).
-const PACE_SENTENCE: &str = "rules' ranking strategy: pace (percent left per hour until reset, \
-                             on the tightest window of a day or longer, else of the shorter \
-                             ones; highest first, so that what a reset would waste is used \
-                             first).\\n";
-
 /// R3, R23 Rules and Output: `[pick] strategy = "pace"` ranks by the percent left per hour
 /// until reset, where the headroom ranks the other way; the text report has a `pace` line and
-/// says the strategy decided, `--json` has `strategy` (also with nothing feasible), and the
-/// request to Jev one sentence more. The default changes nothing.
+/// says the strategy decided, and `--json` has `strategy` (also with nothing feasible).
+/// The default changes nothing.
 #[test]
 fn the_pace_strategy() {
     let sb = Sandbox::new();
@@ -1304,7 +917,7 @@ fn the_pace_strategy() {
         ("claude", "team", team.as_path()),
     ];
     configure(&sb, &accounts, "");
-    let headroom = pick(&sb, false, &[]);
+    let headroom = pick(&sb, &[]);
     assert_eq!(
         headroom.code,
         Some(0),
@@ -1319,25 +932,21 @@ fn the_pace_strategy() {
         "{}",
         headroom.stdout
     );
-    let headroom_json: Value = serde_json::from_str(&pick(&sb, false, &["--json"]).stdout).unwrap();
+    let headroom_json: Value = serde_json::from_str(&pick(&sb, &["--json"]).stdout).unwrap();
     assert_eq!(headroom_json["strategy"], "headroom");
-    let headroom_request = pick(&sb, false, &["--print-request"]).stdout;
 
     configure(&sb, &accounts, "[pick]\nstrategy = \"pace\"\n");
-    let out = pick(&sb, false, &[]);
+    let out = pick(&sb, &[]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert_eq!(field(&out, "account"), "claude:team");
-    assert_eq!(
-        field(&out, "decided by"),
-        "rules, strategy pace (no_key: TYPESAFE_API_KEY is not set)"
-    );
+    assert_eq!(field(&out, "decided by"), "rules, strategy pace");
     assert!(
         field(&out, "pace").starts_with("1.25%/h on Week (all models) (resets in "),
         "{}",
         out.stdout
     );
     assert!(field(&out, "limit").starts_with("Week (all models) 30% left, resets in "));
-    let v: Value = serde_json::from_str(&pick(&sb, false, &["--json"]).stdout).unwrap();
+    let v: Value = serde_json::from_str(&pick(&sb, &["--json"]).stdout).unwrap();
     assert_eq!(v["strategy"], "pace");
     assert_eq!(v["account"], "claude:team");
     let by_account = |v: &Value, account: &str| -> Value {
@@ -1370,21 +979,13 @@ fn the_pace_strategy() {
         }
         assert_eq!(a, b);
     }
-    // One sentence more in the request, nothing else.
-    let request = pick(&sb, false, &["--print-request"]).stdout;
-    assert!(request.contains(PACE_SENTENCE), "{request}");
-    assert_eq!(
-        without_clock(&request.replacen(PACE_SENTENCE, "", 1)),
-        without_clock(&headroom_request)
-    );
-
     // Nothing feasible: the strategy and the paces all the same.
     configure(
         &sb,
         &accounts,
         "[pick]\nstrategy = \"pace\"\nmin_headroom = 100\n",
     );
-    let out = pick(&sb, false, &["--json"]);
+    let out = pick(&sb, &["--json"]);
     assert_eq!(out.code, Some(1), "{}{}", out.stdout, out.stderr);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(
@@ -1400,10 +1001,10 @@ fn the_pace_strategy() {
 #[test]
 fn run_launches_claude_with_the_options() {
     let (sb, max, _) = two_accounts(
-        "[pick.claude]\nmodels = [\"claude-opus-5-5\"]\nefforts = [\"high\", \"max\"]\n\
+        "[pick.claude]\nmodels = [\"claude-opus-5-5\"]\n\
          default_effort = \"high\"\n",
     );
-    let out = pick(&sb, false, &["--run", "--", "-p", "hello"]);
+    let out = pick(&sb, &["--run", "--", "-p", "hello"]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert!(
         out.stderr
@@ -1454,13 +1055,9 @@ fn run_launches_codex_with_the_options() {
         &sb,
         &[("codex", "work", &work)],
         "[pick]\nexclude = [\"claude:default\"]\n\n[pick.codex]\nmodels = [\"gpt-6-astra\"]\n\
-         efforts = [\"high\", \"xhigh\"]\ndefault_effort = \"xhigh\"\n",
+         default_effort = \"xhigh\"\n",
     );
-    let out = pick(
-        &sb,
-        false,
-        &["--provider", "codex", "--run", "--", "fix the bug"],
-    );
+    let out = pick(&sb, &["--provider", "codex", "--run", "--", "fix the bug"]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     let runs: Vec<_> = sb
         .codex_invocations()
@@ -1517,8 +1114,8 @@ fn run_warns_about_an_inherited_child_session_marker() {
 /// Resuming); `--run --json` is a usage error, and arguments after `--` no longer need `--run`.
 #[test]
 fn run_respects_the_users_options_and_refuses_unnamed_sessions() {
-    let (sb, _, _) = two_accounts(&format!("{NOTES}{MODELS}"));
-    let out = pick(&sb, false, &["--run", "--", "--model", "fable"]);
+    let (sb, _, _) = two_accounts(MODELS);
+    let out = pick(&sb, &["--run", "--", "--model", "fable"]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert!(
         out.stderr.contains(
@@ -1541,11 +1138,10 @@ fn run_respects_the_users_options_and_refuses_unnamed_sessions() {
         &["--resume", id, "--resume", "other", "--fork-session"],
     ] {
         for run in [true, false] {
-            let (sb, _, _) = two_accounts(&format!("{NOTES}{MODELS}"));
-            sb.set_jev_response(&answer("claude:account-1 / claude-opus-5-5", 0.9, &[]));
+            let (sb, _, _) = two_accounts(MODELS);
             let mut argv: Vec<&str> = if run { vec!["--run", "--"] } else { vec!["--"] };
             argv.extend(args);
-            let out = pick(&sb, true, &argv);
+            let out = pick(&sb, &argv);
             assert_eq!(out.code, Some(1), "{argv:?}: {}{}", out.stdout, out.stderr);
             assert!(
                 out.stderr.contains(&format!(
@@ -1556,20 +1152,14 @@ fn run_respects_the_users_options_and_refuses_unnamed_sessions() {
                 out.stderr
             );
             assert!(sb.invocations().is_empty(), "{argv:?}");
-            assert!(
-                sb.curl_invocations().is_empty(),
-                "refused before asking Jev: {argv:?}"
-            );
         }
     }
 
-    for args in [&["--run", "--json"][..], &["--print-request", "--run"]] {
-        assert_eq!(pick(&sb, false, args).code, Some(2), "{args:?}");
-    }
+    assert_eq!(pick(&sb, &["--run", "--json"]).code, Some(2));
     // A new session's arguments without `--run`: shown in the command, nothing launched.
-    let (sb, _, _) = two_accounts(&format!("{NOTES}{MODELS}"));
+    let (sb, _, _) = two_accounts(MODELS);
     for args in [&["--", "x"][..], &["--", "-p", "hi"]] {
-        let out = pick(&sb, false, args);
+        let out = pick(&sb, args);
         assert_eq!(out.code, Some(0), "{args:?}: {}{}", out.stdout, out.stderr);
         assert_eq!(
             field(&out, "command"),
@@ -1579,7 +1169,7 @@ fn run_respects_the_users_options_and_refuses_unnamed_sessions() {
             )
         );
     }
-    let out = pick(&sb, false, &["--json", "--", "-p", "hi"]);
+    let out = pick(&sb, &["--json", "--", "-p", "hi"]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(
         v["command"],
@@ -1707,20 +1297,15 @@ fn shared_store(pick: &str, ago: i64, index: bool) -> (Sandbox, PathBuf) {
 }
 
 /// R23 (Resuming): the account that ran the session lately is recommended to resume it, ahead
-/// of more headroom; nothing is injected, nothing is logged without `--run`, and Jev reads the
-/// warm account by alias, never the session.
+/// of more headroom; nothing is injected, and nothing is logged without `--run`.
 #[test]
 fn resume_prefers_the_account_that_ran_it() {
-    // Models and efforts are configured: resuming, none of them is injected.
-    let (sb, _) = shared_store(
-        &format!("{NOTES}{MODELS}efforts = [\"high\", \"max\"]\ndefault_effort = \"high\"\n"),
-        300,
-        true,
-    );
+    // Models and a default effort are configured: resuming, none is injected.
+    let (sb, _) = shared_store(&format!("{MODELS}default_effort = \"high\"\n"), 300, true);
     // Launched three hours ago; the transcript was written to five minutes ago, there.
     log_launch(&sb, "claude:team", 3 * 3600, "/w/proj", SESSION, None);
     let before = std::fs::read_to_string(sb.launch_log()).unwrap();
-    let out = pick(&sb, false, &["--", "--resume", SESSION]);
+    let out = pick(&sb, &["--", "--resume", SESSION]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert_eq!(field(&out, "account"), "claude:team");
     assert_eq!(field(&out, "model"), "the session's (claude-opus-5-5)");
@@ -1748,7 +1333,7 @@ fn resume_prefers_the_account_that_ran_it() {
     );
     assert!(launched(&sb).is_empty());
 
-    let out = pick(&sb, false, &["--json", "--", "--resume", SESSION]);
+    let out = pick(&sb, &["--json", "--", "--resume", SESSION]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     let keys: Vec<&str> = v["session"]
         .as_object()
@@ -1782,6 +1367,8 @@ fn resume_prefers_the_account_that_ran_it() {
     );
     assert_eq!(v["model"], Value::Null);
     assert_eq!(v["effort"], Value::Null);
+    assert_eq!(v["decided_by"], "rules");
+    assert_eq!(v["effort_by"], Value::Null);
     assert_eq!(
         v["command"],
         json!(["remuda", "run", "claude:team", "--resume", SESSION])
@@ -1806,31 +1393,6 @@ fn resume_prefers_the_account_that_ran_it() {
             ("claude:team", true, true)
         ]
     );
-
-    // Jev reads the warm account by alias, and nothing of the session.
-    let out = pick(&sb, true, &["--print-request", "--", "--resume", SESSION]);
-    assert_eq!(out.code, Some(0), "{}", out.stderr);
-    let body = out.stdout;
-    assert!(
-        body.contains("resuming a session: claude:account-2 ran the session to be resumed ")
-            && body.contains(" minutes ago (its prompt cache is warm)"),
-        "{body}"
-    );
-    for leak in [
-        SESSION,
-        "766560c5",
-        "/w/proj",
-        "Refactor the parser",
-        "claude:team",
-        sb.root().to_str().unwrap(),
-    ] {
-        assert!(!body.contains(leak), "{leak:?} in {body}");
-    }
-    let v: Value = serde_json::from_str(&body).unwrap();
-    assert!(
-        v["questions"].get("effort_claude").is_none(),
-        "no effort when resuming"
-    );
 }
 
 /// R23 (Resuming): the last activity is the later of the launch and the transcript's last
@@ -1839,16 +1401,16 @@ fn resume_prefers_the_account_that_ran_it() {
 #[test]
 fn the_last_activity_and_the_window() {
     // The transcript was written to before the launch: the launch counts.
-    let (sb, _) = shared_store(&format!("{NOTES}{MODELS}"), 2 * 3600, true);
+    let (sb, _) = shared_store(MODELS, 2 * 3600, true);
     log_launch(&sb, "claude:team", 600, "/w/proj", SESSION, None);
-    let out = pick(&sb, false, &["--json", "--", "--resume", SESSION]);
+    let out = pick(&sb, &["--json", "--", "--resume", SESSION]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     let age = v["session"]["age_seconds"].as_i64().unwrap();
     assert!((600..660).contains(&age), "the launch's time: {age}");
     assert_eq!(v["account"], "claude:team");
 
     // Written to lately, but elsewhere than the launch: only the launch counts, three hours ago.
-    let (sb, _) = shared_store(&format!("{NOTES}{MODELS}"), 300, true);
+    let (sb, _) = shared_store(MODELS, 300, true);
     log_launch(
         &sb,
         "claude:team",
@@ -1857,7 +1419,7 @@ fn the_last_activity_and_the_window() {
         SESSION,
         None,
     );
-    let out = pick(&sb, false, &["--", "--resume", SESSION]);
+    let out = pick(&sb, &["--", "--resume", SESSION]);
     assert_eq!(field(&out, "account"), "claude:max");
     assert_eq!(
         field(&out, "session"),
@@ -1868,7 +1430,7 @@ fn the_last_activity_and_the_window() {
     );
     // A longer window takes it in; 0 turns affinity off.
     let (sb, _) = shared_store(
-        &format!("[pick]\nnotes = \"x\"\naffinity_minutes = 240\n\n{MODELS}"),
+        &format!("[pick]\naffinity_minutes = 240\n\n{MODELS}"),
         300,
         true,
     );
@@ -1881,16 +1443,16 @@ fn the_last_activity_and_the_window() {
         None,
     );
     assert_eq!(
-        field(&pick(&sb, false, &["--", "--resume", SESSION]), "account"),
+        field(&pick(&sb, &["--", "--resume", SESSION]), "account"),
         "claude:team"
     );
     let (sb, _) = shared_store(
-        &format!("[pick]\nnotes = \"x\"\naffinity_minutes = 0\n\n{MODELS}"),
+        &format!("[pick]\naffinity_minutes = 0\n\n{MODELS}"),
         300,
         true,
     );
     log_launch(&sb, "claude:team", 60, "/w/proj", SESSION, None);
-    let out = pick(&sb, false, &["--", "--resume", SESSION]);
+    let out = pick(&sb, &["--", "--resume", SESSION]);
     assert_eq!(field(&out, "account"), "claude:max");
     assert!(
         field(&out, "session").contains("(affinity off: [pick] affinity_minutes = 0)"),
@@ -1899,8 +1461,8 @@ fn the_last_activity_and_the_window() {
     );
 
     // Never launched through remuda: no account to prefer.
-    let (sb, _) = shared_store(&format!("{NOTES}{MODELS}"), 300, true);
-    let out = pick(&sb, false, &["--", "--resume", SESSION]);
+    let (sb, _) = shared_store(MODELS, 300, true);
+    let out = pick(&sb, &["--", "--resume", SESSION]);
     assert_eq!(field(&out, "account"), "claude:max");
     assert_eq!(
         field(&out, "session"),
@@ -1915,7 +1477,7 @@ fn the_last_activity_and_the_window() {
 /// with the fork's own last activity; and `--resume <id> --fork-session` is a fork.
 #[test]
 fn a_fork_of_the_session_counts() {
-    let (sb, shared) = shared_store(&format!("{NOTES}{MODELS}"), 5 * 3600, true);
+    let (sb, shared) = shared_store(MODELS, 5 * 3600, true);
     let fork = "f0f0f0f0-0000-4000-8000-000000000000";
     write_transcript(&shared, fork, "/w/proj", 120, "claude-opus-5-5");
     sb.remuda().arg("sessions").assert().success();
@@ -1923,7 +1485,6 @@ fn a_fork_of_the_session_counts() {
     log_launch(&sb, "claude:team", 3 * 3600, "/w/proj", fork, Some(SESSION));
     let out = pick(
         &sb,
-        false,
         &["--json", "--", "--resume", SESSION, "--fork-session"],
     );
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
@@ -1950,12 +1511,12 @@ fn a_fork_of_the_session_counts() {
 #[test]
 fn a_warm_account_that_is_not_feasible_is_named() {
     let (sb, _) = shared_store(
-        &format!("[pick]\nnotes = \"x\"\nexclude = [\"claude:team\"]\n\n{MODELS}"),
+        &format!("[pick]\nexclude = [\"claude:team\"]\n\n{MODELS}"),
         300,
         true,
     );
     log_launch(&sb, "claude:team", 3600, "/w/proj", SESSION, None);
-    let out = pick(&sb, false, &["--", "--resume", SESSION]);
+    let out = pick(&sb, &["--", "--resume", SESSION]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert_eq!(field(&out, "account"), "claude:max");
     assert!(
@@ -1974,7 +1535,7 @@ fn a_warm_account_that_is_not_feasible_is_named() {
 /// so. The facts are read from the index, never by scanning the stores.
 #[test]
 fn accounts_that_cannot_see_the_session() {
-    let (sb, max, team) = two_accounts(&format!("{NOTES}{MODELS}"));
+    let (sb, max, team) = two_accounts(MODELS);
     write_transcript(
         &team.join("projects"),
         SESSION,
@@ -1984,7 +1545,7 @@ fn accounts_that_cannot_see_the_session() {
     );
     std::fs::create_dir_all(max.join("projects")).unwrap();
     // Not indexed yet: every account is offered, and the model is unknown.
-    let out = pick(&sb, false, &["--", "--resume", SESSION]);
+    let out = pick(&sb, &["--", "--resume", SESSION]);
     assert_eq!(field(&out, "account"), "claude:max");
     assert!(
         out.stdout.contains(
@@ -2001,7 +1562,7 @@ fn accounts_that_cannot_see_the_session() {
     );
 
     sb.remuda().arg("sessions").assert().success();
-    let out = pick(&sb, false, &["--", "--resume", SESSION]);
+    let out = pick(&sb, &["--", "--resume", SESSION]);
     assert_eq!(field(&out, "account"), "claude:team");
     assert_eq!(
         why_not(&out, "claude:max"),
@@ -2013,11 +1574,7 @@ fn accounts_that_cannot_see_the_session() {
         out.stdout
     );
     // The provider is the session's: a codex `--provider` conflicts.
-    let out = pick(
-        &sb,
-        false,
-        &["--provider", "codex", "--", "--resume", SESSION],
-    );
+    let out = pick(&sb, &["--provider", "codex", "--", "--resume", SESSION]);
     assert_eq!(out.code, Some(1));
     assert!(
         out.stderr
@@ -2032,10 +1589,10 @@ fn accounts_that_cannot_see_the_session() {
 #[test]
 fn index_entries_that_are_gone_or_not_the_session_are_ignored() {
     // Gone since it was indexed.
-    let (sb, shared) = shared_store(&format!("{NOTES}{MODELS}"), 300, true);
+    let (sb, shared) = shared_store(MODELS, 300, true);
     log_launch(&sb, "claude:team", 3 * 3600, "/w/proj", SESSION, None);
     std::fs::remove_file(shared.join("-w-proj").join(format!("{SESSION}.jsonl"))).unwrap();
-    let out = pick(&sb, false, &["--json", "--", "--resume", SESSION]);
+    let out = pick(&sb, &["--json", "--", "--resume", SESSION]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["session"]["model"], Value::Null);
     assert_eq!(v["session"]["indexed"], false);
@@ -2044,7 +1601,7 @@ fn index_entries_that_are_gone_or_not_the_session_are_ignored() {
     assert_eq!(v["account"], "claude:max");
 
     // The entry names another file, written to lately: not the session's.
-    let (sb, shared) = shared_store(&format!("{NOTES}{MODELS}"), 3 * 3600, true);
+    let (sb, shared) = shared_store(MODELS, 3 * 3600, true);
     log_launch(&sb, "claude:team", 3 * 3600, "/w/proj", SESSION, None);
     let other = "0e0e0e0e-0000-4000-8000-000000000000";
     write_transcript(&shared, other, "/w/proj", 60, "claude-fable-5-1");
@@ -2056,7 +1613,7 @@ fn index_entries_that_are_gone_or_not_the_session_are_ignored() {
         text.replace(&format!("{SESSION}.jsonl"), &format!("{other}.jsonl")),
     )
     .unwrap();
-    let out = pick(&sb, false, &["--json", "--", "--resume", SESSION]);
+    let out = pick(&sb, &["--json", "--", "--resume", SESSION]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(
         v["session"]["model"],
@@ -2099,7 +1656,7 @@ fn independent_copies_are_each_their_accounts() {
     configure(
         &sb,
         &[("claude", "max", &max), ("claude", "team", &team)],
-        &format!("{NOTES}{MODELS}"),
+        MODELS,
     );
     // max's copy: Opus, written to a minute ago; team's: Fable, idle for three hours.
     write_transcript(
@@ -2120,7 +1677,7 @@ fn independent_copies_are_each_their_accounts() {
     log_launch(&sb, "claude:max", 4 * 3600, "/w/proj", SESSION, None);
     log_launch(&sb, "claude:team", 3 * 3600, "/w/proj", SESSION, None);
 
-    let out = pick(&sb, false, &["--json", "--", "--resume", SESSION]);
+    let out = pick(&sb, &["--json", "--", "--resume", SESSION]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["session"]["last_account"], "claude:team");
@@ -2146,7 +1703,7 @@ fn independent_copies_are_each_their_accounts() {
 /// order of their paths.
 #[test]
 fn of_copies_in_one_store_the_latest_counts() {
-    let (sb, shared) = shared_store(&format!("{NOTES}{MODELS}"), 60, false);
+    let (sb, shared) = shared_store(MODELS, 60, false);
     // The current copy (`-w-proj`, a minute ago, Fable) and an old one that sorts first.
     write_transcript(&shared, SESSION, "/w/proj", 60, "claude-fable-5-1");
     write_transcript_in(
@@ -2159,7 +1716,7 @@ fn of_copies_in_one_store_the_latest_counts() {
     );
     sb.remuda().arg("sessions").assert().success();
     log_launch(&sb, "claude:team", 3 * 3600, "/w/proj", SESSION, None);
-    let out = pick(&sb, false, &["--json", "--", "--resume", SESSION]);
+    let out = pick(&sb, &["--json", "--", "--resume", SESSION]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     let age = v["session"]["age_seconds"].as_i64().unwrap();
@@ -2169,13 +1726,11 @@ fn of_copies_in_one_store_the_latest_counts() {
     assert_eq!(v["account"], "claude:team");
 }
 
-/// R23 (Resuming, The request): a per-model window's label may name the session's model (here
-/// a path, as the quota names it and the transcript too). Resuming, Jev reads the windows by
-/// their kind only: the label is not sent; locally the window applies as named.
+/// R23 (Resuming): a per-model window applies to an arbitrary transcript model label.
 #[test]
-fn a_quota_label_naming_the_session_model_is_never_sent() {
+fn a_quota_label_naming_the_session_model_applies() {
     let secret = "/Users/private_client/projects/SECRET_MODEL";
-    let (sb, shared) = shared_store(&format!("{NOTES}{MODELS}"), 300, false);
+    let (sb, shared) = shared_store(MODELS, 300, false);
     write_transcript(&shared, SESSION, "/w/proj", 300, secret);
     for (account, used) in [("claude:max", 40.0), ("claude:team", 80.0)] {
         let home = PathBuf::from(home_of(&sb, account));
@@ -2193,19 +1748,8 @@ fn a_quota_label_naming_the_session_model_is_never_sent() {
     }
     sb.remuda().arg("sessions").assert().success();
     log_launch(&sb, "claude:team", 3 * 3600, "/w/proj", SESSION, None);
-    let out = pick(&sb, true, &["--print-request", "--", "--resume", SESSION]);
-    assert_eq!(out.code, Some(0), "{}", out.stderr);
-    for leak in [secret, "SECRET_MODEL", "private_client"] {
-        assert!(!out.stdout.contains(leak), "{leak:?} in {}", out.stdout);
-    }
-    assert!(
-        out.stdout
-            .contains("weekly window of the session's model: 50% used"),
-        "{}",
-        out.stdout
-    );
     // Locally the window applies: it binds max (50% left, less than its general 60%).
-    let out = pick(&sb, false, &["--json", "--", "--resume", SESSION]);
+    let out = pick(&sb, &["--json", "--", "--resume", SESSION]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     let max = &v["candidates"][1];
     assert_eq!(max["account"], "claude:max");
@@ -2216,7 +1760,7 @@ fn a_quota_label_naming_the_session_model_is_never_sent() {
 /// another login, whose cache never held the session: it is not warm, and nothing is preferred.
 #[test]
 fn a_name_registered_again_with_another_home_is_not_warm() {
-    let (sb, _) = shared_store(&format!("{NOTES}{MODELS}"), 300, true);
+    let (sb, _) = shared_store(MODELS, 300, true);
     // Run as claude:team ten minutes ago, when team was another home: warm by the time alone.
     let old = sb.root().join("h/team-before");
     log_launch_as(
@@ -2228,7 +1772,7 @@ fn a_name_registered_again_with_another_home_is_not_warm() {
         SESSION,
         None,
     );
-    let out = pick(&sb, false, &["--", "--resume", SESSION]);
+    let out = pick(&sb, &["--", "--resume", SESSION]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert_eq!(field(&out, "account"), "claude:max");
     assert!(
@@ -2239,17 +1783,17 @@ fn a_name_registered_again_with_another_home_is_not_warm() {
         out.stdout
     );
     // The same home, spelled with a trailing slash, is another home string (R2).
-    let (sb, _) = shared_store(&format!("{NOTES}{MODELS}"), 300, true);
+    let (sb, _) = shared_store(MODELS, 300, true);
     let home = format!("{}/", home_of(&sb, "claude:team"));
     log_launch_as(&sb, "claude:team", &home, 600, "/w/proj", SESSION, None);
-    let out = pick(&sb, false, &["--json", "--", "--resume", SESSION]);
+    let out = pick(&sb, &["--json", "--", "--resume", SESSION]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["session"]["affine"], false);
     assert_eq!(v["account"], "claude:max");
     // Byte for byte the registered home: warm.
-    let (sb, _) = shared_store(&format!("{NOTES}{MODELS}"), 300, true);
+    let (sb, _) = shared_store(MODELS, 300, true);
     log_launch(&sb, "claude:team", 600, "/w/proj", SESSION, None);
-    let out = pick(&sb, false, &["--json", "--", "--resume", SESSION]);
+    let out = pick(&sb, &["--json", "--", "--resume", SESSION]);
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["session"]["affine"], true);
     assert_eq!(v["account"], "claude:team");
@@ -2260,12 +1804,12 @@ fn a_name_registered_again_with_another_home_is_not_warm() {
 #[test]
 fn nothing_feasible_still_tells_the_session() {
     let (sb, _) = shared_store(
-        &format!("[pick]\nnotes = \"x\"\nexclude = [\"claude:team\", \"claude:max\"]\n\n{MODELS}"),
+        &format!("[pick]\nexclude = [\"claude:team\", \"claude:max\"]\n\n{MODELS}"),
         300,
         true,
     );
     log_launch(&sb, "claude:team", 3600, "/w/proj", SESSION, None);
-    let out = pick(&sb, false, &["--", "--resume", SESSION]);
+    let out = pick(&sb, &["--", "--resume", SESSION]);
     assert_eq!(out.code, Some(1), "{}{}", out.stdout, out.stderr);
     let session = field(&out, "session");
     assert!(
@@ -2287,12 +1831,12 @@ fn nothing_feasible_still_tells_the_session() {
 #[test]
 fn run_tells_why_not_the_warm_account() {
     let (sb, _) = shared_store(
-        &format!("[pick]\nnotes = \"x\"\nexclude = [\"claude:team\"]\n\n{MODELS}"),
+        &format!("[pick]\nexclude = [\"claude:team\"]\n\n{MODELS}"),
         300,
         true,
     );
     log_launch(&sb, "claude:team", 3600, "/w/proj", SESSION, None);
-    let out = pick(&sb, false, &["--run", "--", "--resume", SESSION]);
+    let out = pick(&sb, &["--run", "--", "--resume", SESSION]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert!(
         out.stderr.contains(&format!(
@@ -2322,7 +1866,7 @@ fn run_tells_why_not_the_warm_account() {
 /// after `--`.
 #[test]
 fn the_command_shown_replays_as_the_same_arguments() {
-    let (sb, _, _) = two_accounts(&format!("{NOTES}{MODELS}"));
+    let (sb, _, _) = two_accounts(MODELS);
     let args = [
         "-p",
         "Please print $(printf CHANGED) with spaces",
@@ -2331,7 +1875,7 @@ fn the_command_shown_replays_as_the_same_arguments() {
     ];
     let mut argv = vec!["--"];
     argv.extend(args);
-    let out = pick(&sb, false, &argv);
+    let out = pick(&sb, &argv);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     let command = field(&out, "command").to_string();
     assert!(
@@ -2348,7 +1892,6 @@ fn the_command_shown_replays_as_the_same_arguments() {
         .env("PATH", sb.path_var())
         .env("FAKE_CLAUDE_OUT", sb.claude_out())
         .env("FAKE_CODEX_OUT", sb.codex_out())
-        .env("FAKE_CURL_OUT", sb.curl_out())
         .env("TZ", "UTC")
         .current_dir(sb.work())
         .status()
@@ -2360,21 +1903,15 @@ fn the_command_shown_replays_as_the_same_arguments() {
     assert_eq!(inv.args[..want.len()], want, "{command}");
 }
 
-/// R23 (The request, Resuming): a transcript's model is any text; a path there is shown on the
-/// user's terminal and never sent.
+/// R23 (Resuming): a transcript's model is arbitrary text, displayed as recorded.
 #[test]
-fn a_transcript_model_is_never_sent() {
-    let (sb, shared) = shared_store(&format!("{NOTES}{MODELS}"), 300, false);
+fn a_transcript_model_is_shown_as_recorded() {
+    let (sb, shared) = shared_store(MODELS, 300, false);
     let secret = "/Users/private-client/projects/SECRET-MODEL";
     write_transcript(&shared, SESSION, "/w/proj", 300, secret);
     sb.remuda().arg("sessions").assert().success();
     log_launch(&sb, "claude:team", 3600, "/w/proj", SESSION, None);
-    let out = pick(&sb, true, &["--print-request", "--", "--resume", SESSION]);
-    assert_eq!(out.code, Some(0), "{}", out.stderr);
-    for leak in [secret, "SECRET-MODEL", "private-client"] {
-        assert!(!out.stdout.contains(leak), "{leak:?} in {}", out.stdout);
-    }
-    let out = pick(&sb, false, &["--", "--resume", SESSION]);
+    let out = pick(&sb, &["--", "--resume", SESSION]);
     assert_eq!(field(&out, "model"), format!("the session's ({secret})"));
 }
 
@@ -2382,14 +1919,14 @@ fn a_transcript_model_is_never_sent() {
 /// <id>`: the same arguments, nothing injected, logged with the session's id.
 #[test]
 fn run_resumes_exactly_as_remuda_run() {
-    let (sb, _) = shared_store(&format!("{NOTES}{MODELS}"), 300, true);
+    let (sb, _) = shared_store(MODELS, 300, true);
     log_launch(&sb, "claude:team", 3600, "/w/proj", SESSION, None);
-    let out = pick(&sb, false, &["--run", "--", "--resume", SESSION]);
+    let out = pick(&sb, &["--run", "--", "--resume", SESSION]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert!(
         out.stderr.contains(&format!(
-            "remuda: pick: claude:team / default, effort agent default; decided by rules \
-             (no_key: TYPESAFE_API_KEY is not set); resume {SESSION} (its prompt cache is warm)"
+            "remuda: pick: claude:team / default, effort agent default; decided by rules; \
+             resume {SESSION} (its prompt cache is warm)"
         )),
         "{}",
         out.stderr
@@ -2405,7 +1942,7 @@ fn run_resumes_exactly_as_remuda_run() {
     assert_eq!(log[1]["args"], json!(["--resume", SESSION]));
 
     // `remuda run` itself: the same launch.
-    let (sb2, _) = shared_store(&format!("{NOTES}{MODELS}"), 300, true);
+    let (sb2, _) = shared_store(MODELS, 300, true);
     sb2.remuda()
         .args(["run", "claude:team", "--resume", SESSION])
         .assert()
@@ -2440,7 +1977,7 @@ fn run_resumes_codex_as_given() {
         &sb,
         &[("codex", "work", &work), ("codex", "other", &other)],
         "[pick]\nexclude = [\"claude:default\"]\n\n[pick.codex]\nmodels = [\"gpt-6-astra\"]\n\
-         efforts = [\"high\", \"xhigh\"]\ndefault_effort = \"xhigh\"\n",
+         default_effort = \"xhigh\"\n",
     );
     let id = "019a0000-0000-7000-8000-000000000001";
     write_rollout(
@@ -2455,7 +1992,7 @@ fn run_resumes_codex_as_given() {
     );
     sb.remuda().arg("sessions").assert().success();
     log_launch(&sb, "codex:work", 900, "/w/proj", id, None);
-    let out = pick(&sb, false, &["--", "resume", id]);
+    let out = pick(&sb, &["--", "resume", id]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert_eq!(field(&out, "account"), "codex:work");
     assert_eq!(field(&out, "model"), "the session's (gpt-6-sol)");
@@ -2464,7 +2001,7 @@ fn run_resumes_codex_as_given() {
         "cannot see this session (its store is not this account's)"
     );
     assert_eq!(why_not(&out, "claude:default"), "excluded ([pick] exclude)");
-    let out = pick(&sb, false, &["--run", "--", "resume", id]);
+    let out = pick(&sb, &["--run", "--", "resume", id]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     let runs: Vec<_> = sb
         .codex_invocations()
@@ -2479,72 +2016,8 @@ fn run_resumes_codex_as_given() {
     assert_eq!(log.last().unwrap()["args"], json!(["resume", id]));
 }
 
-/// One feasible pair with efforts to score: only the effort is asked, the rules keep the pair,
-/// and the output says Jev chose only the effort.
-#[test]
-fn one_option_asks_jev_only_the_effort() {
-    let (sb, _, _) = two_accounts(
-        "[pick]\nnotes = \"x\"\nexclude = [\"team\"]\n\n[pick.claude]\n\
-         efforts = [\"medium\", \"high\", \"max\"]\ndefault_effort = \"medium\"\n",
-    );
-    sb.set_jev_response(
-        r#"{"model": "jev-1.13.0", "answers": {"effort_claude": {"type": "score", "score": 2.0,
-            "confidence": 0.9, "probabilities": {"0": 0.0, "1": 0.1, "2": 0.9}}}}"#,
-    );
-    let out = pick(&sb, true, &[]);
-    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
-    assert_eq!(field(&out, "account"), "claude:max");
-    assert_eq!(field(&out, "effort"), "max (jev, confidence 0.90)");
-    assert_eq!(
-        field(&out, "decided by"),
-        "rules (single_option: only one option; jev was asked only the effort)"
-    );
-    let body: Value = serde_json::from_str(&sb.jev_request_body()).unwrap();
-    assert!(body["questions"].get("launch").is_none(), "{body:#}");
-    assert_eq!(body["questions"]["effort_claude"]["type"], "score");
-    let v: Value = serde_json::from_str(&pick(&sb, true, &["--json"]).stdout).unwrap();
-    assert_eq!(
-        (&v["decided_by"], &v["reason"], &v["effort_by"]),
-        (&json!("rules"), &json!("single_option"), &json!("jev"))
-    );
-    assert_eq!(v["jev"]["confidence"], Value::Null);
-}
-
-/// An unusable effort answer costs only the effort: the pair is still Jev's, the effort is
-/// `default_effort`, and the problem is reported.
-#[test]
-fn a_bad_effort_answer_keeps_the_launch() {
-    let (sb, _, _) = two_accounts(&format!(
-        "{NOTES}{MODELS}efforts = [\"medium\", \"high\"]\ndefault_effort = \"medium\"\n"
-    ));
-    let mut response: Value = serde_json::from_str(&answer(
-        "claude:account-2 / claude-opus-5-5",
-        0.9,
-        &[("claude:account-2 / claude-opus-5-5", 0.95)],
-    ))
-    .unwrap();
-    response["answers"]["effort_claude"] = json!({"type": "score", "score": 7, "confidence": 0.9});
-    sb.set_jev_response(&response.to_string());
-    let out = pick(&sb, true, &[]);
-    assert_eq!(field(&out, "account"), "claude:team");
-    assert_eq!(field(&out, "decided by"), "jev (confidence 0.90)");
-    assert_eq!(
-        field(&out, "effort"),
-        "medium (jev's effort answer is unusable: `effort_claude.score` is not a number from 0 \
-         to 1)"
-    );
-    let v: Value = serde_json::from_str(&pick(&sb, true, &["--json"]).stdout).unwrap();
-    assert_eq!(v["effort"], "medium");
-    assert_eq!(v["effort_by"], "rules");
-    assert_eq!(
-        v["jev"]["effort_error"],
-        "`effort_claude.score` is not a number from 0 to 1"
-    );
-    assert_eq!(v["jev"]["error"], Value::Null);
-}
-
 /// Without `models`, a per-model window is shown for the `default` pair, in the output, the
-/// JSON and the request, and does not make it infeasible.
+/// JSON, and does not make it infeasible.
 #[test]
 fn per_model_windows_without_models_are_shown_not_counted() {
     let sb = Sandbox::new();
@@ -2561,7 +2034,7 @@ fn per_model_windows_without_models_are_shown_not_counted() {
         ),
     );
     configure(&sb, &[("claude", "max", &max)], "");
-    let out = pick(&sb, false, &[]);
+    let out = pick(&sb, &[]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert_eq!(field(&out, "account"), "claude:max");
     assert!(
@@ -2571,7 +2044,7 @@ fn per_model_windows_without_models_are_shown_not_counted() {
         "{}",
         out.stdout
     );
-    let v: Value = serde_json::from_str(&pick(&sb, false, &["--json"]).stdout).unwrap();
+    let v: Value = serde_json::from_str(&pick(&sb, &["--json"]).stdout).unwrap();
     let c = v["candidates"]
         .as_array()
         .unwrap()
@@ -2582,15 +2055,6 @@ fn per_model_windows_without_models_are_shown_not_counted() {
     assert_eq!(c["headroom"], 60.0);
     assert_eq!(c["default_model_windows"][0]["label"], "Week (Fable)");
     assert_eq!(c["default_model_windows"][0]["percent"], 100.0);
-    let body = pick(&sb, false, &["--print-request"]).stdout;
-    let body: Value = serde_json::from_str(body.trim_end()).unwrap();
-    assert!(
-        body["state"]
-            .as_str()
-            .unwrap()
-            .contains("(per-model; applies only if the agent's default model is in this family)"),
-        "{body:#}"
-    );
 }
 
 /// R23, R24: `pick` writes nothing without `--run`: the usage it reads, cached or live, is not
@@ -2602,8 +2066,8 @@ fn pick_records_no_usage_history() {
         Some(&max),
         "Current session: 9% used \u{b7} resets Sep 24 at 3:19am (Asia/Shanghai)\n",
     );
-    for args in [&[][..], &["--json"], &["--live"], &["--print-request"]] {
-        let out = pick(&sb, false, args);
+    for args in [&[][..], &["--json"], &["--live"]] {
+        let out = pick(&sb, args);
         assert_eq!(out.code, Some(0), "{args:?}: {}{}", out.stdout, out.stderr);
     }
     assert!(!sb.invocations().is_empty(), "--live asked claude");
@@ -2636,16 +2100,16 @@ fn json_without_age(stdout: &str) -> Value {
 #[test]
 fn wait_changes_nothing_when_a_pair_is_feasible() {
     let (sb, _, _) = two_accounts(MODELS);
-    let plain = pick(&sb, false, &["--json"]);
-    let waited = pick(&sb, false, &["--json", "--wait", "--max-wait", "0"]);
+    let plain = pick(&sb, &["--json"]);
+    let waited = pick(&sb, &["--json", "--wait", "--max-wait", "0"]);
     assert_eq!((plain.code, waited.code), (Some(0), Some(0)));
     assert_eq!(
         json_without_age(&waited.stdout),
         json_without_age(&plain.stdout)
     );
     assert_eq!(waited.stderr, plain.stderr);
-    let plain = pick(&sb, false, &[]);
-    let waited = pick(&sb, false, &["--wait"]);
+    let plain = pick(&sb, &[]);
+    let waited = pick(&sb, &["--wait"]);
     assert_eq!(waited.code, Some(0));
     assert_eq!(without_clock(&waited.stdout), without_clock(&plain.stdout));
     assert_eq!(waited.stderr, plain.stderr);
@@ -2670,8 +2134,8 @@ fn wait_with_nothing_to_wait_for_exits_at_once() {
         "[pick]\nexclude = [\"claude:max\"]\n",
     );
     let start = std::time::Instant::now();
-    let plain = pick(&sb, false, &[]);
-    let out = pick(&sb, false, &["--wait"]);
+    let plain = pick(&sb, &[]);
+    let out = pick(&sb, &["--wait"]);
     assert!(start.elapsed() < std::time::Duration::from_secs(30));
     assert_eq!(out.code, Some(1));
     assert_eq!(out.stdout, plain.stdout);
@@ -2685,7 +2149,7 @@ fn wait_with_nothing_to_wait_for_exits_at_once() {
         )
     );
     // Not of `--provider`, and no codex account at all.
-    let out = pick(&sb, false, &["--wait", "--provider", "codex", "--json"]);
+    let out = pick(&sb, &["--wait", "--provider", "codex", "--json"]);
     assert_eq!(out.code, Some(1));
     assert_eq!(
         serde_json::from_str::<Value>(&out.stdout).unwrap()["account"],
@@ -2734,7 +2198,7 @@ fn used_up_for(resets_in: i64) -> (Sandbox, PathBuf, i64) {
 #[test]
 fn max_wait_gives_up_when_the_next_check_is_later() {
     let (sb, _, resets_at) = used_up_for(86_400 + 5_400);
-    let plain = pick(&sb, false, &[]);
+    let plain = pick(&sb, &[]);
     assert_eq!(plain.code, Some(1));
     let next = jiff::Timestamp::from_second(resets_at + 30)
         .unwrap()
@@ -2743,7 +2207,7 @@ fn max_wait_gives_up_when_the_next_check_is_later() {
         .to_string();
     for max_wait in ["0", "1", "60"] {
         let start = std::time::Instant::now();
-        let out = pick(&sb, false, &["--wait", "--max-wait", max_wait]);
+        let out = pick(&sb, &["--wait", "--max-wait", max_wait]);
         assert!(start.elapsed() < std::time::Duration::from_secs(30));
         assert_eq!(out.code, Some(1), "{max_wait}");
         assert_eq!(out.stdout, plain.stdout);
@@ -2765,24 +2229,23 @@ fn max_wait_gives_up_when_the_next_check_is_later() {
             "{max_wait}"
         );
     }
-    let out = pick(&sb, false, &["--wait", "--max-wait", "1", "--json"]);
+    let out = pick(&sb, &["--wait", "--max-wait", "1", "--json"]);
     assert_eq!(out.code, Some(1));
     let v: Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(v["account"], Value::Null);
     assert!(sb.invocations().is_empty(), "--wait never queries live");
 }
 
-/// R23 `--wait`: it does not combine with `--print-request`, and `--max-wait` needs it.
+/// R23 `--wait`: `--max-wait` needs it and requires a nonnegative duration.
 #[test]
 fn wait_options_that_do_not_combine() {
     let (sb, _) = used_up_for_an_hour();
     for args in [
-        &["--wait", "--print-request"][..],
-        &["--max-wait", "5"],
+        &["--max-wait", "5"][..],
         &["--wait", "--max-wait", "-1"],
         &["--wait", "--max-wait", "never"],
     ] {
-        let out = pick(&sb, false, args);
+        let out = pick(&sb, args);
         assert_eq!(out.code, Some(2), "{args:?}: {}", out.stderr);
     }
 }
@@ -2798,7 +2261,7 @@ fn wait_refuses_an_unnamed_session_before_waiting() {
         for refused in [&["-c"][..], &["--resume"]] {
             let args = [&["--wait", "--max-wait", "600"][..], run, &["--"], refused].concat();
             let start = std::time::Instant::now();
-            let out = pick(&sb, false, &args);
+            let out = pick(&sb, &args);
             assert!(
                 start.elapsed() < std::time::Duration::from_secs(30),
                 "{args:?}"
@@ -2821,11 +2284,11 @@ fn wait_refuses_an_unnamed_session_before_waiting() {
 #[test]
 fn unnamed_sessions_are_refused_when_nothing_is_feasible() {
     let (sb, _) = used_up_for_an_hour();
-    assert_eq!(pick(&sb, false, &[]).code, Some(1), "nothing is feasible");
+    assert_eq!(pick(&sb, &[]).code, Some(1), "nothing is feasible");
     for refused in [&["--resume"][..], &["-c"]] {
         for mode in [&[][..], &["--run"], &["--json"]] {
             let args = [mode, &["--"], refused].concat();
-            let out = pick(&sb, false, &args);
+            let out = pick(&sb, &args);
             assert_eq!(out.code, Some(1), "{args:?}: {}{}", out.stdout, out.stderr);
             assert!(
                 out.stderr.contains(&format!(
@@ -2866,7 +2329,7 @@ fn a_feasible_pair_checks_only_its_providers_arguments() {
         &[("claude", "max", &max), ("codex", "work", &work)],
         "[pick]\nexclude = [\"claude:default\"]\n",
     );
-    let out = pick(&sb, false, &["--offline"]);
+    let out = pick(&sb, &[]);
     assert_eq!(field(&out, "account"), "codex:work");
     assert!(
         why_not(&out, "claude:max / default").starts_with("Week (all models): 100% used"),
@@ -2875,12 +2338,12 @@ fn a_feasible_pair_checks_only_its_providers_arguments() {
     );
     for wait in [&[][..], &["--wait"]] {
         let args = [
-            &["--offline", "--run"][..],
+            &["--run"][..],
             wait,
             &["--", "-c", "model_reasoning_effort=high"],
         ]
         .concat();
-        let out = pick(&sb, false, &args);
+        let out = pick(&sb, &args);
         assert_eq!(out.code, Some(0), "{args:?}: {}{}", out.stdout, out.stderr);
         assert!(
             !out.stderr.contains("starts a new session"),
@@ -2905,7 +2368,7 @@ fn a_feasible_pair_checks_only_its_providers_arguments() {
 #[test]
 fn wait_resumes_a_named_session() {
     // Both accounts used up for an hour; team ran the session a few minutes ago.
-    let (sb, shared) = shared_store(&format!("{NOTES}{MODELS}"), 300, false);
+    let (sb, shared) = shared_store(MODELS, 300, false);
     for account in ["claude:max", "claude:team"] {
         let home = PathBuf::from(home_of(&sb, account));
         sb.write_claude_json(
@@ -2918,7 +2381,6 @@ fn wait_resumes_a_named_session() {
     let start = std::time::Instant::now();
     let out = pick(
         &sb,
-        false,
         &[
             "--wait",
             "--max-wait",
@@ -2962,7 +2424,6 @@ fn wait_resumes_a_named_session() {
     let start = std::time::Instant::now();
     let out = pick(
         &sb,
-        false,
         &["--wait", "--max-wait", "600", "--", "--resume", SESSION],
     );
     assert!(start.elapsed() < std::time::Duration::from_secs(30));
@@ -2977,9 +2438,9 @@ fn wait_resumes_a_named_session() {
     );
 
     // Feasible: `--wait` changes nothing, the warm account first.
-    let (sb, _) = shared_store(&format!("{NOTES}{MODELS}"), 300, true);
+    let (sb, _) = shared_store(MODELS, 300, true);
     log_launch(&sb, "claude:team", 600, "/w/proj", SESSION, None);
-    let out = pick(&sb, false, &["--wait", "--", "--resume", SESSION]);
+    let out = pick(&sb, &["--wait", "--", "--resume", SESSION]);
     assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
     assert_eq!(field(&out, "account"), "claude:team");
 }
@@ -3109,8 +2570,8 @@ fn wait_run_checks_only_the_providers_that_can_launch() {
             .collect()
     };
     for wait in [&[][..], &["--wait"]] {
-        let args = [&["--offline", "--run"][..], wait, &effort].concat();
-        let out = pick(&sb, false, &args);
+        let args = [&["--run"][..], wait, &effort].concat();
+        let out = pick(&sb, &args);
         assert_eq!(out.code, Some(0), "{args:?}: {}{}", out.stdout, out.stderr);
     }
     assert_eq!(launches(), [["-c", "model_reasoning_effort=high"]; 2]);
@@ -3129,11 +2590,11 @@ fn wait_run_checks_only_the_providers_that_can_launch() {
         ),
     );
     let args = [
-        &["--offline", "--live", "--wait", "--max-wait", "0", "--run"][..],
+        &["--live", "--wait", "--max-wait", "0", "--run"][..],
         &effort,
     ]
     .concat();
-    let out = pick(&sb, false, &args);
+    let out = pick(&sb, &args);
     assert_eq!(out.code, Some(1), "{}{}", out.stdout, out.stderr);
     assert!(out.stderr.contains("gave up waiting"), "{}", out.stderr);
     assert!(

@@ -14,15 +14,12 @@ use jiff::tz::TimeZone;
 use crate::account_command::OnPath;
 use crate::identity::{self, Identity};
 use crate::index::{self, Index, RefreshStats};
-use crate::privacy::Aliases;
 use crate::provider::Provider;
 use crate::registry::{self, Account, Home, Registry};
 use crate::stats::{self, By, Period};
 use crate::usage::history;
 use crate::{Env, owned, paths};
-use crate::{
-    attribution, jev, launch, live, pick, probe, setup, text, transcript, tui, usage, wait,
-};
+use crate::{attribution, launch, live, pick, probe, setup, text, transcript, tui, usage, wait};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -119,12 +116,7 @@ enum Command {
         account: String,
     },
     /// Recommend the account, model and effort to launch now, from usage and `[pick]` in
-    /// config.toml; with TYPESAFE_API_KEY set and notes, TypeSafe's Jev chooses among the feasible
-    /// options
-    ///
-    /// Without a key, `--offline`, or `[pick] notes`, nothing is sent and the rules decide. The
-    /// request carries aliased usage and your notes as written: write accounts in the notes as
-    /// `provider:name` to have them aliased too. `--print-request` shows it without sending.
+    /// config.toml; the rules choose among the feasible options
     Pick {
         /// Only this provider's accounts: `claude` or `codex`
         #[arg(long)]
@@ -135,15 +127,9 @@ enum Command {
         /// Seconds to wait for each account's live query
         #[arg(long, value_name = "SECONDS", default_value = "90", value_parser = parse_timeout)]
         timeout: Duration,
-        /// Never contact Jev: the rules decide
-        #[arg(long)]
-        offline: bool,
         /// Print the recommendation and every candidate as JSON
-        #[arg(long, conflicts_with_all = ["run", "print_request"])]
+        #[arg(long, conflicts_with = "run")]
         json: bool,
-        /// Print the JSON body Jev would get (without the key) and send nothing
-        #[arg(long, conflicts_with_all = ["run", "wait"])]
-        print_request: bool,
         /// When nothing is feasible, wait until something is, trying again after the earliest
         /// reset that blocks; then print (or launch) as without it. Never queries live by itself
         #[arg(long)]
@@ -268,9 +254,7 @@ fn dispatch(cli: Cli, ctx: &Context) -> Result<ExitCode> {
             provider,
             live,
             timeout,
-            offline,
             json,
-            print_request,
             wait,
             max_wait,
             run,
@@ -280,9 +264,7 @@ fn dispatch(cli: Cli, ctx: &Context) -> Result<ExitCode> {
             PickOptions {
                 provider,
                 live: live.then_some(timeout),
-                offline,
                 json,
-                print_request,
                 wait: wait.then_some(max_wait),
                 run,
                 args,
@@ -296,18 +278,16 @@ struct PickOptions {
     provider: Option<String>,
     /// `--live`, with its timeout.
     live: Option<Duration>,
-    offline: bool,
     json: bool,
-    print_request: bool,
     /// `--wait`, with its `--max-wait`.
     wait: Option<Option<Duration>>,
     run: bool,
     args: Vec<String>,
 }
 
-/// `remuda pick` (R23): the rules find what is feasible and rank it; Jev chooses among it when
-/// there is a key, notes and a choice to make; the decision is printed, or launched with
-/// `--run` exactly as `remuda run` would. Exits 1 when nothing is feasible.
+/// `remuda pick` (R23): the rules find what is feasible, rank it and choose the first pair;
+/// the decision is printed, or launched with `--run` exactly as `remuda run` would. Exits 1
+/// when nothing is feasible.
 fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
     let registry = Registry::load(config)?;
     let only = o.provider.as_deref().map(parse_provider).transpose()?;
@@ -375,7 +355,7 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
         let wait = (o.wait.is_some() && feasible.is_empty())
             .then(|| pick::next_attempt(&candidates, &entries, now));
         // Arguments that neither start a new session nor name one to resume are refused here,
-        // before anything is sent, with `--run` or without (the command shown is one remuda
+        // before waiting or launching, with `--run` or without (the command shown is one remuda
         // would launch), for each provider a pair may come from (R23): with a feasible pair,
         // the providers of the feasible pairs, as a launch would read them; with none (and
         // before a wait rather than after it), every provider with an account that nothing
@@ -431,39 +411,7 @@ fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
         }
         return Ok(ExitCode::FAILURE);
     }
-    let mut aliases = Aliases::default();
-    for account in &accounts {
-        aliases.note(&account.qualified());
-    }
-    let request = jev::request(
-        &entries,
-        &candidates,
-        settings,
-        &aliases,
-        now,
-        &ctx.tz,
-        session.as_ref(),
-    );
-    let key = ctx.env.get(jev::KEY_VAR).map(String::as_str);
-    let skip = jev::skip_reason(o.offline, key, settings, &request);
-    if o.print_request {
-        println!("{}", request.body);
-        if let Some(reason) = &skip {
-            eprintln!(
-                "remuda: note: this request would not be sent ({})",
-                reason.name()
-            );
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
-    let asked = match skip {
-        Some(reason) => pick::Asked::Skipped(reason),
-        None => {
-            let curl = launch::find_on_path("curl", ctx.env.get("PATH").map(String::as_str)).ok();
-            jev::ask(curl.as_deref(), key.unwrap_or_default(), &request)
-        }
-    };
-    let decision = pick::decide(&candidates, &entries, settings, asked)
+    let decision = pick::decide(&candidates, &entries, settings)
         .expect("a feasible candidate was found above");
     if o.json {
         let report = pick::to_json(

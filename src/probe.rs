@@ -1,9 +1,8 @@
 //! Running short, non-interactive commands: agent commands for an account, with output
 //! captured, stdin closed (or, for JSON-RPC over stdio, held open until the answers arrived),
-//! bounded by a timeout (R4, R7, R10, R10a); and `curl` for `remuda pick`'s one request, fed its
-//! configuration on stdin (R23). Each runs in its own process group, which is terminated when
-//! the command times out; what a command that exited left running is left alone, except by a
-//! JSON-RPC server's run, which leaves nothing behind (R4).
+//! bounded by a timeout (R4, R7, R10, R10a). Each runs in its own process group, which is
+//! terminated when the command times out; what a command that exited left running is left
+//! alone, except by a JSON-RPC server's run, which leaves nothing behind (R4).
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -124,41 +123,10 @@ pub fn run_captured_with(
     changes: &[EnvChange],
     timeout: Duration,
 ) -> Outcome {
-    run(program, args, changes, None, timeout)
-}
-
-/// Runs `program args...` with the inherited environment, `stdin` written to its standard input
-/// (on a thread, then closed) and stdout/stderr captured, like [`run_captured`]. For `curl -K -`,
-/// which reads its configuration, and so the request's secrets, from there (R23).
-pub fn run_with_stdin(program: &Path, args: &[&str], stdin: &[u8], timeout: Duration) -> Outcome {
-    run(program, args, &[], Some(stdin), timeout)
-}
-
-fn run(
-    program: &Path,
-    args: &[&str],
-    changes: &[EnvChange],
-    stdin: Option<&[u8]>,
-    timeout: Duration,
-) -> Outcome {
-    let feed = if stdin.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    };
-    let mut run = match Bounded::start(program, args, changes, feed, timeout) {
+    let mut run = match Bounded::start(program, args, changes, Stdio::null(), timeout) {
         Ok(run) => run,
         Err(e) => return Outcome::SpawnFailed(e.to_string()),
     };
-    if let (Some(mut pipe), Some(input)) = (run.child.stdin.take(), stdin) {
-        // A thread, so that a child that does not read everything cannot block this one; an
-        // error (EPIPE from a child that exited early) shows in its exit status. Dropping the
-        // pipe closes it.
-        let input = input.to_vec();
-        thread::spawn(move || {
-            let _ = pipe.write_all(&input);
-        });
-    }
     let stdout = Capture::of(run.child.stdout.take().map(OwnedFd::from));
     match run.exit_by(run.deadline) {
         Ok(Some(status)) => {
@@ -265,9 +233,9 @@ fn response(line: &str, ids: &HashSet<u64>) -> Option<(u64, Value)> {
     (ids.contains(&id) && answered).then_some((id, value))
 }
 
-/// A command with a deadline, leading its own process group: what [`run_captured`],
-/// [`run_with_stdin`] and [`run_json_rpc`] all run on. Its own group, so that what it starts
-/// goes with it: codex installed through npm or bun is a node shim whose child is the real
+/// A command with a deadline, leading its own process group: what [`run_captured`] and
+/// [`run_json_rpc`] run on. Its own group, so that what it starts goes with it: codex
+/// installed through npm or bun is a node shim whose child is the real
 /// server. The group is terminated and the child reaped when this is dropped, so that no way out
 /// of a run (an answer, a timeout, an early exit, an error, or a server that does not exit after
 /// its stdin closed) leaves it, or a process it started, running; only [`Bounded::leave`], for
@@ -634,20 +602,6 @@ mod tests {
         assert_eq!(outcome.success_stdout(), Some("done\n"));
     }
 
-    /// R23: `run_with_stdin` hands the child its input and closes it, larger than a pipe's
-    /// buffer included, and still times out.
-    #[test]
-    fn writes_stdin_then_closes_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = script(dir.path(), "s", "wc -c | tr -d ' '; echo \"$1\"");
-        let input = vec![b'x'; 300_000];
-        let outcome = run_with_stdin(&p, &["arg"], &input, Duration::from_secs(10));
-        assert_eq!(outcome.success_stdout(), Some("300000\narg\n"));
-        let slow = script(dir.path(), "slow", "exec sleep 30");
-        let outcome = run_with_stdin(&slow, &[], b"x", Duration::from_millis(200));
-        assert_eq!(outcome, Outcome::TimedOut);
-    }
-
     #[test]
     fn kills_on_timeout() {
         let dir = tempfile::tempdir().unwrap();
@@ -907,7 +861,7 @@ mod tests {
     }
 
     /// R4: what a command that ran to its end left running is left alone, whatever its exit
-    /// status and however it was fed: a helper an agent started on the side is the agent's.
+    /// status: a helper an agent started on the side is the agent's.
     /// (Long after the grace a group gets to go: nothing ended it meanwhile.)
     #[test]
     fn what_a_command_that_exited_left_running_is_left_alone() {
@@ -917,33 +871,15 @@ mod tests {
         let quiet = "sleep 30 >/dev/null 2>&1 & echo $! > \"$1/$2\"";
         let ok = script(dir.path(), "ok", &format!("{quiet}; echo done"));
         let failing = script(dir.path(), "failing", &format!("{quiet}; exit 4"));
-        let fed = script(dir.path(), "fed", &format!("{quiet}; cat; echo done"));
         let outcome = run_captured(&ok, &[d, "ok.pid"], &keep(), t);
         assert_eq!(outcome.success_stdout(), Some("done\n"));
         let outcome = run_captured(&failing, &[d, "failing.pid"], &keep(), t);
         assert_eq!(outcome.describe(t), "exited with status 4");
-        let outcome = run_with_stdin(&fed, &[d, "fed.pid"], b"fed\n", t);
-        assert_eq!(outcome.success_stdout(), Some("fed\ndone\n"));
         thread::sleep(TERM_GRACE + GRACE);
-        let left = ["ok.pid", "failing.pid", "fed.pid"].map(|name| pid_in(&dir.path().join(name)));
+        let left = ["ok.pid", "failing.pid"].map(|name| pid_in(&dir.path().join(name)));
         let survived = left.map(alive);
         left.into_iter().for_each(end);
-        assert_eq!(survived, [true; 3]);
-    }
-
-    /// R4, R23: a command fed on stdin that times out takes its process group with it too.
-    #[test]
-    fn a_timeout_kills_the_process_group_of_a_command_fed_on_stdin() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = script(
-            dir.path(),
-            "s",
-            "sleep 30 & echo $! > \"$1/left\"; cat >/dev/null; exec sleep 30",
-        );
-        let d = dir.path().to_str().unwrap();
-        let outcome = run_with_stdin(&p, &[d], b"fed\n", Duration::from_secs(5));
-        assert_eq!(outcome, Outcome::TimedOut);
-        assert!(gone(pid_in(&dir.path().join("left"))), "left survived");
+        assert_eq!(survived, [true; 2]);
     }
 
     /// R4: outside the terminal's foreground process group, reading the terminal or changing

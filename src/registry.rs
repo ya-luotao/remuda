@@ -1281,7 +1281,7 @@ mod tests {
     #[test]
     fn append_and_remove_preserve_the_pick_table() {
         let pick = "# how to pick\n[pick]\nexclude = [\"claude:team\"] # the company's\n\
-                    notes = \"\"\"\nkeep claude:max for refactors\n\"\"\"\n\n\
+                    min_headroom = 20 # keep room for refactors\n\n\
                     [pick.claude]\nmodels = [\"claude-opus-5-5\"] # first is the default\n";
         let original = format!(
             "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n\n\
@@ -1294,7 +1294,7 @@ mod tests {
         let reg = parse(&out).unwrap();
         assert_eq!(reg.pick, parse(&original).unwrap().pick);
         assert_eq!(reg.pick.exclude, ["claude:team"]);
-        assert_eq!(reg.pick.notes, "keep claude:max for refactors");
+        assert_eq!(reg.pick.min_headroom, 20);
 
         let out = removed(&original, 0);
         assert!(out.ends_with(pick), "{out}");
