@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::attribution::Attribution;
 use crate::index::{self, Given, RefreshStats};
-use crate::pricing::{PRICES_AS_OF, Prices, Rate};
+use crate::pricing::{PRICES_AS_OF, Prices, RequestRate};
 use crate::provider::Provider;
 use crate::registry::Account;
 use crate::text::{self, human_count, human_usd};
@@ -1438,7 +1438,7 @@ pub fn requests<'a>(
     let mut groups: Vec<Vec<String>> = Vec::new();
     let mut group_of_accounts: HashMap<Vec<String>, usize> = HashMap::new();
     let mut group_of_file: HashMap<&Path, usize> = HashMap::new();
-    let mut rates: HashMap<(Provider, &str), Option<Rate>> = HashMap::new();
+    let mut rates: HashMap<(Provider, &str), Option<RequestRate>> = HashMap::new();
     let mut list = Vec::with_capacity(winners.len());
     for (key, winner) in winners {
         let file = winner.file;
@@ -1470,7 +1470,7 @@ pub fn requests<'a>(
         };
         let rate = *rates
             .entry((file.provider, model))
-            .or_insert_with(|| prices.rate(file.provider, model));
+            .or_insert_with(|| prices.request_rate(file.provider, model));
         list.push(Request {
             key,
             ts: winner.ts,
@@ -2367,7 +2367,7 @@ overall
   gpt-test      1.5K         200            0      30         12   1.7K        -
   total         1.5K        1.2M          160     120         12   1.2M  $12.34+
 
-Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.
+Cost ≈ API list price (prices as of 2026-10-21): an estimate, not a bill.
 Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
 "
         );
@@ -2383,7 +2383,7 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
                 "MODEL          INPUT  CACHE READ  CACHE WRITE  OUTPUT  REASONING  TOTAL    COST",
                 "claude:max",
                 "claude:default + claude:max",
-                "Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.",
+                "Cost ≈ API list price (prices as of 2026-10-21): an estimate, not a bill.",
             ]
         );
         let all = Table {
@@ -2398,7 +2398,7 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
             "Tokens · all time\n\n\
              MODEL  INPUT  CACHE READ  CACHE WRITE  OUTPUT  REASONING  TOTAL  COST\n\
              overall\n  no tokens\n\n\
-             Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.\n"
+             Cost ≈ API list price (prices as of 2026-10-21): an estimate, not a bill.\n"
         );
     }
 

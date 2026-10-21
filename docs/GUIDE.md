@@ -343,11 +343,14 @@ models = ["gpt-6-astra"]
 ## Cost estimates
 
 The statistics price each request at the provider's public API list price, built into remuda (as
-of 2026-10-07). Claude's 5-minute and 1-hour cache writes are priced separately, as are fast mode
+of 2026-10-21). Claude's 5-minute and 1-hour cache writes are priced separately, as are fast mode
 (twice the price on the models that offer it) and US-only inference (1.1 times the price on the
-models from 4.6 on), as the transcripts record them. Codex's cache writes are priced at 1.25
-times the input price from GPT-5.6 on, and at the input price before. A Codex request with more
-than 272K input tokens is priced at the long-context price on the models that have one.
+models from 4.6 on), as the transcripts record them. Haiku 5.5 uses five times its base prices
+when a request's prompt exceeds 100K tokens, including cache reads and both cache writes.
+Codex's cache writes use the default 30-minute rate: 1.25 times the input price from GPT-5.6
+on, and the input price before; rollouts do not record the lifetime needed to price 12-hour
+writes. A Codex request with more than 272K input tokens is priced at the long-context price
+on the models that have one. These thresholds apply per request, not to the period's total.
 
 To price a model remuda does not know, or to use another price, add a `[prices."<model>"]` table
 to `config.toml`, in USD per million tokens:
@@ -365,6 +368,8 @@ cache_write_1h = 10
 `cache_write_5m` (for Codex, the cache-write price) and `cache_write_1h` are optional, and a count whose price is left out is not
 priced. The table applies to the model id as recorded, or to it without a trailing date
 (`claude-haiku-4-5` also prices `claude-haiku-4-5-20251001`).
+Overrides set base prices; the built-in model's fast-mode, US-only and long-context multipliers
+still apply.
 
 A cost followed by `+` (`$12.34+`) leaves out requests that could not be priced, and `-` means
 nothing could be; the models concerned are named below the command-line table or after Overall
@@ -459,7 +464,7 @@ Accounts with `share = false` and the source itself are not checked.
 - **Token statistics** are counted from the agents' own transcripts. Each request counts once,
   even when a message is written in several records, a session is forked, or a store is shared
   by several accounts. Each request is also priced at the provider's public API list
-  price (built in, as of 2026-10-07), which estimates what the usage would cost on the API; for
+  price (built in, as of 2026-10-21), which estimates what the usage would cost on the API; for
   subscription logins it is not a bill. No agent is run and nothing is fetched.
 - **Recommendations** (`remuda pick`) read the same usage and `[pick]`; the only request remuda
   makes itself goes to TypeSafe, and only with a key and notes (see

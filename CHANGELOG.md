@@ -48,6 +48,11 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   terminals keep the compact one-line header.
 - The TUI's Stats view shows Overall and the models not priced before the account or project
   breakdown. The chart, shares, scrolling and command-line report order stay the same (SPEC R20).
+- Refresh API list prices as of 2026-10-21: add Claude Sonnet 5.5 and Haiku 5.5, GPT-6.1 Sol,
+  GPT-6 Luna and GPT-5.6 Luna. Haiku 5.5's prices increase fivefold above 100K prompt tokens,
+  including cache reads and writes, per request; config overrides keep that multiplier.
+  GPT-6.1 Sol uses its reduced cached-input price, and the new Codex models keep the 272K
+  long-context threshold (SPEC R20).
 
 - The configuration pane of the Accounts view (beside the view from 120 columns, below the table
   otherwise, then the whole view on a second `p`) is replaced by the account card above; `Esc`

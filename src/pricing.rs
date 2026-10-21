@@ -11,8 +11,9 @@ use toml_edit::DocumentMut;
 use crate::provider::Provider;
 use crate::stats::Tokens;
 
-/// When the built-in prices were read from the providers' pricing pages.
-pub const PRICES_AS_OF: &str = "2026-10-07";
+/// When the built-in prices were read from Anthropic's pricing page and OpenAI's
+/// https://developers.openai.com/api/docs/pricing.md (standard processing).
+pub const PRICES_AS_OF: &str = "2026-10-21";
 
 /// The keys of a `[prices."<model>"]` table.
 pub const OVERRIDE_KEYS: [&str; 5] = [
@@ -54,14 +55,14 @@ impl Rate {
     /// Picodollars for one request's `tokens`; `None` when a nonzero count has no price.
     /// Reasoning is part of output and not priced again. `fast` / `us` are the request's
     /// flags and count only where the rate has `fast_mode` / `us_premium`; the long-context
-    /// price follows from the counts where the rate has `long_context`.
+    /// price follows from the counts where the rate has `long_context`. For model-specific
+    /// prompt tiers (Haiku 5.5), use [`Prices::cost`] instead of the base rate alone.
     pub fn cost(&self, tokens: &Tokens, fast: bool, us: bool) -> Option<u128> {
-        let long = self.long_context
-            && tokens
-                .input
-                .saturating_add(tokens.cache_read)
-                .saturating_add(tokens.cache_write())
-                > LONG_CONTEXT_TOKENS;
+        self.cost_scaled(tokens, fast, us, 1)
+    }
+
+    fn cost_scaled(&self, tokens: &Tokens, fast: bool, us: bool, multiplier: u128) -> Option<u128> {
+        let long = self.long_context && prompt_tokens(tokens) > LONG_CONTEXT_TOKENS;
         // The multiplier of the input and cache prices, and of the output price, as
         // (numerator, denominator).
         let (inputs, output) = match long {
@@ -69,7 +70,7 @@ impl Rate {
             false => ((1, 1), (1, 1)),
         };
         let scale = |price: u64, (num, den): (u128, u128)| {
-            let mut p = u128::from(price);
+            let mut p = u128::from(price) * multiplier;
             if fast && self.fast_mode {
                 p *= 2;
             }
@@ -89,6 +90,31 @@ impl Rate {
                 + part(tokens.cache_write_1h, self.cache_write_1h, inputs)?
                 + part(tokens.output, Some(self.output), output)?,
         )
+    }
+}
+
+fn prompt_tokens(tokens: &Tokens) -> u64 {
+    tokens
+        .input
+        .saturating_add(tokens.cache_read)
+        .saturating_add(tokens.cache_write())
+}
+
+/// A model's base rate and prompt tier, cached together but evaluated per request.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RequestRate {
+    base: Rate,
+    haiku_tier: bool,
+}
+
+impl RequestRate {
+    pub(crate) fn cost(&self, tokens: &Tokens, fast: bool, us: bool) -> Option<u128> {
+        let multiplier = if self.haiku_tier && prompt_tokens(tokens) > 100_000 {
+            5
+        } else {
+            1
+        };
+        self.base.cost_scaled(tokens, fast, us, multiplier)
     }
 }
 
@@ -167,10 +193,10 @@ impl Prices {
         Ok(prices)
     }
 
-    /// The rate of `model` for a request of `provider`: an override for the id as recorded,
+    /// The base rate of `model` for `provider`: an override for the id as recorded,
     /// else for the id without its date, else the built-in price of `provider` for the id
     /// without its date. An override keeps the built-in model's `fast_mode`, `us_premium` and
-    /// `long_context`.
+    /// `long_context`. Use [`Self::cost`] to include model-specific prompt tiers.
     pub fn rate(&self, provider: Provider, model: &str) -> Option<Rate> {
         let bare = undated(model);
         let built_in = built_in(provider, bare);
@@ -190,6 +216,25 @@ impl Prices {
             fast_mode: built_in.is_some_and(|r| r.fast_mode),
             us_premium: built_in.is_some_and(|r| r.us_premium),
             long_context: built_in.is_some_and(|r| r.long_context),
+        })
+    }
+
+    /// Picodollars for a request, including its model's prompt tier and recorded flags (R20).
+    pub fn cost(
+        &self,
+        provider: Provider,
+        model: &str,
+        tokens: &Tokens,
+        fast: bool,
+        us: bool,
+    ) -> Option<u128> {
+        self.request_rate(provider, model)?.cost(tokens, fast, us)
+    }
+
+    pub(crate) fn request_rate(&self, provider: Provider, model: &str) -> Option<RequestRate> {
+        Some(RequestRate {
+            base: self.rate(provider, model)?,
+            haiku_tier: provider == Provider::Claude && undated(model) == "claude-haiku-5-5",
         })
     }
 }
@@ -285,6 +330,12 @@ const CLAUDE: &[(&str, [u64; 5], bool, bool)] = &[
         false,
     ),
     (
+        "claude-sonnet-5-5",
+        [2_000, 2_500, 4_000, 100, 10_000],
+        false,
+        true,
+    ),
+    (
         "claude-sonnet-5",
         [2_000, 2_500, 4_000, 200, 10_000],
         false,
@@ -308,6 +359,7 @@ const CLAUDE: &[(&str, [u64; 5], bool, bool)] = &[
         false,
         false,
     ),
+    ("claude-haiku-5-5", [100, 125, 200, 10, 500], false, true),
     (
         "claude-haiku-4-5",
         [1_000, 1_250, 2_000, 100, 5_000],
@@ -329,8 +381,11 @@ const CLAUDE: &[(&str, [u64; 5], bool, bool)] = &[
 const CODEX: &[(&str, [u64; 4], bool)] = &[
     ("gpt-5.6-sol", [4_000, 400, 5_000, 20_000], true),
     ("gpt-6-astra", [10_000, 1_000, 12_500, 50_000], true),
+    ("gpt-6.1-sol", [2_000, 100, 2_500, 10_000], true),
+    ("gpt-6-luna", [100, 10, 125, 500], true),
     ("gpt-6-sol", [2_000, 200, 2_500, 10_000], true),
     ("gpt-5.6-terra", [2_000, 200, 2_500, 12_000], true),
+    ("gpt-5.6-luna", [200, 20, 250, 1_200], true),
     ("gpt-5.5", [5_000, 500, 5_000, 30_000], true),
     ("gpt-5.4", [2_500, 250, 2_500, 15_000], true),
     ("gpt-5.3-codex", [1_750, 175, 1_750, 14_000], false),
@@ -425,6 +480,9 @@ mod tests {
         let claude = |m| rate(Provider::Claude, m);
         assert_eq!(claude("claude-fable-5-1").cache_read, Some(250_000));
         assert_eq!(claude("claude-fable-5").cache_read, Some(1_000_000));
+        assert_eq!(claude("claude-sonnet-5-5").cache_read, Some(100_000));
+        assert_eq!(claude("claude-sonnet-5").cache_read, Some(200_000));
+        assert_eq!(claude("claude-haiku-5-5").cache_read, Some(10_000));
         assert_eq!(
             claude("claude-opus-4-5-20251101"),
             claude("claude-opus-4-5")
@@ -444,6 +502,26 @@ mod tests {
         }
         assert_eq!(prices.rate(Provider::Codex, "claude-opus-5"), None);
         assert_eq!(prices.rate(Provider::Claude, "gpt-5.4"), None);
+        assert_eq!(
+            prices.cost(
+                Provider::Codex,
+                "claude-haiku-5-5",
+                &tokens(M, 0, 0, 0, 0),
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            prices.cost(
+                Provider::Claude,
+                "claude-haiku-5-5-preview",
+                &tokens(M, 0, 0, 0, 0),
+                false,
+                false
+            ),
+            None
+        );
         for model in ["codex-auto-review", "gpt-5.3-codex-spark", "gpt-test"] {
             assert_eq!(prices.rate(Provider::Codex, model), None, "{model}");
         }
@@ -487,6 +565,11 @@ mod tests {
         assert_eq!(cost("claude-opus-4-5", false), Some(5_000_000_000_000));
         assert_eq!(cost("claude-opus-5-5", true), Some(8_800_000_000_000));
         assert_eq!(cost("claude-haiku-4-5", false), Some(1_000_000_000_000));
+        assert_eq!(cost("claude-sonnet-5-5", false), Some(2_200_000_000_000));
+        assert_eq!(
+            Prices::default().cost(Provider::Claude, "claude-haiku-5-5", &input, true, true),
+            Some(550_000_000_000)
+        );
     }
 
     /// R20: codex prices input without cached, cached input, and output (reasoning included);
@@ -513,9 +596,12 @@ mod tests {
         let write = tokens(0, 0, 2_000, 0, 0);
         for (model, usd) in [
             ("gpt-6-astra", 12_500_000),
+            ("gpt-6.1-sol", 2_500_000),
+            ("gpt-6-luna", 125_000),
             ("gpt-6-sol", 2_500_000),
             ("gpt-5.6-sol", 5_000_000),
             ("gpt-5.6-terra", 2_500_000),
+            ("gpt-5.6-luna", 250_000),
             ("gpt-5.5", 5_000_000),
             ("gpt-5.4", 2_500_000),
             ("gpt-5.3-codex", 1_750_000),
@@ -529,7 +615,10 @@ mod tests {
             );
         }
         for &(model, [input, _, write, _], _) in CODEX {
-            let ratio = match ["gpt-5.6-", "gpt-6-"].iter().any(|p| model.starts_with(p)) {
+            let ratio = match ["gpt-5.6-", "gpt-6-", "gpt-6.1-"]
+                .iter()
+                .any(|p| model.starts_with(p))
+            {
                 true => (5, 4),
                 false => (1, 1),
             };
@@ -543,8 +632,8 @@ mod tests {
 
     /// R20: a codex request with more than 272K input tokens, cached and cache write included,
     /// is priced at twice the input, cached and cache-write prices and 1.5 times the output
-    /// price, on the models that have a long-context price; exactly, since every such price is
-    /// even.
+    /// price, on the models that have a long-context price; exactly, since every such output
+    /// price in picodollars is even.
     #[test]
     fn codex_long_context_reprices_the_whole_request() {
         let gpt = rate(Provider::Codex, "gpt-5.4");
@@ -589,9 +678,33 @@ mod tests {
         );
 
         let long: Vec<_> = CODEX.iter().filter(|row| row.2).collect();
-        assert_eq!(long.len(), 6);
-        for &&(model, prices, _) in &long {
-            assert!(prices.iter().all(|p| p % 2 == 0), "{model}: {prices:?}");
+        assert_eq!(long.len(), 9);
+        for &&(model, _, _) in &long {
+            assert_eq!(rate(Provider::Codex, model).output % 2, 0, "{model}");
+        }
+        for (model, input, read, write, output) in [
+            ("gpt-6.1-sol", 2_000_000u128, 100_000, 2_500_000, 10_000_000),
+            ("gpt-6-luna", 100_000, 10_000, 125_000, 500_000),
+            ("gpt-5.6-luna", 200_000, 20_000, 250_000, 1_200_000),
+        ] {
+            let rate = rate(Provider::Codex, model);
+            let at = tokens(100_000, 170_000, 2_000, 0, 13);
+            assert_eq!(
+                rate.cost(&at, false, false),
+                Some(100_000 * input + 170_000 * read + 2_000 * write + 13 * output),
+                "{model}"
+            );
+            let over = tokens(100_001, 170_000, 2_000, 0, 13);
+            assert_eq!(
+                rate.cost(&over, false, false),
+                Some(
+                    100_001 * input * 2
+                        + 170_000 * read * 2
+                        + 2_000 * write * 2
+                        + 13 * output * 3 / 2
+                ),
+                "{model}"
+            );
         }
         // An override keeps the flag.
         let prices =

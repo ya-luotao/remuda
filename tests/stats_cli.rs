@@ -302,7 +302,7 @@ fn stats_by_account_and_model() {
         [
             "Not priced: claude-advisor-test, claude-haiku-test, claude-test \
              (add [prices.\"<model>\"] to config.toml)",
-            "Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.",
+            "Cost ≈ API list price (prices as of 2026-10-21): an estimate, not a bill.",
             "",
         ]
     );
@@ -934,7 +934,7 @@ fn stats_by_account_is_the_report_as_it_was() {
         "  claude-haiku-test       30           0            0       5          -     35       -\n",
         "  total                 1.2K        137K         2.2K     726         90   141K  $0.08+\n",
         "\n",
-        "Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.\n",
+        "Cost ≈ API list price (prices as of 2026-10-21): an estimate, not a bill.\n",
         "Not priced: claude-advisor-test, claude-haiku-test, claude-test (add [prices.\"<model>\"] to config.toml)\n",
     );
     let max = concat!(
@@ -949,7 +949,7 @@ fn stats_by_account_is_the_report_as_it_was() {
         "  claude-test      5           0            0       5          -     10     -\n",
         "  total            5           0            0       5          -     10     -\n",
         "\n",
-        "Cost ≈ API list price (prices as of 2026-10-07): an estimate, not a bill.\n",
+        "Cost ≈ API list price (prices as of 2026-10-21): an estimate, not a bill.\n",
         "Not priced: claude-test (add [prices.\"<model>\"] to config.toml)\n",
     );
     assert_eq!(stats(&s.sb, &[]), all);

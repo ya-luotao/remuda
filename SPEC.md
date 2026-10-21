@@ -1502,7 +1502,7 @@ stays reserved so that the entries after it keep theirs.
 
 Token counts per account (or project) and model, read from the agents' own transcripts, for a
 period, and their estimated cost: what the requests would cost at the providers' public API list prices (prices as
-of 2026-10-07). Most accounts are subscription logins, so the cost is an estimate for comparison
+of 2026-10-21). Most accounts are subscription logins, so the cost is an estimate for comparison
 (≈ API list price), not a bill. Computing them runs no agent command and makes no network request:
 the prices are built into remuda and can be overridden in `config.toml` (R3).
 
@@ -1659,8 +1659,11 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   | `claude-opus-5-5` | 4 | 5 | 8 | 0.20 | 20 |
   | `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-opus-4-5` | 5 | 6.25 | 10 | 0.50 | 25 |
   | `claude-opus-4-1`, `claude-opus-4` | 15 | 18.75 | 30 | 1.50 | 75 |
+  | `claude-sonnet-5-5` | 2 | 2.50 | 4 | 0.10 | 10 |
   | `claude-sonnet-5` | 2 | 2.50 | 4 | 0.20 | 10 |
   | `claude-sonnet-4-6`, `claude-sonnet-4-5`, `claude-sonnet-4` | 3 | 3.75 | 6 | 0.30 | 15 |
+  | `claude-haiku-5-5` (prompt ≤100K tokens) | 0.10 | 0.125 | 0.20 | 0.01 | 0.50 |
+  | `claude-haiku-5-5` (prompt >100K tokens) | 0.50 | 0.625 | 1 | 0.05 | 2.50 |
   | `claude-haiku-4-5` | 1 | 1.25 | 2 | 0.10 | 5 |
   | `claude-3-5-haiku` | 0.80 | 1 | 1.60 | 0.08 | 4 |
 
@@ -1670,9 +1673,12 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   | Model | Input | Cached input | Cache write | Output | Long context |
   | --- | ---: | ---: | ---: | ---: | :---: |
   | `gpt-6-astra` | 10 | 1 | 12.50 | 50 | yes |
+  | `gpt-6.1-sol` | 2 | 0.10 | 2.50 | 10 | yes |
+  | `gpt-6-luna` | 0.10 | 0.01 | 0.125 | 0.50 | yes |
   | `gpt-6-sol` | 2 | 0.20 | 2.50 | 10 | yes |
   | `gpt-5.6-sol` | 4 | 0.40 | 5 | 20 | yes |
   | `gpt-5.6-terra` | 2 | 0.20 | 2.50 | 12 | yes |
+  | `gpt-5.6-luna` | 0.20 | 0.02 | 0.25 | 1.20 | yes |
   | `gpt-5.5` | 5 | 0.50 | 5 | 30 | yes |
   | `gpt-5.4` | 2.50 | 0.25 | 2.50 | 15 | yes |
   | `gpt-5.3-codex`, `gpt-5.2-codex`, `gpt-5.2` | 1.75 | 0.175 | 1.75 | 14 | no |
@@ -1680,9 +1686,12 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   | `gpt-5.1-codex-mini` | 0.25 | 0.025 | 0.25 | 2 | no |
   | `o4-mini` | 1.10 | 0.275 | 1.10 | 4.40 | no |
 
-  `gpt-5.6-sol`'s price is a promotional one, through 2026-11-21. Other codex models have no
-  public API price (`codex-auto-review`, codex's own routing id, and `gpt-5.3-codex-spark`, for
-  example) and are priced only by `[prices]`.
+  Sources: [Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing) and
+  [OpenAI pricing](https://developers.openai.com/api/docs/pricing.md), standard processing.
+  Codex cache writes use the default 30-minute rate: rollouts do not record the lifetime.
+  `gpt-5.6-sol`'s price is a promotional one, available at least through 2026-11-21. Codex models
+  not listed above are priced only by `[prices]`; some have no public API price
+  (`codex-auto-review`, codex's own routing id, and `gpt-5.3-codex-spark`, for example).
   - **[unverified]** (as the API documents; not observed): fast mode on `claude-opus-5-5`,
     `claude-opus-5`, and `claude-opus-4-8` doubles every price
     (input 8, 10, and 10; output 40, 50, and 50; the cache prices keep their ratio to input); on
@@ -1690,8 +1699,12 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   - **[unverified]** (as the API documents; not observed): US-only inference multiplies every
     price by 1.1 on the models from 4.6 on: `claude-fable-5-1`,
     `claude-fable-5`, `claude-mythos-5-1`, `claude-mythos-5`, `claude-opus-5-5`, `claude-opus-5`,
-    `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-5`, and
-    `claude-sonnet-4-6`; with fast mode, both apply.
+    `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-5-5`,
+    `claude-sonnet-5`, `claude-sonnet-4-6`, and `claude-haiku-5-5`; with fast mode, both apply.
+  - Claude Haiku 5.5: a request with more than 100,000 input tokens, cache reads and both cache
+    writes included, uses five times every base price, including output. Exactly 100,000 uses
+    the base prices. The threshold applies per request, before costs are summed; US-only
+    inference also applies to the higher prices.
   - Codex: input without cached and cache write at the input price, cached input at the cached
     price, cache write at the cache-write price, and output (reasoning included, not priced
     again) at the output price.
@@ -1703,7 +1716,7 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
     matches. Claude's prices apply to claude's requests, codex's to codex's.
   - `[prices."<model>"]` in `config.toml` (R3) gives the price of a model, found by the id as
     recorded or else without its date: it replaces the built-in price or prices a model that has
-    none. Fast mode, US-only inference, and codex long context apply to it as to the built-in
+    none. Fast mode, US-only inference, and long-context multipliers apply to it as to the built-in
     model of the same id. A count whose price it leaves out is not priced. For codex,
     `cache_read` is the cached-input price and `cache_write_5m` the cache-write price.
   - A request is not priced when its model has no price (`unknown` included) or a nonzero count
@@ -1711,9 +1724,10 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
     followed by `+` (`$12.34+`), one with nothing priced as `-`, and the models with such
     requests are named below the command-line table or after Overall in the TUI.
   - Not modelled (known limitations): the long-context premium of `claude-sonnet-4-5` and
-    `claude-sonnet-4` (input beyond 200K tokens; the 4.6 and later models have none), batch and
+    `claude-sonnet-4` (input beyond 200K tokens; later models except Haiku 5.5 have none), batch and
     priority processing, codex's fast and priority processing (rollouts do not record it),
-    server tools such as web search, and data residency other than US-only.
+    codex's 12-hour cache-write rate (rollouts do not record the lifetime), server tools such
+    as web search, and data residency other than US-only.
   - The cost is exact (integer picodollars; override prices are rounded to 10⁻⁶ USD per million
     tokens) and shown rounded to the cent: below $1,000 with two decimals (`$0.42`, `$12.34`), a
     cost that is not zero but below half a cent as `<$0.01`, and from $1,000 on like counts
