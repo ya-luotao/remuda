@@ -43,9 +43,9 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Changed
 
-- The TUI's tall header gives the active navigation tab the same three-row height as the
-  remuda mark, with centered labels and more space between the mark and wordmark; short
-  terminals keep the compact one-line header.
+- The TUI's tall header extends the mark's two tracks into a frame around single-line navigation,
+  open on the right, with the wordmark and private badge in its upper rail. Selected tabs stay
+  one row tall; short terminals keep the compact one-line header.
 - The TUI's Stats view shows Overall and the models not priced before the account or project
   breakdown. The chart, shares, scrolling and command-line report order stay the same (SPEC R20).
 - Refresh API list prices as of 2026-10-21: add Claude Sonnet 5.5 and Haiku 5.5, GPT-6.1 Sol,

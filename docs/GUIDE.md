@@ -5,9 +5,10 @@ Details behind the overview in the [README](../README.md). The normative behavio
 
 ## TUI interaction
 
-In a terminal at least 40 rows tall, the header is three rows: the remuda mark and the active
-navigation tab have the same height, with the labels centered vertically. A shorter terminal
-keeps the one-line header, leaving the rows to the views.
+In a terminal at least 40 rows tall, the header uses the mark's two tracks as a three-row frame,
+open on the right, around single-line navigation. The wordmark and private badge sit in the upper
+rail; the selected tab stays one row tall. A shorter terminal keeps the compact one-line header,
+leaving the rows to the views.
 
 In an expanded preview, the movement keys scroll the preview instead of the list. In forms, `Tab`
 or `↓` moves to the next field, `Shift-Tab` or `↑` to the previous one, `Enter` submits and `Esc`

@@ -3335,43 +3335,59 @@ fn accounts_view_loading() {
     assert!(all.contains("u: live usage"), "{all}");
 }
 
-/// A tall terminal gives the active tab the mark's full height, with its label centered;
-/// a shorter one keeps the one-line header, and the body starts right below it.
+/// A tall terminal wraps one-line navigation in the mark's tracks, with the wordmark and
+/// private badge in the upper rail. A shorter one keeps the one-line header.
 #[test]
-fn header_shows_the_mark_when_tall() {
+fn header_wraps_navigation_in_the_mark_tracks_when_tall() {
     let mut app = app();
     update(&mut app, Event::Resize(80, render::TALL));
     let lines = screen(&app);
-    assert_eq!(lines[0], " ╭─────");
+    assert!(lines[0].starts_with(" ╭─ remuda ─"), "{}", lines[0]);
     assert!(
-        lines[1].starts_with(" │╭────  remuda  1 Accounts  2 Live"),
+        lines[1].starts_with(" ││ 1 Accounts  2 Live  3 History  4 Stats"),
         "{}",
         lines[1]
     );
     assert!(lines[1].ends_with("?: help · q: quit"), "{}", lines[1]);
-    assert_eq!(lines[2], " ││");
+    assert!(lines[2].starts_with(" │╰───"), "{}", lines[2]);
+    assert_eq!(lines[0].chars().count(), 43);
+    assert_eq!(lines[2].chars().count(), 43);
     assert!(lines[3].starts_with("Accounts"), "{}", lines[3]);
 
-    for view in ['1', '2', '3', '4'] {
-        keys(&mut app, &[Key::Char(view)]);
-        for private in [false, true] {
-            app.private = private;
-            let mut terminal = Terminal::new(TestBackend::new(80, render::TALL)).unwrap();
-            terminal.draw(|f| render::render(&app, f)).unwrap();
-            let buffer = terminal.backend().buffer();
-            let selected = |y| {
-                (0..80)
-                    .filter(|&x| {
-                        buffer[(x, y)]
-                            .modifier
-                            .contains(ratatui::style::Modifier::REVERSED)
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let middle = selected(1);
-            assert!(!middle.is_empty(), "view {view}, private {private}");
-            assert_eq!(selected(0), middle);
-            assert_eq!(selected(2), middle);
+    for width in [43, 60, 61, 80] {
+        update(&mut app, Event::Resize(width, render::TALL));
+        for view in ['1', '2', '3', '4'] {
+            keys(&mut app, &[Key::Char(view)]);
+            let mut public_selection = Vec::new();
+            for private in [false, true] {
+                app.private = private;
+                let lines = screen(&app);
+                assert_eq!(lines[0].contains("PRIVATE"), private);
+                assert!(!lines[1].contains("PRIVATE"));
+                assert!(lines[1].contains("4 Stats"), "{}", lines[1]);
+                assert_eq!(lines[1].contains("?: help"), width >= 61);
+                let mut terminal = Terminal::new(TestBackend::new(width, render::TALL)).unwrap();
+                terminal.draw(|f| render::render(&app, f)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let selected = |y| {
+                    (0..width)
+                        .filter(|&x| {
+                            buffer[(x, y)]
+                                .modifier
+                                .contains(ratatui::style::Modifier::REVERSED)
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let middle = selected(1);
+                assert!(!middle.is_empty(), "view {view}, private {private}");
+                assert!(selected(0).is_empty());
+                assert!(selected(2).is_empty());
+                if private {
+                    assert_eq!(middle, public_selection, "private mode must not move tabs");
+                } else {
+                    public_selection = middle;
+                }
+            }
         }
     }
     app.private = false;
@@ -3380,6 +3396,14 @@ fn header_shows_the_mark_when_tall() {
     let lines = screen(&app);
     assert!(lines[0].starts_with(" remuda  1 Accounts"), "{}", lines[0]);
     assert!(lines[1].starts_with("Accounts"), "{}", lines[1]);
+
+    app.mode = Mode::PickForRun;
+    app.private = true;
+    update(&mut app, Event::Resize(80, render::TALL));
+    let lines = screen(&app);
+    assert!(lines[0].contains("remuda") && lines[0].contains("PRIVATE"));
+    assert!(lines[1].starts_with(" ││ run: pick an account "));
+    assert!(!lines[1].contains("1 Accounts"));
 }
 
 #[test]
@@ -5448,7 +5472,8 @@ fn stats_view_degrades_on_narrow_terminals() {
     }
     update(&mut app, Event::Resize(160, 40));
     let lines = screen(&app);
-    assert!(lines[2].trim_end().len() < 100, "{}", lines[2]);
+    let (_, header) = line_with(&lines, "ACCOUNT / MODEL");
+    assert!(header.chars().count() < 100, "{header}");
     let (_, haiku) = line_with(&lines, "claude-haiku-4-5-20251001 ");
     assert!(haiku.contains("35"), "not cut: {haiku}");
 }

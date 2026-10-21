@@ -43,12 +43,8 @@ const OK: Style = Style::new().fg(Color::Green);
 const USER: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 const CODEX_STYLE: Style = Style::new().fg(Color::Magenta);
 
-/// From this height on, the header is three lines tall and shows the mark.
+/// From this height on, the header wraps navigation in a three-row track frame.
 pub const TALL: u16 = 40;
-
-/// The mark (docs/VI.md) in box-drawing characters: two parallel tracks that turn the same way
-/// into an `r`. Their right and bottom ends line up, as in the SVG.
-const MARK: [&str; 3] = [" ╭─────", " │╭────", " ││"];
 
 /// Header, body, status and hints.
 struct Frame4 {
@@ -59,11 +55,7 @@ struct Frame4 {
 }
 
 fn frame_areas(area: Rect) -> Frame4 {
-    let header = if area.height >= TALL {
-        MARK.len() as u16
-    } else {
-        1
-    };
+    let header = if area.height >= TALL { 3 } else { 1 };
     let [header, body, status, hints] = Layout::vertical([
         Constraint::Length(header),
         Constraint::Fill(1),
@@ -168,37 +160,7 @@ pub fn render_with(app: &App, snapshot: &mut privacy::Snapshot, f: &mut Frame) {
 
 fn draw(app: &App, f: &mut Frame) {
     let areas = frame_areas(f.area());
-    let header = header(app);
-    let area = areas.header;
-    let tall = area.height > 1;
-    let mark_width = if tall { text::width(MARK[0]) + 1 } else { 0 };
-    let keys = Line::styled("?: help · q: quit ", DIM);
-    // The views come first where both do not fit (the logo and `PRIVATE` take room).
-    let room = mark_width + header.width() + keys.width() <= area.width as usize;
-    for row in 0..area.height {
-        let middle = row == area.height / 2;
-        let mut line = header.clone();
-        if !middle {
-            // Keep the tab's styling on its padding rows so it matches the mark's height.
-            for span in &mut line.spans {
-                span.content = " ".repeat(span.width()).into();
-            }
-        }
-        if tall {
-            line.spans.insert(
-                0,
-                Span::styled(text::pad(MARK[row as usize], mark_width), BOLD),
-            );
-        }
-        let area = Rect::new(area.x, area.y + row, area.width, 1);
-        f.render_widget(line, area);
-        if middle && room {
-            f.render_widget(
-                Paragraph::new(keys.clone()).alignment(Alignment::Right),
-                area,
-            );
-        }
-    }
+    header(app, f, areas.header);
     match app.view {
         View::Accounts => accounts_view(app, f, areas.body),
         // The pane stays blank under the card, which is the preview then.
@@ -249,25 +211,55 @@ const PRIVATE: Style = Style::new()
     .bg(Color::Yellow)
     .add_modifier(Modifier::BOLD);
 
-fn header(app: &App) -> Line<'static> {
-    let mut spans = vec![Span::styled(" remuda ", BOLD)];
+fn header(app: &App, f: &mut Frame, area: Rect) {
+    let mut brand = Line::from(Span::styled(" remuda ", BOLD));
     if app.private {
-        spans.push(Span::styled(" PRIVATE ", PRIVATE));
-        spans.push(Span::raw(" "));
+        brand.spans.push(Span::styled(" PRIVATE ", PRIVATE));
+        brand.spans.push(Span::raw(" "));
     }
+    let mut nav = Line::default();
     if app.mode == Mode::PickForRun {
-        spans.push(Span::raw(" run: pick an account "));
-        return Line::from(spans);
+        nav.spans.push(Span::raw(" run: pick an account "));
+    } else {
+        for (i, view) in View::ALL.iter().enumerate() {
+            let label = format!(" {} {} ", i + 1, view.title());
+            nav.spans.push(if *view == app.view {
+                Span::styled(label, SELECTED)
+            } else {
+                Span::raw(label)
+            });
+        }
     }
-    for (i, view) in View::ALL.iter().enumerate() {
-        let label = format!(" {} {} ", i + 1, view.title());
-        spans.push(if *view == app.view {
-            Span::styled(label, SELECTED)
-        } else {
-            Span::raw(label)
-        });
+
+    let mut line = area;
+    if area.height > 1 {
+        // The mark's two tracks become an open frame, not a taller navigation block.
+        // Keep the frame content-sized; the help hints sit outside it.
+        let width = nav
+            .width()
+            .max(brand.width())
+            .min(area.width.saturating_sub(3) as usize);
+        let tail = "─".repeat(width.saturating_sub(brand.width()));
+        brand.spans.insert(0, Span::styled(" ╭─", DIM));
+        brand.spans.push(Span::styled(tail, DIM));
+        f.render_widget(brand, Rect::new(area.x, area.y, area.width, 1));
+        f.render_widget(
+            Line::styled(format!(" │╰{}", "─".repeat(width)), DIM),
+            Rect::new(area.x, area.y + 2, area.width, 1),
+        );
+        nav.spans.insert(0, Span::styled(" ││", DIM));
+        line = Rect::new(area.x, area.y + 1, area.width, 1);
+    } else {
+        brand.spans.extend(nav.spans);
+        nav = brand;
     }
-    Line::from(spans)
+    let keys = Line::styled("?: help · q: quit ", DIM);
+    // Navigation wins when there is not enough room for the hints too.
+    let room = nav.width() + keys.width() <= line.width as usize;
+    f.render_widget(nav, line);
+    if room {
+        f.render_widget(Paragraph::new(keys).alignment(Alignment::Right), line);
+    }
 }
 
 fn index_status(app: &App) -> Span<'static> {

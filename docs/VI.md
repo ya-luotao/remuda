@@ -19,6 +19,11 @@ Use simple geometry, neutral backgrounds, and small lime accents. Write **Remuda
 - Use Ink on light backgrounds and the reversed Paper version on dark backgrounds. Do not stretch, rotate, add shadows, or change the track spacing.
 - SVGs are editable masters. Wordmark letters are converted to paths, so no font installation is required.
 
+The tall TUI header adapts the two-track motif into a frame around single-line navigation,
+open on the right. The wordmark sits in the upper rail; the left tracks and lower rail wrap the
+tabs without enlarging their selection background. This terminal treatment does not change the
+logo assets above.
+
 ## Colors
 
 | Color | sRGB | Use |
