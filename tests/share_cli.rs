@@ -271,8 +271,7 @@ fn a_linked_projects_gets_the_memory_variable() {
             .assert()
             .success()
             .stderr(predicate::str::contains(format!(
-                "remuda: {option} given: {MEMORY_DIR_VAR} is not set for this session, so \
-                 memory is written through the projects link"
+                "remuda: {option} given: {MEMORY_DIR_VAR} is not set for this session\n"
             )));
         let inv = s.sb.only_invocation();
         assert_eq!(inv.memory_dir, None, "{form:?}");

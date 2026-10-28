@@ -817,7 +817,12 @@ appeared in no `history.jsonl`.
     authentication settings (R18) is not an item to link: the notice says instead, while the
     home has no `settings.json`, that the file is not shared, naming the keys and never their
     values, and that the account needs one of its own; a home that has its own hears nothing
-    of it. This is a notice that the account does not share those items, not an error.
+    of it. One that cannot be read as a JSON object is not an item to link either (`setup`
+    leaves it out the same way, R18): the notice says instead that the file is not shared
+    and why, whether or not the home has a `settings.json` of its own, and asks nothing of
+    the account: the file is the source's to fix, and the source's account card shows the
+    problem (R22). This is a notice that the account does not share those items, not an
+    error.
   - The source's `installed_plugins.json` records an `installPath` under `<home>/plugins/` (the
     home's path as registered) while the home's `plugins` resolves to the source's: that link
     cannot be removed without breaking those plugins for every account. The message gives
@@ -1199,7 +1204,8 @@ more; what is there can be deleted by hand.
   TUI launch's warnings, naming the settings and never their values: `warning: <account> reads
   the authentication settings of <source> through its settings.json link: <keys>`. For this
   the source's `settings.json` is read at every such launch; a file that cannot be read is not
-  reported there (R11 reports it) and does not fail the launch. The credentials of a login are
+  reported there (the source's account card is where it shows, R22) and does not fail the
+  launch. The credentials of a login are
   not settings: they are in the Keychain, or in the home's `.credentials.json`, which is never
   linked. Settings that should apply to one account only, authentication among them, belong
   outside the source's `settings.json`: in a home that does not link it (one with a
@@ -1241,8 +1247,10 @@ more; what is there can be deleted by hand.
   too. remuda creates nothing: claude makes the directories when it first writes.
   - Not set when the user passes `--settings` or `--setting-sources` (either form): remuda does
     not know whether they choose `autoMemoryDirectory`, so the user decides, and a notice on
-    stderr, or among the TUI launch's warnings, says the variable is not set and memory is
-    written through the link. Not set when the user set the variable themselves: it is theirs,
+    stderr, or among the TUI launch's warnings, says the variable is not set (`<option> given:
+    CLAUDE_CODE_REMOTE_MEMORY_DIR is not set for this session`; where memory goes then is
+    the settings' business, so the notice does not say). Not set when the user set the
+    variable themselves: it is theirs,
     neither set nor removed, and nothing is said. Not set when a settings file chooses
     `autoMemoryDirectory` (the source's, the home's, or the project's `.claude/settings.json`
     and `.claude/settings.local.json`, read as R22 reads them): remuda does not know which of
@@ -1251,12 +1259,15 @@ more; what is there can be deleted by hand.
     whose `projects` is its own, for the source, an opted-out account, a codex account, or a
     call that is not a session (R6).
   - **A variable already in remuda's environment.** With the source's home as its value, it was
-    set by an outer remuda launch (a member's session that starts remuda again): it is decided
-    again for this launch, and removed from the child's environment when this launch does not
-    set it, so the source, an opted-out account, or a member whose `projects` is its own never
-    inherits it. With any other value it is the user's: remuda neither sets nor removes it. Not
-    covered: a `claude` started inside a member's session without remuda inherits the variable
-    and keeps its memory under the source's home.
+    set by an outer remuda launch (a member's session that starts remuda again): a session
+    launch of a claude account (R6) decides it again, and removes it from the child's
+    environment when it does not set it, so a session of the source, of an opted-out account,
+    or of a member whose `projects` is its own never inherits it. A launch that is not a
+    session of a claude account (a subcommand, `--help`, `--version`, a codex launch) changes
+    nothing about it: the environment passes through as it is. With any other value it is the
+    user's: remuda neither sets nor removes it. Not covered: a `claude` started inside a
+    member's session without remuda inherits the variable and keeps its memory under the
+    source's home.
   - Basis (verified on 2.1.286, `-p`, with an agent given by `--agents`, and again through
     `remuda run`): with the variable set, the agent's `MEMORY.md` and notes were written under
     `<dir>/agent-memory/<agent>/`, the home got no `agent-memory`, and auto-memory stayed in

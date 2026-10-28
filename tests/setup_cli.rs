@@ -476,15 +476,18 @@ fn setup_does_not_link_settings_it_cannot_read() {
     source_home(&source);
     fs::write(source.join("settings.json"), "[]").unwrap();
     sb.write_config("[share.claude]\nfrom = \"default\"\n");
+    let home = new_home(&sb, "work");
     sb.remuda()
         .args(["setup", "work"])
         .assert()
         .success()
-        .stderr(predicate::str::contains(
+        .stderr(predicate::str::contains(format!(
             "remuda: warning: settings.json not linked: that of claude:default cannot be read \
-             as a JSON object, so it cannot be checked for authentication settings\n",
-        ));
-    assert!(!names(&new_home(&sb, "work")).contains(&"settings.json".to_string()));
+             as a JSON object, so it cannot be checked for authentication settings; this \
+             account has no shared settings, so give {} a settings.json of its own\n",
+            home.display()
+        )));
+    assert!(!names(&home).contains(&"settings.json".to_string()));
     assert_eq!(stored(&sb).len(), 1);
 }
 

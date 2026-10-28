@@ -218,27 +218,30 @@ pub fn link_notes(plan: &Plan, linked: Option<&Linked>, paths: bool) -> Vec<Note
             ),
         });
     }
+    // Nothing stands in for the link: the account has no shared settings at all (R18). The
+    // command line names the home, the TUI's notice does not (R21).
+    let no_shared = format!(
+        "; this account has no shared settings, so give {} a {SETTINGS} of its own",
+        if paths {
+            plan.account.home.to_string()
+        } else {
+            "it".to_string()
+        }
+    );
     match &linked.settings {
-        // Nothing stands in for the link: the account has no shared settings at all (R18).
         Some(Unlinked::Authentication(keys)) => notes.push(Note {
             warning: true,
             text: format!(
                 "{SETTINGS} not linked: {source} sets authentication settings ({}), which stay \
-                 per account; this account has no shared settings, so give {} a {SETTINGS} \
-                 of its own",
-                keys.join(", "),
-                if paths {
-                    plan.account.home.to_string()
-                } else {
-                    "it".to_string()
-                }
+                 per account{no_shared}",
+                keys.join(", ")
             ),
         }),
         Some(Unlinked::Unreadable) => notes.push(Note {
             warning: true,
             text: format!(
                 "{SETTINGS} not linked: that of {source} cannot be read as a JSON object, so \
-                 it cannot be checked for authentication settings"
+                 it cannot be checked for authentication settings{no_shared}"
             ),
         }),
         None => {}
@@ -650,22 +653,34 @@ mod tests {
         assert_eq!(owned(&notes)[1..], rest("it"));
         assert!(notes.iter().all(|n| !n.text.contains('/')), "{notes:?}");
 
+        // A `settings.json` that cannot be read ends the same way: no shared settings, so
+        // the account needs its own; the command line names the home, the TUI does not.
         let one = Linked {
             linked: vec!["projects"],
             settings: Some(Unlinked::Unreadable),
             ..Linked::default()
         };
+        let unreadable = |home: &str| {
+            format!(
+                "settings.json not linked: that of claude:default cannot be read as a JSON \
+                 object, so it cannot be checked for authentication settings; this account has \
+                 no shared settings, so give {home} a settings.json of its own"
+            )
+        };
         assert_eq!(
-            texts(&link_notes(&plan, Some(&one), false)),
+            owned(&link_notes(&plan, Some(&one), false)),
             [
-                (false, "linked 1 item to claude:default: projects"),
                 (
-                    true,
-                    "settings.json not linked: that of claude:default cannot be read as a JSON \
-                     object, so it cannot be checked for authentication settings"
+                    false,
+                    "linked 1 item to claude:default: projects".to_string()
                 ),
-                (true, cleanup),
+                (true, unreadable("it")),
+                (true, cleanup.to_string()),
             ]
+        );
+        assert_eq!(
+            owned(&link_notes(&plan, Some(&one), true))[1],
+            (true, unreadable("/r/homes/claude/work"))
         );
         // Without a shared `projects` there is no shared store to clean up.
         let apart = Linked {

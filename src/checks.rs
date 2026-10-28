@@ -147,8 +147,9 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
 /// items of the source it does not link, with the link that would share each (a notice: an
 /// account whose `projects` is its own does not see the source's sessions, R16; a
 /// `settings.json` the source sets authentication in is not for linking, and the account
-/// needs one of its own); members whose `plugins` link the source's installs go through;
-/// members that read the source's authentication settings through a linked `settings.json`.
+/// needs one of its own; one that cannot be read as a JSON object is not either, and is the
+/// source's to fix); members whose `plugins` link the source's installs go through; members
+/// that read the source's authentication settings through a linked `settings.json`.
 pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check> {
     let mut checks = Vec::new();
     let Some(source) = &sharing.source else {
@@ -265,28 +266,31 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
         // What the home does not share, in one notice: the items, how to link one, and what
         // not having `projects` means (R16). `file-history` and `agent-memory` go with a
         // linked `projects` (above: the latter is shared by the launch where it is not said).
-        // A `settings.json` the source sets authentication in is not for linking (`setup`
-        // leaves it out, R18): the account needs one of its own, said while it has none.
+        // A `settings.json` of the source that is not for linking (`setup` leaves it out,
+        // R18) is left out of the list and said apart: one that sets authentication, while
+        // the home has none of its own, which then needs one; one that cannot be read as a
+        // JSON object, which is the source's to fix (its account card says so, R22).
+        let unreadable_settings = from.settings().is_err() && items.unlinked(Id::Settings);
         let own_settings = !withheld.is_empty() && items.unlinked(Id::Settings);
         let needs_own_settings =
             own_settings && fs::symlink_metadata(Id::Settings.at(&home)).is_err();
+        let settings_apart = needs_own_settings || unreadable_settings;
         let unlinked: Vec<&str> = items
             .unlinked_items()
             .filter(|item| {
                 !(projects_linked && matches!(item.id, Id::FileHistory | Id::AgentMemory))
             })
-            .filter(|item| !(own_settings && item.id == Id::Settings))
+            .filter(|item| !((own_settings || unreadable_settings) && item.id == Id::Settings))
             .map(|item| item.name)
             .collect();
-        let needs_own = |message: Marked| {
-            listed(
-                message.words(format!(
-                    "{settings_file} is not shared: that of {name} sets authentication \
-                     settings ("
-                )),
-                &withheld,
-            )
-            .words("), so this account needs one of its own")
+        let not_shared = |message: Marked| {
+            let message = message.words(format!("{settings_file} is not shared: that of {name} "));
+            if unreadable_settings {
+                message.words("cannot be read as a JSON object")
+            } else {
+                listed(message.words("sets authentication settings ("), &withheld)
+                    .words("), so this account needs one of its own")
+            }
         };
         if !unlinked.is_empty() {
             let mut message = say(format!(
@@ -304,17 +308,17 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
                 .path(format!("{}/<item>", from.home().display()))
                 .words(" ")
                 .path(format!("{}/<item>", home.display()));
-            if needs_own_settings {
-                message = needs_own(message.words("; "));
+            if settings_apart {
+                message = not_shared(message.words("; "));
             }
             checks.push(Check {
                 account: Some(account.qualified()),
                 message,
             });
-        } else if needs_own_settings {
+        } else if settings_apart {
             checks.push(Check {
                 account: Some(account.qualified()),
-                message: needs_own(Marked::default()),
+                message: not_shared(Marked::default()),
             });
         }
         // A plugin installed from a member's home is recorded through that home's `plugins`
@@ -1601,6 +1605,73 @@ mod tests {
                 "does not share settings.json, CLAUDE.md with claude:default; to share an \
                  item: ln -s <> <>"
             ]
+        );
+    }
+
+    /// R11, R18: a `settings.json` of the source that cannot be read as a JSON object is not
+    /// for linking either (`setup` leaves it out): the notice does not suggest the link, and
+    /// says instead that the file is not shared and why, with or without a `settings.json` of
+    /// the member's own; the file is the source's to fix (its account card reports it, R22),
+    /// so nothing is asked of the member.
+    #[test]
+    fn a_sources_settings_file_that_cannot_be_read_is_not_suggested_for_linking() {
+        let f = Root::new();
+        let native = f.root.join("home/.claude");
+        fs::write(native.join("settings.json"), "[]").unwrap();
+        let max = f.root.join("max");
+        fs::create_dir_all(&max).unwrap();
+        let accounts = vec![Account::default_for(CLAUDE), named("max", &max)];
+        let sharing = sharing_from(Account::default_for(CLAUDE));
+        let unreadable = (
+            Some("claude:max"),
+            "settings.json is not shared: that of claude:default cannot be read as a JSON \
+             object",
+        );
+        let got = sharing_checks(&accounts, &f.env, &sharing);
+        assert_eq!(messages(&got), [unreadable]);
+        assert_eq!(shapes(&got), [unreadable.1]);
+        assert!(
+            !got.iter()
+                .any(|c| c.account.as_deref() == Some("claude:default")),
+            "{got:?}"
+        );
+        // With other items not shared, the same notice carries it, after the link to make.
+        fs::write(native.join("CLAUDE.md"), "x").unwrap();
+        let got = sharing_checks(&accounts, &f.env, &sharing);
+        assert_eq!(
+            messages(&got),
+            [(
+                Some("claude:max"),
+                format!(
+                    "does not share CLAUDE.md with claude:default; to share an item: ln -s \
+                     {}/<item> {}/<item>; settings.json is not shared: that of claude:default \
+                     cannot be read as a JSON object",
+                    native.display(),
+                    max.display()
+                )
+                .as_str()
+            )]
+        );
+        // A `settings.json` of its own changes nothing: the source's file is still not one
+        // to link, and nothing is asked of this account.
+        fs::write(max.join("settings.json"), r#"{"model": "y"}"#).unwrap();
+        let got = sharing_checks(&accounts, &f.env, &sharing);
+        assert_eq!(
+            shapes(&got),
+            [
+                "does not share CLAUDE.md with claude:default; to share an item: ln -s <> <>; \
+                 settings.json is not shared: that of claude:default cannot be read as a JSON \
+                 object"
+            ]
+        );
+        assert!(!got[0].message.contains("needs one of its own"), "{got:?}");
+        // One that cannot be read at all (a directory) is treated the same way.
+        fs::remove_file(native.join("settings.json")).unwrap();
+        fs::create_dir(native.join("settings.json")).unwrap();
+        let got = sharing_checks(&accounts, &f.env, &sharing);
+        assert!(
+            got[0].message.ends_with(unreadable.1) && !got[0].message.contains("settings.json,"),
+            "{got:?}"
         );
     }
 

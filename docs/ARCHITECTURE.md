@@ -159,7 +159,8 @@ cannot differ between them (R6, R16, R18).
         ├─ env_change      CLAUDE_CONFIG_DIR=<home, byte-for-byte>  (or unset for default)
         ├─ classify(args)  NewSession │ Fork{of} │ Existing{id} │ NotASession
         ├─ share::at_launch   only for sessions of claude members of [share.claude]:
-        │     ├─ share::plan      reads the links, three settings files at most (no writes)
+        │     ├─ share::plan      reads the links and at most five settings files (the
+        │     │                   source's, the home's, the project's three); no writes
         │     └─ Plan::shared     CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home> for a linked
         │                         projects (or its removal), the notices
         └─ record          LaunchRecord { ts, account, cwd, args, session_id, fork_of }

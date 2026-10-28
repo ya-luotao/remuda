@@ -755,10 +755,7 @@ fn tui_launches_get_shared_configuration() {
     };
     assert_eq!(
         warnings,
-        &[
-            "--settings given: CLAUDE_CODE_REMOTE_MEMORY_DIR is not set for this session, so \
-           memory is written through the projects link"
-        ]
+        &["--settings given: CLAUDE_CODE_REMOTE_MEMORY_DIR is not set for this session"]
     );
     let inv = sb.only_invocation();
     assert_eq!(inv.args[..2], ["--settings", "/x.json"]);

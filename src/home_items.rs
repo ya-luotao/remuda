@@ -257,11 +257,6 @@ impl Relations {
         self.get(id) == Relation::Unlinked
     }
 
-    /// The source has the item to share, whether or not the home links it.
-    pub fn source_has(&self, id: Id) -> bool {
-        self.get(id) != Relation::Absent
-    }
-
     /// The items the source has that the home does not reach ([`Relations::unlinked`]), in
     /// the catalog's order: what the home does not share (R11).
     pub fn unlinked_items(&self) -> impl Iterator<Item = &'static Item> {
@@ -303,14 +298,6 @@ impl Source {
         self.settings
             .get_or_init(|| share::read_settings(&Id::Settings.at(&self.home)))
             .as_ref()
-    }
-
-    /// [`Source::settings`] with its error as it was raised, for a launch that fails on it.
-    pub fn into_settings(self) -> anyhow::Result<Map<String, Value>> {
-        let path = Id::Settings.at(&self.home);
-        self.settings
-            .into_inner()
-            .unwrap_or_else(|| share::read_settings(&path))
     }
 
     /// The authentication settings of the source, as `key` or `env.NAME` (R18): what keeps
@@ -649,7 +636,6 @@ mod tests {
             assert_eq!(got.get(id), relation, "{id:?}");
             assert_eq!(got.linked(id), relation == Relation::Linked, "{id:?}");
             assert_eq!(got.unlinked(id), relation == Relation::Unlinked, "{id:?}");
-            assert_eq!(got.source_has(id), relation != Relation::Absent, "{id:?}");
         }
         // Nothing is the source's for a home that is the source's own directory by another
         // path: every item it has resolves to itself.
@@ -872,8 +858,8 @@ mod tests {
     }
 
     /// R11, R18: the source's settings are read once and its authentication settings named
-    /// from that read; a file that cannot be read names none, and a launch gets the error of
-    /// the read itself.
+    /// from that read; a file that cannot be read names none, and the error is the read's
+    /// own.
     #[test]
     fn the_sources_settings_are_read_once() {
         let f = Root::new();
@@ -885,21 +871,20 @@ mod tests {
         assert_eq!(source.withheld(), ["apiKeyHelper", "env.AWS_PROFILE"]);
         fs::write(home.join("settings.json"), "{}").unwrap();
         assert_eq!(source.withheld(), ["apiKeyHelper", "env.AWS_PROFILE"]);
-        assert!(source.into_settings().unwrap().contains_key("model"));
+        assert!(source.settings().unwrap().contains_key("model"));
         // Not asked before: read now.
         assert_eq!(
-            Source::at(&home).into_settings().unwrap(),
-            Map::new(),
+            Source::at(&home).settings().unwrap(),
+            &Map::new(),
             "the file as it is now"
         );
 
         fs::write(home.join("settings.json"), "[]").unwrap();
         let source = Source::at(&home);
         assert_eq!(source.withheld(), Vec::<String>::new());
-        assert!(source.settings().is_err());
         let direct = share::read_settings(&home.join("settings.json")).unwrap_err();
         assert_eq!(
-            format!("{:#}", source.into_settings().unwrap_err()),
+            format!("{:#}", source.settings().unwrap_err()),
             format!("{direct:#}")
         );
         // No file: empty settings, not an error.

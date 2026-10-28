@@ -108,7 +108,8 @@ pub fn at_launch(
 
 /// What `account` gets from the source of `sharing` for a session launched with `user_args`
 /// in `cwd` (R18, R22), decided by reading only; it cannot fail: a settings file that cannot
-/// be read chooses nothing (R11 reports it).
+/// be read chooses nothing (the source's or the home's own is reported by that account's
+/// card, R22; a project's counts as absent).
 pub fn plan(
     sharing: &Sharing,
     account: &Account,
@@ -141,7 +142,7 @@ pub fn plan(
 
     // A home that links the source's `settings.json` reads all of it, authentication
     // included: its sessions are told (R11 says it too). A file that cannot be read says
-    // nothing here: R11 reports it.
+    // nothing here: the source's account card reports it (R22).
     if plan.items.linked(Id::Settings) {
         let keys = source.withheld();
         if !keys.is_empty() {
@@ -173,8 +174,7 @@ pub fn plan(
     });
     if let Some(option) = user_settings {
         plan.notices.push(format!(
-            "{option} given: {MEMORY_DIR_VAR} is not set for this session, so memory is \
-             written through the projects link"
+            "{option} given: {MEMORY_DIR_VAR} is not set for this session"
         ));
         return plan;
     }
@@ -1275,7 +1275,8 @@ mod tests {
         );
         // `team` keeps its own settings: nothing to say.
         assert_eq!(notices(&team, "team"), Vec::<String>::new());
-        // A file that cannot be read is R11's to report, and a fully linked home still starts.
+        // A file that cannot be read is the source's account card's to report (R22), and a
+        // fully linked home still starts.
         fs::write(&settings, "[]").unwrap();
         assert_eq!(notices(&max, "max"), Vec::<String>::new());
     }
@@ -1536,8 +1537,7 @@ mod tests {
         // The user's own settings: remuda does not know whether they choose the location.
         let notice = |option: &str| {
             vec![format!(
-                "{option} given: {MEMORY_DIR_VAR} is not set for this session, so memory is \
-                 written through the projects link"
+                "{option} given: {MEMORY_DIR_VAR} is not set for this session"
             )]
         };
         assert_eq!(
