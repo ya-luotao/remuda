@@ -490,7 +490,6 @@ fn a_pick_table_is_a_load_error_for_every_command() {
             &["list"][..],
             &["usage"],
             &["usage", "max", "--live"],
-            &["usage", "--history"],
             &["sessions"],
             &["stats"],
             &["run", "max", "-p", "hi"],

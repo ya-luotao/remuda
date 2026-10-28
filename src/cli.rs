@@ -17,7 +17,6 @@ use crate::index::{self, Index, RefreshStats};
 use crate::provider::Provider;
 use crate::registry::{self, Account, Home, Registry};
 use crate::stats::{self, By, Period};
-use crate::usage::history;
 use crate::{Env, owned, paths};
 use crate::{attribution, launch, live, probe, setup, text, transcript, tui, usage};
 
@@ -61,13 +60,6 @@ enum Command {
         /// Seconds to wait for each account's live query (claude scans local session history: 2-20 s; codex: about 1-2 s)
         #[arg(long, value_name = "SECONDS", default_value = "90", value_parser = parse_timeout)]
         timeout: Duration,
-        /// Show the recorded usage history (state/usage-history.jsonl) and each current window's pace instead
-        #[arg(long, conflicts_with = "live")]
-        history: bool,
-        /// With --history: how many days back
-        #[arg(long, value_name = "N", default_value = "7", requires = "history",
-              value_parser = clap::value_parser!(u32).range(1..=3650))]
-        days: u32,
     },
     /// Recent sessions, newest first: time, accounts, title, cwd
     Sessions {
@@ -85,10 +77,6 @@ enum Command {
         /// Sections by `account`, or by `project`: the directory each session started in
         #[arg(long, value_name = "SECTIONS", default_value = "account", value_parser = parse_by)]
         by: By,
-        /// Print every request of the period as CSV instead, one line each (for reconciling
-        /// with a bill); exit 1 when the report is incomplete
-        #[arg(long, conflicts_with = "by")]
-        csv: bool,
     },
     /// Create a new home under $REMUDA_HOME/homes/<provider>/<name>, register it and log in;
     /// with [share.claude], a claude home is first linked to the source's
@@ -180,19 +168,13 @@ fn dispatch(cli: Cli, ctx: &Context) -> Result<ExitCode> {
             account,
             live,
             timeout,
-            history,
-            days,
-        }) => match history {
-            true => usage_history(&config, account, days, ctx),
-            false => usage(&config, account, live, timeout, ctx),
-        },
+        }) => usage(&config, account, live, timeout, ctx),
         Some(Command::Sessions { limit }) => sessions(&config, limit, ctx),
         Some(Command::Stats {
             account,
             period,
             by,
-            csv,
-        }) => stats(&config, account, period, (!csv).then_some(by), ctx),
+        }) => stats(&config, account, period, by, ctx),
         Some(Command::Setup {
             provider,
             name,
@@ -412,7 +394,6 @@ fn usage(
         Some(reference) => vec![registry.resolve(&reference)?],
         None => registry.all(&ctx.env),
     };
-    let mut points = Vec::new();
     let reports: Vec<(String, bool)> = if live {
         // A missing claude fails the whole command; a missing codex, each codex account (R10).
         let claude = match accounts.iter().any(|a| a.provider == Provider::Claude) {
@@ -424,27 +405,14 @@ fn usage(
             claude: claude.as_deref(),
             codex: codex.as_deref(),
         };
-        let answers = probe::parallel(&accounts, |account| {
-            let (text, ok, reading) =
-                usage::live_attempt(account, &agents, &ctx.tz, ctx.clock, timeout);
-            // Only usage that was told: not a failure, nor an answer without it (R24).
-            (text, ok, recorded(account, reading.as_ref()))
-        });
-        answers
-            .into_iter()
-            .map(|(text, ok, mut more)| {
-                points.append(&mut more);
-                (text, ok)
-            })
-            .collect()
+        probe::parallel(&accounts, |account| {
+            usage::live_report(account, &agents, &ctx.tz, ctx.clock, timeout)
+        })
     } else {
-        let (reports, mut more) = cached_reports(&accounts, ctx);
-        points.append(&mut more);
-        reports
+        cached_reports(&accounts, ctx)
     };
     let text: Vec<&str> = reports.iter().map(|(text, _)| text.as_str()).collect();
     print!("{}", text.join("\n"));
-    record(config, points, ctx);
     Ok(if reports.iter().all(|(_, ok)| *ok) {
         ExitCode::SUCCESS
     } else {
@@ -452,67 +420,17 @@ fn usage(
     })
 }
 
-/// `remuda usage`'s reports of cached usage, and the points they record (R10, R24). Each
-/// account's cache is read, then read at the time after that (`ctx.clock`), not when the
-/// command started: a window whose reset fell in between has reset since, and neither its old
-/// percentage nor a note about a reset already passed is printed or recorded.
-fn cached_reports(
-    accounts: &[Account],
-    ctx: &Context,
-) -> (Vec<(String, bool)>, Vec<history::Point>) {
-    let mut points = Vec::new();
-    let reports = accounts
+/// `remuda usage`'s reports of cached usage (R10). Each account's cache is read, then read at
+/// the time after that (`ctx.clock`), not when the command started: a window whose reset fell
+/// in between has reset since, and neither its old percentage nor a note about it is printed.
+fn cached_reports(accounts: &[Account], ctx: &Context) -> Vec<(String, bool)> {
+    accounts
         .iter()
         .map(|account| {
-            let (text, reading) = usage::cached_attempt(account, &ctx.env, &ctx.tz, ctx.clock);
-            points.extend(recorded(account, reading.as_ref()));
+            let text = usage::cached_report(account, &ctx.env, &ctx.tz, ctx.clock);
             (text, true)
         })
-        .collect();
-    (reports, points)
-}
-
-/// The points of `account`'s `reading` for the usage history (R24); none without one.
-fn recorded(account: &Account, reading: Option<&usage::Reading>) -> Vec<history::Point> {
-    reading.map_or_else(Vec::new, |r| history::points(&account.qualified(), r))
-}
-
-/// Records `points` in the usage history, compacting it, as `remuda usage` does (R24): once
-/// what they come from has been printed, since the lock may be waited for. The history is a
-/// by-product: what keeps it from being written is not told.
-fn record(config: &Path, points: Vec<history::Point>, ctx: &Context) {
-    let state = owned::state_dir(config);
-    let _ = history::record(&state, points, (ctx.clock)(), true, &owned::Flock);
-}
-
-/// `remuda usage --history` (R24): what the history records for each account, or for one,
-/// over the last `days` days. Records nothing itself.
-fn usage_history(
-    config: &Path,
-    account: Option<String>,
-    days: u32,
-    ctx: &Context,
-) -> Result<ExitCode> {
-    let registry = Registry::load(config)?;
-    let accounts = match account {
-        Some(reference) => vec![registry.resolve(&reference)?],
-        None => registry.all(&ctx.env),
-    };
-    let path = owned::usage_history(&owned::state_dir(config));
-    let points = match history::load(&path) {
-        Ok(Some(points)) => points,
-        Ok(None) => {
-            println!("no usage history yet ({})", path.display());
-            return Ok(ExitCode::SUCCESS);
-        }
-        Err(e) => bail!("cannot read {}: {e:#}", path.display()),
-    };
-    let names: Vec<String> = accounts.iter().map(Account::qualified).collect();
-    print!(
-        "{}",
-        history::report(&points, &names, days, ctx.now, &ctx.tz)
-    );
-    Ok(ExitCode::SUCCESS)
+        .collect()
 }
 
 /// Titles wider than this (in display columns) are shortened in `remuda sessions`.
@@ -689,13 +607,13 @@ fn sessions(config: &Path, limit: usize, ctx: &Context) -> Result<ExitCode> {
 
 /// `remuda stats`: the statistics cache (`state/stats.json`) brought up to date and saved when
 /// it changed (a failed save is a warning), attribution without live sessions, then one
-/// period's table with sections `by` accounts or projects, only of `account` if given, or with
-/// `by` `None`, its requests as CSV (R5, R20). Runs no agent.
+/// period's table with sections `by` accounts or projects, only of `account` if given (R5,
+/// R20). Runs no agent.
 fn stats(
     config: &Path,
     account: Option<String>,
     period: Period,
-    by: Option<By>,
+    by: By,
     ctx: &Context,
 ) -> Result<ExitCode> {
     let registry = Registry::load(config)?;
@@ -723,19 +641,6 @@ fn stats(
     let attribution = attribution::collect(&accounts, &ctx.env, &owned::launch_log(&state), &[]);
     let incomplete = unreadable_lines(&refreshed, "transcript", "counted as last read");
     let filter = filter.as_deref();
-    let Some(by) = by else {
-        let counted = stats::requests(&cache, &sources, &attribution, &accounts, &registry.prices);
-        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-        stats::csv(&mut out, &counted, period, ctx.now, &ctx.tz, filter)?;
-        // A line of prose would break the CSV: the exit status says it is incomplete (R20).
-        for line in &incomplete {
-            eprintln!("Incomplete: {line}");
-        }
-        return Ok(match incomplete.is_empty() {
-            true => ExitCode::SUCCESS,
-            false => ExitCode::FAILURE,
-        });
-    };
     let text = match by {
         By::Account => {
             let report = stats::report(
@@ -938,9 +843,9 @@ fn parse_timeout(s: &str) -> std::result::Result<Duration, String> {
 mod tests {
     use super::*;
 
-    /// R10, R24 (PR review): cached usage is read at the time it was read, not when the command
+    /// R10 (PR review): cached usage is read at the time it was read, not when the command
     /// started: a window whose reset falls between the two has reset since. Its old percentage
-    /// is neither printed nor recorded, and no note of a reset already passed is printed.
+    /// is not printed, and no note of a reset already passed is printed.
     #[test]
     fn cached_usage_is_read_when_it_was_read_not_when_remuda_started() {
         let dir = tempfile::tempdir().unwrap();
@@ -978,15 +883,15 @@ mod tests {
             stdout_is_tty: false,
             stderr_is_tty: false,
         };
-        let (reports, points) = cached_reports(std::slice::from_ref(&max), &ctx);
+        let reports = cached_reports(std::slice::from_ref(&max), &ctx);
         let [(text, true)] = reports.as_slice() else {
             panic!("{reports:?}")
         };
         assert!(text.contains("reset since cached (Oct 8 11:00)"), "{text}");
         assert!(!text.contains("34%") && !text.contains("note:"), "{text}");
-        let labels: Vec<&str> = points.iter().map(|p| p.label.as_str()).collect();
-        assert_eq!(labels, ["Week (all models)"]);
-        assert_eq!(points[0].ts, fetched);
+        // The week, ahead, as recorded; the age, as of the time after the read too.
+        assert!(text.contains("Week (all models)  77%"), "{text}");
+        assert!(text.contains("cached 1h ago (Oct 8 10:00)"), "{text}");
     }
 
     /// R16: the account chosen in the picker of `remuda run` is launched only if the registry

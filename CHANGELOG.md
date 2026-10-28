@@ -57,6 +57,14 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 - The configuration pane of the Accounts view (beside the view from 120 columns, below the table
   otherwise, then the whole view on a second `p`) is replaced by the account card above; `Esc`
   closes the card in one step, and switching views closes it too (SPEC R22).
+- The pace of a usage window moves from `remuda usage --history` into `remuda usage` (cached
+  and `--live`), as a note under a window that is on pace to be used up before its reset:
+  `note: at this pace 100% by Oct 30 10:55, 2h05m before the reset`. It is worked out from the
+  current reading alone, for a window of known length (codex's minutes, else its label) whose
+  reset is ahead, with at least 25% and less than 100% used, ahead of an even pace, and only
+  while the time it would reach 100% is still ahead and at least a minute before the reset. A
+  cache that does not say when it was written gets none, and the TUI shows no such note
+  (SPEC R10).
 
 ### Removed
 
@@ -73,6 +81,17 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   Scripts that used `remuda pick` or `remuda usage --wait` must choose the account themselves,
   for example from `remuda usage`. `TYPESAFE_API_KEY` is unused and can be removed from your
   setup.
+- **Breaking:** the usage history, `remuda usage --history` and `--days`, and
+  `remuda stats --csv` (SPEC R3, R5, R10, R13, R16, R20, R24). `remuda usage` and the TUI no longer
+  record what they read in `state/usage-history.jsonl`, nothing reads that file any more, and
+  leaving the TUI no longer waits up to 2 seconds for recordings. `--history`, `--days` and
+  `--csv` are now unexpected arguments (exit 2). Remuda does not delete an existing history:
+  the file stays in `state/`, unused.
+  **Migration:** delete `$REMUDA_HOME/state/usage-history.jsonl` (by default
+  `~/.remuda/state/usage-history.jsonl`) by hand; nothing needs it. For the pace of a window,
+  read the note `remuda usage` now prints (see **Changed**). Scripts that read
+  `remuda stats --csv` must read the text report of `remuda stats [--by project]` instead,
+  which has no line per request.
 
 ## [0.3.0] - 2026-10-13
 

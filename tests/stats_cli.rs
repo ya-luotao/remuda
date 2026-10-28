@@ -1,5 +1,4 @@
-//! R5, R20: `remuda stats [<account>] [--period today|7d|30d|all] [--by account|project |
-//! --csv]`.
+//! R5, R20: `remuda stats [<account>] [--period today|7d|30d|all] [--by account|project]`.
 
 mod common;
 
@@ -1111,96 +1110,28 @@ fn stats_by_project_for_one_account() {
     assert_eq!(labels(&out), Vec::<&str>::new(), "{out}");
 }
 
-/// R5, R20 **CSV**: one line per request counted, by time (none last), with its accounts,
-/// session, project and exact cost (empty when not priced; claude records no reasoning);
-/// fields quoted as RFC 4180 has it. The costs add up to the text report's.
+/// R5, R20: `stats --csv` was removed on 2026-10-28: unknown to clap, it is a usage error
+/// (exit 2) that reads no transcript and writes nothing, whatever it is given with. A `--by`
+/// that names no sections is one too.
 #[test]
-fn stats_csv() {
+fn stats_has_no_csv_option() {
     let s = setup();
     project_fixtures(&s);
-    let out = s.sb.remuda().args(["stats", "--csv"]).assert().success();
-    let out = out.get_output();
-    let csv = String::from_utf8(out.stdout.clone()).unwrap();
-    let expected = [
-        "timestamp,provider,accounts,session_id,project,model,input,cache_read,cache_write_5m,\
-         cache_write_1h,output,reasoning,fast,us_only,cost_usd"
-            .to_string(),
-        format!(
-            "2026-09-20T10:00:00Z,claude,claude:team,{S_T},/w/alpha/,claude-test,\
-             11,0,0,0,11,,false,false,0.198000000011"
-        ),
-        format!(
-            "2026-09-20T10:01:00Z,claude,claude:default,{S_A},/w/alpha,claude-test,\
-             100,0,0,0,100,,false,false,1.8000000001"
-        ),
-        format!(
-            "2026-09-20T10:02:00Z,claude,claude:max,{S_B},\"/w/b, \"\"q\"\"\",claude-test,\
-             20,0,0,0,20,,false,false,0.36000000002"
-        ),
-        format!(
-            "2026-09-20T10:03:00Z,claude,claude:default,{S_A},/w/alpha,claude-test,\
-             1,0,0,0,1,,false,false,0.018000000001"
-        ),
-        format!(
-            "2026-09-20T10:04:00Z,claude,claude:default + claude:max,{S_M},/w/alpha,\
-             claude-test,5,0,0,0,5,,false,false,0.090000000005"
-        ),
-        format!("2026-09-20T10:05:00Z,claude,,{S_U},,claude-nope,10,0,0,0,10,,false,false,"),
-        format!(",claude,,{S_U},,claude-nope,1,0,0,0,1,,false,false,"),
-    ]
-    .map(|l| l + "\n")
-    .concat();
-    assert_eq!(csv, expected);
-    // Progress goes to stderr, as for the text report; nothing else does.
-    assert!(
-        !String::from_utf8_lossy(&out.stderr).contains("Incomplete"),
-        "{:?}",
-        out.stderr
-    );
-
-    // The exact costs add up to the overall cost of the text report: 2,466,000,000,137
-    // picodollars, shown as $2.47.
-    let pico: u128 = csv
-        .lines()
-        .skip(1)
-        .filter_map(|l| l.rsplit(',').next().filter(|c| !c.is_empty()))
-        .map(|c| {
-            let (whole, frac) = c.split_once('.').unwrap_or((c, ""));
-            whole.parse::<u128>().unwrap() * 1_000_000_000_000
-                + format!("{frac:0<12}").parse::<u128>().unwrap()
-        })
-        .sum();
-    assert_eq!(pico, 2_466_000_000_137);
-    assert_eq!(
-        block(&stats(&s.sb, &[]), "overall")[0],
-        "claude-test 137 0 0 137 - 274 $2.47"
-    );
-
-    // With an account and a period, like the text report.
-    let max = stats(&s.sb, &["--csv", "max"]);
-    let sessions: Vec<&str> = max
-        .lines()
-        .skip(1)
-        .map(|l| l.split(',').nth(3).unwrap())
-        .collect();
-    assert_eq!(sessions, [S_B, S_M]);
-    assert_eq!(
-        stats(&s.sb, &["--csv", "--period", "today"]),
-        format!("{}\n", expected.lines().next().unwrap())
-    );
-}
-
-/// R5: `--csv` lists requests, not sections: it goes with no `--by`.
-#[test]
-fn stats_csv_and_by_conflict() {
-    let s = setup();
-    for by in ["account", "project"] {
+    for args in [
+        &["stats", "--csv"][..],
+        &["stats", "max", "--csv"],
+        &["stats", "--csv", "--period", "today"],
+        &["stats", "--period", "7d", "--csv", "max"],
+        &["stats", "--by", "project", "--csv"],
+    ] {
         s.sb.remuda()
-            .args(["stats", "--csv", "--by", by])
+            .args(args)
             .assert()
             .code(2)
-            .stderr(predicates::str::contains("cannot be used with"));
+            .stdout("")
+            .stderr(predicates::str::contains("unexpected argument '--csv'"));
     }
+    assert!(!s.sb.remuda_home().join("state").exists());
     s.sb.remuda()
         .args(["stats", "--by", "team"])
         .assert()
@@ -1208,33 +1139,37 @@ fn stats_csv_and_by_conflict() {
         .stderr(predicates::str::contains("expected account or project"));
 }
 
-/// R20 **CSV**: an incomplete report keeps stdout pure CSV: the `Incomplete:` line goes to
-/// stderr and the exit status is 1. The text report is unchanged: the line on stdout, exit 0.
+/// R20 **Command**: by project too, a report from a store that cannot be read says so in a
+/// line on stdout after the table, naming the store and what is counted as last read below
+/// it, and exits 0.
 #[test]
-fn stats_csv_says_on_stderr_and_by_its_exit_status_that_it_is_incomplete() {
+fn stats_by_project_says_on_stdout_that_it_is_incomplete() {
     let s = setup();
     project_fixtures(&s);
-    let complete = stats(&s.sb, &["--csv"]);
+    let complete = stats(&s.sb, &["--by", "project"]);
     let store = s.native.canonicalize().unwrap();
     fs::set_permissions(&store, fs::Permissions::from_mode(0o000)).unwrap();
-    let out = s.sb.remuda().args(["stats", "--csv"]).assert().code(1);
-    let by_project =
+    let out =
         s.sb.remuda()
             .args(["stats", "--by", "project"])
             .assert()
-            .success();
+            .success()
+            .get_output()
+            .clone();
     fs::set_permissions(&store, fs::Permissions::from_mode(0o755)).unwrap();
-    let out = out.get_output();
-    assert_eq!(String::from_utf8(out.stdout.clone()).unwrap(), complete);
-    let stderr = String::from_utf8(out.stderr.clone()).unwrap();
-    let said = format!("Incomplete: cannot read {}: ", store.display());
-    assert!(stderr.starts_with(&said), "{stderr}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let line = stdout
+        .strip_prefix(complete.as_str())
+        .unwrap_or_else(|| panic!("the same report, then the line:\n{stdout}"));
     assert!(
-        stderr.ends_with("; 4 transcripts below it are counted as last read\n"),
-        "{stderr}"
+        line.starts_with(&format!("Incomplete: cannot read {}: ", store.display())),
+        "{line}"
     );
-    let text = String::from_utf8(by_project.get_output().stdout.clone()).unwrap();
-    assert!(text.lines().last().unwrap().starts_with(&said), "{text}");
+    assert!(
+        line.ends_with("; 4 transcripts below it are counted as last read\n"),
+        "{line}"
+    );
+    assert_eq!(line.lines().count(), 1, "{line}");
 }
 
 /// R20 **Cache**: a cache of schema 3 has no project directories, and files it holds would be
@@ -1260,8 +1195,8 @@ fn a_cache_of_schema_3_is_rebuilt_for_the_projects() {
 /// R20 **Cache**, **Projects** (critic review 2 of #26): a cache of schema 4, written before a
 /// subagent's rollout stopped taking its fork parent's `session_meta` for its project, holds
 /// that project for a file that has not changed, and would hand it on to a file read on from
-/// its offset. It is rebuilt: run as it is, then once the rollout grew, the CSV is what a
-/// whole read gives.
+/// its offset. It is rebuilt: run as it is, then once the rollout grew, the report by project
+/// is what a whole read gives.
 #[test]
 fn a_cache_of_schema_4_with_the_parents_project_is_rebuilt() {
     let sb = Sandbox::new();
@@ -1281,13 +1216,9 @@ fn a_cache_of_schema_4_with_the_parents_project_is_rebuilt() {
         ]
         .concat(),
     );
-    let projects = |csv: &str| -> Vec<String> {
-        csv.lines()
-            .skip(1)
-            .map(|l| l.split(',').nth(4).unwrap().to_string())
-            .collect()
-    };
-    assert_eq!(projects(&stats(&sb, &["--csv"])), ["/w/turn"]);
+    let by_project = |sb: &Sandbox| stats(sb, &["--by", "project"]);
+    let first = by_project(&sb);
+    assert_eq!(labels(&first), ["/w/turn", "overall"]);
 
     // As the previous reading rule left it.
     let cache = sb.remuda_home().join("state/stats.json");
@@ -1300,16 +1231,17 @@ fn a_cache_of_schema_4_with_the_parents_project_is_rebuilt() {
         file.as_object_mut().unwrap().remove("codex_head");
     }
     fs::write(&cache, v.to_string()).unwrap();
-    assert_eq!(projects(&stats(&sb, &["--csv"])), ["/w/turn"], "unchanged");
+    assert_eq!(by_project(&sb), first, "unchanged");
 
     append(
         &rollout,
         &cx::tokens([250, 150, 30, 10], [150, 100, 20, 6], &cx::ts(3)),
     );
-    let grown = stats(&sb, &["--csv"]);
-    assert_eq!(projects(&grown), ["/w/turn", "/w/turn"], "grown");
+    let grown = by_project(&sb);
+    assert_eq!(labels(&grown), ["/w/turn", "overall"], "grown");
+    assert_ne!(grown, first, "the request read on is counted");
     fs::remove_file(&cache).unwrap();
-    assert_eq!(stats(&sb, &["--csv"]), grown, "as read whole");
+    assert_eq!(by_project(&sb), grown, "as read whole");
 }
 
 /// R20 **Cache**: a cache of schema 5 keyed a codex request by its total, so the first requests
@@ -1332,8 +1264,16 @@ fn a_cache_of_schema_5_keyed_by_totals_is_rebuilt() {
             .concat(),
         );
     }
-    let complete = stats(&sb, &["--csv"]);
-    assert_eq!(complete.lines().count(), 3, "{complete}");
+    // Twice the tokens of one request: 2 × 30,026.
+    let complete = stats(&sb, &[]);
+    assert_eq!(
+        block(&complete, "overall"),
+        [
+            "gpt-test 46K 13.8K 0 276 0 60.1K -",
+            "total 46K 13.8K 0 276 0 60.1K -"
+        ],
+        "{complete}"
+    );
 
     // As the previous keying rule left it: one key for both.
     let cache = sb.remuda_home().join("state/stats.json");
@@ -1346,47 +1286,7 @@ fn a_cache_of_schema_5_keyed_by_totals_is_rebuilt() {
         file.as_object_mut().unwrap().remove("codex_record");
     }
     fs::write(&cache, v.to_string()).unwrap();
-    assert_eq!(stats(&sb, &["--csv"]), complete);
+    assert_eq!(stats(&sb, &[]), complete);
     let v: Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
     assert_eq!(v["schema_version"], remuda::stats::SCHEMA_VERSION);
-}
-
-/// R20 **Codex**, **CSV** (critic review 1 of S4B): a request's time is its record's, to the
-/// second, before its event is written, after it is read in a later run, and read whole.
-#[test]
-fn stats_csv_codex_request_at_its_records_time() {
-    let sb = Sandbox::new();
-    let codex = sb.home().join(".codex");
-    let usage = [100, 50, 10, 4];
-    let rollout = cx::write_rollout(
-        &codex,
-        R1,
-        &[
-            cx::meta(R1, "/w/proj", json!("cli"), 0, &cx::ts(0)),
-            cx::model_turn("gpt-test", &cx::ts(1)),
-            cx::usage_record(
-                R1,
-                "resp_1",
-                cx::usage(usage),
-                cx::usage(usage),
-                "2026-09-20T10:02:59.900Z",
-            ),
-        ]
-        .concat(),
-    );
-    let times = |csv: &str| -> Vec<String> {
-        csv.lines()
-            .skip(1)
-            .map(|l| l.split(',').next().unwrap().to_string())
-            .collect()
-    };
-    assert_eq!(times(&stats(&sb, &["--csv"])), ["2026-09-20T10:02:59Z"]);
-    append(
-        &rollout,
-        &cx::tokens(usage, usage, "2026-09-20T10:47:01.000Z"),
-    );
-    let grown = stats(&sb, &["--csv"]);
-    assert_eq!(times(&grown), ["2026-09-20T10:02:59Z"], "{grown}");
-    fs::remove_file(sb.remuda_home().join("state/stats.json")).unwrap();
-    assert_eq!(stats(&sb, &["--csv"]), grown, "as read whole");
 }
