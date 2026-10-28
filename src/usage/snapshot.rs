@@ -1,8 +1,8 @@
-//! A usage snapshot read at an instant (SPEC R10, R23). A [`UsageRow`] is what an agent said at
-//! some time; what it means now depends on when it was said and on whether the window has reset
-//! since. [`Snapshot::at`] answers that once, for `remuda usage`, `remuda pick` and the TUI
-//! alike: each window's reset as an instant, whether it has passed, the
-//! percentage (unknown once it has), and the snapshot's age and staleness.
+//! A usage snapshot read at an instant (SPEC R10). A [`UsageRow`] is what an agent said at some
+//! time; what it means now depends on when it was said and on whether the window has reset
+//! since. [`Snapshot::at`] answers that once, for `remuda usage` and the TUI alike: each window's
+//! reset as an instant, whether it has passed, the percentage (unknown once it has), and the
+//! snapshot's age.
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -148,15 +148,6 @@ pub struct Reading {
 }
 
 impl Reading {
-    /// Older than `after_minutes`, or of unknown age; live usage never is (R23).
-    pub fn stale(&self, after_minutes: u32) -> bool {
-        match (self.source, self.age_seconds) {
-            (Source::Live, _) => false,
-            (Source::Cached, None) => true,
-            (Source::Cached, Some(age)) => age > i64::from(after_minutes) * 60,
-        }
-    }
-
     /// `5h ago`; `None` when the age is unknown.
     pub fn age_text(&self) -> Option<String> {
         self.age_seconds.map(format_ago)
@@ -475,7 +466,7 @@ mod tests {
         }
     }
 
-    /// R10, R23: a window whose reset fell after the usage was recorded is of unknown usage,
+    /// R10: a window whose reset fell after the usage was recorded is of unknown usage,
     /// not 0% used; one whose reset is still ahead reads as recorded, however old the data.
     #[test]
     fn a_reset_that_passed_since_the_usage_was_recorded_leaves_it_unknown() {
@@ -523,7 +514,7 @@ mod tests {
         assert!(Snapshot::cached(&undated).at(now).windows[0].reset_passed());
     }
 
-    /// R10, R23: a reset that was already behind when the usage was recorded says nothing: a
+    /// R10: a reset that was already behind when the usage was recorded says nothing: a
     /// live answer keeps its percentage, whatever its reset reads as.
     #[test]
     fn a_reset_behind_when_recorded_leaves_the_percentage() {
@@ -600,12 +591,12 @@ mod tests {
             Some(ts("2026-09-30T12:00:00Z"))
         );
         assert_eq!(later.age_seconds, Some(5 * 3600));
-        assert!(!later.stale(1), "live usage is never stale");
     }
 
-    /// R23: cached usage older than the given minutes, or of unknown age, is stale.
+    /// R10: a snapshot's age runs from the time it was recorded to the time it is read at; it
+    /// is unknown without a recorded time.
     #[test]
-    fn age_and_staleness() {
+    fn age() {
         let now = ts(NOW);
         let aged = |fetched_at: Option<&str>| {
             let cache = cached(fetched_at, Vec::new());
@@ -614,12 +605,8 @@ mod tests {
         let two_hours = aged(Some("2026-09-27T08:00:00Z"));
         assert_eq!(two_hours.age_seconds, Some(7200));
         assert_eq!(two_hours.age_text().as_deref(), Some("2h ago"));
-        assert!(!two_hours.stale(120), "exactly as old as allowed");
-        assert!(two_hours.stale(119));
-        assert!(aged(Some("2026-09-27T07:59:59Z")).stale(120));
         let unknown = aged(None);
         assert_eq!((unknown.age_seconds, unknown.age_text()), (None, None));
-        assert!(unknown.stale(u32::MAX));
         // A clock that runs behind the cache: no negative age.
         let ahead = aged(Some("2026-09-27T10:00:30Z"));
         assert_eq!(ahead.age_seconds, Some(0));

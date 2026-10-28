@@ -19,7 +19,7 @@ use crate::registry::{self, Account, Home, Registry};
 use crate::stats::{self, By, Period};
 use crate::usage::history;
 use crate::{Env, owned, paths};
-use crate::{attribution, launch, live, pick, probe, setup, text, transcript, tui, usage, wait};
+use crate::{attribution, launch, live, probe, setup, text, transcript, tui, usage};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -61,16 +61,8 @@ enum Command {
         /// Seconds to wait for each account's live query (claude scans local session history: 2-20 s; codex: about 1-2 s)
         #[arg(long, value_name = "SECONDS", default_value = "90", value_parser = parse_timeout)]
         timeout: Duration,
-        /// Wait until the account has no window used up (less than `[pick] min_headroom`
-        /// percent left), then print its usage; tries again after the earliest reset
-        #[arg(long)]
-        wait: bool,
-        /// With --wait: give up (exit 1) when the next check would come later than this many
-        /// seconds from now
-        #[arg(long, value_name = "SECONDS", requires = "wait", value_parser = parse_max_wait)]
-        max_wait: Option<Duration>,
         /// Show the recorded usage history (state/usage-history.jsonl) and each current window's pace instead
-        #[arg(long, conflicts_with_all = ["live", "wait", "max_wait"])]
+        #[arg(long, conflicts_with = "live")]
         history: bool,
         /// With --history: how many days back
         #[arg(long, value_name = "N", default_value = "7", requires = "history",
@@ -115,38 +107,6 @@ enum Command {
         /// Account: `name` or `provider:name`
         account: String,
     },
-    /// Recommend the account, model and effort to launch now, from usage and `[pick]` in
-    /// config.toml; the rules choose among the feasible options
-    Pick {
-        /// Only this provider's accounts: `claude` or `codex`
-        #[arg(long)]
-        provider: Option<String>,
-        /// Query usage live first (`claude -p /usage`, `codex app-server`); a failed query falls back to the cache
-        #[arg(long)]
-        live: bool,
-        /// Seconds to wait for each account's live query
-        #[arg(long, value_name = "SECONDS", default_value = "90", value_parser = parse_timeout)]
-        timeout: Duration,
-        /// Print the recommendation and every candidate as JSON
-        #[arg(long, conflicts_with = "run")]
-        json: bool,
-        /// When nothing is feasible, wait until something is, trying again after the earliest
-        /// reset that blocks; then print (or launch) as without it. Never queries live by itself
-        #[arg(long)]
-        wait: bool,
-        /// With --wait: give up (exit 1) when the next check would come later than this many
-        /// seconds from now
-        #[arg(long, value_name = "SECONDS", requires = "wait", value_parser = parse_max_wait)]
-        max_wait: Option<Duration>,
-        /// Launch the recommendation as `remuda run` does; arguments after `--` go to the agent
-        #[arg(long)]
-        run: bool,
-        /// Arguments for the agent, after `--`: in the command shown, and launched with --run.
-        /// `--resume <id>` (claude) or `resume|fork <id>` (codex) recommends the account to
-        /// resume that session as, preferring the one that ran it lately (its prompt cache is warm)
-        #[arg(last = true, value_name = "ARGS")]
-        args: Vec<String>,
-    },
     /// Launch claude as an account; all arguments after the account go to claude verbatim
     ///
     /// `-h/--help` is not handled here so that `remuda run <account> --help` reaches claude;
@@ -176,8 +136,8 @@ pub struct Context {
     pub cwd: Option<PathBuf>,
     pub now: Timestamp,
     /// The clock, for the TUI (which keeps running) and for a command that waits for an agent
-    /// (`pick`, `usage --live`): what the agent says is read when it has answered. Other
-    /// commands use `now`.
+    /// (`usage --live`): what the agent says is read when it has answered. Other commands use
+    /// `now`.
     pub clock: fn() -> Timestamp,
     pub tz: TimeZone,
     pub stdin_is_tty: bool,
@@ -220,14 +180,11 @@ fn dispatch(cli: Cli, ctx: &Context) -> Result<ExitCode> {
             account,
             live,
             timeout,
-            wait,
-            max_wait,
             history,
             days,
-        }) => match (history, wait) {
-            (true, _) => usage_history(&config, account, days, ctx),
-            (false, true) => usage_wait(&config, account, live, timeout, max_wait, ctx),
-            (false, false) => usage(&config, account, live, timeout, ctx),
+        }) => match history {
+            true => usage_history(&config, account, days, ctx),
+            false => usage(&config, account, live, timeout, ctx),
         },
         Some(Command::Sessions { limit }) => sessions(&config, limit, ctx),
         Some(Command::Stats {
@@ -250,234 +207,7 @@ fn dispatch(cli: Cli, ctx: &Context) -> Result<ExitCode> {
             let (account, args) = typed.unwrap_or((account, args));
             run_account(&config, account, args, ctx)
         }
-        Some(Command::Pick {
-            provider,
-            live,
-            timeout,
-            json,
-            wait,
-            max_wait,
-            run,
-            args,
-        }) => pick(
-            &config,
-            PickOptions {
-                provider,
-                live: live.then_some(timeout),
-                json,
-                wait: wait.then_some(max_wait),
-                run,
-                args,
-            },
-            ctx,
-        ),
     }
-}
-
-struct PickOptions {
-    provider: Option<String>,
-    /// `--live`, with its timeout.
-    live: Option<Duration>,
-    json: bool,
-    /// `--wait`, with its `--max-wait`.
-    wait: Option<Option<Duration>>,
-    run: bool,
-    args: Vec<String>,
-}
-
-/// `remuda pick` (R23): the rules find what is feasible, rank it and choose the first pair;
-/// the decision is printed, or launched with `--run` exactly as `remuda run` would. Exits 1
-/// when nothing is feasible.
-fn pick(config: &Path, o: PickOptions, ctx: &Context) -> Result<ExitCode> {
-    let registry = Registry::load(config)?;
-    let only = o.provider.as_deref().map(parse_provider).transpose()?;
-    let accounts = registry.all(&ctx.env);
-    // A session the arguments resume or fork (R23 Resuming): only its provider's accounts can
-    // resume it, the account that ran it lately is preferred, and nothing is injected.
-    let resume = pick::session_args(&o.args)?;
-    let only = match (only, &resume) {
-        (Some(only), Some(resume)) if only != resume.provider => bail!(
-            "--provider {only}, but the arguments {} a {} session",
-            resume.kind.name(),
-            resume.provider
-        ),
-        (Some(only), _) => Some((only, format!("--provider {only}"))),
-        (None, Some(resume)) => Some((
-            resume.provider,
-            format!("the session resumed is {}'s", resume.provider),
-        )),
-        (None, None) => None,
-    };
-    let state = owned::state_dir(config);
-    let session = resume.map(|resume| {
-        pick::read_session(
-            resume,
-            &accounts,
-            &ctx.env,
-            &owned::launch_log(&state),
-            &state.join("index.json"),
-        )
-    });
-    let resumed;
-    let settings = match &session {
-        Some(_) => {
-            resumed = registry.pick.for_resume();
-            &resumed
-        }
-        None => &registry.pick,
-    };
-    let claude = claude_program(ctx).ok();
-    let codex = program(ctx, Provider::Codex).ok();
-    let sources = pick::Sources {
-        env: &ctx.env,
-        clock: ctx.clock,
-        agents: &OnPath {
-            claude: claude.as_deref(),
-            codex: codex.as_deref(),
-        },
-        live: o.live,
-        provider: only,
-        seen_by: session
-            .as_ref()
-            .and_then(|s| s.seen_by.as_ref())
-            .map(|seen| seen.keys().cloned().collect()),
-    };
-    // With `--wait`, each attempt gathers again (the cache, or with `--live` a new query) until
-    // one finds a feasible pair (R23); without it, one attempt.
-    let deadline = wait::deadline((ctx.clock)(), o.wait.flatten());
-    let mut status = WaitStatus::new(ctx.stderr_is_tty, &ctx.tz, std::io::stderr());
-    let attempt = || -> Result<_> {
-        // Everything below reads the usage at `now`, the time it was all gathered: a live query
-        // may have taken a while (R23).
-        let (entries, now) = pick::gather(&accounts, settings, &sources);
-        let candidates = pick::candidates(&entries, settings, now, session.as_ref());
-        let feasible = pick::ranked(&candidates);
-        let wait = (o.wait.is_some() && feasible.is_empty())
-            .then(|| pick::next_attempt(&candidates, &entries, now));
-        // Arguments that neither start a new session nor name one to resume are refused here,
-        // before waiting or launching, with `--run` or without (the command shown is one remuda
-        // would launch), for each provider a pair may come from (R23): with a feasible pair,
-        // the providers of the feasible pairs, as a launch would read them; with none (and
-        // before a wait rather than after it), every provider with an account that nothing
-        // time does not change blocks. A session's arguments pass for its provider; the
-        // others' accounts are blocked.
-        for provider in Provider::ALL {
-            let checked = if feasible.is_empty() {
-                entries
-                    .iter()
-                    .any(|e| e.account.provider == provider && e.blocked.is_none())
-            } else {
-                feasible
-                    .iter()
-                    .any(|c| entries[candidates[*c].entry].account.provider == provider)
-            };
-            if checked {
-                pick::run_args(provider, None, None, &o.args)?;
-            }
-        }
-        Ok(((entries, now, candidates, feasible), wait))
-    };
-    let ((entries, now, candidates, feasible), ended) = wait::until(
-        attempt,
-        deadline,
-        ctx.clock,
-        std::thread::sleep,
-        &mut status,
-    )?;
-    if feasible.is_empty() {
-        if o.json {
-            let report = pick::to_json(
-                &entries,
-                &candidates,
-                None,
-                settings,
-                &o.args,
-                session.as_ref(),
-                now,
-            );
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        } else {
-            // The session's facts do not wait for a choice: who ran it, and why it cannot be
-            // resumed as that account (R23 Resuming).
-            if let Some(session) = &session {
-                let rows = pick::session_rows(session, &entries, &candidates, None, settings, now);
-                print!("{}", pick::format_session(&rows));
-            }
-            print!("{}", pick::format_not_feasible(&entries, &candidates));
-        }
-        eprintln!("remuda: nothing to recommend: no account and model is feasible");
-        if let Some(line) = ended_text(&ended, &ctx.tz) {
-            eprintln!("remuda: {line}");
-        }
-        return Ok(ExitCode::FAILURE);
-    }
-    let decision = pick::decide(&candidates, &entries, settings)
-        .expect("a feasible candidate was found above");
-    if o.json {
-        let report = pick::to_json(
-            &entries,
-            &candidates,
-            Some(&decision),
-            settings,
-            &o.args,
-            session.as_ref(),
-            now,
-        );
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(ExitCode::SUCCESS);
-    }
-    if !o.run {
-        print!(
-            "{}",
-            pick::format_text(
-                &entries,
-                &candidates,
-                &decision,
-                settings,
-                now,
-                &o.args,
-                session.as_ref()
-            )
-        );
-        return Ok(ExitCode::SUCCESS);
-    }
-    let chosen = &candidates[decision.chosen];
-    let account = &entries[chosen.entry].account;
-    let (args, notices) = pick::run_args(
-        account.provider,
-        chosen.model.as_deref(),
-        decision.effort.as_deref(),
-        &o.args,
-    )?;
-    eprintln!(
-        "remuda: pick: {}",
-        pick::summary(&entries, &candidates, &decision, session.as_ref(), now)
-    );
-    if let Some(session) = &session {
-        let rows = pick::session_rows(
-            session,
-            &entries,
-            &candidates,
-            Some(decision.chosen),
-            settings,
-            now,
-        );
-        for (label, text) in rows {
-            let label = if label.is_empty() {
-                String::new()
-            } else {
-                format!("{label} ")
-            };
-            eprintln!("remuda: pick: {label}{text}");
-        }
-    }
-    if let Some(hint) = pick::live_hint(&entries[chosen.entry], chosen) {
-        eprintln!("remuda: pick: usage unknown: {hint}");
-    }
-    for notice in notices {
-        eprintln!("remuda: {notice}");
-    }
-    exec_as(config, &registry, account, args, ctx)
 }
 
 /// The account and the agent's arguments of `remuda run`, cut from the command line as typed
@@ -783,140 +513,6 @@ fn usage_history(
         history::report(&points, &names, days, ctx.now, &ctx.tz)
     );
     Ok(ExitCode::SUCCESS)
-}
-
-/// `remuda usage --wait <account>` (R10): reads the account's usage (the cache, or with
-/// `--live` a live query) until it has no window used up by `[pick] min_headroom`, trying again
-/// as R23's `--wait` does, then prints it as `remuda usage` would. Exits 1 when the live query
-/// failed (no usage can come of waiting) or `--max-wait` runs out, with the last reading.
-fn usage_wait(
-    config: &Path,
-    account: Option<String>,
-    live: bool,
-    timeout: Duration,
-    max_wait: Option<Duration>,
-    ctx: &Context,
-) -> Result<ExitCode> {
-    let Some(reference) = account else {
-        eprintln!(
-            "remuda: `usage --wait` needs an account (to wait for any account use `remuda pick \
-             --wait`)"
-        );
-        return Ok(ExitCode::from(2));
-    };
-    let registry = Registry::load(config)?;
-    let account = registry.resolve(&reference)?;
-    let min_headroom = registry.pick.min_headroom;
-    // As `usage --live`: a missing claude fails the command; a missing codex, the query.
-    let claude = match live && account.provider == Provider::Claude {
-        true => Some(claude_program(ctx)?),
-        false => None,
-    };
-    let codex = program(ctx, Provider::Codex).ok();
-    let agents = OnPath {
-        claude: claude.as_deref(),
-        codex: codex.as_deref(),
-    };
-    let deadline = wait::deadline((ctx.clock)(), max_wait);
-    let mut status = WaitStatus::new(ctx.stderr_is_tty, &ctx.tz, std::io::stderr());
-    // Every reading the wait takes is recorded (R24), once it is over and the last is printed.
-    let mut points = Vec::new();
-    let attempt = || {
-        let (text, ok, reading) = if live {
-            usage::live_attempt(&account, &agents, &ctx.tz, ctx.clock, timeout)
-        } else {
-            let (text, reading) = usage::cached_attempt(&account, &ctx.env, &ctx.tz, ctx.clock);
-            (text, true, reading)
-        };
-        let now = (ctx.clock)();
-        let wait = match (ok, &reading) {
-            (false, _) => Some(wait::Wait::Never("the live query failed".to_string())),
-            (true, Some(reading)) => wait::schedule(
-                usage::exhausted(reading, min_headroom)
-                    .into_iter()
-                    .map(|window| (&account, window)),
-                now,
-            ),
-            (true, None) => None,
-        };
-        points.extend(recorded(&account, reading.as_ref()));
-        Ok::<_, anyhow::Error>((text, wait))
-    };
-    let (text, ended) = wait::until(
-        attempt,
-        deadline,
-        ctx.clock,
-        std::thread::sleep,
-        &mut status,
-    )?;
-    print!("{text}");
-    record(config, points, ctx);
-    Ok(match ended_text(&ended, &ctx.tz) {
-        None => ExitCode::SUCCESS,
-        Some(line) => {
-            eprintln!("remuda: {line}");
-            ExitCode::FAILURE
-        }
-    })
-}
-
-/// Why `--wait` stopped without what it waited for (R23, R10); `None` when it got it.
-fn ended_text(ended: &wait::Ended, tz: &TimeZone) -> Option<String> {
-    match ended {
-        wait::Ended::Ready => None,
-        wait::Ended::Never(why) => Some(format!("nothing to wait for: {why}")),
-        wait::Ended::GaveUp { next } => Some(format!(
-            "gave up waiting: the next check ({}) would come after --max-wait",
-            usage::format_time(*next, tz)
-        )),
-        wait::Ended::TimeUp { next, deadline } => Some(format!(
-            "gave up waiting: --max-wait ran out ({}) before the check due at {} was made",
-            usage::format_time(*deadline, tz),
-            usage::format_time(*next, tz)
-        )),
-    }
-}
-
-/// The `--wait` status line on stderr (R23, R10): only when stderr is a terminal (piped
-/// output never sees a `\r`-rewritten line), rewritten in place before each nap, and cleared
-/// once the wait is over, before the result or an error is printed ([`wait::until`] sees to it).
-struct WaitStatus<'a, W: std::io::Write> {
-    tty: bool,
-    tz: &'a TimeZone,
-    shown: bool,
-    out: W,
-}
-
-impl<'a, W: std::io::Write> WaitStatus<'a, W> {
-    fn new(tty: bool, tz: &'a TimeZone, out: W) -> Self {
-        WaitStatus {
-            tty,
-            tz,
-            shown: false,
-            out,
-        }
-    }
-}
-
-impl<W: std::io::Write> wait::Status for WaitStatus<'_, W> {
-    fn show(&mut self, wait: &wait::Wait, now: Timestamp) {
-        if !self.tty {
-            return;
-        }
-        if let Some(line) = wait::status_line(wait, now, self.tz) {
-            let _ = write!(self.out, "{REWRITE_LINE}remuda: {line}");
-            let _ = self.out.flush();
-            self.shown = true;
-        }
-    }
-
-    fn clear(&mut self) {
-        if self.shown {
-            let _ = write!(self.out, "{REWRITE_LINE}");
-            let _ = self.out.flush();
-            self.shown = false;
-        }
-    }
 }
 
 /// Titles wider than this (in display columns) are shortened in `remuda sessions`.
@@ -1338,97 +934,9 @@ fn parse_timeout(s: &str) -> std::result::Result<Duration, String> {
     Duration::try_from_secs_f64(secs).map_err(|e| e.to_string())
 }
 
-/// `--max-wait`: a finite number of seconds, 0 included (one attempt, no waiting).
-fn parse_max_wait(s: &str) -> std::result::Result<Duration, String> {
-    let secs: f64 = s.parse().map_err(|_| format!("not a number: {s:?}"))?;
-    if !secs.is_finite() || secs < 0.0 {
-        return Err(format!("must be a number of seconds, 0 or more: {s:?}"));
-    }
-    Duration::try_from_secs_f64(secs).map_err(|e| e.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// R10, R24 (lane review 6): `usage --wait` reads each cached attempt against a time taken
-    /// after the cache was read. Here the reading of the cache takes until after the session's
-    /// reset (`.claude.json` is a FIFO, written only once remuda has opened it, and the clock
-    /// moves past the reset in between; no sleep orders the two): the session, at 100% when
-    /// remuda started, has reset since, so nothing is used up and the wait is done (exit 0), and
-    /// its old percentage is not recorded. Read against a time taken before the cache, it would
-    /// still be at 100%: `--max-wait 0` would give up (exit 1) and record it.
-    #[test]
-    fn a_cached_wait_reads_the_cache_before_the_time() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static WRITTEN: AtomicBool = AtomicBool::new(false);
-        fn clock() -> Timestamp {
-            match WRITTEN.load(Ordering::SeqCst) {
-                false => "2026-10-08T10:30:00Z".parse().unwrap(),
-                true => "2026-10-08T11:00:30Z".parse().unwrap(),
-            }
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("max");
-        std::fs::create_dir(&home).unwrap();
-        let fifo = home.join(".claude.json");
-        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
-        // SAFETY: a NUL-terminated path.
-        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        let config = dir.path().join("config.toml");
-        std::fs::write(
-            &config,
-            format!(
-                "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{}\"\n",
-                home.display()
-            ),
-        )
-        .unwrap();
-        let fetched: Timestamp = "2026-10-08T10:00:00Z".parse().unwrap();
-        let cache = format!(
-            r#"{{"cachedUsageUtilization": {{"fetchedAtMs": {}, "utilization": {{"limits": [
-              {{"kind": "session", "percent": 100, "resets_at": "2026-10-08T11:00:00Z"}},
-              {{"kind": "weekly_all", "percent": 77, "resets_at": "2099-01-01T00:00:00Z"}}]}}}}}}"#,
-            fetched.as_millisecond()
-        );
-        let writer = std::thread::spawn(move || {
-            use std::io::Write;
-            // Opening a FIFO to write waits for a reader to open it: once this returns,
-            // `usage_wait` is reading the cache (it cannot reach the end before this end is
-            // closed), and any time it took before that was taken before the reset.
-            let mut cache_file = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
-            // The time moves past the reset, then the cache is there to be read.
-            WRITTEN.store(true, Ordering::SeqCst);
-            cache_file.write_all(cache.as_bytes()).unwrap();
-        });
-        let ctx = Context {
-            args: Vec::new(),
-            env: [("HOME".to_string(), dir.path().display().to_string())].into(),
-            cwd: None,
-            now: "2026-10-08T10:30:00Z".parse().unwrap(),
-            clock,
-            tz: TimeZone::UTC,
-            stdin_is_tty: false,
-            stdout_is_tty: false,
-            stderr_is_tty: false,
-        };
-        let code = usage_wait(
-            &config,
-            Some("max".into()),
-            false,
-            Duration::from_secs(90),
-            Some(Duration::ZERO),
-            &ctx,
-        )
-        .unwrap();
-        writer.join().unwrap();
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
-        let path = owned::usage_history(&owned::state_dir(&config));
-        let points = history::load(&path).unwrap().unwrap();
-        let labels: Vec<&str> = points.iter().map(|p| p.label.as_str()).collect();
-        assert_eq!(labels, ["Week (all models)"]);
-        assert_eq!(points[0].ts, fetched);
-    }
 
     /// R10, R24 (PR review): cached usage is read at the time it was read, not when the command
     /// started: a window whose reset falls between the two has reset since. Its old percentage
@@ -1725,89 +1233,13 @@ mod tests {
         );
     }
 
-    /// R23, R10 `--max-wait`: seconds, 0 included; nothing negative or infinite.
+    /// R5 `--timeout`: a positive, finite number of seconds; not 0.
     #[test]
-    fn max_wait_takes_zero_and_more() {
-        assert_eq!(parse_max_wait("0"), Ok(Duration::ZERO));
-        assert_eq!(parse_max_wait("1.5"), Ok(Duration::from_millis(1500)));
-        for bad in ["-1", "inf", "NaN", "soon", ""] {
-            assert!(parse_max_wait(bad).is_err(), "{bad:?}");
+    fn timeout_takes_a_positive_number_of_seconds() {
+        assert_eq!(parse_timeout("1.5"), Ok(Duration::from_millis(1500)));
+        assert_eq!(parse_timeout("90"), Ok(Duration::from_secs(90)));
+        for bad in ["0", "-1", "inf", "NaN", "soon", ""] {
+            assert!(parse_timeout(bad).is_err(), "{bad:?}");
         }
-        assert!(
-            parse_timeout("0").is_err(),
-            "--timeout still needs a positive number"
-        );
-    }
-
-    /// R23, R10: the `--wait` status line only on a terminal, rewritten in place and cleared
-    /// before the result; nothing at all when stderr is piped.
-    #[test]
-    fn the_wait_status_line_only_on_a_terminal() {
-        let account = Account {
-            provider: Provider::Claude,
-            name: "max".into(),
-            home: Home::Path("/h/max".into()),
-        };
-        let now: Timestamp = "2026-10-08T10:00:00Z".parse().unwrap();
-        let cached = usage::CachedUsage {
-            fetched_at: Some(now),
-            rows: vec![usage::UsageRow {
-                label: "Week (Fable)".into(),
-                percent: 100.0,
-                severity: None,
-                resets: Some(usage::Resets::At("2026-10-08T11:12:00Z".parse().unwrap())),
-                window_minutes: None,
-            }],
-        };
-        let reading = usage::Snapshot::cached(&cached).at(now);
-        let wait = wait::schedule([(&account, &reading.windows[0])], now).unwrap();
-        use wait::Status;
-        let tz = TimeZone::UTC;
-        let mut status = WaitStatus::new(false, &tz, Vec::new());
-        status.show(&wait, now);
-        status.clear();
-        assert_eq!(String::from_utf8(status.out).unwrap(), "");
-        let mut status = WaitStatus::new(true, &tz, Vec::new());
-        status.show(&wait, now);
-        status.show(&wait, now);
-        status.clear();
-        status.clear();
-        let out = status.out;
-        let line = "\r\x1b[2Kremuda: waiting: claude:max Week (Fable) 100% used, resets in 1h12m; \
-                    next check Oct 8 11:12 (Ctrl-C stops)";
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            format!("{line}{line}\r\x1b[2K")
-        );
-    }
-
-    /// R23, R10 `--max-wait` (lane review round 2): the two ways the deadline ends a wait are
-    /// told apart: a next check due after it, and one due before it that remuda woke too late
-    /// to make (a computer that slept, a clock set forward).
-    #[test]
-    fn why_a_wait_gave_up() {
-        let at = |s: &str| s.parse::<Timestamp>().unwrap();
-        let tz = TimeZone::UTC;
-        let gave_up = wait::Ended::GaveUp {
-            next: at("2026-10-08T11:00:30Z"),
-        };
-        assert_eq!(
-            ended_text(&gave_up, &tz).unwrap(),
-            "gave up waiting: the next check (Oct 8 11:00) would come after --max-wait"
-        );
-        let time_up = wait::Ended::TimeUp {
-            next: at("2026-10-08T10:01:00Z"),
-            deadline: at("2026-10-08T10:02:00Z"),
-        };
-        assert_eq!(
-            ended_text(&time_up, &tz).unwrap(),
-            "gave up waiting: --max-wait ran out (Oct 8 10:02) before the check due at Oct 8 \
-             10:01 was made"
-        );
-        assert_eq!(ended_text(&wait::Ended::Ready, &tz), None);
-        assert_eq!(
-            ended_text(&wait::Ended::Never("x".into()), &tz).unwrap(),
-            "nothing to wait for: x"
-        );
     }
 }

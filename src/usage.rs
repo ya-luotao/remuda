@@ -431,11 +431,10 @@ pub fn cached_report(
     cached_attempt(account, env, tz, clock).0
 }
 
-/// [`cached_report`], and the reading it shows (`None` without cached usage): for
-/// `remuda usage`, for `usage --wait` (R10), which reads it for windows that are used up, and
-/// for the usage history (R24), which records it. The cache is read first and `clock` asked
-/// after that: usage is read against the time it was read at (R10), so a reset that falls while
-/// the cache is read (or while the command ran before) has passed since.
+/// [`cached_report`], and the reading it shows (`None` without cached usage): for the usage
+/// history (R24), which records it. The cache is read first and `clock` asked after that: usage
+/// is read against the time it was read at (R10), so a reset that falls while the cache is read
+/// (or while the command ran before) has passed since.
 pub fn cached_attempt(
     account: &Account,
     env: &Env,
@@ -467,17 +466,6 @@ fn cached_text(
             (text, Some(reading))
         }
     }
-}
-
-/// The windows of `reading` that are used up for `usage --wait` (R10): of known usage, with
-/// less than `min_headroom` percent left (`[pick] min_headroom`, R3). A window that has reset
-/// since its usage was recorded is unknown, never used up.
-pub fn exhausted(reading: &Reading, min_headroom: u32) -> Vec<&Window> {
-    reading
-        .windows
-        .iter()
-        .filter(|w| w.left().is_some_and(|left| left < f64::from(min_headroom)))
-        .collect()
 }
 
 /// Claude's live usage query (R10): `/usage` in print mode, which calls no model, leaving no
@@ -684,8 +672,7 @@ pub fn live_report(
 }
 
 /// [`live_report`], and the reading it shows (`None` when the answer gave no usage rows): for
-/// `usage --wait --live` (R10) and for the usage history (R24). The answer is read when it
-/// arrived, by `clock` after the query.
+/// the usage history (R24). The answer is read when it arrived, by `clock` after the query.
 pub fn live_attempt(
     account: &Account,
     agents: &dyn Runner,
@@ -1701,38 +1688,5 @@ mod tests {
                 "Week (Fable) 90% !!"
             ]
         );
-    }
-
-    /// R10 `usage --wait`: a window is used up with less than `min_headroom` percent left, of
-    /// known usage only: one that has reset since it was cached never is.
-    #[test]
-    fn used_up_windows_are_known_and_below_min_headroom() {
-        let at = |s: &str| s.parse::<Timestamp>().unwrap();
-        let now = at("2026-10-08T10:00:00Z");
-        let row = |label: &str, percent: f64, resets: &str| UsageRow {
-            label: label.into(),
-            percent,
-            severity: None,
-            resets: Some(Resets::At(at(resets))),
-            window_minutes: None,
-        };
-        let cached = CachedUsage {
-            fetched_at: Some(at("2026-10-08T08:00:00Z")),
-            rows: vec![
-                row("Session", 100.0, "2026-10-08T09:00:00Z"),
-                row("Week (all models)", 90.0, "2026-10-09T09:00:00Z"),
-                row("Week (Fable)", 95.5, "2026-10-09T09:00:00Z"),
-            ],
-        };
-        let reading = Snapshot::cached(&cached).at(now);
-        let labels = |min| -> Vec<String> {
-            exhausted(&reading, min)
-                .iter()
-                .map(|w| w.label.clone())
-                .collect()
-        };
-        assert_eq!(labels(10), ["Week (Fable)"]);
-        assert_eq!(labels(11), ["Week (all models)", "Week (Fable)"]);
-        assert!(labels(0).is_empty());
     }
 }

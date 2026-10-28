@@ -612,10 +612,11 @@ fn setup_login_failure_keeps_the_links() {
     assert_eq!(stored(&sb).len(), 1);
 }
 
-/// R3, R14, R23: `setup` refuses, before creating anything, an account that would leave the
-/// registry invalid (a bare name in `[pick]` becoming ambiguous).
+/// R3, R13, R14: while `config.toml` holds `[pick]` (the configuration of the removed
+/// `remuda pick`), it does not load, and `setup` refuses before creating anything: no home, no
+/// login, the file as it was.
 #[test]
-fn setup_refuses_a_name_that_would_leave_the_config_invalid() {
+fn setup_refuses_while_the_config_has_a_pick_table() {
     let sb = Sandbox::new();
     let personal = sb.make_claude_home("h/personal");
     sb.write_config(&format!(
@@ -624,15 +625,22 @@ fn setup_refuses_a_name_that_would_leave_the_config_invalid() {
         personal.display()
     ));
     let before = sb.read_config();
-    sb.remuda()
-        .args(["setup", "--provider", "codex", "personal"])
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains(
-            "adding codex:personal would leave",
-        ));
+    for provider in ["claude", "codex"] {
+        sb.remuda()
+            .args(["setup", "--provider", provider, "work"])
+            .assert()
+            .code(1)
+            .stdout("")
+            .stderr(format!(
+                "remuda: invalid {}: `remuda pick` was removed: remove its [pick] and \
+                 [pick.<provider>] tables by hand\n",
+                sb.config_path().display()
+            ));
+        assert!(!sb.remuda_home().join("homes").exists(), "{provider}");
+    }
     assert_eq!(sb.read_config(), before);
-    assert!(!sb.remuda_home().join("homes/codex/personal").exists());
+    assert!(sb.logins().is_empty());
+    assert!(sb.invocations().is_empty());
 }
 
 /// R5, R6: while the login has the terminal, Ctrl-C and Ctrl-\ are the login's alone: remuda

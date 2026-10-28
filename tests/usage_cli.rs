@@ -708,9 +708,9 @@ fn an_interrupt_reaches_a_running_codex_query() {
     assert_eq!(got, (Some(libc::SIGINT), true, true));
 }
 
-/// One `remuda <args>` (`usage --live`, or a command that waits with `--live`) over 60 claude
-/// and 60 codex accounts (and the two `default` ones), each query a fake agent that hangs, sent
-/// `signal` `after` remuda was started: whether any process remuda had started outlived it.
+/// One `remuda <args>` (`usage --live`) over 60 claude and 60 codex accounts (and the two
+/// `default` ones), each query a fake agent that hangs, sent `signal` `after` remuda was
+/// started: whether any process remuda had started outlived it.
 ///
 /// remuda is given the writing end of a pipe, which every process it starts inherits: the
 /// reading end sees the end of the pipe when the last of them is gone, and not before. That
@@ -1379,15 +1379,15 @@ fn live_usage_is_recorded_at_the_answer_not_the_start() {
 }
 
 /// R4, R10 (lane review round 1): SIGTERM, which `kill` or a supervisor sends remuda alone, is
-/// passed on like Ctrl-C: the live query that `usage --wait --live` has under way (in a process
-/// group of its own, which no timeout of remuda's ends once remuda is gone) ends with remuda.
+/// passed on like Ctrl-C: the live query under way (in a process group of its own, which no
+/// timeout of remuda's ends once remuda is gone) ends with remuda.
 #[test]
-fn a_sigterm_reaches_the_query_of_a_live_usage_wait() {
+fn a_sigterm_reaches_a_running_live_query() {
     let Setup { sb, .. } = setup();
     let got = interrupted(
         &sb,
         "claude",
-        &["usage", "max", "--wait", "--live", "--timeout", "60"],
+        &["usage", "max", "--live", "--timeout", "60"],
         libc::SIGTERM,
     );
     assert_eq!(got, (Some(libc::SIGTERM), true, true));
@@ -1395,248 +1395,32 @@ fn a_sigterm_reaches_the_query_of_a_live_usage_wait() {
     let got = interrupted(
         &sb,
         "codex",
-        &[
-            "usage",
-            "codex:default",
-            "--wait",
-            "--live",
-            "--timeout",
-            "60",
-        ],
+        &["usage", "codex:default", "--live", "--timeout", "60"],
         libc::SIGTERM,
     );
     assert_eq!(got, (Some(libc::SIGTERM), true, true));
 }
 
-/// R4, R23 (lane review round 1): the same for the queries of `pick --wait --live` (and of
-/// `usage --live`), started in parallel: SIGTERM among the starts reaches every one of them,
-/// the ones running and the ones being started, and so it does once they all run.
+/// R4 (lane review round 1): the same for the queries of `usage --live`, started in parallel:
+/// SIGTERM among the starts reaches every one of them, the ones running and the ones being
+/// started, and so it does once they all run.
 #[test]
 fn a_sigterm_while_queries_are_starting_reaches_them_all() {
-    for args in [
-        &["pick", "--wait", "--live", "--timeout", "60"][..],
-        &["usage", "--live", "--timeout", "60"],
-    ] {
-        // Among the starts, and once they all run.
-        let moments = (0..120)
-            .step_by(12)
-            .chain([1000])
-            .map(Duration::from_millis);
-        for after in moments {
-            assert!(
-                !outlived_by_a_query(after, libc::SIGTERM, args),
-                "{args:?}: terminated after {after:?}: a query outlived remuda"
-            );
-        }
-    }
-}
-
-// --- wait --------------------------------------------------------------------------------
-
-/// `remuda <args>`: exit code, stdout, stderr, and how long it took.
-fn timed(sb: &Sandbox, args: &[&str]) -> (Option<i32>, String, String, Duration) {
-    let start = Instant::now();
-    let out = sb.remuda().args(args).output().unwrap();
-    (
-        out.status.code(),
-        String::from_utf8(out.stdout).unwrap(),
-        String::from_utf8(out.stderr).unwrap(),
-        start.elapsed(),
-    )
-}
-
-/// R10 `usage --wait`: it waits for one account; without one it is a usage error that points
-/// to `pick --wait`. `--max-wait` needs `--wait`.
-#[test]
-fn usage_wait_needs_an_account() {
-    let Setup { sb, .. } = setup();
-    let (code, stdout, stderr, _) = timed(&sb, &["usage", "--wait"]);
-    assert_eq!(code, Some(2), "{stderr}");
-    assert_eq!(stdout, "");
-    assert!(
-        stderr.contains("to wait for any account use `remuda pick --wait`"),
-        "{stderr}"
-    );
-    for args in [
-        &["usage", "max", "--max-wait", "5"][..],
-        &["usage", "max", "--wait", "--max-wait", "-1"],
-    ] {
-        let (code, _, stderr, _) = timed(&sb, args);
-        assert_eq!(code, Some(2), "{args:?}: {stderr}");
-    }
-    assert!(sb.invocations().is_empty());
-}
-
-/// R10 `usage --wait`: an account with no window used up (less than `[pick] min_headroom`
-/// percent left) is done at once, printed as `usage` prints it: also when the only window that
-/// was used up has reset since it was cached (unknown, never used up; no `--live` is implied),
-/// and when there is no cached usage at all.
-#[test]
-fn usage_wait_is_done_at_once_when_nothing_is_used_up() {
-    let Setup { sb, max, .. } = setup();
-    let at = |offset_secs: i64| {
-        jiff::Timestamp::from_second((now_ms() / 1000) as i64 + offset_secs).unwrap()
-    };
-    let (session, week) = (at(-3600), at(2 * 86_400));
-    let limits = format!(
-        r#"{{"limits": [
-            {{"kind": "session", "percent": 100, "severity": "critical", "resets_at": "{session}"}},
-            {{"kind": "weekly_all", "percent": 77, "severity": "warning", "resets_at": "{week}"}}]}}"#
-    );
-    sb.write_claude_json(Some(&max), &cache_json(7200, &limits));
-    for account in ["max", "team"] {
-        let plain = stdout_of(sb.remuda().args(["usage", account]).assert().success());
-        let (code, stdout, stderr, took) = timed(&sb, &["usage", account, "--wait"]);
-        assert_eq!(code, Some(0), "{account}: {stderr}");
-        assert_eq!(stdout, plain);
-        assert_eq!(stderr, "", "{account}: no status line on a pipe");
-        assert!(took < Duration::from_secs(30), "{account}: {took:?}");
-    }
-    let max_out = stdout_of(sb.remuda().args(["usage", "max"]).assert().success());
-    assert!(max_out.contains("reset since cached"), "{max_out}");
-    assert!(sb.invocations().is_empty(), "--wait never queries live");
-}
-
-/// R10 `usage --wait --max-wait`: a window used up whose reset is later than the deadline:
-/// remuda gives up at once (no check would come before it) with the account's usage, exit 1.
-/// `--max-wait 0` is one look.
-#[test]
-fn usage_wait_gives_up_when_the_next_check_is_after_max_wait() {
-    let Setup { sb, max, .. } = setup();
-    // The Fable window is at 100% until 2099.
-    sb.write_claude_json(Some(&max), &cache_json(200, LIMITS));
-    let plain = stdout_of(sb.remuda().args(["usage", "max"]).assert().success());
-    for max_wait in ["0", "1", "3600"] {
-        let (code, stdout, stderr, took) =
-            timed(&sb, &["usage", "max", "--wait", "--max-wait", max_wait]);
-        assert_eq!(code, Some(1), "{max_wait}: {stderr}");
-        assert_eq!(stdout, plain);
+    let args = ["usage", "--live", "--timeout", "60"];
+    // Among the starts, and once they all run.
+    let moments = (0..120)
+        .step_by(12)
+        .chain([1000])
+        .map(Duration::from_millis);
+    for after in moments {
         assert!(
-            stderr.starts_with(
-                "remuda: gave up waiting: the next check (Sep 25 05:00) would \
-                 come after --max-wait"
-            ),
-            "{max_wait}: {stderr}"
+            !outlived_by_a_query(after, libc::SIGTERM, &args),
+            "terminated after {after:?}: a query outlived remuda"
         );
-        assert!(took < Duration::from_secs(30), "{max_wait}: {took:?}");
     }
-    // A `min_headroom` of 0 leaves nothing used up: done.
-    sb.write_config(&format!("{}[pick]\nmin_headroom = 0\n", sb.read_config()));
-    let (code, stdout, _, _) = timed(&sb, &["usage", "max", "--wait", "--max-wait", "0"]);
-    assert_eq!((code, stdout), (Some(0), plain));
-    assert!(sb.invocations().is_empty());
 }
 
-/// R10 `usage --wait --live`: each attempt asks the agent; a query that failed is nothing to
-/// wait for (exit 1, as `usage --live` exits), one whose answer has nothing used up is done.
-#[test]
-fn usage_wait_live_asks_the_agent() {
-    let Setup { sb, max, .. } = setup();
-    // No fixture: the fake claude exits 1.
-    let (code, stdout, stderr, _) = timed(&sb, &["usage", "max", "--wait", "--live"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(stdout.starts_with("claude:max  error: "), "{stdout}");
-    assert_eq!(
-        stderr,
-        "remuda: nothing to wait for: the live query failed\n"
-    );
-    sb.set_live_usage(Some(&max), LIVE_SAMPLE);
-    let (code, stdout, stderr, _) = timed(&sb, &["usage", "max", "--wait", "--live"]);
-    assert_eq!(code, Some(0), "{stderr}");
-    assert!(stdout.starts_with("claude:max  live\n"), "{stdout}");
-    let invs = sb.invocations_with(Some(&max));
-    assert_eq!(invs.len(), 2);
-    assert!(invs.iter().all(|i| i.args == LIVE_ARGS));
-}
-
-// --- history (R24) with --wait (R10) ------------------------------------------------------
-
-/// R24, R10: `--history` shows what was recorded; it does not combine with `--wait` (nor with
-/// `--max-wait`, which needs `--wait`).
-#[test]
-fn history_does_not_combine_with_wait() {
-    let Setup { sb, .. } = setup();
-    for args in [
-        &["usage", "max", "--history", "--wait"][..],
-        &["usage", "max", "--wait", "--history"],
-        &["usage", "max", "--history", "--wait", "--max-wait", "5"],
-        &["usage", "max", "--history", "--max-wait", "5"],
-    ] {
-        let (code, stdout, stderr, _) = timed(&sb, args);
-        assert_eq!(code, Some(2), "{args:?}: {stderr}");
-        assert_eq!(stdout, "", "{args:?}");
-    }
-    let (_, _, stderr, _) = timed(&sb, &["usage", "max", "--history", "--wait"]);
-    assert!(stderr.contains("cannot be used with"), "{stderr}");
-    assert!(!sb.remuda_home().join("state").exists());
-}
-
-/// R24, R10: `usage --wait` records the reading it prints, as `usage` does: cached at the cache
-/// time, when it is done at once and when it gives up (`--max-wait`) on a window used up; live at
-/// the time the answer arrived. A live query that failed records nothing.
-#[test]
-fn usage_wait_records_the_reading_it_prints() {
-    let Setup { sb, max, team } = setup();
-    // Nothing used up: done at once.
-    let fetched = now_ms() as i64 - 60_000;
-    let free = r#"{"limits": [{"kind": "session", "percent": 34,
-        "resets_at": "2099-09-23T15:39:59Z"}]}"#;
-    sb.write_claude_json(Some(&team), &cache_at(fetched, free));
-    let (code, _, stderr, _) = timed(&sb, &["usage", "team", "--wait"]);
-    assert_eq!(code, Some(0), "{stderr}");
-    let got = history(&sb);
-    let ts = jiff::Timestamp::from_millisecond(fetched)
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        got,
-        [
-            serde_json::json!({"ts": ts, "account": "claude:team", "label": "Session",
-            "model": null, "percent": 34.0, "resets_at": "2099-09-23T15:39:59Z",
-            "source": "cached"})
-        ]
-    );
-
-    // A window used up until 2099: gives up at once, and what it printed is recorded.
-    sb.write_claude_json(Some(&max), &cache_at(fetched, LIMITS));
-    let (code, stdout, _, _) = timed(&sb, &["usage", "max", "--wait", "--max-wait", "0"]);
-    assert_eq!(code, Some(1));
-    assert!(stdout.contains("Week (Fable)"), "{stdout}");
-    let max_points: Vec<_> = history(&sb)
-        .into_iter()
-        .filter(|p| p["account"] == "claude:max")
-        .collect();
-    let labels: Vec<&str> = max_points
-        .iter()
-        .map(|p| p["label"].as_str().unwrap())
-        .collect();
-    assert_eq!(labels, ["Session", "Week (all models)", "Week (Fable)"]);
-    assert!(max_points.iter().all(|p| p["ts"] == ts.as_str()));
-
-    // Live: recorded at the answer; a failed query (no fixture for the default) records nothing.
-    let before = history(&sb).len();
-    let (code, _, _, _) = timed(&sb, &["usage", "default", "--wait", "--live"]);
-    assert_eq!(code, Some(1));
-    assert_eq!(history(&sb).len(), before);
-    let mut free_live = LIVE_SAMPLE.replace("85% used", "15% used");
-    free_live = free_live.replace("74% used", "14% used");
-    sb.set_live_usage(Some(&team), &free_live);
-    let start = jiff::Timestamp::now();
-    let (code, stdout, stderr, _) = timed(&sb, &["usage", "team", "--wait", "--live"]);
-    assert_eq!(code, Some(0), "{stderr}");
-    assert!(stdout.starts_with("claude:team  live\n"), "{stdout}");
-    let live: Vec<_> = history(&sb)
-        .into_iter()
-        .filter(|p| p["source"] == "live")
-        .collect();
-    assert_eq!(live.len(), 3, "{live:?}");
-    for p in &live {
-        assert_eq!(p["account"], "claude:team");
-        let at: jiff::Timestamp = p["ts"].as_str().unwrap().parse().unwrap();
-        assert!(at >= start, "{p}");
-    }
-    assert!(!sb.launch_log().exists());
-}
+// --- history (R24) -----------------------------------------------------------------------
 
 /// R10, R24: a codex window is recorded with the minutes codex told (`window_minutes`), and
 /// `--history` paces it by them, not by its label: 40% used half an hour into a window of 90
@@ -1692,72 +1476,33 @@ fn a_codex_window_is_paced_by_its_minutes() {
     assert!(sb.codex_invocations().is_empty());
 }
 
-/// R10, R24: `usage --wait` takes a second attempt and records the first one's reading only.
-/// The session is used up and resets in about ten seconds: the first attempt waits, the next
-/// is `MIN_INTERVAL` (60 s) later, when the cached session has reset since: done, exit 0. The
-/// history holds the first attempt's points, once each: the second attempt's week is the same
-/// reading, its session (`reset since cached`) is not recorded. The wait is real, and the
-/// status line is there on a terminal (stderr is a pseudo-terminal here).
+// --- removed options (R5, R10) -----------------------------------------------------------
+
+/// R5, R10: `usage --wait` and `--max-wait` were removed with `remuda pick` (2026-10-28):
+/// unknown to clap, each is a usage error (exit 2) that reads no usage, runs no query and
+/// records nothing, whatever it is given with. (No window is used up here, so that a `--wait`
+/// that came back would return at once, failing this test instead of waiting.)
 #[test]
-fn usage_wait_records_the_attempt_before_a_reset_once() {
-    use std::os::fd::FromRawFd;
-    let Setup { sb, max, .. } = setup();
-    let fetched = now_ms() as i64 - 60_000;
-    let reset = jiff::Timestamp::from_millisecond(now_ms() as i64 + 10_000).unwrap();
-    let limits = format!(
-        r#"{{"limits": [
-            {{"kind": "session", "percent": 100, "resets_at": "{reset}"}},
-            {{"kind": "weekly_all", "percent": 20, "resets_at": "2099-09-23T15:39:59Z"}}]}}"#
-    );
-    sb.write_claude_json(Some(&max), &cache_at(fetched, &limits));
-    let (master, slave) = pty();
-    let mut cmd = sb.remuda_process();
-    // SAFETY: the descriptor `pty` opened; the command owns it from here, and closes it once
-    // it is dropped.
-    let terminal_end = unsafe { std::fs::File::from_raw_fd(slave) };
-    cmd.args(["usage", "max", "--wait"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(terminal_end);
-    let start = Instant::now();
-    let remuda = cmd.spawn().unwrap();
-    // Only remuda has the terminal's end now: reading ends when it is gone.
-    drop(cmd);
-    let terminal = std::thread::spawn(move || {
-        use std::io::Read;
-        // SAFETY: the descriptor `pty` opened; this file is its only owner.
-        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
-        let mut shown = Vec::new();
-        let _ = master.read_to_end(&mut shown);
-        String::from_utf8_lossy(&shown).into_owned()
-    });
-    let out = remuda.wait_with_output().unwrap();
-    let took = start.elapsed();
-    let shown = terminal.join().unwrap();
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(out.status.success(), "{stdout}{shown}");
-    assert!(
-        took >= Duration::from_secs(60),
-        "took {took:?}: no second attempt"
-    );
-    assert!(took < Duration::from_secs(90), "took {took:?}");
-    assert!(
-        shown.contains("remuda: waiting: claude:max Session 100% used"),
-        "{shown:?}"
-    );
-    assert!(stdout.contains("reset since cached"), "{stdout}");
-    let ts = jiff::Timestamp::from_millisecond(fetched)
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        history(&sb),
-        [
-            serde_json::json!({"ts": ts, "account": "claude:max", "label": "Session",
-                "model": null, "percent": 100.0, "resets_at": reset.to_string(),
-                "source": "cached"}),
-            serde_json::json!({"ts": ts, "account": "claude:max",
-                "label": "Week (all models)", "model": null, "percent": 20.0,
-                "resets_at": "2099-09-23T15:39:59Z", "source": "cached"}),
-        ]
-    );
+fn usage_has_no_wait_options() {
+    let Setup { sb, .. } = setup();
+    for (args, unknown) in [
+        (&["usage", "max", "--wait"][..], "--wait"),
+        (&["usage", "--wait"], "--wait"),
+        (&["usage", "max", "--wait", "--live"], "--wait"),
+        (&["usage", "max", "--live", "--wait"], "--wait"),
+        (&["usage", "max", "--history", "--wait"], "--wait"),
+        (&["usage", "max", "--max-wait", "0"], "--max-wait"),
+        (&["usage", "max", "--wait", "--max-wait", "5"], "--wait"),
+    ] {
+        let out = sb.remuda().args(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(
+            stderr.contains(&format!("unexpected argument '{unknown}'")),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert!(sb.invocations().is_empty());
+    assert!(!sb.remuda_home().join("state").exists());
 }
