@@ -116,14 +116,16 @@ fn cached_usage_for_every_account_without_running_claude() {
         headers[2].starts_with("claude:team no cached usage"),
         "{out}"
     );
+    // The 5-hour window is `5h`, not `Session`: a session is what Live and History list.
     let rows = [
-        "Session 34% resets Sep 23 15:39",
+        "5h 34% resets Sep 23 15:39",
         "Week (all models) 77% ! resets Sep 25 04:59",
         "Week (Fable) 100% !! resets Sep 25 04:59",
     ];
     assert_eq!(b[0].1, rows);
     assert_eq!(b[1].1, rows);
     assert!(b[2].1.is_empty());
+    assert!(!out.contains("Session"), "{out}");
     assert!(
         sb.invocations().is_empty(),
         "cached usage must not run claude"
@@ -158,7 +160,7 @@ fn cached_usage_past_a_reset_says_so() {
     assert_eq!(
         b[0].1,
         [
-            format!("Session - reset since cached ({})", utc(session)),
+            format!("5h - reset since cached ({})", utc(session)),
             format!("Week (all models) 77% ! resets {}", utc(week)),
         ],
         "{out}"
@@ -178,7 +180,7 @@ fn cached_usage_uses_the_given_time_zone() {
     );
     let b = blocks(&out);
     assert_eq!(b.len(), 1, "{out}");
-    assert_eq!(b[0].1[0], "Session 34% resets Sep 23 23:39");
+    assert_eq!(b[0].1[0], "5h 34% resets Sep 23 23:39");
 }
 
 #[test]
@@ -243,13 +245,13 @@ fn live_usage_runs_claude_per_account_with_its_env() {
         ["claude:default live", "claude:max live", "claude:team live"]
     );
     let sample_rows = [
-        "Session 9% resets Sep 24 at 3:19am (Asia/Shanghai)",
+        "5h 9% resets Sep 24 at 3:19am (Asia/Shanghai)",
         "Week (all models) 74% resets Sep 29 at 11:59am (Asia/Shanghai)",
         // Live rows carry no severity: marked from the percentage like the TUI (75 % / 90 %).
         "Week (Fable) 85% ! resets Sep 29 at 11:59am (Asia/Shanghai)",
     ];
     assert_eq!(b[0].1, sample_rows);
-    assert_eq!(b[1].1, ["Session 0%"]);
+    assert_eq!(b[1].1, ["5h 0%"]);
     assert_eq!(b[2].1, sample_rows);
 
     assert_eq!(sb.invocations().len(), 3);
@@ -286,7 +288,7 @@ fn live_usage_runs_without_disable_nonessential_traffic() {
     let b = blocks(&out);
     assert_eq!(b[0].0, "claude:max live", "{out}");
     assert_eq!(b[0].1.len(), 3, "{out}");
-    assert!(b[0].1[0].starts_with("Session 9%"), "{out}");
+    assert!(b[0].1[0].starts_with("5h 9%"), "{out}");
     let invs = sb.invocations_with(Some(&max));
     assert_eq!(invs.len(), 1);
     assert_eq!(invs[0].args, LIVE_ARGS);
@@ -353,7 +355,7 @@ fn live_usage_read_in_part_is_shown_as_is() {
         assert!(out.contains(line), "{line:?} in:\n{out}");
     }
     // Not the aligned rows of an answer that was read.
-    assert!(!out.contains("  Session  "), "{out}");
+    assert!(!out.contains("  5h  "), "{out}");
 }
 
 /// R10: claude 2.1.292's answer when it could not get the account's limits: how the account is
@@ -428,7 +430,7 @@ fn live_usage_with_a_reset_time_out_of_range_is_shown_as_said() {
     assert_eq!(
         b[0].1,
         [
-            "Session 40% resets Oct 9, 2:60pm (UTC)",
+            "5h 40% resets Oct 9, 2:60pm (UTC)",
             "Week (all models) 50% resets Jan 2, 2027 at 3:99pm (UTC)",
             "Week (Fable) 60% resets Jan 2, 2027, 3:-1pm (UTC)",
         ]
@@ -590,7 +592,7 @@ fn a_query_that_touches_the_terminal_is_not_stopped() {
     assert!(out.status.success(), "{stdout}{stderr}");
     let b = blocks(&stdout);
     assert_eq!(b[0].0, "claude:max live", "{stdout}");
-    assert_eq!(b[0].1, ["Session 7%"], "{stdout}");
+    assert_eq!(b[0].1, ["5h 7%"], "{stdout}");
     assert!(took < Duration::from_secs(4), "took {took:?}: stopped");
     // It did reach the terminal: the write went through, and the read failed (EIO).
     let said = |name: &str| std::fs::read_to_string(sb.home().join(name)).unwrap();
@@ -857,7 +859,7 @@ fn a_reset_within_the_hour_with_much_left_gets_a_note() {
     let out = stdout_of(sb.remuda().args(["usage", "max"]).assert().success());
     let b = blocks(&out);
     assert_eq!(b[0].1.len(), 3, "{out}");
-    assert!(b[0].1[0].starts_with("Session 34% resets "), "{out}");
+    assert!(b[0].1[0].starts_with("5h 34% resets "), "{out}");
     // 30 or 31 minutes, as the clock turns between the fixture and the run.
     let note = &b[0].1[1];
     assert!(
@@ -907,7 +909,7 @@ fn a_window_on_pace_to_be_used_up_gets_a_note() {
     assert_eq!(
         blocks(&out)[0].1,
         [
-            format!("Session 85% ! resets {}", utc(reset)),
+            format!("5h 85% ! resets {}", utc(reset)),
             format!(
                 "note: at this pace 100% by {}, 1h40m before the reset",
                 utc(plus(now, 20 * 60))

@@ -12,6 +12,7 @@ use crate::account_config::{
     ConfigView, Content, Entry as ConfigEntry, Origin, PluginContents, Role as ConfigRole, Summary,
     Synced,
 };
+use crate::checks::{self, Check};
 use crate::identity::Identity;
 use crate::index::Entry;
 use crate::live::LiveSession;
@@ -503,7 +504,7 @@ fn tail(s: &str, max: usize) -> String {
 
 /// A usage column: its header and the row label it shows.
 fn usage_columns(app: &App) -> Vec<(String, String)> {
-    let mut labels: Vec<String> = vec!["Session".into(), "Week (all models)".into()];
+    let mut labels: Vec<String> = vec!["5h".into(), "Week (all models)".into()];
     for a in &app.accounts {
         for r in a.rows() {
             if !labels.contains(&r.label) {
@@ -515,7 +516,7 @@ fn usage_columns(app: &App) -> Vec<(String, String)> {
         .into_iter()
         .map(|label| {
             let header = match label.as_str() {
-                "Session" => "SESSION".to_string(),
+                "5h" => "5H".to_string(),
                 "Week (all models)" => "WEEK".to_string(),
                 other => match scope(other) {
                     Some(("Week", model)) => model.to_string(),
@@ -662,7 +663,8 @@ fn accounts_table(app: &App, f: &mut Frame, table: Rect) -> u16 {
         .map(dim)
         .collect();
     head.extend(columns.iter().map(|(h, _)| dim(h.clone())));
-    head.push(dim("SOURCE"));
+    // The reading's age, and whether it is the cache or a live answer.
+    head.push(dim("AS OF"));
     lines.push(row(head, &widths));
     lines.extend(visible_rows(
         app.accounts_list,
@@ -698,10 +700,10 @@ fn accounts_table(app: &App, f: &mut Frame, table: Rect) -> u16 {
     name_w
 }
 
-/// A model-scoped limit's label, `Week (<model>)` or `Session (<model>)` (codex, R10):
-/// `("Week" | "Session", model)`.
+/// A model-scoped limit's label, `Week (<model>)` or `5h (<model>)` (codex, R10):
+/// `("Week" | "5h", model)`.
 fn scope(label: &str) -> Option<(&'static str, &str)> {
-    ["Week", "Session"].into_iter().find_map(|kind| {
+    ["Week", "5h"].into_iter().find_map(|kind| {
         let model = label
             .strip_prefix(kind)?
             .strip_prefix(" (")?
@@ -710,11 +712,11 @@ fn scope(label: &str) -> Option<(&'static str, &str)> {
     })
 }
 
-/// Marker for a usage row on the timeline: `S` session, `W` all-models week, the lowercase
-/// initial of the model for a model-scoped week or session.
+/// Marker for a usage row on the timeline: `S` the 5-hour window, `W` the all-models week,
+/// the lowercase initial of the model for a model-scoped week or 5-hour window.
 fn marker(label: &str) -> char {
     match label {
-        "Session" => 'S',
+        "5h" => 'S',
         "Week (all models)" => 'W',
         other => scope(other)
             .and_then(|(_, model)| model.chars().next())
@@ -723,7 +725,7 @@ fn marker(label: &str) -> char {
 }
 
 /// How the timeline's legend names a row other than `S` and `W`: `week (<model>)`,
-/// `session (<model>)`, else its label.
+/// `5h (<model>)`, else its label.
 fn legend_text(label: &str) -> String {
     match scope(label) {
         Some((kind, model)) => format!("{} ({model})", kind.to_ascii_lowercase()),
@@ -816,7 +818,7 @@ fn timeline_view(app: &App, f: &mut Frame, area: Rect, name_w: usize) {
         spans.push(Span::raw(format!(" {next}")));
         lines.push(Line::from(spans));
     }
-    let mut legend = String::from("S session · W week (all models)");
+    let mut legend = String::from("S 5h · W week (all models)");
     for (c, text) in &scoped {
         legend.push_str(&format!(" · {c} {text}"));
     }
@@ -829,13 +831,17 @@ fn timeline_view(app: &App, f: &mut Frame, area: Rect, name_w: usize) {
 
 fn checks_view(app: &App, f: &mut Frame, area: Rect) {
     let mut lines = vec![section("Checks", area.width)];
-    let mut problems: Vec<String> = Vec::new();
-    if let Some(checks) = &app.checks {
-        problems.extend(checks.iter().map(|c| match &c.account {
-            Some(a) => format!("{}: {}", short(a), c.message),
-            None => c.message.to_string(),
-        }));
-    }
+    let said = |c: &Check| match &c.account {
+        Some(a) => format!("{}: {}", short(a), c.message),
+        None => c.message.to_string(),
+    };
+    let level = |level: checks::Level| {
+        app.checks
+            .iter()
+            .flatten()
+            .filter(move |c| c.level == level)
+    };
+    let mut problems: Vec<String> = level(checks::Level::Warning).map(said).collect();
     for a in &app.accounts {
         let name = short(&a.account.qualified()).to_string();
         if a.identity == Some(Identity::NotLoggedIn) {
@@ -845,21 +851,39 @@ fn checks_view(app: &App, f: &mut Frame, area: Rect) {
             problems.push(format!("{name}: live usage failed: {e}"));
         }
     }
+    // The notes are no problems: they follow every warning (R11).
+    let notes: Vec<String> = level(checks::Level::Note).map(said).collect();
     if app.checks.is_none() {
         lines.push(Line::styled("checking…", DIM));
     } else if problems.is_empty() {
         lines.push(Line::styled("✓ no problems found", OK));
     }
-    for p in problems {
-        for (i, l) in text::wrap(&p, (area.width as usize).saturating_sub(2))
-            .into_iter()
-            .enumerate()
-        {
-            let prefix = if i == 0 { "! " } else { "  " };
-            lines.push(Line::styled(format!("{prefix}{l}"), WARN));
-        }
+    let width = (area.width as usize).saturating_sub(2);
+    for p in &problems {
+        lines.extend(told(WARNING, p, width).into_iter().map(Line::from));
+    }
+    for n in &notes {
+        lines.extend(told(NOTE, n, width).into_iter().map(Line::from));
     }
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// How a warning is told (R11): after `!`, in the warning's color.
+const WARNING: (&str, Style) = ("! ", WARN);
+/// How a note is told (R11): after a `·`, dim, all of it.
+const NOTE: (&str, Style) = ("· ", DIM);
+
+/// What a check tells, wrapped at `width` after its mark (`(mark, style)`: [`WARNING`] or
+/// [`NOTE`]), a line each, the lines after the first indented as far.
+fn told((mark, style): (&str, Style), said: &str, width: usize) -> Vec<Span<'static>> {
+    text::wrap(said, width)
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let lead = if i == 0 { mark } else { "  " };
+            Span::styled(format!("{lead}{l}"), style)
+        })
+        .collect()
 }
 
 // ---- Account card (R22) ----------------------------------------------------------------
@@ -954,10 +978,10 @@ fn account_card(app: &App, f: &mut Frame) {
     f.render_widget(Paragraph::new(shown), text_area);
 }
 
-/// A window's name in the usage fact: `session`, `week`, `<model> week`, `<model> 5h`.
+/// A window's name in the usage fact: `5h`, `week`, `<model> week`, `<model> 5h`.
 fn window_name(label: &str) -> String {
     match label {
-        "Session" => "session".to_string(),
+        "5h" => "5h".to_string(),
         "Week (all models)" => "week".to_string(),
         other => match scope(other) {
             Some(("Week", model)) => format!("{model} week"),
@@ -967,25 +991,28 @@ fn window_name(label: &str) -> String {
     }
 }
 
-/// The problems the checks list for one account (R11), the machine-wide ones with them (an
-/// environment override or a shared store's cleanup concerns this account too), and what the
-/// view adds: not logged in, a failed live query.
-fn account_problems(app: &App, a: &AccountState) -> Vec<String> {
+/// What the checks tell of one account (R11), the machine-wide ones with it (an environment
+/// override or a shared store's cleanup concerns this account too): the warnings, with what
+/// the view adds (not logged in, a failed live query), and the notes.
+fn account_problems(app: &App, a: &AccountState) -> (Vec<String>, Vec<String>) {
     let qualified = a.account.qualified();
-    let mut problems: Vec<String> = app
-        .checks
-        .iter()
-        .flatten()
-        .filter(|c| c.account.is_none() || c.account.as_deref() == Some(qualified.as_str()))
-        .map(|c| c.message.to_string())
-        .collect();
+    let level = |level: checks::Level| {
+        app.checks
+            .iter()
+            .flatten()
+            .filter(move |c| c.level == level)
+            .filter(|c| c.account.is_none() || c.account.as_deref() == Some(qualified.as_str()))
+            .map(|c| c.message.to_string())
+            .collect::<Vec<_>>()
+    };
+    let mut problems = level(checks::Level::Warning);
     if a.identity == Some(Identity::NotLoggedIn) {
         problems.push("not logged in".to_string());
     }
     if let Some(Err(e)) = &a.live {
         problems.push(format!("live usage failed: {e}"));
     }
-    problems
+    (problems, level(checks::Level::Note))
 }
 
 /// What the view knows of the account, above its configuration (R22): never none or zero for
@@ -1101,25 +1128,24 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
     // `checking…` first while the checks run (the first time, on `r`, and after the account
     // list changed: an account added since was never checked), and what is known already
     // (the last run's problems, not logged in, a failed live query) under it, not hidden until
-    // they answer. `✓` only for a run that has answered and is not being repeated.
-    let problems = account_problems(app, a);
-    let mut checks: Vec<Vec<Span<'static>>> = Vec::new();
+    // they answer. `✓` only for a run that has answered and is not being repeated, and has
+    // no warning: the notes follow the warnings (R11).
+    let (problems, notes) = account_problems(app, a);
+    let mut checks: Vec<Span<'static>> = Vec::new();
     if app.checks.is_none() || app.work.checks.is_running() {
-        checks.push(vec![Span::styled("checking…", DIM)]);
+        checks.push(Span::styled("checking…", DIM));
     } else if problems.is_empty() {
-        checks.push(vec![Span::styled("✓ no problems found", OK)]);
+        checks.push(Span::styled("✓ no problems found", OK));
     }
+    let width = value_w.saturating_sub(2).max(1);
     for p in &problems {
-        for (j, l) in text::wrap(p, value_w.saturating_sub(2).max(1))
-            .into_iter()
-            .enumerate()
-        {
-            let prefix = if j == 0 { "! " } else { "  " };
-            checks.push(vec![Span::styled(format!("{prefix}{l}"), WARN)]);
-        }
+        checks.extend(told(WARNING, p, width));
+    }
+    for n in &notes {
+        checks.extend(told(NOTE, n, width));
     }
     for (i, line) in checks.into_iter().enumerate() {
-        facts.push(fact(if i == 0 { "Checks" } else { "" }, line));
+        facts.push(fact(if i == 0 { "Checks" } else { "" }, vec![line]));
     }
 
     let shares = if !claude {
@@ -1135,6 +1161,15 @@ fn account_card_facts(app: &App, width: usize) -> Vec<Line<'static>> {
         }
     };
     facts.extend(facts_packed("Shares", vec![shares], value_w));
+    // The link every account loads the source's plugins through, a line of its own where it
+    // is one (R22).
+    if let Some(Ok(view)) = app.config.loaded.as_ref().filter(|_| claude)
+        && let Some(link) = &view.plugins_link
+    {
+        for l in text::wrap(&link.to_string(), value_w) {
+            facts.push(fact("", vec![Span::raw(l)]));
+        }
+    }
     facts
 }
 

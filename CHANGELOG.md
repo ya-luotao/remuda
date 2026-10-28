@@ -65,6 +65,25 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   while the time it would reach 100% is still ahead and at least a minute before the reset. A
   cache that does not say when it was written gets none, and the TUI shows no such note
   (SPEC R10).
+- **Breaking:** the five-hour usage window is labeled `5h` instead of `Session` wherever Remuda
+  shows it: in `remuda usage` (`5h`, and `5h (<model>)` for a per-model Codex window), as the
+  Accounts table's `5H` column, in the timeline's legend (`S 5h`; the marker is still `S`), and
+  in the account card's usage. A session is now only what Live and History list. Claude's own
+  `Current session` line is read as before (SPEC R10).
+  **Migration:** scripts that match `Session` in the output of `remuda usage` must match `5h`
+  (and `5h (` for a per-model window) instead.
+- Checks have two levels. Warnings, for what is broken or overridden, come first with `!` as
+  before; notes follow, dim, after a `·`, without `!`, in the Accounts view and in the account
+  card alike. The notice of what a member does not share (`does not share … with <source>; to
+  share an item: ln -s …`, with the sentence about `settings.json` it may carry, or that
+  sentence alone) is a note; every other check stays a warning. `✓ no problems found` now
+  means no warning, and notes may follow it. That a member's `plugins` must stay a symlink,
+  because the source's plugins are installed through it, is no longer a check: it leaves the
+  Accounts view and becomes a line of that member's account card, under its part in sharing,
+  with the same wording and number, masked in private mode as before (SPEC R11, R21, R22).
+- The Accounts table's `SOURCE` column is renamed `AS OF`; its values (`cached 1h ago`,
+  `live 0s ago`) are unchanged. "Source" is the `[share.claude]` source of shared
+  configuration.
 
 ### Removed
 

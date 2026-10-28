@@ -453,7 +453,7 @@ fn usage_reads_codex_rate_limits_from_rollouts() {
     assert_eq!(
         rows,
         &[
-            "Session - reset since cached (Sep 22 18:00)",
+            "5h - reset since cached (Sep 22 18:00)",
             "Week (all models) 20% resets Sep 27 09:06"
         ]
     );
@@ -491,7 +491,7 @@ const CX_ACCOUNT: &str = r#"{"account":{"type":"chatgpt","email":"cx@example.com
 
 const LIVE_ROWS: [&str; 3] = [
     "Week (all models) 99% !! resets Sep 26 09:22",
-    "Session (GPT-5.3-Codex-Spark) 5% resets Sep 25 01:33",
+    "5h (GPT-5.3-Codex-Spark) 5% resets Sep 25 01:33",
     "Week (GPT-5.3-Codex-Spark) 7% resets Sep 29 16:40",
 ];
 
@@ -606,7 +606,7 @@ fn live_usage_codex_logged_out_fails() {
     assert_eq!(code, Some(1), "{out}");
     let b = blocks(&out);
     assert_eq!(b.len(), 3, "{out}");
-    assert_eq!(block(&b, "claude:default").1, ["Session 3%"]);
+    assert_eq!(block(&b, "claude:default").1, ["5h 3%"]);
     assert_eq!(block(&b, "codex:default").1, LIVE_ROWS);
     assert_eq!(
         block(&b, "codex:work").0,

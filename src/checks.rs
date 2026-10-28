@@ -12,18 +12,28 @@ use crate::home_items::{self, Id, Source};
 use crate::index::Store;
 use crate::privacy::Marked;
 use crate::registry::{Account, CLAUDE, Home, Sharing};
-use crate::share::{self, Installs};
+use crate::share;
 use crate::{launch, usage};
 
-/// One problem worth a warning.
+/// One thing the accounts view tells (R11), a warning or a note.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
     /// `provider:name` of the account concerned; `None` for machine-wide problems.
     pub account: Option<String>,
+    pub level: Level,
     /// What to tell, in its pieces: each path in it is a piece of its own, and so is each name
     /// read from a file (a plugin, a settings key), so private mode masks those and leaves
     /// what the message says around them (R21).
     pub message: Marked,
+}
+
+/// How a check is told (R11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    /// Something broken or overridden: told first, with `!`.
+    Warning,
+    /// A fact of the layout, true of a healthy setup too: told after the warnings, dim.
+    Note,
 }
 
 /// A message that starts with remuda's own `words`.
@@ -74,6 +84,7 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
         if env.get(*var).is_some_and(|v| !v.is_empty()) {
             checks.push(Check {
                 account: None,
+                level: Level::Warning,
                 message: say(format!("{var} is set: {what}")),
             });
         }
@@ -82,6 +93,7 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
     if launch::child_session_unsaved(env) {
         checks.push(Check {
             account: None,
+            level: Level::Warning,
             message: say(launch::child_session_warning()),
         });
     }
@@ -95,6 +107,7 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
         if matches!(account.home, Home::Path(_)) && !home.is_dir() {
             checks.push(Check {
                 account: Some(qualified),
+                level: Level::Warning,
                 message: say("home ").path(home.display()).words(" does not exist"),
             });
             continue;
@@ -102,6 +115,7 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
         for (link, target) in dangling_symlinks(&home) {
             checks.push(Check {
                 account: Some(qualified.clone()),
+                level: Level::Warning,
                 message: say("dangling symlink ")
                     .path(link.display())
                     .words(" -> ")
@@ -126,6 +140,7 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
         if !missing.is_empty() {
             checks.push(Check {
                 account: None,
+                level: Level::Warning,
                 message: say("projects ").path(store.path.display()).words(format!(
                     " is shared by {}, but {} {} no cleanupPeriodDays in settings.json \
                          (the default 30-day cleanup deletes everyone's sessions)",
@@ -144,12 +159,12 @@ pub fn run(accounts: &[Account], env: &Env, stores: &[Store]) -> Vec<Check> {
 /// account's (checked even without the source's home); members that share `projects` with
 /// the source but not `file-history`, or not `agent-memory` where a settings file chooses
 /// `autoMemoryDirectory` (a launch then does not redirect memory); once per member, the
-/// items of the source it does not link, with the link that would share each (a notice: an
+/// items of the source it does not link, with the link that would share each (a note: an
 /// account whose `projects` is its own does not see the source's sessions, R16; a
 /// `settings.json` the source sets authentication in is not for linking, and the account
 /// needs one of its own; one that cannot be read as a JSON object is not either, and is the
-/// source's to fix); members whose `plugins` link the source's installs go through; members
-/// that read the source's authentication settings through a linked `settings.json`.
+/// source's to fix); members that read the source's authentication settings through a linked
+/// `settings.json`. All of them warnings but the note.
 pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check> {
     let mut checks = Vec::new();
     let Some(source) = &sharing.source else {
@@ -159,6 +174,7 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
     if !accounts.iter().any(|a| a.qualified() == name) {
         checks.push(Check {
             account: Some(name),
+            level: Level::Warning,
             message: say("[share.claude] from names this account, which is not registered"),
         });
         return checks;
@@ -172,14 +188,12 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             .map_or(source.home.to_string(), |d| d.display().to_string());
         checks.push(Check {
             account: Some(name.clone()),
+            level: Level::Warning,
             message: say("home ")
                 .path(home)
                 .words(" of the shared configuration source does not exist: nothing is shared"),
         });
     }
-    let installs = from
-        .as_ref()
-        .map(|from| share::installed_plugins(from.home()));
     // A settings file of the source that cannot be read chooses nothing and sets no
     // authentication.
     let unread = Map::new();
@@ -201,6 +215,7 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
         for link in home_items::linked_elsewhere(account, accounts, env) {
             checks.push(Check {
                 account: Some(account.qualified()),
+                level: Level::Warning,
                 // The item's name and what breaks are the catalog's (`home_items`), remuda's
                 // own words; the other account is a name.
                 message: say(format!(
@@ -243,6 +258,7 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             if items.unlinked(Id::FileHistory) {
                 checks.push(Check {
                     account: Some(account.qualified()),
+                    level: Level::Warning,
                     message: apart(Id::FileHistory, ""),
                 });
             }
@@ -259,6 +275,7 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
                 );
                 checks.push(Check {
                     account: Some(account.qualified()),
+                    level: Level::Warning,
                     message: apart(Id::AgentMemory, &why),
                 });
             }
@@ -269,7 +286,9 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
         // A `settings.json` of the source that is not for linking (`setup` leaves it out,
         // R18) is left out of the list and said apart: one that sets authentication, while
         // the home has none of its own, which then needs one; one that cannot be read as a
-        // JSON object, which is the source's to fix (its account card says so, R22).
+        // JSON object, which is the source's to fix (its account card says so, R22). The
+        // notice is a note whichever of these it says (R11): it tells what this home does not
+        // share, not that something is broken in it.
         let unreadable_settings = from.settings().is_err() && items.unlinked(Id::Settings);
         let own_settings = !withheld.is_empty() && items.unlinked(Id::Settings);
         let needs_own_settings =
@@ -313,48 +332,22 @@ pub fn sharing(accounts: &[Account], env: &Env, sharing: &Sharing) -> Vec<Check>
             }
             checks.push(Check {
                 account: Some(account.qualified()),
+                level: Level::Note,
                 message,
             });
         } else if settings_apart {
             checks.push(Check {
                 account: Some(account.qualified()),
+                level: Level::Note,
                 message: not_shared(Marked::default()),
             });
-        }
-        // A plugin installed from a member's home is recorded through that home's `plugins`
-        // link, which every account then depends on.
-        if let Some(Installs::Known(plugins)) = &installs
-            && items.linked(Id::Plugins)
-        {
-            let through = Id::Plugins.at(&home);
-            let held = plugins
-                .values()
-                .filter(|installs| {
-                    installs
-                        .iter()
-                        .any(|i| i.path.as_deref().is_some_and(|p| p.starts_with(&through)))
-                })
-                .count();
-            if held > 0 {
-                let (plugins, are, stop) = if held == 1 {
-                    ("plugin", "is", "stops")
-                } else {
-                    ("plugins", "are", "stop")
-                };
-                checks.push(Check {
-                    account: Some(account.qualified()),
-                    message: Marked::default().path(through.display()).words(format!(
-                        " must stay a symlink: {held} {plugins} of {name} {are} installed \
-                         through it and {stop} loading for every account without it"
-                    )),
-                });
-            }
         }
         // A home that links the source's `settings.json` reads all of it, authentication
         // included (R18).
         if items.linked(Id::Settings) && !withheld.is_empty() {
             checks.push(Check {
                 account: Some(account.qualified()),
+                level: Level::Warning,
                 message: listed(
                     say(format!(
                         "{settings_file} is that of {name} through a symlink, and it sets \
@@ -493,6 +486,10 @@ mod tests {
             .collect()
     }
 
+    fn levels(checks: &[Check]) -> Vec<Level> {
+        checks.iter().map(|c| c.level).collect()
+    }
+
     #[test]
     fn a_clean_setup_has_no_problems() {
         let f = Root::new();
@@ -567,6 +564,7 @@ mod tests {
             said.iter().map(|m| (None, *m)).collect::<Vec<_>>()
         );
         assert_eq!(shapes(&got), said);
+        assert_eq!(levels(&got), [Level::Warning; 5]);
         for check in &got {
             for (_, value) in values {
                 assert!(!check.message.as_str().contains(value), "{check:?}");
@@ -675,6 +673,7 @@ mod tests {
                 "dangling symlink <> -> <>"
             ]
         );
+        assert_eq!(levels(&got), [Level::Warning; 3]);
         let paths: Vec<&str> = got[1]
             .message
             .pieces()
@@ -810,6 +809,7 @@ mod tests {
             shapes(&got),
             ["home <> of the shared configuration source does not exist: nothing is shared"]
         );
+        assert_eq!(levels(&got), [Level::Warning]);
         let got = sharing_checks(&accounts[..1], &f.env, &sharing_from(named("gone", &gone)));
         assert_eq!(
             messages(&got),
@@ -818,6 +818,7 @@ mod tests {
                 "[share.claude] from names this account, which is not registered"
             )]
         );
+        assert_eq!(levels(&got), [Level::Warning]);
     }
 
     /// R11, R18: a member whose `projects` is the source's shares the source's `agent-memory`
@@ -1031,8 +1032,10 @@ mod tests {
         symlink(f.root.join("home/.claude.json"), max.join(".claude.json")).unwrap();
         symlink(team.join("history.jsonl"), max.join("history.jsonl")).unwrap();
         symlink(native.join("sessions"), max.join("sessions")).unwrap();
+        let got = sharing_checks(&accounts, &f.env, &sharing);
+        assert_eq!(levels(&got), [Level::Warning; 3]);
         assert_eq!(
-            messages(&sharing_checks(&accounts, &f.env, &sharing)),
+            messages(&got),
             [
                 (
                     Some("claude:max"),
@@ -1152,6 +1155,9 @@ mod tests {
         mixed.push(named("own", &own));
         let got = sharing_checks(&mixed, &f.env, &sharing);
         assert_eq!(messages(&got), [linked, needs_own]);
+        // Read through the link is a warning; the settings the account does not share are
+        // what it is told it does not share, a note (R11).
+        assert_eq!(levels(&got), [Level::Warning, Level::Note]);
         assert_eq!(
             shapes(&got)[0],
             "settings.json is that of claude:default through a symlink, and it sets \
@@ -1318,6 +1324,11 @@ mod tests {
                 })
                 .collect();
             assert_eq!(notices.len(), 1, "{case}");
+            // The notice is the one note; everything else said of the member is a warning.
+            for check in &checks {
+                let noted = check.message.starts_with("does not share ");
+                assert_eq!(check.level == Level::Note, noted, "{case}");
+            }
             let notice = &notices[0].message;
             assert!(
                 notice.starts_with(&format!(
@@ -1355,11 +1366,13 @@ mod tests {
         }
     }
 
-    /// R11, R18: installs recorded through a member's `plugins` link make that link one every
-    /// account depends on. Not said without such an install, for a `plugins` of the member's
-    /// own, or when the list is not recognized.
+    /// R11, R22: installs recorded through a member's `plugins` link make that link one every
+    /// account depends on; that is a fact of a healthy layout, which the member's account card
+    /// says (R22), not a check. The checks say nothing of it, with one install through the
+    /// link or two, beside a directory of a similar name, or with a list that is not
+    /// recognized; a `plugins` of the member's own is the one item it does not share.
     #[test]
-    fn a_plugins_link_that_installs_go_through() {
+    fn a_plugins_link_that_installs_go_through_is_not_a_check() {
         let f = Root::new();
         let native = f.root.join("home/.claude");
         fs::create_dir_all(native.join("plugins/cache/m")).unwrap();
@@ -1411,43 +1424,26 @@ mod tests {
             [team_notice]
         );
 
+        // One install through `max`'s link, then two.
         write(
             &max.join("plugins/cache/m/a"),
             &native.join("plugins/cache/m/b"),
         );
         assert_eq!(
             messages(&sharing_checks(&accounts, &f.env, &sharing)),
-            [
-                (
-                    Some("claude:max"),
-                    format!(
-                        "{} must stay a symlink: 1 plugin of claude:default is installed \
-                         through it and stops loading for every account without it",
-                        max.join("plugins").display()
-                    )
-                    .as_str()
-                ),
-                team_notice,
-            ]
-        );
-        assert_eq!(
-            shapes(&sharing_checks(&accounts, &f.env, &sharing))[0],
-            "<> must stay a symlink: 1 plugin of claude:default is installed through it and \
-             stops loading for every account without it"
+            [team_notice]
         );
         write(
             &max.join("plugins/cache/m/a"),
             &max.join("plugins/cache/m/b"),
         );
         let got = sharing_checks(&accounts, &f.env, &sharing);
+        assert_eq!(messages(&got), [team_notice]);
         assert!(
-            got[0].message.ends_with(
-                "2 plugins of claude:default are installed through it and stop loading for \
-                 every account without it"
-            ),
+            !got.iter()
+                .any(|c| c.message.contains("must stay a symlink")),
             "{got:?}"
         );
-        assert_eq!(got.len(), 2);
 
         // Another directory whose name begins the same way is not below `plugins`.
         write(
@@ -1500,6 +1496,8 @@ mod tests {
                 not_sharing(&native, &max, "projects, agents").as_str()
             )]
         );
+        // What the home does not link is the user's choice: a note, not a warning.
+        assert_eq!(levels(&got), [Level::Note]);
         // The store and both ends of the link to make are paths; the rest stays readable.
         assert_eq!(
             shapes(&got),
@@ -1562,6 +1560,8 @@ mod tests {
                  settings ({}, {}), so this account needs one of its own"
             ]
         );
+        // Said alone, it is still the notice of what the account does not share: a note.
+        assert_eq!(levels(&got), [Level::Note]);
         // With other items not shared, the same notice carries it.
         fs::write(native.join("CLAUDE.md"), "x").unwrap();
         let got = sharing_checks(&accounts, &f.env, &sharing);
@@ -1630,6 +1630,7 @@ mod tests {
         let got = sharing_checks(&accounts, &f.env, &sharing);
         assert_eq!(messages(&got), [unreadable]);
         assert_eq!(shapes(&got), [unreadable.1]);
+        assert_eq!(levels(&got), [Level::Note]);
         assert!(
             !got.iter()
                 .any(|c| c.account.as_deref() == Some("claude:default")),
@@ -1725,6 +1726,7 @@ mod tests {
                  cleanup deletes everyone's sessions)"
             ]
         );
+        assert_eq!(levels(&got), [Level::Warning]);
 
         // Codex accounts sharing a `sessions` store are no concern of cleanupPeriodDays.
         let shared_sessions = f.root.join("codex-sessions");

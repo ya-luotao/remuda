@@ -13,7 +13,7 @@ use super::app::{
 };
 use super::render;
 use crate::attribution::Attribution;
-use crate::checks::Check;
+use crate::checks::{Check, Level as CheckLevel};
 use crate::identity::Identity;
 use crate::index::{Entry, Store};
 use crate::live::{Control, LiveSession, Source};
@@ -546,7 +546,7 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
         &mut app,
         Event::CachedUsage {
             account: account("max"),
-            result: cached(vec![row("Session", 10.0, None, None)]),
+            result: cached(vec![row("5h", 10.0, None, None)]),
         },
     );
     assert_eq!(
@@ -563,7 +563,7 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
         Event::LiveUsage {
             account: account("max"),
             answered_at: ts(NOW),
-            result: Ok(LiveUsage::Rows(vec![row("Session", 55.0, None, None)]).into()),
+            result: Ok(LiveUsage::Rows(vec![row("5h", 55.0, None, None)]).into()),
         },
     );
     // Only the accounts that finished can be asked again.
@@ -576,7 +576,7 @@ fn live_usage_is_per_account_and_replaces_the_cache() {
         Event::LiveUsage {
             account: account("max"),
             answered_at: ts(NOW),
-            result: Ok(LiveUsage::Rows(vec![row("Session", 56.0, None, None)]).into()),
+            result: Ok(LiveUsage::Rows(vec![row("5h", 56.0, None, None)]).into()),
         },
     );
     assert_eq!(app.accounts[1].rows()[0].percent, 56.0);
@@ -650,7 +650,7 @@ fn private_mode_keeps_the_window_lengths() {
             account: account("max"),
             result: cached(vec![
                 lasting(90, row("2h window", 10.0, None, None)),
-                row("Session", 5.0, None, None),
+                row("5h", 5.0, None, None),
             ]),
         },
     );
@@ -660,9 +660,7 @@ fn private_mode_keeps_the_window_lengths() {
         Event::LiveUsage {
             account: account("team"),
             answered_at: ts(NOW),
-            result: Ok(
-                LiveUsage::Rows(vec![lasting(300, row("Session", 55.0, None, None))]).into(),
-            ),
+            result: Ok(LiveUsage::Rows(vec![lasting(300, row("5h", 55.0, None, None))]).into()),
         },
     );
     app.private = true;
@@ -691,7 +689,7 @@ fn late_results_follow_their_account_when_rows_move() {
         Event::LiveUsage {
             account: account("team"),
             answered_at: ts(NOW),
-            result: Ok(LiveUsage::Rows(vec![row("Session", 42.0, None, None)]).into()),
+            result: Ok(LiveUsage::Rows(vec![row("5h", 42.0, None, None)]).into()),
         },
     );
     assert_eq!(app.accounts[1].rows()[0].percent, 42.0);
@@ -704,7 +702,7 @@ fn late_results_follow_their_account_when_rows_move() {
         Event::LiveUsage {
             account: account("max"),
             answered_at: ts(NOW),
-            result: Ok(LiveUsage::Rows(vec![row("Session", 99.0, None, None)]).into()),
+            result: Ok(LiveUsage::Rows(vec![row("5h", 99.0, None, None)]).into()),
         },
     );
     update(
@@ -718,7 +716,7 @@ fn late_results_follow_their_account_when_rows_move() {
         &mut app,
         Event::CachedUsage {
             account: account("max"),
-            result: cached(vec![row("Session", 99.0, None, None)]),
+            result: cached(vec![row("5h", 99.0, None, None)]),
         },
     );
     assert_eq!(app.accounts, before);
@@ -3084,6 +3082,7 @@ fn checks_run_once_more_when_the_account_list_changed_meanwhile() {
     // The answer for the old list is not the one shown, and the checks start again.
     let old = Check {
         account: Some("claude:team".into()),
+        level: CheckLevel::Warning,
         message: "home does not exist".into(),
     };
     assert_eq!(update(&mut app, Event::Checks(vec![old])), [Effect::Checks]);
@@ -3243,12 +3242,7 @@ fn populated_accounts() -> App {
         Event::CachedUsage {
             account: account("default"),
             result: cached(vec![
-                row(
-                    "Session",
-                    34.0,
-                    Some("normal"),
-                    Some("2026-09-24T14:00:00Z"),
-                ),
+                row("5h", 34.0, Some("normal"), Some("2026-09-24T14:00:00Z")),
                 row(
                     "Week (all models)",
                     77.0,
@@ -3268,12 +3262,7 @@ fn populated_accounts() -> App {
         &mut app,
         Event::CachedUsage {
             account: account("max"),
-            result: cached(vec![row(
-                "Session",
-                5.0,
-                None,
-                Some("2026-09-24T12:30:00Z"),
-            )]),
+            result: cached(vec![row("5h", 5.0, None, Some("2026-09-24T12:30:00Z"))]),
         },
     );
     update(
@@ -3292,7 +3281,7 @@ fn populated_accounts() -> App {
             answered_at: ts(NOW),
             result: Ok(LiveUsage::Rows(vec![
                 UsageRow {
-                    label: "Session".into(),
+                    label: "5h".into(),
                     percent: 12.0,
                     severity: None,
                     resets: Some(Resets::Text("Sep 24 at 1pm (UTC)".into())),
@@ -3313,6 +3302,7 @@ fn populated_accounts() -> App {
         &mut app,
         Event::Checks(vec![Check {
             account: None,
+            level: CheckLevel::Warning,
             message: "ANTHROPIC_API_KEY is set: it overrides every account's /login".into(),
         }]),
     );
@@ -3406,14 +3396,20 @@ fn header_wraps_navigation_in_the_mark_tracks_when_tall() {
     assert!(!lines[1].contains("1 Accounts"));
 }
 
+/// R10, R16: the table names the 5-hour window `5H` and the reading's age `AS OF`: neither
+/// `SESSION` (the sessions of Live and History) nor `SOURCE` (the source of shared
+/// configuration, R18). The timeline's legend names the 5-hour window `5h` under its letter.
 #[test]
 fn accounts_view_populated() {
     let app = populated_accounts();
     let lines = screen(&app);
     let all = lines.join("\n");
     let (_, head) = line_with(&lines, "ACCOUNT");
-    for col in ["EMAIL", "ORG", "PLAN", "SESSION", "WEEK", "Fable", "SOURCE"] {
+    for col in ["EMAIL", "ORG", "PLAN", "5H", "WEEK", "Fable", "AS OF"] {
         assert!(head.contains(col), "{head}");
+    }
+    for gone in ["SESSION", "SOURCE"] {
+        assert!(!head.contains(gone), "{head}");
     }
     let (_, default) = line_with(&lines, "me@example.com");
     for cell in ["34%", "77%", "100%", "cached 5m ago"] {
@@ -3458,11 +3454,158 @@ fn accounts_view_populated() {
     let max_track = &lines[track_y + 1];
     assert!(max_track.starts_with("max"), "{all}");
     assert!(max_track.contains("S 1h00m W 5d23h"), "{max_track}");
-    assert!(all.contains("f week (Fable)"), "{all}");
+    assert!(
+        all.contains("S 5h · W week (all models) · f week (Fable)"),
+        "{all}"
+    );
 
     // Checks: the env check, the login state.
     assert!(all.contains("! ANTHROPIC_API_KEY is set"), "{all}");
     assert!(all.contains("! team: not logged in"), "{all}");
+}
+
+/// The colors of the cells that `needle` is drawn in, on the line that holds it.
+fn colors_of(app: &App, needle: &str) -> Vec<ratatui::style::Color> {
+    let (w, h) = app.size;
+    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+    terminal.draw(|f| render::render(app, f)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let lines = screen(app);
+    let (y, line) = line_with(&lines, needle);
+    let x = crate::text::width(&line[..line.find(needle).unwrap()]);
+    (x..x + crate::text::width(needle))
+        .map(|x| buffer[(x as u16, y as u16)].fg)
+        .collect()
+}
+
+/// R11: the checks tell their warnings first, each after `!`, those the view adds among them
+/// (not logged in), and their notes after every warning, each after a `·`, dim and without a
+/// `!`, whatever order they were found in. Notes alone are no problem: the view found none.
+/// The account card tells them the same way.
+#[test]
+fn notes_follow_the_warnings_dim_and_without_a_mark() {
+    use ratatui::style::Color;
+
+    let mut app = populated_accounts();
+    update(&mut app, Event::Resize(160, 40));
+    let warning = Check {
+        account: None,
+        level: CheckLevel::Warning,
+        message: "ANTHROPIC_API_KEY is set: it overrides every account's /login".into(),
+    };
+    // The note first, as found.
+    app.checks = Some(vec![note_of_max(), warning.clone()]);
+    let lines = screen(&app);
+    let all = lines.join("\n");
+    let (env, _) = line_with(&lines, "! ANTHROPIC_API_KEY is set");
+    let (login, _) = line_with(&lines, "! team: not logged in");
+    let (noted, _) = line_with(&lines, "· max: does not share agents with claude:default");
+    assert!(env < login && login < noted, "{all}");
+    assert!(!all.contains("! max: does not share"), "{all}");
+    assert!(!all.contains("no problems found"), "{all}");
+    let dim = |needle: &str| colors_of(&app, needle);
+    assert!(
+        dim("· max: does not share agents")
+            .iter()
+            .all(|c| *c == Color::DarkGray),
+        "{all}"
+    );
+    assert!(
+        dim("! ANTHROPIC_API_KEY")
+            .iter()
+            .all(|c| *c == Color::Yellow),
+        "{all}"
+    );
+
+    // Notes alone: no problem found, the notes under it.
+    for a in &mut app.accounts {
+        if a.account.name == "team" {
+            a.identity = Some(logged_in("team@example.com"));
+        }
+    }
+    app.checks = Some(vec![note_of_max()]);
+    let lines = screen(&app);
+    let (found, _) = line_with(&lines, "✓ no problems found");
+    let (noted, _) = line_with(&lines, "· max: does not share agents");
+    assert!(found < noted, "{}", lines.join("\n"));
+
+    // The card of max: the note under its checks, dim, after the warning that concerns
+    // every account.
+    app.checks = Some(vec![note_of_max(), warning]);
+    keys(&mut app, &[Key::Char('j'), Key::Char('p')]);
+    let lines = screen(&app);
+    let all = lines.join("\n");
+    let (warned, _) = line_with(&lines, "Checks     ! ANTHROPIC_API_KEY is set");
+    let (noted, _) = line_with(&lines, "· does not share agents with claude:default");
+    assert!(warned < noted, "{all}");
+    assert!(!all.contains("! does not share"), "{all}");
+    assert!(
+        colors_of(&app, "· does not share agents")
+            .iter()
+            .all(|c| *c == Color::DarkGray),
+        "{all}"
+    );
+    // Notes alone in the card: no problem found.
+    app.checks = Some(vec![note_of_max()]);
+    let lines = screen(&app);
+    let (found, _) = line_with(&lines, "Checks     ✓ no problems found");
+    let (noted, _) = line_with(&lines, "· does not share agents with claude:default");
+    assert_eq!(noted, found + 1, "{}", lines.join("\n"));
+}
+
+/// A note of max's: the items of the source it does not link (R11).
+fn note_of_max() -> Check {
+    Check {
+        account: Some("claude:max".into()),
+        level: CheckLevel::Note,
+        message: "does not share agents with claude:default; to share an item: ln -s \
+                  /h/default/<item> /h/max/<item>"
+            .into(),
+    }
+}
+
+/// R22: a member's `plugins` link that the source's installs go through is a line of the
+/// card's part in sharing, under it, in the card's own color; the card of an account where
+/// it is not one has no such line.
+#[test]
+fn the_card_says_a_plugins_link_must_stay_under_its_part_in_sharing() {
+    let mut app = populated_accounts();
+    update(&mut app, Event::Resize(160, 40));
+    keys(&mut app, &[Key::Char('j'), Key::Char('p')]);
+    let mut view = config_view();
+    view.plugins_link = Some(
+        crate::privacy::Marked::default()
+            .path("/h/max/plugins")
+            .words(
+                " must stay a symlink: 2 plugins of claude:default are installed through it \
+                 and stop loading for every account without it",
+            ),
+    );
+    answer_config(&mut app, "max", view);
+    let lines = screen(&app);
+    let all = lines.join("\n");
+    let (shares, _) = line_with(
+        &lines,
+        "Shares     member of default: shares what its home links to it",
+    );
+    let (link, line) = line_with(
+        &lines,
+        "           /h/max/plugins must stay a symlink: 2 plugins of claude:default",
+    );
+    assert_eq!(link, shares + 1, "{all}");
+    assert!(!line.contains('!'), "{all}");
+    assert!(all.contains("account without it"), "{all}");
+    assert!(
+        colors_of(&app, "/h/max/plugins must stay a symlink")
+            .iter()
+            .all(|c| *c == ratatui::style::Color::Reset),
+        "{all}"
+    );
+
+    // Without it, nothing is said of a link.
+    app.config.loaded = Some(Ok(config_view()));
+    let all = text(&app);
+    assert!(!all.contains("must stay a symlink"), "{all}");
 }
 
 /// R10: a window that has reset since its usage was recorded shows `reset` where its
@@ -3481,12 +3624,7 @@ fn accounts_view_windows_past_their_reset() {
             result: Ok(CachedUsage {
                 fetched_at: Some(ts("2026-09-24T09:00:00Z")),
                 rows: vec![
-                    row(
-                        "Session",
-                        95.0,
-                        Some("critical"),
-                        Some("2026-09-24T11:00:00Z"),
-                    ),
+                    row("5h", 95.0, Some("critical"), Some("2026-09-24T11:00:00Z")),
                     row(
                         "Week (all models)",
                         77.0,
@@ -3589,7 +3727,7 @@ fn accounts_view_a_per_model_window_past_its_reset_alone() {
     );
     let legend = &lines[axis_y + 1 + app.accounts.len()];
     assert!(
-        legend.contains("S session · W week (all models) · f week (Fable)"),
+        legend.contains("S 5h · W week (all models) · f week (Fable)"),
         "{legend}"
     );
 }
@@ -3607,7 +3745,7 @@ fn accounts_view_a_live_reset_behind_its_answer_is_not_replaced() {
             result: Ok(CachedUsage {
                 fetched_at: Some(ts("2026-09-24T09:00:00Z")),
                 rows: vec![
-                    row("Session", 20.0, None, Some("2026-09-24T14:00:00Z")),
+                    row("5h", 20.0, None, Some("2026-09-24T14:00:00Z")),
                     row(
                         "Week (all models)",
                         50.0,
@@ -3627,7 +3765,7 @@ fn accounts_view_a_live_reset_behind_its_answer_is_not_replaced() {
             answered_at: ts(NOW),
             result: Ok(LiveUsage::Rows(vec![
                 UsageRow {
-                    label: "Session".into(),
+                    label: "5h".into(),
                     percent: 60.0,
                     severity: None,
                     resets: Some(Resets::Text("Sep 24 at 11am (UTC)".into())),
@@ -3683,7 +3821,7 @@ fn accounts_view_a_queued_live_answer_keeps_its_answer_time() {
             answered_at: ts("2026-09-24T12:00:40Z"),
             result: Ok(LiveUsage::Rows(vec![
                 UsageRow {
-                    label: "Session".into(),
+                    label: "5h".into(),
                     percent: 60.0,
                     severity: None,
                     resets: Some(Resets::Text("Sep 24 at 12pm (UTC)".into())),
@@ -3720,7 +3858,7 @@ fn accounts_view_a_queued_live_answer_keeps_its_answer_time() {
         .collect();
     assert_eq!(
         used,
-        [("Session", Some(60.0)), ("Week (all models)", None)],
+        [("5h", Some(60.0)), ("Week (all models)", None)],
         "the session reset before the answer, the week after it"
     );
     let lines = screen(&app);
@@ -4027,7 +4165,7 @@ fn accounts_table_stays_compact_on_a_wide_terminal() {
             account: account("default"),
             result: Ok(CachedUsage {
                 fetched_at: Some(ts("2026-09-24T11:34:00Z")),
-                rows: vec![row("Session", 1.0, None, None)],
+                rows: vec![row("5h", 1.0, None, None)],
             }),
         },
     );
@@ -4035,7 +4173,7 @@ fn accounts_table_stays_compact_on_a_wide_terminal() {
     let lines = screen(&app);
     let (_, head) = line_with(&lines, "ACCOUNT");
     // Usage sits next to the identity instead of across the screen.
-    assert!(head.find("SESSION").unwrap() < 100, "{head}");
+    assert!(head.find("5H").unwrap() < 100, "{head}");
     let (_, default) = line_with(&lines, "me@example.com");
     assert!(default.contains("cached 26m ago"), "not cut: {default}");
 }
@@ -4294,7 +4432,7 @@ fn codex_accounts_show_identity_and_usage() {
                         Some("2026-09-26T12:00:00Z"),
                     ),
                     row(
-                        &format!("Session ({spark})"),
+                        &format!("5h ({spark})"),
                         5.0,
                         None,
                         Some("2026-09-24T14:00:00Z"),
@@ -4322,7 +4460,7 @@ fn codex_accounts_show_identity_and_usage() {
         Event::LiveUsage {
             account: codex_account("default"),
             answered_at: ts(NOW),
-            result: Ok(LiveUsage::Rows(vec![row("Session", 1.0, None, None)]).into()),
+            result: Ok(LiveUsage::Rows(vec![row("5h", 1.0, None, None)]).into()),
         },
     );
     let lines = screen(&app);
@@ -4335,7 +4473,7 @@ fn codex_accounts_show_identity_and_usage() {
     let (_, native) = line_with(&lines, "codex:default ");
     assert!(native.contains("not logged in"), "{native}");
     let all = lines.join("\n");
-    for part in [format!("g session ({spark})"), format!("g week ({spark})")] {
+    for part in [format!("g 5h ({spark})"), format!("g week ({spark})")] {
         assert!(all.contains(&part), "{part}: {all}");
     }
     assert_eq!(all.matches(&format!("g week ({spark})")).count(), 1);
@@ -6192,7 +6330,7 @@ fn secret_app() -> App {
             Event::CachedUsage {
                 account,
                 result: cached(vec![
-                    row("Session", 34.0, None, Some("2026-09-24T14:00:00Z")),
+                    row("5h", 34.0, None, Some("2026-09-24T14:00:00Z")),
                     row(
                         "Week (all models)",
                         77.0,
@@ -6218,6 +6356,7 @@ fn secret_app() -> App {
         Event::Checks(vec![
             Check {
                 account: Some("claude:zqalpha".into()),
+                level: CheckLevel::Warning,
                 message: Marked::default()
                     .words("home ")
                     .path(format!("{ZQ_HOME}/.zqhomes/zqchk (old), x"))
@@ -6226,6 +6365,7 @@ fn secret_app() -> App {
             // A name read from a file: text from elsewhere.
             Check {
                 account: Some("claude:zqalpha".into()),
+                level: CheckLevel::Warning,
                 message: Marked::default()
                     .words("enabled plugin ")
                     .text("zqtools/zqplugin@zqmarket")
@@ -7196,11 +7336,13 @@ fn private_mode_keeps_what_a_message_says_around_its_paths() {
         Event::Checks(vec![
             Check {
                 account: None,
+                level: CheckLevel::Warning,
                 message: Marked::default()
                     .words("ANTHROPIC_API_KEY is set: it overrides every account's /login"),
             },
             Check {
                 account: Some("claude:zqalpha".into()),
+                level: CheckLevel::Warning,
                 message: Marked::default()
                     .words("home ")
                     .path(&home)
@@ -7208,6 +7350,7 @@ fn private_mode_keeps_what_a_message_says_around_its_paths() {
             },
             Check {
                 account: Some("claude:zqalpha".into()),
+                level: CheckLevel::Warning,
                 message: link(
                     Marked::default().words(
                         "shares projects with claude:default through a symlink but not \
@@ -7219,6 +7362,7 @@ fn private_mode_keeps_what_a_message_says_around_its_paths() {
             },
             Check {
                 account: Some("claude:zqalpha".into()),
+                level: CheckLevel::Note,
                 message: link(
                     Marked::default()
                         .words("not sharing sessions with claude:default: it does not see the sessions in ")
@@ -8169,7 +8313,7 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     let (_, usage) = line_with(&lines, "Usage      ");
     assert!(
         usage.contains(
-            "session 34% (2h00m) · week 77% (3d00h) · Fable week 100% (2d00h) · cached 5m ago"
+            "5h 34% (2h00m) · week 77% (3d00h) · Fable week 100% (2d00h) · cached 5m ago"
         ),
         "{usage}"
     );
@@ -8204,9 +8348,12 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     // At 80 columns the usage goes on, a window kept whole, nothing clipped.
     update(&mut app, Event::Resize(80, 24));
     let lines = screen(&app);
-    let (first, usage) = line_with(&lines, "Usage      session 34% (2h00m) · week 77% (3d00h)");
-    assert!(!usage.contains("Fable"), "{usage}");
-    let (next, _) = line_with(&lines, "           Fable week 100% (2d00h) · cached 5m ago");
+    let (first, usage) = line_with(
+        &lines,
+        "Usage      5h 34% (2h00m) · week 77% (3d00h) · Fable week 100% (2d00h)",
+    );
+    assert!(!usage.contains("cached"), "{usage}");
+    let (next, _) = line_with(&lines, "           cached 5m ago");
     assert_eq!(next, first + 1, "{}", lines.join("\n"));
     // A part wider than a line by itself is cut at the width, not clipped.
     let i = app
@@ -8303,6 +8450,7 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     assert!(checks.contains("! ANTHROPIC_API_KEY is set"), "{checks}");
     app.checks = Some(vec![Check {
         account: Some("claude:team".into()),
+        level: CheckLevel::Warning,
         message: "home /h/team does not exist".into(),
     }]);
     let lines = screen(&app);
@@ -8422,6 +8570,7 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
             &mut app,
             Event::Checks(vec![Check {
                 account: None,
+                level: CheckLevel::Warning,
                 message: "ANTHROPIC_API_KEY is set: it overrides every account's /login".into(),
             }]),
         );
@@ -9348,7 +9497,7 @@ fn an_answer_to_a_removed_rows_query_is_not_written_into_the_row_added_again() {
     assert!(fx.contains(&Effect::CachedUsage(max.clone())), "{fx:?}");
     assert_eq!(keys(&mut app, &u), [Effect::LiveUsage(max)]);
     let answers = |identity: Identity, percent: f64| {
-        let rows = || vec![row("Session", percent, None, None)];
+        let rows = || vec![row("5h", percent, None, None)];
         [
             Event::Identity {
                 account: account("max"),
@@ -9387,6 +9536,7 @@ fn an_answer_to_a_removed_rows_query_is_not_written_into_the_row_added_again() {
 fn checks_run_again_when_the_accounts_change_meanwhile() {
     let check = |account: &str| Check {
         account: Some(format!("claude:{account}")),
+        level: CheckLevel::Warning,
         message: "home does not exist".into(),
     };
     let mut app = idle_app();

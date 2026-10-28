@@ -32,6 +32,11 @@ const MAX_DESCRIPTION: usize = 300;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigView {
     pub role: Role,
+    /// For a member whose `plugins` is the source's through a link, and the source's
+    /// `installed_plugins.json` records installs through that link: that the link must stay,
+    /// with how many plugins every account loads through it (R22). In its pieces: the link
+    /// is a path of its own (R21).
+    pub plugins_link: Option<Marked>,
     /// The home's instruction items, its own and those that are the source's through a link.
     pub instructions: Vec<Item>,
     pub synced: Synced,
@@ -416,6 +421,33 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         Some(from) => share::installed_plugins(from),
         None => Installs::Missing,
     };
+    // A plugin of the source's installed from this home is recorded through the home's
+    // `plugins` link (the home's path as registered), which every account then depends on.
+    // Nothing is said when the list is not recognized.
+    if let (Installs::Known(installed), Some((source, _))) = (&source_installs, &plan.source)
+        && plan.items.linked(Id::Plugins)
+    {
+        let through = Id::Plugins.at(&home);
+        let held = installed
+            .values()
+            .filter(|installs| {
+                installs
+                    .iter()
+                    .any(|i| i.path.as_deref().is_some_and(|p| p.starts_with(&through)))
+            })
+            .count();
+        if held > 0 {
+            let (plugins, are, stop) = if held == 1 {
+                ("plugin", "is", "stops")
+            } else {
+                ("plugins", "are", "stop")
+            };
+            view.plugins_link = Some(Marked::default().path(through.display()).words(format!(
+                " must stay a symlink: {held} {plugins} of {source} {are} installed through it \
+                 and {stop} loading for every account without it"
+            )));
+        }
+    }
     for name in share::enabled_plugins(&own) {
         if share::bundled(&name) {
             // Loaded by claude itself, unless the project's settings turn it off.
@@ -1249,11 +1281,12 @@ mod tests {
     use crate::registry::{CLAUDE, Home};
     use crate::test_homes::Root;
 
-    /// [`super::read`], with its problems checked (R21): remuda's own words in them hold no
-    /// path, so one formatted into the words of any problem fails the test that produces it.
+    /// [`super::read`], with its problems and the line about its `plugins` link checked (R21):
+    /// remuda's own words in them hold no path, so one formatted into the words of any of them
+    /// fails the test that produces it.
     fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env) -> ConfigView {
         let view = super::read(account, sharing, cwd, env);
-        for problem in &view.problems {
+        for problem in view.problems.iter().chain(&view.plugins_link) {
             for (piece, kind) in problem.pieces() {
                 assert!(
                     kind != Piece::Words || !piece.contains('/'),
@@ -1862,6 +1895,124 @@ mod tests {
         assert_eq!(view.plugins.len(), 1, "{:?}", view.plugins);
         assert_eq!(view.plugins[0].origin, Origin::AlreadySource);
         assert_eq!(view.plugins[0].path.as_ref(), Some(&through));
+    }
+
+    /// R22: a member whose `plugins` is the source's through a link, where the source's
+    /// `installed_plugins.json` records installs through that link, is told that the link must
+    /// stay, with the number of plugins (not of installs) that every account loads through it.
+    /// Not said with no install through the link, for a directory whose name begins the same
+    /// way, for a list that is not recognized, of a `plugins` of the member's own, of the
+    /// source, or of an account that opted out.
+    #[test]
+    fn a_plugins_link_that_installs_go_through_must_stay() {
+        let f = Root::new();
+        let (src, max, team, solo) = (
+            f.root.join("src"),
+            f.root.join("max"),
+            f.root.join("team"),
+            f.root.join("solo"),
+        );
+        fs::create_dir_all(src.join("plugins/cache/m")).unwrap();
+        fs::create_dir_all(team.join("plugins")).unwrap();
+        for home in [&max, &solo] {
+            fs::create_dir_all(home).unwrap();
+            symlink(src.join("plugins"), home.join("plugins")).unwrap();
+        }
+        let file = src.join("plugins/installed_plugins.json");
+        let installs = |a: &Path, b: &Path| {
+            write(
+                &file,
+                &json!({
+                    "version": 2,
+                    "plugins": {
+                        "a@m": [
+                            {"scope": "project", "installPath": src.join("plugins/cache/m/a")},
+                            {"scope": "user", "installPath": a},
+                        ],
+                        "b@m": [{"scope": "user", "installPath": b}],
+                        "c@m": [{"scope": "user", "installPath": team.join("plugins/cache/m/c")}],
+                        "d@m": [{"scope": "user"}],
+                    },
+                })
+                .to_string(),
+            );
+        };
+        let source = named("src", &src);
+        let sharing = Sharing {
+            source: Some(source.clone()),
+            opted_out: vec!["claude:solo".into()],
+        };
+        let link = |account: &Account| {
+            read(account, &sharing, None, &f.env)
+                .plugins_link
+                .map(|m| m.to_string())
+        };
+        let (max, team, solo) = (
+            named("max", &max),
+            named("team", &team),
+            named("solo", &solo),
+        );
+        installs(
+            &src.join("plugins/cache/m/a"),
+            &src.join("plugins/cache/m/b"),
+        );
+        assert_eq!(link(&max), None);
+
+        let through = f.root.join("max/plugins");
+        installs(&through.join("cache/m/a"), &src.join("plugins/cache/m/b"));
+        let view = read(&max, &sharing, None, &f.env);
+        let said = view.plugins_link.expect("the link must stay");
+        assert_eq!(
+            said.to_string(),
+            format!(
+                "{} must stay a symlink: 1 plugin of claude:src is installed through it and \
+                 stops loading for every account without it",
+                through.display()
+            )
+        );
+        // The link is a path; the rest stays readable (R21).
+        let shape: String = said
+            .pieces()
+            .map(|(piece, kind)| if kind == Piece::Path { "<>" } else { piece })
+            .collect();
+        assert_eq!(
+            shape,
+            "<> must stay a symlink: 1 plugin of claude:src is installed through it and stops \
+             loading for every account without it"
+        );
+        // Said of that member only.
+        for other in [&team, &solo, &source] {
+            assert_eq!(link(other), None, "{other:?}");
+        }
+
+        installs(&through.join("cache/m/a"), &through.join("cache/m/b"));
+        assert_eq!(
+            link(&max),
+            Some(format!(
+                "{} must stay a symlink: 2 plugins of claude:src are installed through it and \
+                 stop loading for every account without it",
+                through.display()
+            ))
+        );
+
+        // Another directory whose name begins the same way is not below `plugins`.
+        installs(
+            &f.root.join("max/plugins-old/a"),
+            &src.join("plugins/cache/m/b"),
+        );
+        assert_eq!(link(&max), None);
+
+        // An account that opted out is no member: nothing is said of its link, installs
+        // through it or not.
+        installs(
+            &f.root.join("solo/plugins/cache/m/a"),
+            &src.join("plugins/cache/m/b"),
+        );
+        assert_eq!(link(&solo), None);
+
+        // A list that is not recognized says nothing of the link (the card reports the list).
+        write(&file, r#"{"version": 1}"#);
+        assert_eq!(link(&max), None);
     }
 
     /// R18, R22: a member whose `settings.json` is a symlink to the source's gets no settings

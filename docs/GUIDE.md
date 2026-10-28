@@ -1,468 +1,498 @@
 # Remuda guide
 
-Details behind the overview in the [README](../README.md). The normative behavior is specified in
-[SPEC.md](../SPEC.md).
+The [README](../README.md) is the overview; this guide is the manual behind it: every command, key
+and check, and what to do when something looks wrong. [SPEC.md](../SPEC.md) is the behavior
+contract, and the entries named here (R10, R18, …) hold the exact rules.
 
-## TUI interaction
+## Accounts and homes
 
-In a terminal at least 40 rows tall, the header uses the mark's two tracks as a three-row frame,
-open on the right, around single-line navigation. The wordmark and private badge sit in the upper
-rail; the selected tab stays one row tall. A shorter terminal keeps the compact one-line header,
-leaving the rows to the views.
+| Term | Meaning |
+| --- | --- |
+| provider | The agent an account belongs to: `claude` (Claude Code) or `codex` (Codex). Codex accounts show only their login method until a live usage query gives the email and plan, list no running sessions (Codex has no list to read), and share no configuration. |
+| home | The directory where one login keeps its credentials, sessions and settings: `~/.claude` or the one `CLAUDE_CONFIG_DIR` names; `~/.codex` or `CODEX_HOME`. |
+| account | A name for a home, unique within its provider and matching `[A-Za-z0-9_-]+`. Remuda launches an account by setting its provider's variable to the home. |
+| `default` | Each provider's native login: the home used when the variable is unset. It needs no registering, and launching it removes the variable from the agent's environment. `codex:default` is listed only when `~/.codex` exists or `codex` is on `PATH`. |
+| `provider:name` | How to name an account: `claude:work`, `codex:research`. A bare name will do while only one provider has it; when two do, Remuda lists both instead of guessing. Bare `default` means `claude:default`. |
 
-In an expanded preview, the movement keys scroll the preview instead of the list. In forms, `Tab`
-or `↓` moves to the next field, `Shift-Tab` or `↑` to the previous one, `Enter` submits and `Esc`
-cancels. Confirmations accept `y`; any other key except `Ctrl-P` cancels. In the account picker
-opened by `remuda run` without an account, `Enter` launches the selected account and `Esc` or `q`
-exits without launching anything.
+- `remuda add [--provider claude|codex] <name> <path>` registers an existing home as it is,
+  touching nothing in it. It warns when the directory does not look like a home, and refuses a
+  taken name, a directory already registered under any spelling, and `~/.claude` (`default`).
+- `remuda setup [--provider claude|codex] <name> [--email <EMAIL>]` creates a home at
+  `$REMUDA_HOME/homes/<provider>/<name>`, [links it](#what-setup-links-and-when) if it is a Claude
+  member of `[share.claude]`, registers it, and runs `claude auth login` (the email prefilled) or
+  `codex login`. If the login fails, the account stays registered and Remuda prints the command to
+  retry, such as `remuda run work auth login`.
+- `remuda remove <account>` unregisters an account and prints the `remuda add` that registers its
+  home again; the home is left as it is. `default` and the source of `[share.claude]` cannot be
+  removed.
+- `remuda list [--timeout <SECONDS>]` prints each account's login and home, from
+  `claude auth status --json` (else `.claude.json`) and `codex login status`, 15 seconds at most.
+- `remuda help [<command>]` shows the options of every command.
 
-A terminal started from inside a Claude session (by its Bash tool, for example a background
-launcher, a `screen` or a tmux session) may carry `CLAUDE_CODE_CHILD_SESSION=1`. Claude then
-saves no transcript and no prompt history for an interactive session started there, so such a
-session never appears in the session list and cannot be resumed. Remuda passes the variable on
-like the rest of the environment, and says so: `remuda run` and `remuda pick --run` warn on
-stderr before an interactive Claude session starts, a launch from the TUI prints the warning
-before Claude starts (quit Claude right away to start again with the override) and lists it
-again when Claude exits, and the Accounts view shows it among its checks. Set
-`CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1` in that terminal if it is your own, and the warning
-goes away. Claude reads both variables as switches: `1`, `true`, `yes` and `on` (in any case)
-turn them on, anything else, `0` and `y` included, leaves them off, and Remuda reads them the
-same way. `-p` runs are saved either way and get no warning.
+Homes are registered where they are, and their paths kept byte for byte: Claude Code on macOS
+names a login's Keychain entry after a hash of the home path string, so the same directory spelled
+another way, even with a trailing `/`, is another, logged-out account. Remuda stores the path as
+you registered it (absolute, `~` expanded once), passes it unchanged, and never moves, renames or
+deletes a home ([R2](../SPEC.md#r2-home-path-invariant)).
 
-Resuming a Claude session that is still running elsewhere is refused, because two processes
-writing the same session would overwrite each other. Codex has no source of running sessions, so
-resuming a Codex session in place always asks for confirmation. A fork only reads the original
-session, so it is allowed while it runs.
+### config.toml
 
-A Claude session can be resumed or forked only by an account whose `projects` directory holds
-its transcript: any of the accounts whose `projects` are symlinks to the same directory, as in
-the [shared layout](#shared-configuration), or else only the account that created it. Remuda
-does not copy sessions between accounts; when an account cannot find a session, the message
-says which `projects` to link.
-
-The Stats view computes the statistics in the background the first time it opens, with the
-reading progress in the status line, and again on each `r`; the first computation reads every
-transcript whole. Above the table, a chart shows the period's cost (or tokens, when nothing is
-priced) per hour, day, week or month. Overall and any models not priced come first in the table,
-followed by the breakdown; each account's row shows its share. `b` switches the
-sections between accounts and projects, as `remuda stats --by project` divides them: one per
-directory a session started in, most tokens first, `(no directory)` for sessions that record
-none, with the same Overall above them. A directory too long for its column keeps its end
-(`…/src/app`).
-The view starts by account; `t` and `r` keep the choice. In private mode each directory is masked
-as a path (`~/•••/•••`), so two projects may read the same.
-
-## Private mode
-
-`Ctrl-P` turns private mode on or off; the header then shows `PRIVATE`. It is off when the TUI
-starts and is not saved. While it is on, the TUI shows:
-
-- account names as aliases, `account-1`, `account-2`, … (`codex:account-1` for Codex), numbered
-  when the TUI starts and stable while it runs; `default` is shown as is;
-- emails as `•••@•••`, and organizations, session titles, first messages, session names, message
-  previews, background session logs, search text and typed form values as `•••`;
-- paths with every component masked, and `$HOME` as `~` (`~/•••/•••`);
-- in the account card, the names of agents, skills, commands, plugins, hooks, settings,
-  `env` variables and MCP servers stay visible; descriptions are masked;
-- notices, errors, check messages and the problems of the account card with the above
-  replaced. A path remuda puts there itself is masked whole, and what the message says around
-  it stays readable (the reason, what to do, a `/login` or `/rewind` it names). In text from
-  elsewhere (an agent's output, a system error, a name read from a file) nothing says where a
-  path ends, so a line is masked from its first word with a `/` to its end, and what follows
-  the path on that line is hidden with it; a `/login` there is a path like any other.
-
-It keeps visible the numbers (usage percentages, reset times, token counts, costs), model names, plans,
-login methods, providers, session IDs, pids and times. It does not hide the output of an agent
-after remuda hands it the terminal (the line remuda prints just before does follow private mode),
-and the command-line commands have no private mode. In VS Code's integrated terminal on Linux and
-Windows, `Ctrl-P` opens Quick Open; add `workbench.action.quickOpen` to
-`terminal.integrated.commandsToSkipShell` with a leading `-` so the key reaches remuda.
-
-## Shared configuration
-
-Claude accounts can share one session store and one configuration, so that any account resumes
-any session and nothing diverges between them; only the login stays per account. Name the
-account whose home the others share, typically `default` (whose home is `~/.claude`):
+`$REMUDA_HOME/config.toml` is the registry. `add`, `setup` and `remove` edit it and keep your
+comments, and you may edit it by hand:
 
 ```toml
 [share.claude]
-from = "default"
+from = "default"             # optional: the account the other Claude accounts share
 
 [[account]]
 provider = "claude"
-name = "personal"
-home = "/Users/you/.remuda/homes/claude/personal"
-share = false          # this account keeps only its own configuration
-```
+name = "work"
+home = "/Users/you/.claude-work"
+share = false                # optional: this account shares nothing
 
-### The linked layout
-
-The recommended layout is a home whose shared items are symlinks to the source's:
-
-| Linked to the source | Never linked: one per account |
-| --- | --- |
-| `projects`, `file-history` (sessions, and the file backups `/rewind` needs) | `.claude.json` (the login's identity, MCP servers, project trust) |
-| `settings.json`, `CLAUDE.md`, `skills`, `commands`, `agents`, `hooks`, `plugins` | `history.jsonl` (which account ran which session) |
-| `rules`, `agent-memory`, `output-styles`, `keybindings.json` | `sessions` (running sessions), `remote-settings.json`, `policy-limits.json` (an organization's) |
-
-`remuda setup <name>` makes these links for a new Claude account: in the home it has just
-created, before the login, one link per item the source's home has, each pointing at
-`<source home>/<item>`. It lists what it linked and what the source does not have. That is the
-only time remuda writes into a home: it never adds, changes or removes a link afterwards, and
-never in a home registered with `remuda add`. Codex homes, and Claude homes created without
-`[share.claude]`, are created empty. The home is created under `$REMUDA_HOME/homes/<provider>`,
-and `homes` and `homes/<provider>` must be real directories: if one is a symlink, `setup`
-stops before creating anything.
-
-`settings.json` needs care. A home that links it reads all of it, as its own user settings.
-When `setup` runs and the source's `settings.json` sets authentication or provider settings
-(such as `apiKeyHelper`, `env.ANTHROPIC_API_KEY` or `forceLoginOrgUUID`), or cannot be read,
-`setup` leaves it out and names the settings that are the reason; that account then gets the
-source's settings injected at launch, without them (see below). This is checked once, when
-the home is created. A linked `settings.json` stays the source's file: a setting like these
-that you add to it later is read by every account that links it. Remuda tells you, in the
-Accounts view and at every launch of such an account:
-
-```text
-remuda: warning: claude:work reads the authentication settings of claude:default through its settings.json link: env.ANTHROPIC_API_KEY
-```
-
-but it does not stop it. Keep authentication out of the shared `settings.json`: settings that
-belong to one account go in a home that does not link it (one that gets its settings by
-injection, or one with `share = false`). The login itself is not in `settings.json`: it is in
-the Keychain (or the home's `.credentials.json`), which is never shared.
-
-A home that shares `projects` but has no `settings.json` of its own (the source's was left out,
-or the source had none) should get a small one that sets `cleanupPeriodDays`: injected
-settings reach sessions only, and the Accounts view warns about a shared `projects` whose
-accounts do not all set it. `setup` says so.
-
-In a home you registered with `remuda add`, or for an item the source got later, make the link
-yourself, for example `ln -s ~/.claude/rules ~/.claude-work/rules`. If the home already has a
-directory of that name, move its contents into the source's first: `ln -s` into an existing
-directory creates the link inside it. Do this while no session of that account is running.
-The Accounts view lists what a member's home is missing (see [Account checks](#account-checks)).
-
-Two things to know about the layout: every linked account cleans up the shared `projects` by
-its own `cleanupPeriodDays`, so set it in the shared `settings.json`; and a plugin installed
-from a member account is recorded with a path through that home's `plugins` link, which must
-then stay.
-
-### Injection, the fallback
-
-A home that does not link an item still gets it at launch. Every Claude account other than the
-source starts its sessions (new ones, resumes, forks, `-p` runs; not subcommands, `--help` or
-`--version`) with what its home does not link, injected as launch options before your own
-arguments:
-
-- **Instructions:** `CLAUDE.md`, skills, commands and agents, through
-  `--add-dir=$REMUDA_HOME/shared/claude`, whose `.claude` directory holds one symlink per item
-  the source home has (`CLAUDE.md`, `skills`, `commands`, `agents`), so a session reaches those
-  four items of the source and not the rest of its home. remuda keeps the links current before
-  each launch; a `.claude` from an earlier version, one link to the whole source home, is
-  migrated in place. Restart a remuda TUI that was started before upgrading: until then it
-  launches members without shared instructions, and says so.
-- **Rules:** the source's `rules/**/*.md`, through the same `--add-dir`, as read-only copies
-  under `.claude/rules/` there: claude does not load rules of an added directory through
-  symlinks. remuda refreshes the copies before each launch, so change a rule in the source's
-  home, not in the copy. A rule limited to files by `paths` in its frontmatter is not applied
-  this way (claude ignores `paths` there); the Accounts view names such rules. They do apply in
-  a home whose `rules` is a symlink to the source's, which makes sense for a home that links the
-  other instruction items too: one that links some items and gets the rest injected loads the
-  linked ones twice, and the Accounts view says so. A home that already links `CLAUDE.md`,
-  skills, commands and agents to the source therefore needs a `rules` link as well, once the
-  source has rules.
-- **Settings:** the part of the source's `settings.json` that neither the account's own settings
-  nor the project's `.claude/settings.json` and `.claude/settings.local.json` define, so the
-  shared settings behave like user settings; identical hook entries are not added twice. They are
-  passed as one `--settings` file, written with mode 0600 under `$REMUDA_HOME/state/settings/`.
-  Authentication and provider settings (such as `apiKeyHelper`, `env.ANTHROPIC_API_KEY` or
-  `env.CLAUDE_CODE_USE_BEDROCK`) are never injected. If you pass `--settings` or
-  `--setting-sources` yourself, remuda injects no settings and says so.
-- **Plugins:** `--plugin-dir` for each plugin the source enables and has installed, unless the
-  account or the project turns it off, or the account has installed it itself. A plugin claude
-  bundles (`<name>@builtin`) is loaded by claude itself: nothing is injected for it.
-- **Auto-memory:** the source's memory directory for the project (found the way claude finds it),
-  so every account remembers the same things about it.
-- **Agent memory:** subagents with `memory: user` keep their memory in the source's
-  `agent-memory/`, through `CLAUDE_CODE_REMOTE_MEMORY_DIR` in the session's environment, set only
-  together with the auto-memory location. The variable is not documented by claude, and it also
-  moves the memory of `memory: local` subagents from the project's `.claude/agent-memory-local/`
-  into the source's `projects/<project>/`.
-
-Injection writes nothing into any account home, and a part a home links is not injected again;
-a fully linked home gets nothing injected but the memory variable. Sessions cannot be injected:
-an account whose `projects` is its own sees and resumes only its own sessions. A home that shares
-`projects` with the source through a symlink gets `CLAUDE_CODE_REMOTE_MEMORY_DIR` set to the
-source's home instead of a memory location: its memory is in the source's store already, but
-claude asks for permission on every memory write that goes through the link, and not through
-the source's own path. Its agent memory is the source's too. What an account has for itself is
-not shared: the MCP
-servers and project trust in its `.claude.json`. `share` applies to Claude
-accounts only, and `from` must name a Claude account; anything else is a load error. The Accounts
-view warns about problems such as a missing source home or a plugin whose install is gone.
-
-## Account card
-
-`p` in the Accounts view opens a card over the view with what remuda knows of the selected
-account: its home directory, its login, its usage (each window's percentage and the time to its
-reset, and how old the reading is), its sessions (how many History lists as its, how many run),
-its checks, and its part in sharing. Below, for a Claude account, what its sessions load, for a
-new session in the directory remuda was started in: its `CLAUDE.md`, agents, skills (with those
-turned off by `skillOverrides`, and overrides that name no skill), commands, rules (those limited
-to paths marked), plugins with what each adds (agents, skills, commands, hooks, MCP servers), a
-summary of its settings, its auto-memory directory, the directory for the memory of user-scope
-subagents, and the names of its MCP servers. Each item is marked as the account's own, shared
-from the source of `[share.claude]`, already the source's (a symlink), or not shared, with the
-reason. What is shared comes from the same step that prepares a launch, so the card and a launch
-always agree. Settings are shown by key names and counts only; no values. Synced claude.ai skills
-are shown for the account's own login only.
-
-Entries are listed by name, an installed plugin's too; `d` lists them with their details
-(descriptions, an agent's model, effort and tools, link targets), and lists the entries of items a
-member gets through a link to the source, which are one line otherwise. `[` and `]` move to the
-previous or next account, `y` copies the home directory to the clipboard, and `n`, `u`, `D` and
-`r` work as in the view. `Esc` or `p` closes the card.
-
-## Recommendations
-
-`remuda pick` answers "which account, model and effort should I launch now?" from each account's
-usage (cached, or with `--live` queried first) and the `[pick]` table in `config.toml`:
-
-```toml
-[pick]
-exclude = ["claude:team"]      # never recommended
-prefer = ["claude:max"]        # breaks the last ties
-min_headroom = 10              # percent left required on every window that applies
-stale_after = 120              # minutes after which cached usage is marked stale
-affinity_minutes = 60          # resuming a session: how long its last account stays preferred
-strategy = "headroom"          # how the rules rank: "headroom" (default) or "pace"
-
-[pick.claude]
-models = ["claude-opus-5-5", "claude-fable-5-1"]   # in order of preference; the first is the default
-default_effort = "high"
-
-[pick.codex]
-models = ["gpt-6-astra"]
-```
-
-- **Rules first.** A pair of account and model is feasible when every window that applies to it
-  has at least `min_headroom` percent left: the general windows, plus the per-model week of its
-  family (`claude-fable-5-1` counts against `Week (Fable)`). Without `models`, remuda does not
-  know the agent's default model: per-model windows are shown (`also`), never counted. Write
-  accounts in `[pick]` as `provider:name`. A window whose reset has passed
-  since the cache was written is of unknown usage: remuda names it (`reset since cached`) and
-  neither counts it nor lets it block the pair, and a pair with no known window left ranks after
-  every pair that has one; `--live` asks the agent instead. Old data never makes an exhausted
-  window usable.
-  Excluded and logged-out accounts are not feasible. The feasible pairs are ranked by model
-  order, headroom (in 10-point bands), freshness, the sooner reset, `prefer`, and registry order.
-- **Pace, if you want it.** `strategy = "pace"` ranks by the percent left per hour until reset
-  instead of the headroom: how much an account has to use each hour for none of its limit to be
-  lost at the reset. It counts the weekly windows (a five-hour window only when an account has
-  nothing longer: what is left of it at its reset is no loss while the week holds the budget),
-  never divides by less than an hour, and treats paces within a tenth of each other as a tie
-  that `prefer` breaks. It is worth it when your accounts have weekly limits and you would
-  rather use up what is about to reset unused than keep the most room: an account at 30% left
-  that resets tomorrow goes before one at 60% left that resets in six days. A window that has
-  reset since its usage was cached has no pace, and an account whose weekly windows have all
-  reset since has none, whatever its five-hour window says; an account with no pace ranks after
-  those with one. Feasibility and `--wait` do not change, and the text report adds a `pace` line; `--json`
-  shows each pair's `pace` and `pace_window` under either strategy, so you can compare before
-  switching. The default stays `"headroom"`.
-- **Local selection.** Always the first ranked feasible candidate, with its provider's
-  `default_effort` (none when unset or when resuming or forking). No API key or HTTP transport
-  is used. `default_effort` is independently validated as nonempty `[a-z]+`; for Claude, it
-  must not be a Claude subcommand. Configuration remains strict: remove legacy
-  `[pick] notes` and `[pick.<provider>] efforts` by hand; remuda does not rewrite the file.
-- **Output.** The account, model and effort, `decided by` as `rules` (or
-  `rules, strategy pace`), the binding window and its reset, how old the data is, the `remuda run` command,
-  and every pair that is not feasible with the reason. `--json` prints the same, with every
-  candidate. JSON `decided_by` is `rules`; `effort_by` is `rules` when there is an effort,
-  otherwise null. Both are null with no feasible recommendation. Top-level `reason` and `jev`
-  and candidate `jev_probability` are removed; candidate `why_not` and the other fields remain
-  (the full schema is in [SPEC R23](../SPEC.md#r23-recommendation-pick)). With nothing feasible,
-  `pick` lists the reasons and exits 1.
-- **Launching.** `remuda pick --run [-- <args>...]` launches the recommendation as `remuda run`
-  would: claude gets `--model` and `--effort`, codex `-m` and `-c model_reasoning_effort=`,
-  before your arguments; an option your arguments already set is left alone. Without `--run`,
-  the arguments after `--` only go into the `command` shown, quoted for the shell so that it
-  can be copied and run as is. Arguments that neither start a new session nor name one (`-c`,
-  `--resume` without an id, `codex resume --last`) are refused.
-- **Resuming.** `remuda pick -- --resume <id>` (claude; also `--resume <id> --fork-session`) or
-  `remuda pick -- resume <id>` (codex; also `fork <id>`) recommends the account to resume that
-  session as. Prompt caches are per account: resuming as another account than the one that ran
-  the session lately writes the whole conversation into the new account's cache again, which is
-  slower and spends its limits. So the account that ran it within `affinity_minutes` (from the
-  launch log, and the end of its own copy of the transcript in the session index) ranks first
-  among the feasible ones; it is never made feasible by it. The account is the one launched
-  with that very home: a name registered again with another home is another login, and is not
-  preferred. Where accounts do not share their sessions, each account's model and activity are
-  those of the copy in its own store. An account whose sessions are not shared with the
-  session's store cannot resume it and is not offered (once `remuda sessions` or the TUI has
-  indexed the session). Nothing is injected: the session keeps its own model, whose limits are
-  the ones counted. The output says who ran the session and how long ago, and, when that
-  account cannot be recommended, why, and what resuming elsewhere costs:
-
-  ```text
-  $ remuda pick -- --resume 766560c5-…
-  account     claude:max
-  model       the session's (claude-opus-5-5)
-  …
-  session     resume 766560c5-…: claude:max ran it 12m ago (prompt cache warm: preferred); model claude-opus-5-5
-  command     remuda run claude:max --resume 766560c5-…
-  ```
-
-  `--run` launches it exactly as `remuda run <account> --resume <id>` would, after saying on
-  stderr who ran the session and, when that account is not the one launched, why; like `run`,
-  it does not check whether the session is running elsewhere.
-- **Waiting.** `remuda pick --wait` does not give up when nothing is feasible: it checks again
-  30 seconds after the earliest reset of a window that blocks (at least a minute apart; every 5
-  minutes when no reset is known), and then prints, or with `--run` launches, as usual. Each
-  check reads the cache again; it queries the agents only with `--live`. Without `--live`, a
-  window whose reset has passed is of unknown usage, so `pick --wait` returns right after the
-  reset and says that `--live` would ask. When nothing that blocks passes with time (excluded,
-  logged out), there is nothing to wait for: it exits 1 at once. `--max-wait <SECONDS>` gives up
-  (exit 1) as soon as the next check would come later: with a reset three hours away,
-  `--max-wait 3600` exits at once, since nothing can change before then. On a terminal one
-  status line says what it waits for; Ctrl-C (or SIGTERM) stops it, live queries under way
-  included. With `-- --resume <id>` it waits for the accounts that can resume the session, and
-  still prefers the one that ran it if its cache is warm when something frees up. `remuda usage
-  --wait <account>` does the same for one account: it returns once none of its windows is below
-  `[pick] min_headroom`.
-
-## Cost estimates
-
-The statistics price each request at the provider's public API list price, built into remuda (as
-of 2026-10-21). Claude's 5-minute and 1-hour cache writes are priced separately, as are fast mode
-(twice the price on the models that offer it) and US-only inference (1.1 times the price on the
-models from 4.6 on), as the transcripts record them. Haiku 5.5 uses five times its base prices
-when a request's prompt exceeds 100K tokens, including cache reads and both cache writes.
-Codex's cache writes use the default 30-minute rate: 1.25 times the input price from GPT-5.6
-on, and the input price before; rollouts do not record the lifetime needed to price 12-hour
-writes. A Codex request with more than 272K input tokens is priced at the long-context price
-on the models that have one. These thresholds apply per request, not to the period's total.
-
-To price a model remuda does not know, or to use another price, add a `[prices."<model>"]` table
-to `config.toml`, in USD per million tokens:
-
-```toml
-[prices."claude-opus-4-6"]
+[prices."claude-opus-4-6"]   # optional: USD per million tokens (see Prices)
 input = 5
 output = 25
-cache_read = 0.50
-cache_write_5m = 6.25
-cache_write_1h = 10
 ```
 
-`input` and `output` are required; `cache_read` (for Codex, the cached-input price),
-`cache_write_5m` (for Codex, the cache-write price) and `cache_write_1h` are optional, and a count whose price is left out is not
-priced. The table applies to the model id as recorded, or to it without a trailing date
-(`claude-haiku-4-5` also prices `claude-haiku-4-5-20251001`).
-Overrides set base prices; the built-in model's fast-mode, US-only and long-context multipliers
-still apply.
+Loading is strict: an invalid or duplicate name, a registered `default`, a relative home, `share`
+on a Codex account, a `from` that names no Claude account, or a malformed `[prices]` table stops
+every command with an error naming the file. Keys Remuda does not know are kept and ignored, except
+a top-level `pick`: the `[pick]` tables of the removed `remuda pick` are an error until you delete
+them by hand, and until then `add`, `setup` and `remove` change nothing. Remuda never rewrites the
+file for you.
 
-A cost followed by `+` (`$12.34+`) leaves out requests that could not be priced, and `-` means
-nothing could be; the models concerned are named below the command-line table or after Overall
-in the TUI. Not modelled: the long-context
-premium of Claude Sonnet 4.5 and 4, batch and priority processing, and server tools such as web
-search.
-
-`remuda stats --by project` divides the period by project instead of by account: one section per
-directory a session started in, as the transcript records it, most tokens first, then the same
-`overall` section. Two spellings of one directory (with a trailing `/`, or through a symlink) are
-two projects, and a session resumed elsewhere stays in the directory it started in. Sessions that
-record no directory are under `(no directory)`. With an account (`remuda stats work --by
-project`), only the projects of the sessions attributed to it.
-
-`remuda stats --csv` prints every request of the period instead, one CSV line each, for
-reconciling with a bill or a spreadsheet:
+### $REMUDA_HOME
 
 ```text
-timestamp,provider,accounts,session_id,project,model,input,cache_read,cache_write_5m,cache_write_1h,output,reasoning,fast,us_only,cost_usd
-2026-10-08T03:04:05Z,claude,claude:work,8f0c2d1e-5b7a-4c3e-9a10-6d2f0e4b1c55,/Users/me/src/app,claude-opus-5-5,3,41210,1650,0,412,,false,false,0.024744
+$REMUDA_HOME/                   ~/.remuda unless set
+├── config.toml                 the registry
+├── homes/<provider>/<name>/    homes made by `remuda setup`, below real directories only
+└── state/                      mode 0700, its files 0600
+    ├── index.json              the session index
+    ├── stats.json              the token statistics
+    └── launches.jsonl          one line per launch
 ```
 
-Each request appears once, as in the table, and `cost_usd` is its exact estimated cost (not
-rounded to the cent; empty when it cannot be priced), so the column adds up to the table's
-cost. The CSV takes an account and `--period` like the table, but not `--by`. When a directory
-could not be read, the `Incomplete:` lines go to stderr and the command exits with status 1, so
-that a script does not take a partial CSV for a complete one.
+`launches.jsonl` keeps each launch's time, account, home, directory, session ID, and arguments as
+typed, so a prompt given on the command line is in it; the caches keep titles and directories. So
+`state/` is yours alone: one an earlier version left open is tightened at the next write, and a
+launch log that cannot be made private is not written to (Remuda warns and launches). Anything in
+`state/` may be deleted and is rebuilt, but sessions only `launches.jsonl` attributed lose their
+account.
 
-## Account checks
+## Usage limits
 
-The Accounts view warns about conditions that silently break multi-account setups: an
-`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN` that overrides every
-login, an `ANTHROPIC_BASE_URL` that sends every account's requests elsewhere, dangling symlinks,
-missing or logged-out homes, a shared `projects` store without `cleanupPeriodDays`, and problems
-with the shared configuration: a missing source home, a plugin whose install is gone, instruction
-items that would load twice, and rules limited to `paths` that are not applied where the rules
-are injected. The values of those variables are never shown.
+Each window has a percentage used and a reset. Claude has a five-hour window, `5h`, a week of all
+models, `Week (all models)`, and on some plans a week per model, such as `Week (Fable)`. Codex
+names its windows by length (`5h`, `Week (all models)`, `<N>h window`, `<N>d window`,
+`<N>m window`), since a
+plan's only window may be weekly, and reads its per-model limits live only. The Accounts view puts
+every account's windows in one table and all their resets on one seven-day timeline, a letter per
+window (named in the legend). `remuda usage [<account>]` prints the same as text.
 
-With `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` set, claude's `/usage` asks for nothing new and
-only repeats a reading taken within the hour, if there is one. Remuda's live usage query removes
-the variable for that one command, so `remuda usage --live` and `u` get a new reading; sessions
-you launch keep it, and the Accounts view says so.
+### Cached and live readings
 
-The live usage query is remuda's probe, not one of your sessions: it runs
-`claude -p /usage --no-session-persistence --setting-sources "" --strict-mcp-config`, which loads
-none of the account's settings files and starts none of its MCP servers. Your hooks (a
-`SessionStart` or `SessionEnd` command, say) do not run for it, and the `env` of your settings
-files does not apply to it.
+The `AS OF` column says which reading you see and how old it is: `cached 5m ago`, `live 0s ago`,
+`live…` while a query runs, `live failed`, or `no cache`. A cached reading, the default, asks no
+one: it is Claude's usage cache in `.claude.json`, or the rate limits Codex records in its
+rollouts. A live reading asks every agent now, in parallel, each with its account's own login: `u`
+in the TUI, or `remuda usage --live [--timeout <SECONDS>]` (90 seconds per account; exit 1 if a
+query fails). Claude takes 2 to 20 seconds, Codex a second or two; neither updates the cache.
 
-For each member of `[share.claude]` it also checks the links of the home, and says which link
-to make:
+Claude's live query is `claude -p /usage --no-session-persistence --setting-sources ""
+--strict-mcp-config`, a local command: no model call, no cost, no transcript. It loads none of the
+account's settings files and starts none of its MCP servers, so your hooks do not run and the
+settings' `env` does not apply; and Remuda removes `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` for
+it, since with it `/usage` only repeats a reading from the last hour. When Claude gives no limits,
+one line says why: `no usage limits told for now` (it could not get them just then), or `not
+logged in to a Claude subscription, or using an API key`. Codex's live query is `codex app-server`,
+asked for the rate limits and the account (email and plan), never for a change. It starts as Codex
+does, so it may refresh the login token and writes Codex's own state into the home: that is why it
+runs only when you ask.
 
-- `.claude.json`, `history.jsonl` or `sessions` that is a symlink to another account's: the
-  logins get mixed up, sessions lose their attribution, or running sessions cannot be told
-  apart. Each account needs its own.
-- a home that does not share `projects` with the source: it does not see or resume the sessions
-  there. This is a notice, not an error; its memory is still shared by injection.
-- a home that shares `projects` but not `file-history` (`/rewind` does not find the file
-  backups of another account's session), or not `agent-memory` where a settings file chooses
-  `autoMemoryDirectory` (a launch then does not redirect memory, so the memory of user-scope
-  subagents is not shared).
-- a `plugins` link that installed plugins are recorded through: it must stay a symlink, or
-  those plugins stop loading for every account.
-- a `settings.json` linked to the source's while the source's sets authentication settings:
-  the account reads them through the link (each of its launches says so too).
+When a window's reset has passed since its reading, what it holds now is unknown, so it shows no
+percentage until a new reading: `reset` in the table, `-` and `reset since cached (<time>)` in
+`remuda usage` (`reset since asked` for a live answer), and no marker on the timeline. Readings
+without a severity of their own (live ones, and Codex's) are marked at 75% as a warning and 90% as
+critical: in color in the TUI, as `!` and `!!` in `remuda usage`. A live reset time Remuda cannot
+read is replaced on the timeline by the cached one, while that is ahead.
 
-The first of these is checked even when the source's home is missing.
+### The notes of `remuda usage`
 
-Accounts with `share = false` and the source itself are not checked.
+`remuda usage`, cached or live, may add two notes under a window; the TUI shows neither.
 
-## Data sources
+- `note: resets in 42 min with 71% left`: the window resets within 60 minutes with at least 25%
+  left, which then goes unused. The minutes are rounded up; a reset unknown or passed gets none.
+- `note: at this pace 100% by Oct 30 10:55, 2h05m before the reset`: at the pace of the reading,
+  the window is used up before its reset. A window of length `L` that resets at `R`, read at `t`
+  with `u`% used, reaches 100% at `T = (R − L) + (t − (R − L)) × 100 / u`, and the margin is
+  rounded down. The note needs all of these:
+  - a known length: Codex's minutes, else the label (`5h` is five hours, `Week …` seven days);
+  - a reset known and ahead, and a reading of known time (not a cache without one) taken after
+    the window started;
+  - at least 25% used, and less than 100%;
+  - more of the window used than of its time passed;
+  - `T` still ahead, and at least a minute before the reset.
 
-- **Usage limits** come from what each agent records locally (Claude's usage cache in
-  `.claude.json`, the rate limits in Codex rollouts), or, with `remuda usage --live` or `u` in the
-  TUI, from asking the agent itself (`claude -p /usage`, `codex app-server`).
-- **Usage history** is what remuda itself kept of those readings: each reading of `remuda usage`
-  (also each one `--wait` takes) and of the TUI's Accounts view (cached or live) is recorded in `state/usage-history.jsonl`, at
-  the time the agent took it, for 45 days. `remuda pick` records nothing. `remuda usage
-  --history` shows it per window, with the pace of the current window: `used 71% with 48% of the
-  window elapsed: ahead of an even pace; at this pace 100% by Oct 8 20:00` says the window runs
-  out before its reset at that rate; `behind an even pace; at this pace 83% at reset` says 17%
-  would go unused. A codex window is as long as codex says, to the minute (each of its points
-  records `window_minutes`); Claude's windows, and codex points recorded before remuda kept the
-  minutes, take their length from the label (`Session` 5 hours, `Week` 7 days, codex's `<N>h
-  window`, counted to the hour). `remuda usage` also adds
-  `note: resets in 42 min with 71% left` under a window that resets within the hour with a
-  quarter or more left.
-- **Identity** comes from `claude auth status --json` and `codex login status`. `remuda list`
-  shows a Codex account's login method only; its email and plan appear after a live usage query.
-- **Live sessions** come from `claude agents --json`. They are not available for Codex, because
-  Codex exposes no machine-readable list of running sessions.
-- **Token statistics** are counted from the agents' own transcripts. Each request counts once,
-  even when a message is written in several records, a session is forked, or a store is shared
-  by several accounts. Each request is also priced at the provider's public API list
-  price (built in, as of 2026-10-21), which estimates what the usage would cost on the API; for
-  subscription logins it is not a bill. No agent is run and nothing is fetched.
-- **Recommendations** (`remuda pick`) read the same usage and `[pick]` and select locally;
-  remuda makes no network requests of its own (see
-  [Recommendations](#recommendations)).
-- **Attribution:** new Claude sessions get a pre-assigned `--session-id`, and every launch is
-  recorded in `state/launches.jsonl`, so each session can be attributed to the account that
-  started it.
+## Launching and sessions
 
-Where the agents' local formats are not public interfaces, parsing is best-effort: unrecognized
-data degrades to missing fields rather than errors.
+### remuda run
+
+`remuda run <account> [args...]` replaces itself with the account's agent, `claude` or `codex`, in
+the current directory with the account's home selected. Everything after the account goes to the
+agent unchanged, a `--` included: `remuda run work --resume <id>`, `remuda run work -p "..."`,
+`remuda run codex:research resume <id>`. `-h` and `--help` go to the agent too, so the help of
+`run` itself is `remuda help run`. The agent gets your environment with its home variable set, or
+removed for `default`; a member of `[share.claude]` may also get the
+[memory variable](#memory-through-a-linked-projects).
+
+Without an account, `remuda run` opens the TUI's account picker and takes no other arguments:
+`Enter` launches the selected account, `Esc` or `q` exits, and `u` and `r` work as in the Accounts
+view. An account removed while the picker was open is not launched.
+
+Remuda puts nothing in your shell, and typing `claude` still runs your native login. To make an
+account your default, alias it yourself: `alias claude='remuda run work'`. Only a launch through
+Remuda is attributed in the launch log, gets the memory variable that lets a member with a linked
+`projects` write memory without asking, and is warned before a session Claude would not save or
+that reads another account's authentication settings. Subcommands such as `claude agents --json`
+pass through untouched, and `command claude` skips the alias.
+
+### Attribution
+
+Transcripts do not say which account wrote them, so Remuda attributes a session from three sources:
+
+1. The launch log. For a new Claude session, Remuda generates the ID, logs it, then starts claude
+   with `--session-id <id>`; a fork (`--resume <id> --fork-session`) gets one the same way, and a
+   resume is logged with the ID it names. No ID is given when an argument is a claude subcommand
+   name (`agents`, `mcp`, `update`, …, even as a prompt: `-p update`), or a resume or continue
+   option, `--help` or `--version`.
+2. Running sessions: the account a session runs or ran under.
+3. Each home's `history.jsonl`, for sessions from before Remuda, unless two accounts share it.
+
+A session may belong to several accounts, or to none, which is normal for old and SDK sessions.
+Codex chooses its own IDs: a Codex session belongs to the account whose home holds its rollout.
+
+### Sessions Claude does not save
+
+A terminal started from inside a Claude session (by its Bash tool, or a `screen` or tmux started
+there) may carry `CLAUDE_CODE_CHILD_SESSION=1`. Claude then saves no transcript or prompt history
+for an interactive session started in it: the session never reaches History and cannot be resumed.
+Remuda cannot tell the marker from real nesting, so it passes it on and warns: `run` on stderr, a
+TUI launch before it hands over the terminal (quit Claude to start again) and once Claude exits,
+and the Accounts view. If the terminal is your own, set `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`
+in it. Both are read as Claude reads a switch: `1`, `true`, `yes` and `on`, in any case, are on,
+anything else off. `-p` runs, subcommands and Codex are not affected.
+
+### History
+
+View `3` lists every account's sessions, newest first: time, accounts, title (Claude's AI title or
+Codex's thread name, else the first message) and directory. Teammate, SDK, and Codex `exec` and
+subagent sessions stay hidden until you press `a`; `/` filters by a fuzzy search over title,
+directory and accounts; the preview shows the latest messages, a tool call as `[tool: <name>]`.
+`remuda sessions [--limit <N>]` prints the newest sessions, 30 by default. A directory the index
+cannot read keeps its sessions as last indexed, and the status line says so.
+
+`Enter` resumes the selected session and `f` forks it into a new one, leaving the original as it
+is; both start in the session's last directory, which must exist.
+
+- The account is the one the session is attributed to; with several or none, a picker opens,
+  attributed accounts first. `R` and `F` in the session card let you choose.
+- A Claude session can be continued only by an account whose `projects` store holds it: every
+  account that links that store, or else the one whose home has it. Remuda never copies a session
+  between accounts; the refusal says which `projects` to link.
+- Resuming a Claude session that runs elsewhere is refused, naming its account and pid. Remuda
+  asks every account just before the launch (`Esc` cancels) and refuses when it cannot confirm.
+  A fork only reads the original, so it may run meanwhile.
+- A Codex session is resumed by the account whose home holds it, and resuming it in place asks
+  first, warning when the rollout was written in the last 10 minutes.
+
+### Session card and Live
+
+`p` or Space in History or Live opens the session card: the id, provider and entry point; the
+accounts and whether it runs (pid or background id, and state); when it started and was last
+active; its directory, transcript and store; then the preview. Its keys are in the
+[TUI reference](#tui-reference).
+
+View `2` lists the Claude sessions running now, for every account. Interactive ones are listed
+only; background ones can be attached (`Enter`), shown with their logs (`l`), stopped (`x`; the
+conversation is kept) and, once stopped, removed (`D`, which deletes the session and its worktree);
+`a` shows the stopped ones. Codex sessions never appear here.
+
+## One setup for every account
+
+Claude accounts can share one session store and one configuration, so that any account resumes
+any session and all of them load the same instructions, settings, plugins and memory; only the
+login stays per account. Sharing is done with symlinks: in each member's home, a shared item links
+to the same item in the source's home. `[share.claude] from` in `config.toml` names the source,
+usually `default` (`~/.claude`). Every other Claude account is a member, unless its `[[account]]`
+table sets `share = false`; Codex accounts take no part.
+
+| Linked to the source's | Never linked: one per account |
+| --- | --- |
+| `projects`, `file-history`: the sessions with their auto-memory, and the backups `/rewind` needs | `.claude.json`: the login's identity, MCP servers and project trust |
+| `settings.json`, read whole ([below](#settingsjson-and-authentication)) | `history.jsonl`: which account ran which session |
+| `CLAUDE.md`, `skills`, `commands`, `agents`, `hooks`, `plugins`, `rules`, `output-styles`, `keybindings.json` | `sessions`: the running sessions, by account |
+| `agent-memory`: the memory of subagents with `memory: user` | `remote-settings.json`, `policy-limits.json`, and the credentials |
+
+### What setup links, and when
+
+`remuda setup` links a new member's home once: in the directory it has just created, still empty,
+before registering the account and before the login. It makes one link per item of the left column
+that the source has, `<home>/<item>` pointing at `<source home>/<item>`, then lists what it linked
+and what the source lacks. A link that fails is reported, and the rest are still made; when the
+source's home is missing, nothing is linked. Remuda never touches those links again, and never
+links a home registered with `remuda add`. Codex homes, and Claude homes made without
+`[share.claude]`, start empty.
+
+### settings.json and authentication
+
+A home that links `settings.json` reads all of it, so `setup` checks the source's first. If it sets
+an authentication or provider setting (`apiKeyHelper`, `forceLoginOrgUUID`, `env.ANTHROPIC_API_KEY`
+and the rest of [R18's list](../SPEC.md#r18-shared-configuration)), or is not a JSON object,
+`setup` leaves it out, names the keys but never their values, and asks you to give the new home a
+`settings.json` of its own; until then, the account has no shared settings. That check happens
+once: such a setting added to a linked file later reaches every account that links it. Remuda then
+warns in the Accounts view and at each session launch of those accounts, on stderr from
+`remuda run` or among a TUI launch's warnings (`remuda: warning: claude:work reads the
+authentication settings of claude:default through its settings.json link: env.ANTHROPIC_API_KEY`),
+but does not stop it. Keep one account's settings in its own `settings.json`, or in an account
+with `share = false`. The login itself is no setting: it stays in the Keychain or the home's
+`.credentials.json`.
+
+Every account that shares `projects` cleans it up by its own `cleanupPeriodDays`, and Claude's
+30-day default deletes everyone's old sessions there. Set it in the shared `settings.json`; a home
+that shares `projects` without a `settings.json` needs one of its own that sets it.
+
+### Linking a home by hand
+
+A home registered with `remuda add`, or an item the source gained after `setup`, you link yourself,
+while no session of that account runs: `ln -s ~/.claude/rules ~/.claude-work/rules`. If the home
+already has a directory of that name, move its contents into the source's and remove it first:
+`ln -s` onto a directory puts the link inside it. The Accounts view lists what each member does not
+link, with the command; what is not linked is not shared. Once a plugin is installed from a member
+account, its install is recorded through that member's `plugins` link, which must then stay:
+without it, the plugin stops loading for every account. The member's account card says so.
+
+### Memory through a linked `projects`
+
+A member that links `projects` keeps its auto-memory in the source's store already, by a path
+through the link. Claude grants write access to the memory directory by that path but checks the
+resolved one, so every memory write would ask for permission. Each session launch of such a member
+through Remuda therefore sets `CLAUDE_CODE_REMOTE_MEMORY_DIR` to the source's home: Claude names
+the memory directory by the source's path and writes freely, and keeps the memory of user-scope
+subagents in the source's `agent-memory/`, linked or not.
+
+The variable is not set when you pass `--settings` or `--setting-sources` (Remuda says so), when
+you set it yourself, or when a settings file chooses `autoMemoryDirectory`, where only an
+`agent-memory` link shares subagent memory; nor for the source, an opted-out account, a member whose
+`projects` is its own, or a command that is not a session. Claude does not document it, so it is
+the least stable part of sharing; with it, `memory: local` subagents keep their memory under the
+source's `projects/<project>/`.
+
+### Account card
+
+`p` or Space in the Accounts view opens the account card: the home, the login, the usage (each
+window and the time to its reset, with the reading's age), the sessions in History and running, the
+checks, and the account's part in sharing (alone, source, member, opted out, or source missing).
+Below, for a Claude account, is what a new session in Remuda's own directory loads (`CLAUDE.md`,
+agents, skills, commands, rules, synced claude.ai skills, plugins and what each adds, the settings
+by key names and counts, the memory directories, the MCP servers), each item marked as the
+account's own, already the source's (a link), set by the project, bundled with Claude, or set at
+launch; `d` adds the details. The card comes from the same step that prepares a launch, so the two
+agree: open it on each account to see that they all load the same thing. A Codex account's card
+has the facts only.
+
+## Statistics and cost
+
+Remuda counts input, cache read, cache write, output and reasoning tokens (reasoning is part of
+output; Claude does not record it apart) from the agents' own transcripts: Claude's `projects`
+with subagent transcripts, and Codex's rollouts, archived ones too. Each request counts once, even
+when Claude writes it in several records, a fork copies it, or several accounts share the store.
+Transcripts Claude has cleaned up no longer count; sessions History hides do.
+
+`remuda stats [<account>] [--period today|7d|30d|all] [--by account|project]` prints one period,
+`all` by default; periods start at local midnight. By account, each account comes in registry
+order, then sessions attributed to several accounts, counted once for them together
+(`work + personal`), then unattributed ones, then the overall total they add up to. By project, each
+directory a session started in gets a section, as recorded: two spellings are two projects, a
+resumed session stays where it started, and `(no directory)` holds those that record none. With an
+account, only its sessions count, without the overall section. A directory that could not be read
+is named in an `Incomplete:` line after the table.
+
+View `4` shows the same under a chart of the period's cost (or tokens, when nothing is priced) by
+hour, day, week or month, with Overall and the models not priced first and a share bar per section:
+`t` changes the period, `b` switches between accounts and projects, `r` computes again. The first
+computation reads every transcript whole and takes tens of seconds on a large history (the TUI runs
+it in the background, with progress); later ones read only what changed. It happens once more after
+an upgrade that changes the statistics cache.
+
+### Prices
+
+Each request is priced at the provider's public API list price, built in as of 2026-10-21 (tables
+in [R20](../SPEC.md#r20-token-statistics)): an estimate of what the usage would cost on the API,
+not a bill. Claude's 5-minute and 1-hour cache writes are priced apart; fast mode doubles the price
+on the models that offer it, and US-only inference adds 10% on the models from 4.6 on. Claude Haiku
+5.5 costs five times its base prices for a request with more than 100K input tokens, cache
+included. Codex's cache writes are priced at the 30-minute rate (1.25 times the input price from
+GPT-5.6 on, the input price before), and a request with more than 272K input tokens at the
+long-context price where the model has one. These thresholds apply per request.
+
+A `[prices."<model>"]` table in `config.toml` prices a model Remuda does not know, or replaces a
+built-in price, in USD per million tokens. `input` and `output` are required; `cache_read`,
+`cache_write_5m` and `cache_write_1h` are optional (for Codex, `cache_read` is the cached-input
+price and `cache_write_5m` the cache-write price), and a count without a price is not priced.
+Prices run from 0 to 1,000,000, and no other key is allowed. A table applies to the model id as
+recorded or without its trailing date (`claude-haiku-4-5` prices `claude-haiku-4-5-20251001`), and
+sets base prices: the multipliers above still apply.
+
+A cost followed by `+` (`$12.34+`) leaves out requests that could not be priced, and `-` means none
+could; the models concerned are named under the table, or after Overall in the TUI. Not modelled:
+the long-context premium of Claude Sonnet 4.5 and 4, batch and priority processing, Codex's fast
+and priority processing and 12-hour cache writes, server tools such as web search, and data
+residency other than US-only.
+
+## Checks and troubleshooting
+
+The Accounts view ends with checks for what silently breaks a setup of several accounts, run when
+the TUI starts, on `r`, and when the account list changes. A warning, `!`, means something is
+broken or overrides your setup; a note, `·` and dim, is a fact worth knowing, not a fault, and
+follows the warnings, even after `✓ no problems found`. Checks name variables and settings, never
+their values; the account card shows one account's checks the same way.
+
+| Warning | Why it matters |
+| --- | --- |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN` is set | it overrides every account's `/login` |
+| `ANTHROPIC_BASE_URL` is set | every account's requests go to that endpoint instead of Anthropic's |
+| `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set | `/usage` in a session repeats old readings; Remuda's live query removes it |
+| `CLAUDE_CODE_CHILD_SESSION` is on | interactive sessions started here are [not saved](#sessions-claude-does-not-save) |
+| a home is missing or not logged in | the account cannot be used |
+| a live usage query failed | the agent's error says why |
+| a dangling symlink in a home | its target is gone |
+| a shared `projects` with an account that does not set `cleanupPeriodDays` | the 30-day default deletes everyone's sessions |
+| the source of `[share.claude]` does not exist, or its home is missing | nothing is shared |
+| a member's `.claude.json`, `history.jsonl` or `sessions` links to another account's | the logins mix, attribution is lost, or running sessions cannot be told apart |
+| a member shares `projects` but not `file-history` | `/rewind` misses the backups of sessions from other accounts |
+| a member shares `projects` but not `agent-memory`, and a settings file chooses `autoMemoryDirectory` | the memory of user-scope subagents is not shared |
+| a member's `settings.json` links the source's, which sets authentication settings | the account reads them; give it its own file, or move them out |
+
+Only members are checked for sharing, not the source or accounts with `share = false`. The one
+note, per member, lists the source's items its home does not link, with
+`ln -s <source home>/<item> <home>/<item>`. Without `projects`, it adds that the account does not
+see or resume the source's sessions; when the source's `settings.json` sets authentication settings
+or is not a JSON object, it says the file is not shared and why, instead of offering it.
+
+### Troubleshooting
+
+- **The first stats run is slow.** It reads every transcript whole, once; later runs read only what
+  changed.
+- **Every account shows the same login, or `/login` seems ignored.** An `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN` in your environment overrides them all.
+- **A live reading repeats an old one.** `/usage` in a session does while
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is set; `u` and `--live` remove it. If they say
+  `no usage limits told for now`, Claude could not get the limits just then: try again.
+- **A session is missing from History.** It was started inside a Claude session
+  ([not saved](#sessions-claude-does-not-save)), ended before its first message, or is hidden until
+  `a`; an index that could not read a directory says so in the status line.
+- **Memory writes ask for permission.** The member's session was not launched through Remuda, or
+  the [memory variable](#memory-through-a-linked-projects) was not set for it.
+- **A Codex live query changed the home.** `codex app-server` starts like Codex: it may refresh the
+  login token and writes Codex's own state. Only `u` and `--live` run it.
+
+## TUI reference
+
+`remuda` opens the TUI, which needs a terminal, on four views: `1` Accounts, with the usage table,
+the reset timeline and the checks; `2` Live; `3` History; `4` Stats. In a terminal at least 40 rows
+tall, the header takes three rows, the mark's two tracks framing the tabs, with the wordmark and the
+`PRIVATE` badge in the upper rail; a shorter terminal gets one line. Below the view, the status line
+shows progress, notices and errors, and the hint line the keys at hand.
+
+| Key | Where | What it does |
+| --- | --- | --- |
+| `1` `2` `3` `4`, `Tab`, `Shift-Tab` | views | switch view |
+| `j` `k`, `↑` `↓`, `g` `G`, `Home` `End`, `PgUp` `PgDn` | views, cards | move or scroll: by one, to the first or last, by a page |
+| `Enter` · `f` | History, Live | resume the session (Codex asks first), or attach a background one in Live · fork it |
+| `p`, Space | History, Live · Accounts | open or close the session card · the account card |
+| `n` · `s` | Accounts | start a new session as the selected account · set up a new account |
+| `D` | Accounts · Live | remove the account, keeping its home · remove a stopped background session; both ask first |
+| `l` · `x` | Live | show a background session's logs in the preview · stop it (asks first) |
+| `a` | History · Live | show or hide teammate, SDK, and Codex `exec` and subagent sessions · stopped ones |
+| `/` | History | search: type to filter, `Enter` keeps the filter, `Esc` clears it |
+| `t` · `b` | Stats | next period: all, today, 7 days, 30 days · sections by account or by project |
+| `u` · `r` | views, cards | query live usage for every account · refresh the index, logins, running sessions and checks, and the statistics once computed |
+| `Esc` | anywhere | go back: close a card or the logs, clear the search, cancel a form or a launch check |
+| `Ctrl-P` | anywhere | turn private mode on or off |
+| `?` · `q` | views | show the keys (any key but `Ctrl-P` closes them) · quit; `Ctrl-C` quits anywhere |
+
+In the session card, `Enter` and `f` work as in the list, and in Live so do `l`, `x`, `D` and `a`:
+
+| Key | What it does |
+| --- | --- |
+| `R`, `F` | resume or fork, choosing the account: every Claude account, the session's own first; for Codex, the homes that hold it |
+| `n` | start a new session in the session's directory, as its account |
+| `y`, `Y` | copy the session id, or the transcript path, through the terminal (OSC 52; tmux needs `set-clipboard`) |
+| `m` | read more of the transcript: the last 100, 500, then all messages, then 20 again |
+| `[`, `]` | move to the previous or next session |
+| `p`, Space, `Esc` | close the card |
+
+In the account card, `n`, `u`, `D` and `r` work as in the view; `d` shows or hides the details
+(descriptions, an agent's model, effort and tools, the entries of linked items and plugins); `y`
+copies the home directory; `[` and `]` move to the previous or next account; `p`, Space, `Esc` or
+another view closes it. The movement keys scroll either card. The picker of `remuda run` has none.
+
+### Forms and confirmations
+
+In a form, `Tab` or `↓` goes to the next field, `Shift-Tab` or `↑` back, `Enter` submits and `Esc`
+cancels. The new-session form (`n`) asks for a directory (by default where Remuda was started; `~`
+is expanded, and it must exist) and, for Claude, an optional session name passed as `-n`, refused
+if it starts with `-` or is a claude subcommand. The setup form (`s`) asks for the name, an optional
+email for the Claude login, and the provider. A confirmation takes `y`; any other key but `Ctrl-P`
+cancels. A launch leaves the TUI's screen, prints what runs and hands the terminal over; when the
+agent exits, the TUI lists the launch's warnings and refreshes. It reads `config.toml` again before
+each launch, so an account another `remuda` removed meanwhile is not launched.
+
+### Private mode
+
+`Ctrl-P` turns private mode on or off anywhere, also in forms, the search, the picker, the key list
+and confirmations, which stay open; the header then shows `PRIVATE`. It is off when the TUI starts,
+it is not saved, and the command-line commands have none. While it is on:
+
+- account names other than `default` show as `account-1`, `account-2`, … (`codex:account-1`),
+  numbered when the TUI starts and stable while it runs, unregistered names included; emails show
+  as `•••@•••`, and organizations as `•••`;
+- paths show every component masked and `$HOME` as `~` (`~/•••/•••`), form values included; the
+  session card hides the transcript and store entirely;
+- titles, first messages, session names, previews, background logs, the search, typed values and
+  the account card's descriptions show as `•••`;
+- messages (notices, errors, checks, the account card's problems) mask all of the above. In one
+  Remuda composes, each path is masked whole and the rest stays readable: the reason, what to do,
+  a `/login` or `/rewind` it names. In text from elsewhere, such as an agent's output or a system
+  error, Remuda cannot tell where a path ends, so a line is masked from its first word with a `/`
+  to its end; a `/login` there counts as a path.
+
+Numbers (percentages, reset times, token counts, costs, the chart), model names, plans, login
+methods, providers, session IDs, pids, times, and the names of configuration items in the account
+card stay visible. The agent's own screen, once Remuda hands it the terminal, is not masked; the
+line Remuda prints just before is. In VS Code's terminal on Linux and Windows, `Ctrl-P` opens Quick
+Open: add `-workbench.action.quickOpen` to `terminal.integrated.commandsToSkipShell`.
+
+## Data sources and privacy
+
+| What | Where it comes from |
+| --- | --- |
+| Usage | cached: Claude's usage cache in `.claude.json`, the rate limits in Codex's rollouts; live, when you ask: `claude -p /usage`, `codex app-server` |
+| Identity | `claude auth status --json`, else the account recorded in `.claude.json`; `codex login status` |
+| Sessions, statistics | Claude's `projects`; Codex's `sessions`, `archived_sessions` and `session_index.jsonl` |
+| Running sessions | `claude agents --json`, else `sessions/<pid>.json` checked with `ps` |
+| Attribution | the launch log, running sessions, and each home's `history.jsonl` |
+| The account card | the home's and the project's files; from `.claude.json`, MCP server names and account ids only |
+
+Remuda never reads credentials: not the Keychain, a home's `.credentials.json`, Codex's
+`auth.json`, or the `*.key` files of running sessions. It makes no network requests of its own and
+needs no API key: a live query is the agent asking with its own login, when you ask, and prices are
+built in. It writes only `config.toml`, `state/`, and the homes `setup` creates with their links
+([R13](../SPEC.md#r13-write-boundary)). The agent commands it runs write what the agent writes: a
+launch, a login, `codex app-server`, and `codex login status`, which creates `tmp/` in the home.
+
+The agents' local formats are not public interfaces, so Remuda reads them best-effort: what it does
+not recognize becomes a missing field, never an error.

@@ -114,7 +114,7 @@ The exceptions, all for a type or a small helper:
 | `usage` | Cached and live usage for both providers as rows (what the agent said; a partly read answer is not used), window labels and lengths (the minutes codex tells, else read from the label), the text of `remuda usage` and its notes (a reset close with much left; the pace of a window on its way to 100% before its reset) | R10 |
 | `usage::snapshot` | Rows read at an instant: each window's reset (ahead, passed since, unknown), its percentage and severity (unknown once it has reset since), the snapshot's age. The one place that compares a reset with now; `usage` and the TUI take it from here | R10 |
 | `live` | Running claude sessions: parses `agents --json`, `sessions/*.json` fallback checked against `ps`; attach, logs, stop, rm | R7, R16 |
-| `checks` | Warnings for the Accounts view, among them what a member's home links and does not (the relations of `home_items`, put into words) | R11 |
+| `checks` | Warnings and notes for the Accounts view, among them what a member's home links and does not (the relations of `home_items`, put into words) | R11 |
 | `index` | The session index over claude transcripts and codex rollouts: its stores, how they are listed, the head and tail windows of one file, its cache | R8, R17 |
 | `tracking` | Keeping a cache up to date with the files below a set of directories: which are reused, read on or read whole, the worker threads, what vanished, progress, and a directory that cannot be listed. Private; `index` and `stats` each give it an adapter | R8, R20 |
 | `transcript` | Reading claude transcripts without loading them whole: windows, complete lines, preview | R8 |
