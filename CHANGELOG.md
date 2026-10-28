@@ -8,6 +8,18 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-28
+
+A product reset. Remuda now does three things: it shows what each account has left, it launches
+or resumes a session as any account, and it keeps one setup shared by every Claude account, with
+token statistics on top. What answered one of these questions a second way, or what daily use did
+not reach, is removed: `remuda pick` with `usage --wait`, the usage history with
+`usage --history` and `stats --csv`, and the launch-time injection of shared configuration, so
+that accounts share through links alone. The five-hour window is labeled `5h`, checks come in two
+levels, and the README and the guide are rewritten around the three jobs. Four changes are
+breaking, each with its migration: the three under **Removed**, and the `5h` label under
+**Changed**.
+
 ### Added
 
 - The account card: `p` (or Space) in the TUI's Accounts view now opens a card over the view,
@@ -643,7 +655,8 @@ Initial release.
   `sessions`; a session index over Codex rollouts; resume and fork from the TUI, with confirmation
   before resuming in place.
 
-[Unreleased]: https://github.com/ya-luotao/remuda/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ya-luotao/remuda/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ya-luotao/remuda/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ya-luotao/remuda/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ya-luotao/remuda/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ya-luotao/remuda/releases/tag/v0.1.0

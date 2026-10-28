@@ -1,7 +1,7 @@
 # remuda roadmap
 
-**Status:** v0.3.0 is released. 0.4.0 is a product reset: it removes what daily use did not need
-and rewrites the documentation around what is left (see M4).
+**Status:** v0.4.0 is released: a product reset that removed what daily use did not need and
+rewrote the documentation around what is left (M4).
 
 Remuda lets several Claude Code and Codex logins be used as one: it shows what each account has
 left, launches or resumes a session as any account, and keeps one setup shared by every Claude
@@ -83,12 +83,12 @@ pointing at the source's (SPEC R18): `remuda setup` makes them in the home it cr
 Accounts view reports what a home registered with `add` does not link (R11). Only login state
 stays per account.
 
-**M4 · Product reset** — **In progress** (0.4.0)
-Remove `remuda pick` with `usage --wait` and `[pick]`; the launch-time injection of shared
-configuration; the usage history with `usage --history`; `stats --csv`. Move the pace of a window
-into a note of `remuda usage`. Label the five-hour window `5h`, rename the `SOURCE` column
-`AS OF`, and give checks two levels. Rewrite the README and the guide around the product's three
-jobs, and move the design decisions to docs/DECISIONS.md.
+**M4 · Product reset** — **Done** (0.4.0)
+Removed: `remuda pick` with `usage --wait` and `[pick]`, the launch-time injection of shared
+configuration, the usage history with `usage --history`, and `stats --csv`. The pace of a window
+as a note of `remuda usage`; the five-hour window labeled `5h`, the `SOURCE` column renamed
+`AS OF`, and checks in two levels. The README and the guide rewritten around the product's three
+jobs, and the design decisions moved to docs/DECISIONS.md.
 
 ## Later, as needed
 
