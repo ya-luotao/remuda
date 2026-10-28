@@ -8,16 +8,23 @@ ones that were superseded, each with what replaced it. The behavior itself is sp
 
 - **2026-10-28 · The product is several logins used as one.** Remuda does three things: it
   shows what each account has left, it launches or resumes a session as any account, and it
-  keeps one setup shared by every Claude account. Statistics come on top. Features that answered
-  the same question a second way, or that daily use did not need, were removed: `remuda pick`
-  with `usage --wait` and `[pick]` (a leftover `[pick]` is a load error, as for the Jev keys
-  before it); the launch-time injection of shared configuration; the usage history with
-  `usage --history`; and `stats --csv`. The pace of a window, the one part of the history
-  report a decision needs, became a note of `remuda usage`. The five-hour window is labeled
-  `5h`, since "session" names a coding session everywhere else in Remuda. Checks have two
-  levels, so that a fact about a healthy setup is no longer shown as a warning. *Reason:* the
-  maintainer's use showed `run` and the TUI in daily use and none of the removed features; each
-  removal makes the README, the SPEC and the code shorter, and leaves one way to do each thing.
+  keeps one setup shared by every Claude account. Statistics come on top.
+
+  What changed:
+  - Removed, because each answered a question a second way or daily use did not reach it:
+    `remuda pick` with `usage --wait` and `[pick]` (a leftover `[pick]` is a load error, as the
+    Jev keys were before it), the launch-time injection of shared configuration, the usage
+    history with `usage --history`, and `stats --csv`.
+  - The pace of a window, the one part of the history report a decision needs, became a note
+    of `remuda usage`.
+  - The five-hour window is labeled `5h`, since "session" names a coding session everywhere
+    else in Remuda.
+  - Checks have two levels, so that a fact about a healthy setup is no longer shown as a
+    warning.
+
+  *Reason:* the maintainer's use showed `run` and the TUI in daily use and none of the removed
+  features. Each removal makes the README, the SPEC and the code shorter, and leaves one way to
+  do each thing.
 - **2026-10-04 · A linked `projects` gets `CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>` at
   launch.** claude grants its auto-memory directory by the literal path and then checks the
   resolved one, which through the link is under the source's home and outside the working

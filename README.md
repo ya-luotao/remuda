@@ -13,9 +13,9 @@ left and when it resets, and starts, resumes or forks a session as whichever acc
 from one TUI or the command line. Codex accounts work too, with fewer features.
 
 Remuda never reads, copies or moves a login, and makes no network requests of its own: every
-session is the agent itself, run in that account's home. It is not a gateway or a proxy.
+session is the agent itself, with that account's home selected. It is not a gateway or a proxy.
 
-The Accounts view, rendered with made-up accounts:
+The Accounts view, rendered at 100 columns with made-up accounts:
 
 ```text
  remuda  1 Accounts  2 Live  3 History  4 Stats                                   ?: help · q: quit
@@ -34,8 +34,8 @@ codex:research ·········|·········|········|·····
                S 5h · W week (all models) · f week (Fable)
 Checks ─────────────────────────────────────────────────────────────────────────────────────────────
 ! ANTHROPIC_API_KEY is set: it overrides every account's /login
-· side: does not share rules with claude:default; to share an item: ln -s ~/.claude/rules
-  ~/.remuda/homes/claude/side/rules
+· side: does not share rules with claude:default; to share an item: ln -s /Users/you/.claude/<item>
+  /Users/you/.remuda/homes/claude/side/<item>
 
  n: new session · p: account · s: set up · D: remove · u: live usage · r: refresh
 ```
@@ -60,8 +60,9 @@ cargo install --locked --git https://github.com/ya-luotao/remuda
    from = "default"
    ```
 
-   Every account you set up from now on shares `default`'s sessions, settings, `CLAUDE.md`,
-   skills, commands, agents, hooks, plugins, rules and memory; only its login is its own.
+   Every account you set up from now on shares what `default`'s home has of its sessions,
+   settings, `CLAUDE.md`, skills, commands, agents, hooks, plugins, rules and memory; only its
+   login is its own ([what is linked](docs/GUIDE.md#one-setup-for-every-account)).
 3. **Log in a second time.** `remuda setup work` creates a home under `~/.remuda/homes/`, links
    it to `default`'s and runs `claude auth login`. A home you already have is registered as it
    is with `remuda add work ~/.claude-work`; the Accounts view then lists the links it is
@@ -86,7 +87,8 @@ before its reset. [Usage limits](docs/GUIDE.md#usage-limits) in the guide has th
 
 ### Launch, resume and fork as any account
 
-`remuda run <account>` replaces itself with the agent, started in that account's home. New
+`remuda run <account>` replaces itself with the agent, started in the current directory with that
+account's home selected. New
 Claude sessions get their session ID from Remuda, and every launch is logged, so each session is
 shown under the account that ran it. In the TUI, `n` starts a session as the selected account;
 History resumes or forks any session, and its card (`p`) lets you choose the account with `R` and
@@ -100,8 +102,8 @@ With `[share.claude]`, `remuda setup` links a new account's home to the source's
 (the sessions), `file-history`, `settings.json`, `CLAUDE.md`, `skills`, `commands`, `agents`,
 `hooks`, `plugins`, `rules`, `agent-memory`, `output-styles` and `keybindings.json`. What
 identifies a login stays per account: credentials, `.claude.json`, `history.jsonl` and
-`sessions`. `p` on an account opens its card: login, usage, sessions, and everything its
-sessions load, each item marked as its own or the source's.
+`sessions`. `p` on an account opens its card: login, usage, sessions, and everything a new
+session in Remuda's directory would load, each item marked as its own or the source's.
 
 Remuda also checks for what silently breaks such a setup: an `ANTHROPIC_API_KEY` that overrides
 every login, a shared `settings.json` that sets authentication, a dangling symlink, a home that
@@ -112,8 +114,9 @@ the layout and how to link a home by hand.
 ### Where the tokens went
 
 `remuda stats` and the Stats view (`4`) count input, cache, output and reasoning tokens per
-account (or per project) and model, from the agents' own transcripts, with a chart over time and
-an estimated cost at API list prices. For a subscription the cost is a measure, not a bill.
+account (or per project) and model, from the agents' own transcripts, with an estimated cost at
+API list prices; the Stats view adds a chart over time. For a subscription the cost is a measure,
+not a bill.
 [Statistics and cost](docs/GUIDE.md#statistics-and-cost) lists what is priced and how.
 
 ## Commands
@@ -155,8 +158,9 @@ The full list is in the guide's [TUI reference](docs/GUIDE.md#tui-reference).
   non-secret local metadata; Remuda does not read the Keychain or any token file.
 - **Homes are never moved or rewritten.** Their paths are stored and passed byte for byte, since
   the agent may key its Keychain entry to that exact string.
-- **Writes stay under `~/.remuda`.** The one exception is the links `remuda setup` makes in the
-  home it has just created, before the login.
+- **Writes stay under `$REMUDA_HOME`** (`~/.remuda` unless set): the registry, `state/` and the
+  homes `setup` creates. No account home is written into, except the links `remuda setup` makes
+  in the home it has just created, before the login.
 - **No network requests of its own.** A live reading is the agent asking, and only when you ask.
 - **Your shell is left alone.** `claude` stays your native login unless you alias it.
 

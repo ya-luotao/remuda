@@ -27,6 +27,7 @@ contract, and the entries named here (R10, R18, …) hold the exact rules.
   removed.
 - `remuda list [--timeout <SECONDS>]` prints each account's login and home, from
   `claude auth status --json` (else `.claude.json`) and `codex login status`, 15 seconds at most.
+- `remuda help [<command>]` shows the options of every command.
 
 Homes are registered where they are, and their paths kept byte for byte: Claude Code on macOS
 names a login's Keychain entry after a hash of the home path string, so the same directory spelled
@@ -84,7 +85,8 @@ account.
 
 Each window has a percentage used and a reset. Claude has a five-hour window, `5h`, a week of all
 models, `Week (all models)`, and on some plans a week per model, such as `Week (Fable)`. Codex
-names its windows by length (`5h`, `Week (all models)`, `<N>h window`, `<N>d window`), since a
+names its windows by length (`5h`, `Week (all models)`, `<N>h window`, `<N>d window`,
+`<N>m window`), since a
 plan's only window may be weekly, and reads its per-model limits live only. The Accounts view puts
 every account's windows in one table and all their resets on one seven-day timeline, a letter per
 window (named in the legend). `remuda usage [<account>]` prints the same as text.
@@ -251,9 +253,9 @@ and the rest of [R18's list](../SPEC.md#r18-shared-configuration)), or is not a 
 `setup` leaves it out, names the keys but never their values, and asks you to give the new home a
 `settings.json` of its own; until then, the account has no shared settings. That check happens
 once: such a setting added to a linked file later reaches every account that links it. Remuda then
-warns in the Accounts view and at each session launch of those accounts (`claude:work reads the
-authentication settings of claude:default through its settings.json link: env.ANTHROPIC_API_KEY`),
-but does not stop it. Keep one account's settings in its own `settings.json`, or in an account with
+warns in the Accounts view and on stderr at each session launch of those accounts
+(`remuda: warning: claude:work reads the authentication settings of claude:default through its
+settings.json link: env.ANTHROPIC_API_KEY`), but does not stop it. Keep one account's settings in its own `settings.json`, or in an account with
 `share = false`. The login itself is no setting: it stays in the Keychain or the home's
 `.credentials.json`.
 
