@@ -1,16 +1,16 @@
 //! The items of a claude home and how a member's relate to the source's (SPEC R12, R18).
 //!
 //! Two questions are answered here, and only here. The catalog says what a home holds: each
-//! item's name, whether `setup` links it and on what condition, whether the one `--add-dir`
-//! of a launch carries it, when the source's counts as something to share, and what breaks
-//! when it is another account's. The relations ([`Source::relate`], [`linked_elsewhere`]) say
-//! what a member's home has of them right now. Shared configuration ([`crate::share`]), the
-//! checks ([`crate::checks`]), the Configuration pane ([`crate::account_config`]) and `setup`
-//! ([`crate::setup`]) read these answers; none of them spells an item's name or decides by
-//! itself whether a home has the source's.
+//! item's name, whether `setup` links it and on what condition, whether it is an instruction
+//! item the account card lists (R22), when the source's counts as something to share, and
+//! what breaks when it is another account's. The relations ([`Source::relate`],
+//! [`linked_elsewhere`]) say what a member's home has of them right now. Shared configuration
+//! ([`crate::share`]), the checks ([`crate::checks`]), the account card
+//! ([`crate::account_config`]) and `setup` ([`crate::setup`]) read these answers; none of them
+//! spells an item's name or decides by itself whether a home has the source's.
 //!
-//! How a launch injects the settings, the plugins and the memory locations is not said here:
-//! [`crate::share::plan`] decides that, item by item, from the relations.
+//! What a launch adds for a member (the memory variable of R18) is not said here:
+//! [`crate::share::plan`] decides that from the relations.
 //!
 //! Read-only: nothing is written (R13). A path is always the home as registered with the
 //! item's name appended (R2); realpaths are compared here and never leave the module.
@@ -79,16 +79,6 @@ enum Setup {
     Never,
 }
 
-/// How the `--add-dir=$REMUDA_HOME/shared/claude` of a launch carries an instruction item of
-/// the source's (R18).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddDir {
-    /// As a link under its `.claude`.
-    Link,
-    /// As copies there: claude does not load rules through links.
-    Copies,
-}
-
 /// When the source's item counts as something to share with a member's home.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Counts {
@@ -110,20 +100,21 @@ pub struct Item {
     /// item too (R11).
     pub loses: Option<&'static str>,
     setup: Setup,
-    /// `None`: not an instruction item.
-    add_dir: Option<AddDir>,
+    /// An instruction item: `CLAUDE.md`, `skills`, `commands`, `agents`, `rules`, which the
+    /// account card lists entry by entry (R22).
+    instructions: bool,
     /// What breaks when the home's is a link to another account's (R11).
     breaks: Option<&'static str>,
     counts: Counts,
 }
 
-const fn shared(id: Id, name: &'static str, add_dir: Option<AddDir>, counts: Counts) -> Item {
+const fn shared(id: Id, name: &'static str, instructions: bool, counts: Counts) -> Item {
     Item {
         id,
         name,
         loses: None,
         setup: Setup::Link,
-        add_dir,
+        instructions,
         breaks: None,
         counts,
     }
@@ -135,7 +126,7 @@ const fn per_account(id: Id, name: &'static str, breaks: Option<&'static str>) -
         name,
         loses: None,
         setup: Setup::Never,
-        add_dir: None,
+        instructions: false,
         breaks,
         counts: Counts::Present,
     }
@@ -144,32 +135,31 @@ const fn per_account(id: Id, name: &'static str, breaks: Option<&'static str>) -
 /// Every item of a claude home remuda knows (R18), an [`Id`] at its own position.
 static ITEMS: [Item; 18] = {
     use Counts::{Directory, Present, RuleFile};
-    const LINK: Option<AddDir> = Some(AddDir::Link);
     [
-        shared(Id::Projects, "projects", None, Directory),
+        shared(Id::Projects, "projects", false, Directory),
         Item {
             loses: Some(
                 "/rewind does not find the file backups of a session resumed from another account",
             ),
-            ..shared(Id::FileHistory, "file-history", None, Directory)
+            ..shared(Id::FileHistory, "file-history", false, Directory)
         },
         Item {
             setup: Setup::LinkWithoutAuthentication,
-            ..shared(Id::Settings, "settings.json", None, Present)
+            ..shared(Id::Settings, "settings.json", false, Present)
         },
-        shared(Id::ClaudeMd, "CLAUDE.md", LINK, Present),
-        shared(Id::Skills, "skills", LINK, Present),
-        shared(Id::Commands, "commands", LINK, Present),
-        shared(Id::Agents, "agents", LINK, Present),
-        shared(Id::Hooks, "hooks", None, Present),
-        shared(Id::Plugins, "plugins", None, Present),
-        shared(Id::Rules, "rules", Some(AddDir::Copies), RuleFile),
+        shared(Id::ClaudeMd, "CLAUDE.md", true, Present),
+        shared(Id::Skills, "skills", true, Present),
+        shared(Id::Commands, "commands", true, Present),
+        shared(Id::Agents, "agents", true, Present),
+        shared(Id::Hooks, "hooks", false, Present),
+        shared(Id::Plugins, "plugins", false, Present),
+        shared(Id::Rules, "rules", true, RuleFile),
         Item {
             loses: Some("the memory of user-scope subagents is not shared with this account"),
-            ..shared(Id::AgentMemory, "agent-memory", None, Directory)
+            ..shared(Id::AgentMemory, "agent-memory", false, Directory)
         },
-        shared(Id::OutputStyles, "output-styles", None, Present),
-        shared(Id::Keybindings, "keybindings.json", None, Present),
+        shared(Id::OutputStyles, "output-styles", false, Present),
+        shared(Id::Keybindings, "keybindings.json", false, Present),
         per_account(
             Id::ClaudeJson,
             ".claude.json",
@@ -204,35 +194,15 @@ fn linked_by_setup() -> impl Iterator<Item = &'static Item> {
     ITEMS.iter().filter(|item| item.setup != Setup::Never)
 }
 
-/// The instruction items, which one `--add-dir` gives a member together (R18): the linked
-/// ones, then the rules.
+/// The instruction items, which the account card lists (R22), in the catalog's order.
 pub fn instruction_items() -> impl Iterator<Item = &'static Item> {
-    ITEMS.iter().filter(|item| item.add_dir.is_some())
+    ITEMS.iter().filter(|item| item.instructions)
 }
 
-/// The names of the `N` instruction items that `--add-dir` carries as `how`.
-const fn add_dir_names<const N: usize>(how: AddDir) -> [&'static str; N] {
-    let mut out = [""; N];
-    let (mut i, mut n) = (0, 0);
-    while i < ITEMS.len() {
-        if matches!(ITEMS[i].add_dir, Some(a) if a as u8 == how as u8) {
-            out[n] = ITEMS[i].name;
-            n += 1;
-        }
-        i += 1;
-    }
-    assert!(n == N);
-    out
-}
-
-/// The names of the instruction items [`crate::share`] keeps a link to each of.
-pub const fn add_dir_links() -> [&'static str; 4] {
-    add_dir_names(AddDir::Link)
-}
-
-/// The name of the instruction item [`crate::share`] keeps copies of: the rules.
-pub const fn add_dir_copies() -> &'static str {
-    add_dir_names::<1>(AddDir::Copies)[0]
+/// The items a member shares with the source (R18), in the catalog's order: what `setup`
+/// links, and what R11 reports a member for not linking.
+pub fn shared_items() -> impl Iterator<Item = &'static Item> {
+    ITEMS.iter().take(SHARED)
 }
 
 /// Where `account` keeps an item: in its home, except the native login's `.claude.json` (R2).
@@ -277,7 +247,7 @@ impl Relations {
         self.0.get(id as usize).copied().unwrap_or_default()
     }
 
-    /// The home's resolves to the source's (same realpath): nothing is injected for it.
+    /// The home's resolves to the source's (same realpath): shared.
     pub fn linked(&self, id: Id) -> bool {
         self.get(id) == Relation::Linked
     }
@@ -287,45 +257,10 @@ impl Relations {
         self.get(id) == Relation::Unlinked
     }
 
-    /// The source has the item to share, whether or not the home links it.
-    pub fn source_has(&self, id: Id) -> bool {
-        self.get(id) != Relation::Absent
-    }
-
-    /// The [`instruction_items`] by relation.
-    pub fn instructions(&self) -> Instructions {
-        let mut out = Instructions::default();
-        for item in instruction_items() {
-            match self.get(item.id) {
-                Relation::Linked => out.linked.push(item.name),
-                Relation::Unlinked => out.unlinked.push(item.name),
-                Relation::Absent => {}
-            }
-        }
-        out
-    }
-}
-
-/// How a home's instruction items relate to the source's: an item the source does not have
-/// has nothing to share and counts as neither.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Instructions {
-    /// Items that already resolve to the source's (symlinks).
-    pub linked: Vec<&'static str>,
-    /// Items of the source that the home does not reach.
-    pub unlinked: Vec<&'static str>,
-}
-
-impl Instructions {
-    /// `--add-dir` is injected unless every item the source has already resolves to it.
-    pub fn needs_injection(&self) -> bool {
-        !self.unlinked.is_empty()
-    }
-
-    /// Some items shared through symlinks and others not: with the injected `--add-dir`, the
-    /// linked ones load twice (R11).
-    pub fn partial(&self) -> bool {
-        !self.linked.is_empty() && !self.unlinked.is_empty()
+    /// The items the source has that the home does not reach ([`Relations::unlinked`]), in
+    /// the catalog's order: what the home does not share (R11).
+    pub fn unlinked_items(&self) -> impl Iterator<Item = &'static Item> {
+        shared_items().filter(|item| self.unlinked(item.id))
     }
 }
 
@@ -365,16 +300,9 @@ impl Source {
             .as_ref()
     }
 
-    /// [`Source::settings`] with its error as it was raised, for a launch that fails on it.
-    pub fn into_settings(self) -> anyhow::Result<Map<String, Value>> {
-        let path = Id::Settings.at(&self.home);
-        self.settings
-            .into_inner()
-            .unwrap_or_else(|| share::read_settings(&path))
-    }
-
-    /// The authentication settings of the source, as `key` or `env.NAME` (R18): never
-    /// injected, and read whole by a home that links the file. None when it cannot be read.
+    /// The authentication settings of the source, as `key` or `env.NAME` (R18): what keeps
+    /// `setup` from linking the file, and what a home that links it reads all the same. None
+    /// when it cannot be read.
     pub fn withheld(&self) -> Vec<String> {
         self.settings().map(share::withheld).unwrap_or_default()
     }
@@ -555,8 +483,8 @@ mod tests {
     }
 
     /// R18: the catalog is the list of R18. What `setup` links, in its order; what is never
-    /// linked; nothing in both. The instruction items are the ones one `--add-dir` carries,
-    /// the rules last and as copies. `settings.json` alone is linked on a condition.
+    /// linked; nothing in both. The instruction items are the five the account card lists
+    /// (R22). `settings.json` alone is linked on a condition.
     #[test]
     fn the_catalog_is_the_list_of_r18() {
         for (i, item) in ITEMS.iter().enumerate() {
@@ -622,11 +550,7 @@ mod tests {
             names(instruction_items()),
             ["CLAUDE.md", "skills", "commands", "agents", "rules"]
         );
-        assert_eq!(
-            add_dir_links(),
-            ["CLAUDE.md", "skills", "commands", "agents"]
-        );
-        assert_eq!(add_dir_copies(), "rules");
+        assert_eq!(names(shared_items()), names(linked_by_setup()));
         // What R11 asks to link together with `projects`.
         assert_eq!(
             names(ITEMS.iter().filter(|item| item.loses.is_some())),
@@ -712,7 +636,6 @@ mod tests {
             assert_eq!(got.get(id), relation, "{id:?}");
             assert_eq!(got.linked(id), relation == Relation::Linked, "{id:?}");
             assert_eq!(got.unlinked(id), relation == Relation::Unlinked, "{id:?}");
-            assert_eq!(got.source_has(id), relation != Relation::Absent, "{id:?}");
         }
         // Nothing is the source's for a home that is the source's own directory by another
         // path: every item it has resolves to itself.
@@ -754,35 +677,31 @@ mod tests {
         assert_eq!(got.get(Id::FileHistory), Relation::Absent);
     }
 
-    /// R11, R18: only the instruction items the source has count; an item that resolves to
-    /// the source's is linked.
+    /// R11, R18: the items a home does not share are those the source has that the home does
+    /// not reach, in the catalog's order; an item that resolves to the source's is linked,
+    /// and one only the home has is nothing of the source's.
     #[test]
-    fn instruction_items_by_realpath() {
+    fn unlinked_items_are_the_sources_the_home_does_not_reach() {
         let f = Root::new();
         let source = f
             .home("source")
+            .dir("projects")
             .dir("skills")
             .dir("agents")
             .claude_md("be brief")
             .into_path();
         let home = f.home("home").dir("commands").into_path();
-        let relate = || Source::at(&source).relate(&home).instructions();
-        let got = relate();
-        assert_eq!(got.linked, Vec::<&str>::new());
-        assert_eq!(got.unlinked, ["CLAUDE.md", "skills", "agents"]);
-        assert!(got.needs_injection() && !got.partial());
+        let unlinked = || names(Source::at(&source).relate(&home).unlinked_items());
+        assert_eq!(unlinked(), ["projects", "CLAUDE.md", "skills", "agents"]);
 
         symlink(source.join("CLAUDE.md"), home.join("CLAUDE.md")).unwrap();
         symlink(source.join("skills"), home.join("skills")).unwrap();
-        let got = relate();
-        assert_eq!(got.linked, ["CLAUDE.md", "skills"]);
-        assert_eq!(got.unlinked, ["agents"]);
-        assert!(got.needs_injection() && got.partial());
+        assert_eq!(unlinked(), ["projects", "agents"]);
 
         // `commands` exists only in the home: nothing of the source's to share there.
         symlink(source.join("agents"), home.join("agents")).unwrap();
-        let got = relate();
-        assert!(!got.needs_injection() && !got.partial(), "{got:?}");
+        symlink(source.join("projects"), home.join("projects")).unwrap();
+        assert_eq!(unlinked(), Vec::<&str>::new());
     }
 
     /// R11, R18: the rules are an instruction item only when the source has a rule file, and
@@ -799,23 +718,20 @@ mod tests {
             .into_path();
         let home = f.home("home").linked(&source, &["CLAUDE.md"]).into_path();
         let relate = || Source::at(&source).relate(&home);
-        let got = relate().instructions();
-        assert!(!got.needs_injection(), "{got:?}");
+        assert_eq!(relate().get(Id::Rules), Relation::Absent);
+        assert_eq!(names(relate().unlinked_items()), Vec::<&str>::new());
 
         fs::write(source.join("rules/style.md"), "be terse").unwrap();
-        let got = relate().instructions();
-        assert_eq!(got.linked, ["CLAUDE.md"]);
-        assert_eq!(got.unlinked, ["rules"]);
-        assert!(got.partial());
+        assert_eq!(relate().get(Id::Rules), Relation::Unlinked);
+        assert_eq!(names(relate().unlinked_items()), ["rules"]);
 
         symlink(source.join("rules"), home.join("rules")).unwrap();
-        let got = relate().instructions();
-        assert_eq!(got.linked, ["CLAUDE.md", "rules"]);
-        assert!(!got.needs_injection());
+        assert_eq!(relate().get(Id::Rules), Relation::Linked);
+        assert_eq!(names(relate().unlinked_items()), Vec::<&str>::new());
 
         fs::remove_file(source.join("rules/style.md")).unwrap();
         assert_eq!(relate().get(Id::Rules), Relation::Absent);
-        assert_eq!(relate().instructions().linked, ["CLAUDE.md"]);
+        assert!(relate().linked(Id::ClaudeMd));
     }
 
     /// R11: what stays per account and is a symlink to that item of another claude account is
@@ -942,8 +858,8 @@ mod tests {
     }
 
     /// R11, R18: the source's settings are read once and its authentication settings named
-    /// from that read; a file that cannot be read names none, and a launch gets the error of
-    /// the read itself.
+    /// from that read; a file that cannot be read names none, and the error is the read's
+    /// own.
     #[test]
     fn the_sources_settings_are_read_once() {
         let f = Root::new();
@@ -955,21 +871,20 @@ mod tests {
         assert_eq!(source.withheld(), ["apiKeyHelper", "env.AWS_PROFILE"]);
         fs::write(home.join("settings.json"), "{}").unwrap();
         assert_eq!(source.withheld(), ["apiKeyHelper", "env.AWS_PROFILE"]);
-        assert!(source.into_settings().unwrap().contains_key("model"));
+        assert!(source.settings().unwrap().contains_key("model"));
         // Not asked before: read now.
         assert_eq!(
-            Source::at(&home).into_settings().unwrap(),
-            Map::new(),
+            Source::at(&home).settings().unwrap(),
+            &Map::new(),
             "the file as it is now"
         );
 
         fs::write(home.join("settings.json"), "[]").unwrap();
         let source = Source::at(&home);
         assert_eq!(source.withheld(), Vec::<String>::new());
-        assert!(source.settings().is_err());
         let direct = share::read_settings(&home.join("settings.json")).unwrap_err();
         assert_eq!(
-            format!("{:#}", source.into_settings().unwrap_err()),
+            format!("{:#}", source.settings().unwrap_err()),
             format!("{direct:#}")
         );
         // No file: empty settings, not an error.

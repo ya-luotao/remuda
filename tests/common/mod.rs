@@ -26,7 +26,8 @@ use tempfile::TempDir;
 /// Record layout (every field terminated by NUL):
 /// `@@invocation`, `cwd=<physical cwd>`, `ccd=<unset|set:VALUE>` (CLAUDE_CONFIG_DIR),
 /// `css=<unset|set:VALUE>` (CLAUDE_SECURESTORAGE_CONFIG_DIR),
-/// `acm=<unset|set:VALUE>` (CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD, R18),
+/// `acm=<unset|set:VALUE>` (CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: a launch once set it
+/// with the shared instructions it injected, and tests prove it no longer does, R18),
 /// `rmd=<unset|set:VALUE>` (CLAUDE_CODE_REMOTE_MEMORY_DIR, R18),
 /// `dnt=<unset|set:VALUE>` (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, R10),
 /// `chs=<unset|set:VALUE>` (CLAUDE_CODE_CHILD_SESSION, R6), then `arg=<argv[i]>` per argument.
@@ -302,7 +303,8 @@ pub struct Invocation {
     pub config_dir: Option<String>,
     /// `None` when `CLAUDE_SECURESTORAGE_CONFIG_DIR` was unset.
     pub securestorage_dir: Option<String>,
-    /// `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` (R18); `None` when unset.
+    /// `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD`, which no launch sets any more (R18);
+    /// `None` when unset.
     pub add_dir_claude_md: Option<String>,
     /// `CLAUDE_CODE_REMOTE_MEMORY_DIR` (R18); `None` when unset.
     pub memory_dir: Option<String>,

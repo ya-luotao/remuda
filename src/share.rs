@@ -1,62 +1,45 @@
-//! Shared configuration, injected at launch (SPEC R18): a claude account gets the source
-//! account's instructions, settings, enabled plugins and memory locations as launch
-//! options. This is the fallback: accounts share one session store and their configuration
-//! through symlinks in the member's home (made by `setup`, [`crate::setup`], or by the user),
-//! and each component a home links that way is skipped here; only what it does not link is
-//! injected, and sessions cannot be. Nothing is written into any home (R13); remuda keeps
-//! only the item links and the copies of the source's rules under
-//! `$REMUDA_HOME/shared/claude/.claude/` and the injected settings in
-//! `$REMUDA_HOME/state/settings/`.
+//! Shared configuration (SPEC R18): accounts share one session store and their configuration
+//! through symlinks in the member's home, made by `setup` ([`crate::setup`]) or by the user.
+//! Nothing is injected at launch and nothing is written anywhere (R13): what a launch adds for
+//! a member is one environment variable, [`MEMORY_DIR_VAR`], for a home whose `projects` is
+//! the source's, so that claude writes its memory by the source's path and not through the
+//! link, and a warning when the member reads the source's authentication settings through its
+//! `settings.json` link. The readers here (settings files, rule files, plugin installs, the
+//! project name claude gives a directory) serve `setup`, the checks (R11) and the account card
+//! (R22).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use anyhow::Result;
+use serde::Deserialize;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::Env;
 use crate::home_items::{self, Id, Membership, Relations};
 use crate::privacy::Marked;
 use crate::registry::{Account, Sharing};
-use crate::{Env, owned};
 
-/// With it set, `--add-dir` also loads `CLAUDE.md` from the added directory (R18).
-const CLAUDE_MD_VAR: &str = "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD";
-/// The instruction items of a home that `--add-dir=$REMUDA_HOME/shared/claude` shares through
-/// a link each, as the catalog of [`home_items`] says.
-const INSTRUCTIONS: [&str; 4] = home_items::add_dir_links();
-/// The rules of a home, shared through the same `--add-dir` as copies: claude does not load
-/// rules of an added directory through links (R18).
-const RULES: &str = home_items::add_dir_copies();
-/// Directory levels of `rules/` that are shared.
+/// Directory levels of `rules/` that are read.
 const MAX_RULES_DEPTH: usize = 16;
-/// Rule files shared at most.
+/// Rule files read at most.
 const MAX_RULES: usize = 1000;
-/// With it set, claude keeps user-scope agent memory under it instead of the home (R18).
+/// With it set, claude keeps user-scope agent memory under it instead of the home, and
+/// auto-memory under its `projects/` (R18).
 pub const MEMORY_DIR_VAR: &str = "CLAUDE_CODE_REMOTE_MEMORY_DIR";
 /// The settings key that moves auto-memory.
 pub const MEMORY_KEY: &str = "autoMemoryDirectory";
 /// Roots longer than this many UTF-16 code units are truncated and hashed by claude
-/// (**[unverified]** in R18): no auto-memory is injected for them.
+/// (**[unverified]** in R22): the card does not know the memory directory for them.
 const MAX_PROJECT_NAME: usize = 200;
 
-/// `$REMUDA_HOME/shared/claude`, next to `config.toml` (R13, R18).
-pub fn dir(config: &Path) -> PathBuf {
-    owned::shared_dir(config)
-}
-
-/// What a launch gets from the source account.
+/// What a launch of a member adds (R18): no option, only environment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Shared {
-    /// Options in the `--option=value` form, to go before the user's arguments.
-    pub args: Vec<String>,
     /// Variables added to the child's environment.
     pub env: Vec<(String, String)>,
     /// Variables removed from the child's environment.
@@ -65,128 +48,75 @@ pub struct Shared {
     pub notices: Vec<String>,
 }
 
-impl Shared {
-    /// The injected options as the launch log records them: names and value sizes, not the
-    /// values (R18).
-    pub fn logged(&self) -> Vec<Injected> {
-        self.args
-            .iter()
-            .map(|arg| match arg.split_once('=') {
-                Some((option, value)) => Injected {
-                    option: option.to_string(),
-                    bytes: value.len(),
-                },
-                None => Injected {
-                    option: arg.clone(),
-                    bytes: 0,
-                },
-            })
-            .collect()
-    }
-}
-
-/// One injected option in the launch log (R18).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Injected {
-    pub option: String,
-    /// Byte size of its value.
-    pub bytes: usize,
-}
-
 /// What a session launch of an account gets from the source (R18), decided without writing
-/// anything: [`apply`] turns it into launch options, and the accounts view shows it (R22).
-#[derive(Debug, Clone, Default, PartialEq)]
+/// anything: [`Plan::shared`] turns it into environment changes, and the account card reads
+/// it (R22).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
-    /// The source (`provider:name`) and its home; `None`: nothing is injected (not a member, or
-    /// the source's home is missing).
+    /// The source (`provider:name`) and its home; `None`: not a member, or the source's home
+    /// is missing.
     pub source: Option<(String, PathBuf)>,
     /// How each item of the home relates to the source's ([`home_items::Source::relate`]).
-    /// One that is linked is shared already (same realpath, R12) and not injected; the
-    /// instruction items get `--add-dir` when [`home_items::Instructions::needs_injection`].
     pub items: Relations,
-    /// The content of the single `--settings` (authentication removed, `autoMemoryDirectory`
-    /// included when remuda adds it); empty: no `--settings`.
-    pub settings: Map<String, Value>,
-    /// The `autoMemoryDirectory` remuda adds (also in `settings`), if any.
-    pub memory: Option<String>,
-    /// The source's home, when [`MEMORY_DIR_VAR`] is set to it: together with `memory`, or when
-    /// `projects` is the source's already (linked). The variable also moves auto-memory,
-    /// to `<source home>/projects/<project>/memory`: with `memory` injected that is where it goes
-    /// anyway; through a linked `projects` it is where it already is, now by a path without the
-    /// link, which claude's own permission check for its memory directory needs.
+    /// The source's home, when [`MEMORY_DIR_VAR`] is set to it: the home's `projects` is the
+    /// source's (linked), and nothing of the user's decides the memory location instead
+    /// (their `--settings` or `--setting-sources`, their own variable, or a settings file that
+    /// chooses `autoMemoryDirectory`). With it claude names its memory directory by the
+    /// source's path, the same directory without the link, which its own permission check
+    /// for that directory needs; the memory of user-scope subagents goes to the source's too.
     pub agent_memory: Option<PathBuf>,
     /// remuda's own environment has [`MEMORY_DIR_VAR`] with the source's home as its value: an
     /// outer remuda launch set it for its own session. It is decided again for this launch and
     /// removed when not set, never inherited.
     pub inherited_memory_dir: bool,
-    /// Each plugin the source enables, in order, injected as `--plugin-dir` or why not; empty
-    /// when the plugins are shared by realpath or not part of the launch.
-    pub plugins: Vec<PluginPlan>,
-    /// Messages for the user that need no write (a `--settings` / `--setting-sources` given).
+    /// Messages for the user: the authentication warning, a `--settings` that keeps the
+    /// variable unset.
     pub notices: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginPlan {
-    /// `name@marketplace`.
-    pub name: String,
-    pub outcome: Result<PluginDir, Skip>,
+impl Plan {
+    /// The environment changes of the plan (R18): the variable where it is set, its removal
+    /// where an outer launch's value would be inherited, and the notices.
+    pub fn shared(&self) -> Shared {
+        let mut shared = Shared {
+            notices: self.notices.clone(),
+            ..Shared::default()
+        };
+        match &self.agent_memory {
+            Some(dir) => shared
+                .env
+                .push((MEMORY_DIR_VAR.to_string(), dir.display().to_string())),
+            None if self.inherited_memory_dir => shared.unset.push(MEMORY_DIR_VAR.to_string()),
+            None => {}
+        }
+        shared
+    }
 }
 
-/// The source's install of a plugin, passed as `--plugin-dir`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginDir {
-    pub path: PathBuf,
-    pub version: Option<String>,
-}
-
-/// Why a plugin the source enables is not injected (R18).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Skip {
-    /// `false` in the `enabledPlugins` of the home or of the project's settings.
-    TurnedOff,
-    /// The home has installed it itself in a way claude loads here.
-    OwnInstall,
-    /// The source has no `user` install whose path exists (R11).
-    NotInstalled,
-    /// The home's or the source's `installed_plugins.json` is not recognized (R11).
-    UnrecognizedList,
-    /// Bundled with claude (`<name>@builtin`): claude loads it from its own bundle, so there is
-    /// no install to inject.
-    Builtin,
-}
-
-/// What `account` gets from the source of `sharing` for a session launched with `user_args`
-/// in `cwd` (R18). Nothing for the source itself, an account with `share = false`, a codex
-/// account, or a source whose home is missing (R11 warns about that). Each component is
-/// skipped when the home already shares it with the source (same realpath, R12). `config` is
-/// `$REMUDA_HOME/config.toml`: the shared directory and the settings files live next to it.
-///
-/// Only a settings file of the source or the home that is not a JSON object fails: everything
-/// else that cannot be read or made degrades to injecting less, with a notice where the user
-/// would miss it.
-pub fn inject(
+/// What a session launch of `account` with `user_args` in `cwd` gets from the source of
+/// `sharing` (R18): [`plan`] as environment changes. Nothing for the source itself, an account
+/// with `share = false`, a codex account, or a source whose home is missing.
+pub fn at_launch(
     sharing: &Sharing,
     account: &Account,
     user_args: &[String],
     cwd: Option<&Path>,
     env: &Env,
-    config: &Path,
-) -> Result<Shared> {
-    apply(&plan(sharing, account, user_args, cwd, env)?, config)
+) -> Shared {
+    plan(sharing, account, user_args, cwd, env).shared()
 }
 
-/// The reads of [`inject`], without its writes (R18, R22): what `account` gets from the source
-/// of `sharing` for a session launched with `user_args` in `cwd`, and why each plugin the
-/// source enables is or is not injected. Fails as [`inject`] does: only on a settings file of
-/// the source or the home that is not a JSON object.
+/// What `account` gets from the source of `sharing` for a session launched with `user_args`
+/// in `cwd` (R18, R22), decided by reading only; it cannot fail: a settings file that cannot
+/// be read chooses nothing (the source's or the home's own is reported by that account's
+/// card, R22; a project's counts as absent).
 pub fn plan(
     sharing: &Sharing,
     account: &Account,
     user_args: &[String],
     cwd: Option<&Path>,
     env: &Env,
-) -> Result<Plan> {
+) -> Plan {
     let mut plan = Plan {
         inherited_memory_dir: sharing
             .source
@@ -201,30 +131,19 @@ pub fn plan(
         home: source,
     } = home_items::membership(sharing, account, env)
     else {
-        return Ok(plan);
+        return plan;
     };
     let Some(home) = account.home_dir(env) else {
-        return Ok(plan);
+        return plan;
     };
     let from = source.home().to_path_buf();
     plan.source = Some((name.clone(), from.clone()));
     plan.items = source.relate(&home);
 
-    // claude takes only the last `--settings`, and `--setting-sources` may leave out the
-    // user's layer the shared settings stand in for: either way, the user decides (R18).
-    let user_settings = user_args.iter().find_map(|a| {
-        ["--settings", "--setting-sources"]
-            .into_iter()
-            .find(|o| a == o || a.strip_prefix(o).is_some_and(|v| v.starts_with('=')))
-    });
-    let own_path = Id::Settings.at(&home);
-    let settings_shared = plan.items.linked(Id::Settings);
-    let memory_shared = plan.items.linked(Id::Projects);
-    let plugins_shared = plan.items.linked(Id::Plugins);
-    // A home that links the source's `settings.json` reads all of it: authentication is
-    // withheld only from injected settings, so its sessions are told (R11 says it too). A file
-    // that cannot be read says nothing here: R11 reports it.
-    if settings_shared {
+    // A home that links the source's `settings.json` reads all of it, authentication
+    // included: its sessions are told (R11 says it too). A file that cannot be read says
+    // nothing here: the source's account card reports it (R22).
+    if plan.items.linked(Id::Settings) {
         let keys = source.withheld();
         if !keys.is_empty() {
             plan.notices.push(format!(
@@ -235,256 +154,51 @@ pub fn plan(
             ));
         }
     }
-    let plugins_part = !plugins_shared;
-    if let Some(option) = user_settings
-        && !(settings_shared && memory_shared)
-    {
+
+    // The variable goes with a linked `projects` only: auto-memory is where the source keeps
+    // it already, and the variable names that directory by a path without the link.
+    if !plan.items.linked(Id::Projects) {
+        return plan;
+    }
+    // A variable the user set is theirs, as it is for claude.
+    if env.contains_key(MEMORY_DIR_VAR) && !plan.inherited_memory_dir {
+        return plan;
+    }
+    // claude takes only the last `--settings`, and `--setting-sources` may leave out the
+    // user's layer: remuda cannot tell whether they choose the memory location, so the user
+    // decides, and is told.
+    let user_settings = user_args.iter().find_map(|a| {
+        ["--settings", "--setting-sources"]
+            .into_iter()
+            .find(|o| a == o || a.strip_prefix(o).is_some_and(|v| v.starts_with('=')))
+    });
+    if let Some(option) = user_settings {
         plan.notices.push(format!(
-            "{option} given: settings and auto-memory from {name} are not injected"
+            "{option} given: {MEMORY_DIR_VAR} is not set for this session"
         ));
+        return plan;
     }
-    let settings_part = !settings_shared && user_settings.is_none();
-    let memory_part = !memory_shared && user_settings.is_none();
-    // A variable the user set is kept.
-    let users = env.contains_key(MEMORY_DIR_VAR) && !plan.inherited_memory_dir;
-    // Auto-memory through a linked `projects` is where the source keeps it, but claude's own
-    // permission check for its memory directory does not follow the link and asks for every
-    // write there. The variable names the source's home instead, so claude reaches the same
-    // directory by a path without the link (and the memory of user-scope subagents goes to
-    // the source's too). Set unless the user chose the memory location themselves.
-    let linked_memory = memory_shared && user_settings.is_none() && !users;
-    let reads = settings_part || memory_part || plugins_part;
-    if !(reads || linked_memory) {
-        return Ok(plan);
-    }
-
-    // A launch that shares everything by symlink does not fail on a malformed settings file
-    // (the read above ignores it); one that injects something does.
-    let source_settings = match source.into_settings() {
-        Ok(settings) => settings,
-        Err(e) if reads => return Err(e),
-        Err(_) => Map::new(),
+    // A location a settings file chose is kept: the source's, the home's own (the same file
+    // where `settings.json` is linked), the project's. One that cannot be read chooses
+    // nothing.
+    let chooses = |settings: Result<Map<String, Value>>| {
+        settings.is_ok_and(|settings| settings.contains_key(MEMORY_KEY))
     };
-    // The home's own settings: read only when it is a file that is not the source's (a
-    // directory or a dangling link defines nothing).
-    let own = if settings_shared {
-        source_settings.clone()
-    } else if fs::metadata(&own_path).is_ok_and(|m| m.is_file()) {
-        if reads {
-            read_settings(&own_path)?
-        } else {
-            read_settings(&own_path).unwrap_or_default()
-        }
-    } else {
-        Map::new()
-    };
-
-    let project = Project::locate(cwd);
-    let layers = project.settings(env);
-    // A location the source, the home or the project's local settings chose is kept.
-    let chosen = source_settings.contains_key(MEMORY_KEY)
-        || own.contains_key(MEMORY_KEY)
-        || layers.iter().any(|l| l.contains_key(MEMORY_KEY));
-    if settings_part || memory_part {
-        let mut injected = Map::new();
-        if settings_part {
-            injected = missing_from(&source_settings, &own);
-            for layer in &layers {
-                injected = missing_from(&injected, layer);
-            }
-            strip_auth(&mut injected);
-        }
-        if memory_part
-            && !chosen
-            && let Some(memory) = project.memory_dir(&from)
-        {
-            injected.insert(MEMORY_KEY.to_string(), Value::String(memory.clone()));
-            plan.memory = Some(memory);
-            if !plan.items.linked(Id::AgentMemory) && !users {
-                plan.agent_memory = Some(from.clone());
-            }
-        }
-        plan.settings = injected;
+    let chosen = source.settings().is_ok_and(|s| s.contains_key(MEMORY_KEY))
+        || chooses(read_settings(&Id::Settings.at(&home)))
+        || Project::locate(cwd)
+            .settings(env)
+            .iter()
+            .any(|layer| layer.contains_key(MEMORY_KEY));
+    if !chosen {
+        plan.agent_memory = Some(from);
     }
-    if linked_memory && !chosen {
-        plan.agent_memory = Some(from.clone());
-    }
-
-    if plugins_part {
-        let installs = installed_plugins(&from);
-        // What the home or the project turned off, or the home installed itself for this
-        // directory, would otherwise load twice.
-        let own_installs = installed_plugins(&home);
-        // Which of them the home has cannot be told: nothing is injected (R11 warns).
-        let own_unknown = matches!(own_installs, Installs::Unrecognized(_));
-        let off = |plugin: &str| turned_off(plugin, &own, &layers);
-        for plugin in enabled_plugins(&source_settings) {
-            let outcome = if bundled(&plugin) {
-                // Nothing to inject either way; what the home or the project turned off is
-                // said to be.
-                Err(if off(&plugin) {
-                    Skip::TurnedOff
-                } else {
-                    Skip::Builtin
-                })
-            } else if own_unknown {
-                Err(Skip::UnrecognizedList)
-            } else if off(&plugin) {
-                Err(Skip::TurnedOff)
-            } else if own_installs.installed_for(&plugin, project.start.as_deref()) {
-                Err(Skip::OwnInstall)
-            } else if matches!(installs, Installs::Unrecognized(_)) {
-                Err(Skip::UnrecognizedList)
-            } else {
-                match installs.user_install(&plugin) {
-                    Some(Install {
-                        path: Some(path),
-                        version,
-                        ..
-                    }) => Ok(PluginDir {
-                        path: path.clone(),
-                        version: version.clone(),
-                    }),
-                    _ => Err(Skip::NotInstalled),
-                }
-            };
-            plan.plugins.push(PluginPlan {
-                name: plugin,
-                outcome,
-            });
-        }
-    }
-    Ok(plan)
+    plan
 }
 
-/// The writes of [`inject`] for `plan` (R18): the `.claude` item links and rule copies next to
-/// `config` when instructions are injected, and the settings file. What cannot be made is left
-/// out of the launch, with a notice.
-pub fn apply(plan: &Plan, config: &Path) -> Result<Shared> {
-    let mut shared = apply_source(plan, config)?;
-    if plan.inherited_memory_dir && !shared.env.iter().any(|(k, _)| k == MEMORY_DIR_VAR) {
-        shared.unset.push(MEMORY_DIR_VAR.to_string());
-    }
-    Ok(shared)
-}
-
-fn apply_source(plan: &Plan, config: &Path) -> Result<Shared> {
-    let mut shared = Shared::default();
-    let Some((name, from)) = &plan.source else {
-        return Ok(shared);
-    };
-    if plan.items.instructions().needs_injection() {
-        let shared_dir = dir(config);
-        match ensure_links(&shared_dir, from) {
-            Ok(()) => {
-                shared
-                    .args
-                    .push(format!("--add-dir={}", shared_dir.display()));
-                shared
-                    .env
-                    .push((CLAUDE_MD_VAR.to_string(), "1".to_string()));
-            }
-            Err(e) => shared.notices.push(format!(
-                "instructions from {name} are not shared this time: {e:#}"
-            )),
-        }
-    }
-    shared.notices.extend(plan.notices.iter().cloned());
-    // The variable moves auto-memory too: only where it already is (a linked `projects`), or
-    // with the settings that pin it there.
-    let mut memory_placed = plan.items.linked(Id::Projects);
-    if !plan.settings.is_empty() {
-        let json = serde_json::to_string(&Value::Object(plan.settings.clone()))?;
-        match write_settings(&settings_dir(config), &json, SystemTime::now()) {
-            Ok(path) => {
-                shared.args.push(format!("--settings={}", path.display()));
-                memory_placed |= plan.memory.is_some();
-            }
-            Err(e) => shared.notices.push(format!(
-                "settings from {name} are not shared this time: {e:#}"
-            )),
-        }
-    }
-    if memory_placed && let Some(dir) = &plan.agent_memory {
-        shared
-            .env
-            .push((MEMORY_DIR_VAR.to_string(), dir.display().to_string()));
-    }
-    for plugin in &plan.plugins {
-        if let Ok(install) = &plugin.outcome {
-            shared
-                .args
-                .push(format!("--plugin-dir={}", install.path.display()));
-        }
-    }
-    Ok(shared)
-}
-
-/// `$REMUDA_HOME/state/settings`: the injected settings, one file per content (R18).
-pub fn settings_dir(config: &Path) -> PathBuf {
-    owned::settings_dir(config)
-}
-
-/// Settings files not used for this long are removed when a new one is written (R18).
-pub const SETTINGS_KEPT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-
-/// Writes `json` to `<dir>/<sha256 of json>.json`, mode 0600, atomically (R18); a file with
-/// that name is reused, and its mtime set to `now` to mark it used. Writing a new file first
-/// removes the files of `dir` not used since [`SETTINGS_KEPT`] before `now`. `dir` is a
-/// directory of remuda's own, the user's alone ([`owned::settings`]).
-pub fn write_settings(dir: &Path, json: &str, now: SystemTime) -> Result<PathBuf> {
-    let name = format!("{:x}.json", Sha256::digest(json.as_bytes()));
-    let path = dir.join(&name);
-    let settings = owned::settings(dir)?;
-    // Held until this returns: a file is never pruned between being chosen and being marked
-    // used, by this remuda or another. Without locks, remuda goes on without one (R18).
-    let _lock = settings
-        .lock_file(SETTINGS_LOCK, &owned::Flock, owned::Lockless::Proceed)
-        .with_context(|| format!("cannot lock {}", dir.join(SETTINGS_LOCK).display()))?;
-    if settings
-        .kind(&name)
-        .is_ok_and(|kind| kind == Some(owned::Kind::File))
-    {
-        settings
-            .touch(&name, now)
-            .with_context(|| format!("cannot use {}", path.display()))?;
-        return Ok(path);
-    }
-    prune_settings(&settings, now);
-    settings.sweep();
-    settings
-        .write(&name, json.as_bytes(), owned::FileMode::Private)
-        .with_context(|| format!("cannot write {}", path.display()))?;
-    Ok(path)
-}
-
-/// The lock file of the settings directory: never a settings file, so never pruned.
-pub const SETTINGS_LOCK: &str = ".lock";
-
-/// Removes the settings files of `dir` (`<64 hex digits>.json`) last used before
-/// [`SETTINGS_KEPT`] ago; anything else there is left alone.
-fn prune_settings(dir: &owned::Dir, now: SystemTime) {
-    let Some(cutoff) = now.checked_sub(SETTINGS_KEPT) else {
-        return;
-    };
-    let Ok(names) = dir.names() else {
-        return;
-    };
-    for name in names {
-        let ours = name
-            .to_str()
-            .and_then(|n| n.strip_suffix(".json"))
-            .is_some_and(|stem| {
-                stem.len() == 64 && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-            });
-        let old = |meta: owned::Meta| meta.kind == owned::Kind::File && meta.modified < cutoff;
-        if ours && dir.meta(&name).is_ok_and(|meta| meta.is_some_and(old)) {
-            let _ = dir.remove_file(&name);
-        }
-    }
-}
-
-/// Settings keys that choose credentials, provider or organization: never injected (R18).
+/// Settings keys that choose credentials, provider or organization: authentication, which
+/// stays per account (R18: `setup` does not link a `settings.json` that sets any of it, and a
+/// member that reads it through a link is warned).
 const AUTH_KEYS: [&str; 8] = [
     "apiKeyHelper",
     "proxyAuthHelper",
@@ -543,13 +257,13 @@ const AUTH_ENV_EXACT: [&str; 5] = [
     "ALL_PROXY",
 ];
 
-/// Whether the settings `env` variable `name` is withheld from members (R18), matched
+/// Whether the settings `env` variable `name` is an authentication setting (R18), matched
 /// case-insensitively: an exact name, a prefix, a secret-like part, or an underscore-separated
 /// part `AUTH`. Two kinds of names are exceptions to the one rule that would otherwise catch
 /// them: the model-name variables (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_MODEL`,
 /// `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL*`, `ANTHROPIC_CUSTOM_MODEL_OPTION*`,
 /// excepted from the `ANTHROPIC_` prefix) and counts ending in `_TOKENS` (excepted from the
-/// `TOKEN` part); any other rule still withholds them.
+/// `TOKEN` part); any other rule still catches them.
 fn withheld_env(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     if AUTH_ENV_EXACT.contains(&upper.as_str()) {
@@ -570,8 +284,8 @@ fn withheld_env(name: &str) -> bool {
     prefixed || part || auth
 }
 
-/// The authentication settings `settings` has, as `key` or `env.VAR`: withheld from members
-/// (R11, R18).
+/// The authentication settings `settings` has, as `key` or `env.VAR`: what keeps `setup`
+/// from linking the file, and what a member that links it is warned it reads (R11, R18).
 pub fn withheld(settings: &Map<String, Value>) -> Vec<String> {
     let mut keys: Vec<String> = AUTH_KEYS
         .iter()
@@ -588,20 +302,7 @@ pub fn withheld(settings: &Map<String, Value>) -> Vec<String> {
     keys
 }
 
-/// Removes the authentication settings from injected settings (an `env` left empty goes too).
-fn strip_auth(settings: &mut Map<String, Value>) {
-    for key in AUTH_KEYS {
-        settings.remove(key);
-    }
-    if let Some(Value::Object(vars)) = settings.get_mut("env") {
-        vars.retain(|name, _| !withheld_env(name));
-        if vars.is_empty() {
-            settings.remove("env");
-        }
-    }
-}
-
-/// Where a session starts, as claude sees it (R18): the launch directory made real and NFC,
+/// Where a session starts, as claude sees it (R22): the launch directory made real and NFC,
 /// and its project root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
@@ -619,7 +320,7 @@ impl Project {
         Project { start, root }
     }
 
-    /// The project's settings that sit above the user's in claude's order (R18):
+    /// The project's settings that sit above the user's in claude's order (R22):
     /// `.claude/settings.json` and `.claude/settings.local.json` of the start directory, and
     /// the local settings of the project root when claude reads those too. Unreadable or
     /// invalid files count as absent.
@@ -643,13 +344,13 @@ impl Project {
             .collect()
     }
 
-    /// `<source>/projects/<project>/memory` (R18); `None` without a start directory, or when
+    /// `<home>/projects/<project>/memory` (R22); `None` without a start directory, or when
     /// the name is too long for remuda to know claude's.
-    pub fn memory_dir(&self, source: &Path) -> Option<String> {
+    pub fn memory_dir(&self, home: &Path) -> Option<String> {
         let project = encode_project(self.root.as_ref()?.to_str()?)?;
         Some(
             Id::Projects
-                .at(source)
+                .at(home)
                 .join(project)
                 .join("memory")
                 .display()
@@ -658,7 +359,7 @@ impl Project {
     }
 }
 
-/// The start directory as claude takes its own cwd: absolute, real, NFC (R18).
+/// The start directory as claude takes its own cwd: absolute, real, NFC (R22).
 fn start_dir(cwd: &Path) -> Option<PathBuf> {
     let real = fs::canonicalize(cwd).ok()?;
     Some(PathBuf::from(real.to_str()?.nfc().collect::<String>()))
@@ -686,7 +387,7 @@ fn reads_root_local_settings(root: &Path, start: &Path, env: &Env) -> bool {
         }
 }
 
-/// The rule files of the `rules` directory `dir` (R18): its `**/*.md` regular files down to
+/// The rule files of the `rules` directory `dir` (R18, R22): its `**/*.md` regular files down to
 /// [`MAX_RULES_DEPTH`] levels, symlinks followed and a directory reached twice read once, as
 /// paths below `dir`, sorted; the first [`MAX_RULES`] in name order, directory by directory.
 /// Empty when `dir` is not a directory.
@@ -736,17 +437,8 @@ fn is_rule_name(name: &std::ffi::OsStr) -> bool {
     name.as_encoded_bytes().ends_with(b".md")
 }
 
-/// The rule files of `dir` ([`rule_files`]) whose frontmatter limits them to paths
-/// ([`rule_has_paths`]).
-pub fn scoped_rules(dir: &Path) -> Vec<PathBuf> {
-    rule_files(dir)
-        .into_iter()
-        .filter(|rel| read_regular(&dir.join(rel)).is_ok_and(|bytes| rule_has_paths(&bytes)))
-        .collect()
-}
-
-/// Whether a rule's frontmatter has a top-level `paths:` key. claude does not apply such a
-/// rule when it comes from an added directory (R18), whatever file is read.
+/// Whether a rule's frontmatter has a top-level `paths:` key: a rule limited to paths, which
+/// the account card marks (R22).
 pub fn rule_has_paths(bytes: &[u8]) -> bool {
     let text = String::from_utf8_lossy(bytes);
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
@@ -763,485 +455,6 @@ pub fn rule_has_paths(bytes: &[u8]) -> bool {
     }
     // A frontmatter that does not end is none.
     false
-}
-
-/// One change to the copies of the source's rules, by path below `rules`.
-enum RuleStep {
-    /// A copy the source no longer has, or a temporary file a write cut short left behind.
-    Remove(PathBuf),
-    /// A directory in a copy's place that the removals leave without files.
-    Clear(PathBuf),
-    Write {
-        rel: PathBuf,
-        bytes: Vec<u8>,
-    },
-}
-
-/// What makes `<root>/rules` hold a copy of each rule file of `<source>/rules` and no other
-/// file of remuda's (R18), decided without writing: a copy that is missing or differs is
-/// written; a regular `*.md` file there that the source no longer has is removed, and so is a
-/// temporary file of an earlier write. A file or a directory of remuda's that is in the way of
-/// a copy goes first (a rule that became a directory, or the reverse). `rules`, a directory on
-/// the way to a copy, or a copy's place taken by anything else is never replaced: that is an
-/// error. A rule that cannot be read is not shared. Anything else under `<root>/rules` is left
-/// alone.
-fn rules_plan(root: &Path, source: &Path) -> Result<Vec<RuleStep>> {
-    let mirror = root.join(RULES);
-    let from = source.join(RULES);
-    let not_dir = |path: &Path| {
-        anyhow::anyhow!(
-            "{} is not a directory; remuda does not replace it",
-            path.display()
-        )
-    };
-    let exists = match fs::symlink_metadata(&mirror) {
-        Ok(meta) if meta.file_type().is_dir() => true,
-        Ok(_) => return Err(not_dir(&mirror)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e).with_context(|| format!("cannot inspect {}", mirror.display())),
-    };
-    let wanted: BTreeMap<PathBuf, Vec<u8>> = rule_files(&from)
-        .into_iter()
-        .filter_map(|rel| Some((read_regular(&from.join(&rel)).ok()?, rel)))
-        .map(|(bytes, rel)| (rel, bytes))
-        .collect();
-    let write = |(rel, bytes)| RuleStep::Write { rel, bytes };
-    if !exists {
-        return Ok(wanted.into_iter().map(write).collect());
-    }
-
-    // The files that stay. A copy is also listed under the name the file system has for it,
-    // which need not be the source's spelling where case is ignored: it is the same file.
-    let id = |rel: &Path| {
-        fs::symlink_metadata(mirror.join(rel))
-            .ok()
-            .filter(|m| m.file_type().is_file())
-            .map(|m| (m.dev(), m.ino()))
-    };
-    let kept: BTreeSet<(u64, u64)> = wanted.keys().filter_map(|rel| id(rel)).collect();
-    let stale: BTreeSet<PathBuf> = rule_copies(&mirror)
-        .into_iter()
-        .filter(|rel| !wanted.contains_key(rel))
-        .filter(|rel| id(rel).is_some_and(|file| !kept.contains(&file)))
-        .collect();
-
-    let mut steps: Vec<RuleStep> = stale.iter().cloned().map(RuleStep::Remove).collect();
-    let mut writes = Vec::new();
-    for (rel, bytes) in wanted {
-        // Each directory on the way is one, or is not there (yet, or once a stale file of
-        // that name is gone).
-        let mut there = true;
-        let mut dir = PathBuf::new();
-        for part in rel.parent().into_iter().flat_map(Path::components) {
-            dir.push(part);
-            let path = mirror.join(&dir);
-            match fs::symlink_metadata(&path) {
-                Ok(meta) if meta.file_type().is_dir() => {}
-                Ok(_) if stale.contains(&dir) => there = false,
-                Ok(_) => return Err(not_dir(&path)),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => there = false,
-                Err(e) => {
-                    return Err(e).with_context(|| format!("cannot inspect {}", path.display()));
-                }
-            }
-            if !there {
-                break;
-            }
-        }
-        let dest = mirror.join(&rel);
-        let same = there
-            && match fs::symlink_metadata(&dest) {
-                Ok(meta) if meta.file_type().is_file() => {
-                    fs::read(&dest).is_ok_and(|copy| copy == bytes)
-                }
-                Ok(meta) if meta.file_type().is_dir() && clears(&mirror, &rel, &stale) => {
-                    steps.push(RuleStep::Clear(rel.clone()));
-                    false
-                }
-                Ok(_) => bail!(
-                    "{} is not a regular file; remuda does not replace it",
-                    dest.display()
-                ),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-                Err(e) => {
-                    return Err(e).with_context(|| format!("cannot inspect {}", dest.display()));
-                }
-            };
-        if !same {
-            writes.push(write((rel, bytes)));
-        }
-    }
-    steps.extend(writes);
-    Ok(steps)
-}
-
-/// Whether the directory `rel` of the copies holds nothing but files that go (`stale`), in
-/// directories that hold nothing else either.
-fn clears(mirror: &Path, rel: &Path, stale: &BTreeSet<PathBuf>) -> bool {
-    let Ok(listing) = fs::read_dir(mirror.join(rel)) else {
-        return false;
-    };
-    listing.flatten().all(|entry| {
-        let rel = rel.join(entry.file_name());
-        match entry.file_type() {
-            Ok(kind) if kind.is_dir() => clears(mirror, &rel, stale),
-            Ok(_) => stale.contains(&rel),
-            Err(_) => false,
-        }
-    })
-}
-
-/// The files under the copies directory `dir` that are remuda's, as paths below it: regular
-/// `*.md` files, and the temporary files of [`apply_rules`]. Symlinks are neither followed nor
-/// listed (remuda puts none there).
-fn rule_copies(dir: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, rel: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-        let Ok(listing) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in listing.flatten() {
-            let name = entry.file_name();
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() {
-                if depth < MAX_RULES_DEPTH {
-                    walk(&dir.join(&name), &rel.join(&name), depth + 1, out);
-                }
-            } else if kind.is_file() && (is_rule_name(&name) || is_temp_name(&name)) {
-                out.push(rel.join(&name));
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(dir, Path::new(""), 1, &mut out);
-    out
-}
-
-/// The name [`apply_rules`] writes a copy under ([`owned::is_temp_name`]): not a rule's name,
-/// so claude never loads a copy half written. Also `.<32 hex digits>.tmp`, the name of
-/// earlier versions, for what one of those left behind.
-fn is_temp_name(name: &OsStr) -> bool {
-    owned::is_temp_name(name)
-        || name
-            .as_encoded_bytes()
-            .strip_prefix(b".")
-            .and_then(|rest| rest.strip_suffix(b".tmp"))
-            .is_some_and(|hex| hex.len() == 32 && hex.iter().all(u8::is_ascii_hexdigit))
-}
-
-/// A level of the copies that is not a directory, a link to one included, is never replaced.
-fn not_replaced(blocked: owned::Blocked) -> anyhow::Error {
-    match blocked.why {
-        owned::Why::Symlink | owned::Why::NotADirectory => anyhow::anyhow!(
-            "{} is not a directory; remuda does not replace it",
-            blocked.path.display()
-        ),
-        owned::Why::Create(_) | owned::Why::Open(_) => blocked.into(),
-    }
-}
-
-/// `rules` in `root` and every directory of `dir` below it, each opened from the one above
-/// and never through a link, with its name; `None` when one is missing, an error when
-/// something else is there.
-fn real_dirs<'a>(root: &owned::Dir, dir: &'a Path) -> Result<Option<Vec<(&'a OsStr, owned::Dir)>>> {
-    let mut levels: Vec<(&OsStr, owned::Dir)> = Vec::new();
-    let parts = dir.components().map(|part| part.as_os_str());
-    for name in std::iter::once(OsStr::new(RULES)).chain(parts) {
-        let opened = levels.last().map_or(root, |(_, above)| above).sub(name);
-        match opened {
-            Ok(level) => levels.push((name, level)),
-            Err(missing) if missing.is_missing() => return Ok(None),
-            Err(blocked) => return Err(not_replaced(blocked)),
-        }
-    }
-    Ok(Some(levels))
-}
-
-/// Carries out [`rules_plan`] in `root`: removals first, then the writes. Every directory on
-/// the way is opened from the one above, or made, one level at a time, never through a link;
-/// each copy is written read-only (mode 0400, so that editing the copy instead of the
-/// source's rule fails) under a temporary name in its directory and renamed into place; a
-/// removed copy's directories go with it when that leaves them empty, `rules` itself included.
-fn apply_rules(root: &owned::Dir, steps: Vec<RuleStep>) -> Result<()> {
-    for step in steps {
-        match step {
-            RuleStep::Remove(rel) => {
-                let dir = rel.parent().unwrap_or(Path::new(""));
-                let (Some(levels), Some(name)) = (real_dirs(root, dir)?, rel.file_name()) else {
-                    continue;
-                };
-                let at = levels.last().map_or(root, |(_, level)| level);
-                // Checked again right before: never anything but a regular file.
-                if at
-                    .kind(name)
-                    .is_ok_and(|kind| kind == Some(owned::Kind::File))
-                    && let Err(e) = at.remove_file(name)
-                    && e.kind() != io::ErrorKind::NotFound
-                {
-                    return Err(e).with_context(|| {
-                        format!("cannot remove {}", at.path().join(name).display())
-                    });
-                }
-                // Fails on a directory that still holds something: it stays.
-                for (depth, (name, _)) in levels.iter().enumerate().rev() {
-                    let above = depth.checked_sub(1).map_or(root, |above| &levels[above].1);
-                    if above.remove_dir(name).is_err() {
-                        break;
-                    }
-                }
-            }
-            RuleStep::Clear(rel) => {
-                if let (Some(levels), Some(name)) = (
-                    real_dirs(root, rel.parent().unwrap_or(Path::new("")))?,
-                    rel.file_name(),
-                ) {
-                    remove_empty_dirs(levels.last().map_or(root, |(_, level)| level), name)?;
-                }
-            }
-            RuleStep::Write { rel, bytes } => {
-                let dir = make_dirs(root, rel.parent().unwrap_or(Path::new("")))?;
-                if let Some(name) = rel.file_name() {
-                    dir.write(name, &bytes, owned::FileMode::ReadOnly)
-                        .with_context(|| {
-                            format!("cannot write {}", dir.path().join(name).display())
-                        })?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// `rules` in `root` and the directories of `dir` below it, each made when missing and never
-/// taken through a link; the last one.
-fn make_dirs(root: &owned::Dir, dir: &Path) -> Result<owned::Dir> {
-    let mut at = root.sub_or_create(RULES).map_err(not_replaced)?;
-    for part in dir.components() {
-        at = at.sub_or_create(part.as_os_str()).map_err(not_replaced)?;
-    }
-    Ok(at)
-}
-
-/// Removes the directory `name` of `above` and the directories in it, none of which holds a
-/// file any more; one that does is an error. A `name` that is not a directory (any more) is
-/// left alone.
-fn remove_empty_dirs(above: &owned::Dir, name: &OsStr) -> Result<()> {
-    let dir = match above.sub(name) {
-        Ok(dir) => dir,
-        Err(missing) if missing.is_missing() => return Ok(()),
-        Err(blocked) => return Err(not_replaced(blocked)),
-    };
-    let names = dir
-        .names()
-        .with_context(|| format!("cannot read {}", dir.path().display()))?;
-    for entry in names {
-        if dir
-            .kind(&entry)
-            .is_ok_and(|kind| kind == Some(owned::Kind::Dir))
-        {
-            remove_empty_dirs(&dir, &entry)?;
-        }
-    }
-    match above.remove_dir(name) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => {
-            Err(e).with_context(|| format!("cannot remove {}", dir.path().display()))
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Makes `<dir>/.claude` a directory holding exactly one symlink per linked instruction item
-/// the source has ([`INSTRUCTIONS`]), each pointing at `<source>/<item>`, and a copy of each of
-/// its rule files under `rules/` ([`rules_plan`]) (R18). When it already is, nothing is
-/// written. Inside an existing directory, a missing link is created, one with another target
-/// is replaced atomically, and one for an item the source no longer has is removed; an entry
-/// that is not a symlink is never replaced, and then nothing is changed. Nothing else in `dir`
-/// or in `.claude` is touched. A `.claude` that is a symlink (the
-/// earlier layout, a link to the whole source home) is migrated: the directory is built under
-/// a temporary name in `dir`, the link is removed, and the directory is renamed into place.
-///
-/// `dir` is `$REMUDA_HOME/shared/claude`. It and `shared` are remuda's own directories, made
-/// when missing; one that is a symlink, or anything else, fails before anything is written
-/// ([`own_dirs`]).
-pub fn ensure_links(dir: &Path, source: &Path) -> Result<()> {
-    let claude = own_dirs(dir)?;
-    let root = dir.join(CLAUDE_DIR);
-    let inspect = |e| anyhow::Error::new(e).context(format!("cannot inspect {}", root.display()));
-    let old_link = match claude.kind(CLAUDE_DIR).map_err(inspect)? {
-        Some(owned::Kind::Dir) => return fill(&claude.sub(CLAUDE_DIR)?, source),
-        Some(owned::Kind::Symlink) => true,
-        Some(_) => bail!(
-            "{} is neither a directory nor a symlink; remuda does not replace it",
-            root.display()
-        ),
-        None => false,
-    };
-
-    let staged = Staged::build(&claude, source)?;
-    if old_link {
-        // Only a symlink is removed, checked again right before: a concurrent remuda may have
-        // put the directory in place already (then nothing is removed) and a directory or a
-        // file is never removed.
-        if claude
-            .kind(CLAUDE_DIR)
-            .is_ok_and(|kind| kind == Some(owned::Kind::Symlink))
-            && let Err(e) = claude.remove_file(CLAUDE_DIR)
-            && e.kind() != io::ErrorKind::NotFound
-        {
-            return match claude.kind(CLAUDE_DIR) {
-                Ok(Some(owned::Kind::Dir)) => fill(&claude.sub(CLAUDE_DIR)?, source),
-                _ => Err(e).with_context(|| format!("cannot remove {}", root.display())),
-            };
-        }
-    }
-    // A directory cannot be renamed over a symlink or a file; over a directory only when it
-    // is empty. On failure, the reason is read from what is there now, not from the errno
-    // (which differs between systems): a directory means another remuda won the race, and
-    // its items are checked instead.
-    match claude.rename(&staged.name, CLAUDE_DIR) {
-        Ok(()) => {
-            staged.commit();
-            Ok(())
-        }
-        Err(e) => match claude.kind(CLAUDE_DIR) {
-            Ok(Some(owned::Kind::Dir)) => {
-                drop(staged);
-                fill(&claude.sub(CLAUDE_DIR)?, source)
-            }
-            _ => {
-                drop(staged);
-                Err(e).with_context(|| format!("cannot create {}", root.display()))
-            }
-        },
-    }
-}
-
-/// The directory in `shared/claude` that an added directory's instructions are read from.
-const CLAUDE_DIR: &str = ".claude";
-
-/// `dir` (`shared/claude`) and the directory it is in (`shared`), each a directory, made when
-/// missing, and `dir` open (R13, R18). One that is a symlink is an error, like one that is
-/// anything else: every write below it, and the removal of rule copies the source no longer
-/// has, would happen where the link points ([`owned::shared`]).
-fn own_dirs(dir: &Path) -> Result<owned::Dir> {
-    Ok(owned::shared(dir)?)
-}
-
-/// The item links and rule copies of `source` in `root` (an existing `.claude` directory),
-/// changed only where they differ: decided for every item first, so an entry remuda does not
-/// replace fails before anything is written, and a directory that is already right gets no
-/// write. A write that fails midway leaves the rest for the next launch. One remuda at a time
-/// (a lock on `root` itself): another's removals never meet this one's writes. Everything is
-/// written through `root`'s descriptor, never through its path (R13).
-fn fill(root: &owned::Dir, source: &Path) -> Result<()> {
-    let _lock = root
-        .lock(&owned::Flock, owned::Lockless::Proceed)
-        .with_context(|| format!("cannot lock {}", root.path().display()))?;
-    enum Action {
-        Create,
-        Remove,
-    }
-    let mut actions = Vec::new();
-    for item in INSTRUCTIONS {
-        let link = root.path().join(item);
-        let target = source.join(item);
-        let wanted = fs::metadata(&target).is_ok();
-        match root.kind(item) {
-            Ok(Some(owned::Kind::Symlink)) => {
-                if !wanted {
-                    actions.push((item, target, Action::Remove));
-                } else if root.read_link(item).ok().as_deref() != Some(target.as_path()) {
-                    actions.push((item, target, Action::Create));
-                }
-            }
-            Ok(Some(_)) => bail!(
-                "{} is not a symlink; remuda does not replace it",
-                link.display()
-            ),
-            Ok(None) => {
-                if wanted {
-                    actions.push((item, target, Action::Create));
-                }
-            }
-            Err(e) => {
-                return Err(e).with_context(|| format!("cannot inspect {}", link.display()));
-            }
-        }
-    }
-    let rules = rules_plan(root.path(), source)?;
-    // What a remuda killed between making a temporary link and renaming it left behind.
-    root.sweep();
-    for (item, target, action) in actions {
-        let link = root.path().join(item);
-        match action {
-            Action::Create => root
-                .replace_link(item, &target)
-                .with_context(|| format!("cannot create {}", link.display()))?,
-            Action::Remove => {
-                // Checked again right before: never anything but a symlink.
-                if root
-                    .kind(item)
-                    .is_ok_and(|kind| kind == Some(owned::Kind::Symlink))
-                    && let Err(e) = root.remove_file(item)
-                    && e.kind() != io::ErrorKind::NotFound
-                {
-                    return Err(e).with_context(|| format!("cannot remove {}", link.display()));
-                }
-            }
-        }
-    }
-    apply_rules(root, rules)
-}
-
-/// A `.claude` directory built under a temporary name, removed again when dropped without
-/// [`Staged::commit`]: every error path after it exists cleans it up.
-struct Staged<'a> {
-    /// `shared/claude`, where it is built and renamed into place.
-    parent: &'a owned::Dir,
-    name: String,
-    path: PathBuf,
-    committed: bool,
-}
-
-impl<'a> Staged<'a> {
-    /// `.claude.<uuid>.tmp` in `parent`, holding a link for each item `source` has, and its
-    /// rules.
-    fn build(parent: &'a owned::Dir, source: &Path) -> Result<Staged<'a>> {
-        let name = format!(".claude.{}.tmp", uuid::Uuid::new_v4().simple());
-        let dir = parent.create_new(&name)?;
-        let staged = Staged {
-            parent,
-            path: dir.path().to_path_buf(),
-            name,
-            committed: false,
-        };
-        for item in INSTRUCTIONS {
-            let target = source.join(item);
-            if fs::metadata(&target).is_ok() {
-                dir.link(item, &target).with_context(|| {
-                    format!("cannot create {}", staged.path.join(item).display())
-                })?;
-            }
-        }
-        apply_rules(&dir, rules_plan(&staged.path, source)?)?;
-        Ok(staged)
-    }
-
-    /// The directory has been renamed into place: nothing to remove.
-    fn commit(mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for Staged<'_> {
-    fn drop(&mut self) {
-        if !self.committed {
-            // Only what `build` created: symlinks, which are unlinked, not followed, and the
-            // rule copies.
-            let _ = self.parent.remove_tree(&self.name);
-        }
-    }
 }
 
 /// Opens `path` for reading only when it is a regular file (symlinks followed): a FIFO or a
@@ -1269,8 +482,8 @@ fn read_regular(path: &Path) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// A `settings.json` as an object: missing is empty; anything but a JSON object is an error
-/// for the launch (R18).
+/// A `settings.json` as an object: missing is empty; anything but a JSON object is an error,
+/// which `setup` and the account card report (R18, R22).
 pub fn read_settings(path: &Path) -> Result<Map<String, Value>> {
     let bytes = match read_regular(path) {
         Ok(bytes) => bytes,
@@ -1289,75 +502,6 @@ pub fn read_settings(path: &Path) -> Result<Map<String, Value>> {
             .words(" is not a JSON object")
             .into()),
     }
-}
-
-/// Keys claude's merge replaces instead of combining: compared whole (R18).
-const REPLACED: [&str; 2] = ["fallbackModel", "modelPicker"];
-/// Keys claude's merge combines one level deep: compared entry by entry, where an entry the
-/// other side has is its (R18). The two marketplace keys are one setting.
-const SHALLOW: [&str; 3] = [
-    "extraKnownMarketplaces",
-    "additionalMarketplaces",
-    "managedMcpServers",
-];
-
-/// The part of `source` that `home` does not define, recursively (R18): keys the home lacks
-/// are taken; objects on both sides recurse; for arrays on both sides, the source's elements
-/// that equal none of the home's are taken; any other key the home defines is the home's.
-/// Where claude's merge does not combine (`fallbackModel`, `modelPicker`) the home's value
-/// wins whole; where it merges one level deep (`extraKnownMarketplaces` and its alias
-/// `additionalMarketplaces`, `managedMcpServers`) an entry the home has wins whole.
-pub fn missing_from(source: &Map<String, Value>, home: &Map<String, Value>) -> Map<String, Value> {
-    let mut out = Map::new();
-    for (key, value) in source {
-        if SHALLOW.contains(&key.as_str())
-            && let Value::Object(entries) = value
-        {
-            let others: Vec<&Value> = match key.as_str() {
-                "managedMcpServers" => home.get(key).into_iter().collect(),
-                _ => ["extraKnownMarketplaces", "additionalMarketplaces"]
-                    .iter()
-                    .filter_map(|k| home.get(*k))
-                    .collect(),
-            };
-            if others.iter().any(|o| !o.is_object()) {
-                continue;
-            }
-            let kept: Map<String, Value> = entries
-                .iter()
-                .filter(|(name, _)| !others.iter().any(|o| o.get(name.as_str()).is_some()))
-                .map(|(name, entry)| (name.clone(), entry.clone()))
-                .collect();
-            if !kept.is_empty() || others.is_empty() {
-                out.insert(key.clone(), Value::Object(kept));
-            }
-            continue;
-        }
-        let Some(own) = home.get(key) else {
-            out.insert(key.clone(), value.clone());
-            continue;
-        };
-        if REPLACED.contains(&key.as_str()) {
-            continue;
-        }
-        match (value, own) {
-            (Value::Object(value), Value::Object(own)) => {
-                let part = missing_from(value, own);
-                if !part.is_empty() {
-                    out.insert(key.clone(), Value::Object(part));
-                }
-            }
-            (Value::Array(value), Value::Array(own)) => {
-                let extra: Vec<Value> =
-                    value.iter().filter(|v| !own.contains(v)).cloned().collect();
-                if !extra.is_empty() {
-                    out.insert(key.clone(), Value::Array(extra));
-                }
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 /// The plugins `settings` enables: keys of `enabledPlugins` set to `true` or to an array (claude
@@ -1395,12 +539,12 @@ pub fn bundled(plugin: &str) -> bool {
         .is_some_and(|(_, marketplace)| marketplace == "builtin")
 }
 
-/// The source's `plugins/installed_plugins.json`.
+/// A home's `plugins/installed_plugins.json` (R22).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Installs {
     /// No such file: nothing is installed.
     Missing,
-    /// Not format version 2 as R18 describes it: no plugin is injected (R11 warns).
+    /// Not format version 2 as R22 describes it: the card reports it.
     Unrecognized(PathBuf),
     /// `plugins.<name@marketplace>`: the installs of each plugin, in file order.
     Known(BTreeMap<String, Vec<Install>>),
@@ -1416,38 +560,18 @@ pub struct Install {
 }
 
 impl Installs {
-    /// The first `user`-scoped install of `plugin` whose `installPath` exists.
-    pub fn install_path(&self, plugin: &str) -> Option<&Path> {
-        self.user_install(plugin)?.path.as_deref()
-    }
-
     /// The first `user`-scoped install of `plugin` whose `installPath` is absolute and exists:
-    /// the one injected (R18).
+    /// the source's install a member's own may resolve to (R22).
     pub fn user_install(&self, plugin: &str) -> Option<&Install> {
         self.installs(plugin)
             .iter()
             .find(|i| i.scope.as_deref() == Some("user") && i.path.as_deref().is_some_and(present))
     }
 
-    /// Whether an install of `plugin` here is one claude loads for a session in `start` (R18,
-    /// its `wb`): with `user` or `managed` scope, with `projectPath` equal to `start`, or with
-    /// `projectPath` and `start` in git repositories of the same root.
-    fn installed_for(&self, plugin: &str, start: Option<&Path>) -> bool {
-        let Installs::Known(plugins) = self else {
-            return false;
-        };
-        let start_root = start.and_then(git_root);
-        plugins.get(plugin).is_some_and(|installs| {
-            installs
-                .iter()
-                .any(|i| loads(i, start, start_root.as_deref()))
-        })
-    }
-
     /// The install of `plugin` a session in `start` uses (R22): among those claude loads there
-    /// ([`Installs::installed_for`]) whose `installPath` is absolute and exists, the most
-    /// specific (`local`, `project`, `user`, `managed`, then any other scope), the first in the
-    /// file among equals.
+    /// ([`loads`]) whose `installPath` is absolute and exists, the most specific (`local`,
+    /// `project`, `user`, `managed`, then any other scope), the first in the file among
+    /// equals.
     pub fn effective(&self, plugin: &str, start: Option<&Path>) -> Option<&Install> {
         let start_root = start.and_then(git_root);
         let rank = |i: &Install| match i.scope.as_deref() {
@@ -1484,7 +608,9 @@ fn present(path: &Path) -> bool {
 }
 
 /// Whether claude loads install `i` for a session in `start`, whose git root is `start_root`
-/// (its `wb`, [`Installs::installed_for`]).
+/// (its `wb`, read from the 2.1.281 bundle, R22): with `user` or `managed` scope, with
+/// `projectPath` equal to `start`, or with `projectPath` and `start` in git repositories of
+/// the same root.
 fn loads(i: &Install, start: Option<&Path>, start_root: Option<&Path>) -> bool {
     if matches!(i.scope.as_deref(), Some("user" | "managed")) {
         return true;
@@ -1496,7 +622,7 @@ fn loads(i: &Install, start: Option<&Path>, start_root: Option<&Path>) -> bool {
         || start_root.is_some_and(|root| git_root(project).as_deref() == Some(root))
 }
 
-/// Reads `<home>/plugins/installed_plugins.json` (R18: format version 2).
+/// Reads `<home>/plugins/installed_plugins.json` (R22: format version 2).
 pub fn installed_plugins(home: &Path) -> Installs {
     #[derive(Deserialize)]
     struct File {
@@ -1543,7 +669,7 @@ pub fn installed_plugins(home: &Path) -> Installs {
     }
 }
 
-/// claude's name for a project directory (R18): every UTF-16 code unit that is not an ASCII
+/// claude's name for a project directory (R22): every UTF-16 code unit that is not an ASCII
 /// letter or digit becomes `-` (a character outside the Basic Multilingual Plane becomes `--`);
 /// `None` beyond [`MAX_PROJECT_NAME`] code units, where claude truncates and hashes.
 fn encode_project(root: &str) -> Option<String> {
@@ -1562,7 +688,7 @@ fn encode_project(root: &str) -> Option<String> {
     )
 }
 
-/// The project root of `start` as claude 2.1.281 finds it, without running git (R18): its
+/// The project root of `start` as claude 2.1.281 finds it, without running git (R22): its
 /// [`git_root`], or with no `.git` anywhere up to `/`, `start` itself. NFC.
 fn project_root(start: &Path) -> PathBuf {
     git_root(start).unwrap_or_else(|| nfc_path(start.to_path_buf()))
@@ -1572,7 +698,7 @@ fn project_root(start: &Path) -> PathBuf {
 /// `start` up to `/` with a `.git` entry, mapped from a linked worktree to its main repository
 /// by [`linked_worktree_root`]; `None` when there is no `.git` up to `/`. NFC.
 ///
-/// Not replicated (R18): claude refuses to follow a `.git` symlink, a `gitdir` or a `commondir`
+/// Not replicated (R22): claude refuses to follow a `.git` symlink, a `gitdir` or a `commondir`
 /// into network locations (on macOS `/net`, `/Network`, `/home/<user>`, `/.vol`, `/.file`, and
 /// `//` UNC paths) and keeps walking up; in those rare layouts remuda may choose a different
 /// root.
@@ -1668,14 +794,13 @@ fn resolve(base: &Path, p: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::symlink;
+    use std::time::Duration;
 
     use serde_json::json;
 
     use super::*;
     use crate::registry::{CLAUDE, CODEX, Home};
-    use crate::test_homes::ClaudeHome;
 
     /// Where a home keeps the memory of its user-scope subagents.
     const AGENT_MEMORY: &str = Id::AgentMemory.name();
@@ -1685,46 +810,6 @@ mod tests {
             Value::Object(m) => m,
             other => panic!("{other}"),
         }
-    }
-
-    /// R18: keys the home lacks come from the source; the home wins on any key it defines;
-    /// objects recurse; arrays get the source's elements the home does not have, so an
-    /// identical hook entry is not added twice.
-    #[test]
-    fn settings_are_the_source_minus_what_the_home_defines() {
-        let hook = json!({"matcher": "Bash", "hooks": [{"type": "command", "command": "lint"}]});
-        let other_hook =
-            json!({"matcher": "Edit", "hooks": [{"type": "command", "command": "fmt"}]});
-        let source = map(json!({
-            "model": "opus",
-            "cleanupPeriodDays": 365,
-            "env": {"A": "1", "B": "2"},
-            "permissions": {"allow": ["Bash(ls)", "Read"], "defaultMode": "plan"},
-            "hooks": {"PreToolUse": [hook.clone(), other_hook.clone()]},
-            "statusLine": {"type": "command", "command": "x"},
-            "enabledPlugins": {"a@m": true},
-        }));
-        let home = map(json!({
-            "model": "sonnet",
-            "env": {"B": "home", "C": "3"},
-            "permissions": {"allow": ["Read"]},
-            "hooks": {"PreToolUse": [hook.clone()]},
-            "statusLine": "not an object",
-        }));
-        assert_eq!(
-            Value::Object(missing_from(&source, &home)),
-            json!({
-                "cleanupPeriodDays": 365,
-                "env": {"A": "1"},
-                "permissions": {"allow": ["Bash(ls)"], "defaultMode": "plan"},
-                "hooks": {"PreToolUse": [other_hook]},
-                "enabledPlugins": {"a@m": true},
-            })
-        );
-        // Everything already there: nothing to add, not even empty objects.
-        assert_eq!(missing_from(&source, &source), Map::new());
-        assert_eq!(missing_from(&Map::new(), &home), Map::new());
-        assert_eq!(missing_from(&source, &Map::new()), source);
     }
 
     #[test]
@@ -1745,9 +830,9 @@ mod tests {
         }
     }
 
-    /// R18, R21: the error of a settings file reads as it did (what a launch prints), and
-    /// says which of its pieces is the file: the Configuration pane masks that whole in
-    /// private mode and keeps what is wrong with it.
+    /// R21, R22: the error of a settings file reads as it did (what `setup` prints), and
+    /// says which of its pieces is the file: the account card masks that whole in private
+    /// mode and keeps what is wrong with it.
     #[test]
     fn a_settings_error_says_which_piece_is_the_file() {
         use crate::privacy::Piece;
@@ -1786,7 +871,7 @@ mod tests {
         );
     }
 
-    /// R18: every UTF-16 code unit that is not an ASCII letter or digit becomes `-` (a
+    /// R22: every UTF-16 code unit that is not an ASCII letter or digit becomes `-` (a
     /// character outside the BMP is two units, so `--`); roots over 200 units are not encoded
     /// (claude truncates and hashes them, unverified); the root is NFC first.
     #[test]
@@ -1818,7 +903,6 @@ mod tests {
             Some(199)
         );
     }
-
     fn git() -> PathBuf {
         let path = std::env::var("PATH").ok();
         crate::launch::find_on_path("git", path.as_deref()).expect("git on PATH")
@@ -1849,7 +933,7 @@ mod tests {
         assert!(status.success(), "git {args:?} in {}", dir.display());
     }
 
-    /// R18: the project root as claude finds it, by walking the file system (fixtures made
+    /// R22: the project root as claude finds it, by walking the file system (fixtures made
     /// with real git): a plain repository and its subdirectories (also inside `.git/hooks`), a
     /// linked worktree, a submodule, a separate git dir, a worktree of a bare repository, a
     /// bare repository itself, and no repository at all.
@@ -1936,7 +1020,7 @@ mod tests {
         }
     }
 
-    /// R18: a worktree whose main repository no longer points back at it (moved), and a
+    /// R22: a worktree whose main repository no longer points back at it (moved), and a
     /// gitfile that leads nowhere (the main repository moved), are their own roots.
     #[test]
     fn moved_worktrees_and_broken_gitfiles_are_their_own_roots() {
@@ -1979,7 +1063,7 @@ mod tests {
         assert_eq!(project_root(&rel), other);
     }
 
-    /// R18: the start directory is the launch directory made real and NFC: a symlinked path,
+    /// R22: the start directory is the launch directory made real and NFC: a symlinked path,
     /// `..`, a trailing slash and an NFD spelling all name one project.
     #[test]
     fn the_start_directory_is_real_and_nfc() {
@@ -2008,8 +1092,9 @@ mod tests {
         assert_eq!(start_dir(&root.join("gone")), None);
     }
 
-    /// R18: plugins come from `installed_plugins.json` version 2: the first `user` install
-    /// whose path exists; anything else is unrecognized and yields no plugin.
+    /// R22: plugins come from `installed_plugins.json` version 2: the first `user` install
+    /// whose path exists; anything else is unrecognized and yields no plugin. An
+    /// `enabledPlugins` array counts as enabled, like `true`.
     #[test]
     fn plugin_install_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -2043,9 +1128,12 @@ mod tests {
         )
         .unwrap();
         let installs = installed_plugins(home);
-        assert_eq!(installs.install_path("a@m"), Some(there.as_path()));
+        let path = |installs: &Installs, plugin: &str| {
+            installs.user_install(plugin).and_then(|i| i.path.clone())
+        };
+        assert_eq!(path(&installs, "a@m"), Some(there.clone()));
         for none in ["b@m", "c@m", "d@m", "x@m"] {
-            assert_eq!(installs.install_path(none), None, "{none}");
+            assert_eq!(path(&installs, none), None, "{none}");
         }
         for bad in [
             json!({"version": 1, "plugins": {}}).to_string(),
@@ -2060,18 +1148,19 @@ mod tests {
                 Installs::Unrecognized(file.clone()),
                 "{bad}"
             );
-            assert_eq!(installed_plugins(home).install_path("a@m"), None);
+            assert_eq!(path(&installed_plugins(home), "a@m"), None);
         }
         assert_eq!(
             enabled_plugins(&map(json!({
-                "enabledPlugins": {"a@m": true, "b@m": false, "c@m": "yes", "d@m": true}
+                "enabledPlugins": {"a@m": true, "b@m": false, "c@m": "yes", "d@m": true,
+                                   "e@m": ["skill-one"]}
             }))),
-            ["a@m", "d@m"]
+            ["a@m", "d@m", "e@m"]
         );
         assert!(enabled_plugins(&map(json!({"enabledPlugins": []}))).is_empty());
     }
 
-    /// R18: the highest settings layer that sets a plugin decides whether it is turned off;
+    /// R22: the highest settings layer that sets a plugin decides whether it is turned off;
     /// an array there, like `true`, enables it.
     #[test]
     fn the_highest_layer_decides_whether_a_plugin_is_off() {
@@ -2091,411 +1180,7 @@ mod tests {
         assert!(!turned_off("b@m", &own, &[layer(json!(false))]));
     }
 
-    /// Sorted entry names of a directory.
-    fn names(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        names
-    }
-
-    /// The item links under `<shared>/.claude`, as `(name, target)`, in item order.
-    fn links(shared: &Path) -> Vec<(&'static str, PathBuf)> {
-        let root = shared.join(".claude");
-        assert!(
-            fs::symlink_metadata(&root).unwrap().file_type().is_dir(),
-            "{} is a directory",
-            root.display()
-        );
-        INSTRUCTIONS
-            .into_iter()
-            .filter_map(|item| {
-                let link = root.join(item);
-                let meta = fs::symlink_metadata(&link).ok()?;
-                assert!(meta.file_type().is_symlink(), "{}", link.display());
-                Some((item, fs::read_link(&link).unwrap()))
-            })
-            .collect()
-    }
-
-    /// Every entry of `dir`, recursively, with its type and link target: a snapshot to prove
-    /// a tree was not touched.
-    fn tree(dir: &Path) -> Vec<(PathBuf, String)> {
-        let mut out = Vec::new();
-        for name in names(dir) {
-            let path = dir.join(&name);
-            let meta = fs::symlink_metadata(&path).unwrap();
-            let kind = if meta.file_type().is_symlink() {
-                format!("-> {}", fs::read_link(&path).unwrap().display())
-            } else if meta.is_dir() {
-                out.extend(tree(&path));
-                "dir".to_string()
-            } else {
-                format!("file {}", meta.len())
-            };
-            out.push((path, kind));
-        }
-        out.sort();
-        out
-    }
-
-    /// A source home with `CLAUDE.md`, `skills` and `agents` (no `commands`), plus a file
-    /// that must never be reachable through the shared directory.
-    fn source_home(root: &Path, name: &str) -> PathBuf {
-        ClaudeHome::at(root.join(name))
-            .skill("review")
-            .dir("agents")
-            .claude_md("be brief")
-            .file(".credentials.json", "secret")
-            .into_path()
-    }
-
-    /// R18, R13: `.claude` is a directory of one link per item the source has, pointing at
-    /// the source's path as registered; a second call writes nothing at all; the links follow
-    /// the source when it changes, and one for an item the source lost is removed. Other
-    /// entries in `shared/claude` and in `.claude` are never touched.
-    #[test]
-    fn the_item_links_are_created_and_kept_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("remuda/shared/claude");
-        let a = source_home(dir.path(), "a");
-        ensure_links(&shared, &a).unwrap();
-        assert_eq!(
-            links(&shared),
-            [
-                ("CLAUDE.md", a.join("CLAUDE.md")),
-                ("skills", a.join("skills")),
-                ("agents", a.join("agents")),
-            ]
-        );
-        assert_eq!(names(&shared), [".claude"]);
-        assert_eq!(
-            names(&shared.join(".claude")),
-            ["CLAUDE.md", "agents", "skills"]
-        );
-
-        // Already right: no write (same inodes and mtimes, no temporary entry).
-        let stamp = |path: &Path| {
-            let m = fs::symlink_metadata(path).unwrap();
-            (m.ino(), m.modified().unwrap())
-        };
-        let root = shared.join(".claude");
-        let before: Vec<_> = [
-            ".claude",
-            ".claude/CLAUDE.md",
-            ".claude/skills",
-            ".claude/agents",
-        ]
-        .iter()
-        .map(|p| stamp(&shared.join(p)))
-        .collect();
-        std::thread::sleep(Duration::from_millis(20));
-        ensure_links(&shared, &a).unwrap();
-        let after: Vec<_> = [
-            ".claude",
-            ".claude/CLAUDE.md",
-            ".claude/skills",
-            ".claude/agents",
-        ]
-        .iter()
-        .map(|p| stamp(&shared.join(p)))
-        .collect();
-        assert_eq!(before, after);
-        assert_eq!(names(&shared), [".claude"]);
-
-        // Another source: retargeted; an item the new source lacks loses its link, one it has
-        // gains one. Entries remuda does not own stay.
-        fs::write(shared.join("notes"), "mine").unwrap();
-        fs::write(root.join("settings.json"), "{}").unwrap();
-        let b = source_home(dir.path(), "b");
-        fs::remove_dir(b.join("agents")).unwrap();
-        fs::create_dir(b.join("commands")).unwrap();
-        ensure_links(&shared, &b).unwrap();
-        assert_eq!(
-            links(&shared),
-            [
-                ("CLAUDE.md", b.join("CLAUDE.md")),
-                ("skills", b.join("skills")),
-                ("commands", b.join("commands")),
-            ]
-        );
-        assert_eq!(names(&shared), [".claude", "notes"]);
-        assert_eq!(
-            names(&root),
-            ["CLAUDE.md", "commands", "settings.json", "skills"]
-        );
-        assert_eq!(
-            fs::read_to_string(root.join("settings.json")).unwrap(),
-            "{}"
-        );
-        assert_eq!(fs::read_to_string(shared.join("notes")).unwrap(), "mine");
-
-        // A dangling source item counts as absent; the registered path is used, not the
-        // canonical one.
-        fs::remove_file(b.join("CLAUDE.md")).unwrap();
-        symlink("/nowhere", b.join("CLAUDE.md")).unwrap();
-        let via = dir.path().join("via");
-        symlink(&b, &via).unwrap();
-        ensure_links(&shared, &via).unwrap();
-        assert_eq!(
-            links(&shared),
-            [
-                ("skills", via.join("skills")),
-                ("commands", via.join("commands")),
-            ]
-        );
-    }
-
-    /// R18: a `.claude` that is a symlink to the whole source home (the earlier layout) is
-    /// migrated in place to the directory of item links, whatever it pointed at; the source
-    /// home and the other entries of `shared/claude` are untouched, and no temporary
-    /// directory is left behind.
-    #[test]
-    fn the_whole_home_link_is_migrated() {
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("remuda/shared/claude");
-        let a = source_home(dir.path(), "a");
-        for old in [a.clone(), PathBuf::from("/elsewhere")] {
-            let _ = fs::remove_dir_all(shared.join(".claude"));
-            let _ = fs::remove_file(shared.join(".claude"));
-            fs::create_dir_all(&shared).unwrap();
-            symlink(&old, shared.join(".claude")).unwrap();
-            fs::write(shared.join("notes"), "mine").unwrap();
-            let source_before = tree(&a);
-            ensure_links(&shared, &a).unwrap();
-            assert_eq!(
-                links(&shared),
-                [
-                    ("CLAUDE.md", a.join("CLAUDE.md")),
-                    ("skills", a.join("skills")),
-                    ("agents", a.join("agents")),
-                ],
-                "from {}",
-                old.display()
-            );
-            assert_eq!(names(&shared), [".claude", "notes"]);
-            assert_eq!(tree(&a), source_before);
-            assert!(!shared.join(".claude/.credentials.json").exists());
-        }
-    }
-
-    /// R18: an entry that is not a symlink is never replaced: an item inside `.claude` fails
-    /// before anything else is changed, and a `.claude` that is neither a directory nor a
-    /// symlink fails too; an unwritable `shared/claude` fails without leaving anything.
-    #[test]
-    fn entries_that_are_not_links_are_left_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("remuda/shared/claude");
-        let a = source_home(dir.path(), "a");
-        let root = shared.join(".claude");
-
-        // A regular file where an item link would go, another item's link wrong: nothing
-        // is created or corrected.
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("CLAUDE.md"), "copied").unwrap();
-        symlink("/old/skills", root.join("skills")).unwrap();
-        let before = tree(&shared);
-        let e = ensure_links(&shared, &a).unwrap_err().to_string();
-        assert!(e.contains("CLAUDE.md is not a symlink"), "{e}");
-        assert_eq!(tree(&shared), before);
-
-        // A directory named like an item.
-        fs::remove_file(root.join("CLAUDE.md")).unwrap();
-        fs::create_dir(root.join("agents")).unwrap();
-        let before = tree(&shared);
-        let e = ensure_links(&shared, &a).unwrap_err().to_string();
-        assert!(e.contains("agents is not a symlink"), "{e}");
-        assert_eq!(tree(&shared), before);
-
-        // `.claude` itself a regular file.
-        fs::remove_dir_all(&root).unwrap();
-        fs::write(&root, "what").unwrap();
-        let e = ensure_links(&shared, &a).unwrap_err().to_string();
-        assert!(
-            e.contains("neither a directory nor a symlink; remuda does not replace it"),
-            "{e}"
-        );
-        assert_eq!(fs::read_to_string(&root).unwrap(), "what");
-        assert_eq!(names(&shared), [".claude"]);
-
-        // `shared/claude` unwritable: the build fails and leaves no temporary directory,
-        // whether `.claude` is missing or the old link.
-        fs::remove_file(&root).unwrap();
-        for old in [None, Some(&a)] {
-            if let Some(old) = old {
-                symlink(old, &root).unwrap();
-            }
-            let before = tree(&shared);
-            fs::set_permissions(&shared, fs::Permissions::from_mode(0o555)).unwrap();
-            let result = ensure_links(&shared, &a);
-            fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
-            let e = result.unwrap_err().to_string();
-            assert!(e.contains("cannot create"), "{e}");
-            assert_eq!(tree(&shared), before);
-            let _ = fs::remove_file(&root);
-        }
-    }
-
-    /// R13, R18: `shared` and `shared/claude` are remuda's own directories. One that is a
-    /// symlink (to a directory holding the user's files, to an empty one, or to nothing) or a
-    /// file is refused before anything is written, where it points or next to it.
-    #[test]
-    fn a_shared_directory_that_is_not_one_is_not_written_through() {
-        for level in ["shared", "shared/claude"] {
-            let dir = tempfile::tempdir().unwrap();
-            let shared = dir.path().join("remuda/shared/claude");
-            let at = dir.path().join("remuda").join(level);
-            let a = source_home(dir.path(), "a");
-            with_rules(&a);
-            let outside = dir.path().join("outside");
-            let root = match level {
-                "shared" => outside.join("claude/.claude"),
-                _ => outside.join(".claude"),
-            };
-            fs::create_dir_all(root.join("rules")).unwrap();
-            fs::write(root.join("rules/mine.md"), "mine").unwrap();
-            symlink("/old/skills", root.join("skills")).unwrap();
-            let empty = dir.path().join("empty");
-            fs::create_dir(&empty).unwrap();
-            fs::create_dir_all(at.parent().unwrap()).unwrap();
-
-            for target in [&outside, &empty, &dir.path().join("missing")] {
-                symlink(target, &at).unwrap();
-                let before = tree(dir.path());
-                let e = ensure_links(&shared, &a).unwrap_err().to_string();
-                assert_eq!(
-                    e,
-                    format!(
-                        "{} is a symlink; remuda does not write through it",
-                        at.display()
-                    )
-                );
-                assert_eq!(tree(dir.path()), before, "{level} -> {}", target.display());
-                assert_eq!(fs::read(root.join("rules/mine.md")).unwrap(), b"mine");
-                fs::remove_file(&at).unwrap();
-            }
-
-            fs::write(&at, "a file").unwrap();
-            let before = tree(dir.path());
-            let e = ensure_links(&shared, &a).unwrap_err().to_string();
-            assert!(
-                e.ends_with(&format!(
-                    "{level} is not a directory; remuda does not replace it"
-                )),
-                "{e}"
-            );
-            assert_eq!(tree(dir.path()), before);
-
-            // Missing: made, as before.
-            fs::remove_file(&at).unwrap();
-            ensure_links(&shared, &a).unwrap();
-            assert_eq!(links(&shared).len(), 3);
-            for path in [&at, &shared] {
-                assert!(fs::symlink_metadata(path).unwrap().file_type().is_dir());
-            }
-        }
-    }
-
-    /// R18: launches that migrate the same whole-home link, or create the directory, at the
-    /// same time all succeed and leave one correct directory and no temporary one: the loser
-    /// of the rename removes its own build and checks the winner's items.
-    #[test]
-    fn concurrent_launches_agree_on_the_links() {
-        use std::sync::{Arc, Barrier};
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("remuda/shared/claude");
-        let a = source_home(dir.path(), "a");
-        for round in 0..20 {
-            let _ = fs::remove_dir_all(shared.join(".claude"));
-            fs::create_dir_all(&shared).unwrap();
-            if round % 2 == 0 {
-                symlink(&a, shared.join(".claude")).unwrap();
-            }
-            let barrier = Arc::new(Barrier::new(8));
-            let threads: Vec<_> = (0..8)
-                .map(|_| {
-                    let (shared, a, barrier) = (shared.clone(), a.clone(), barrier.clone());
-                    std::thread::spawn(move || {
-                        barrier.wait();
-                        ensure_links(&shared, &a)
-                    })
-                })
-                .collect();
-            for t in threads {
-                t.join()
-                    .unwrap()
-                    .unwrap_or_else(|e| panic!("round {round}: {e:#}"));
-            }
-            assert_eq!(
-                links(&shared),
-                [
-                    ("CLAUDE.md", a.join("CLAUDE.md")),
-                    ("skills", a.join("skills")),
-                    ("agents", a.join("agents")),
-                ],
-                "round {round}"
-            );
-            assert_eq!(names(&shared), [".claude"], "round {round}");
-            assert_eq!(
-                names(&shared.join(".claude")),
-                ["CLAUDE.md", "agents", "skills"],
-                "round {round}"
-            );
-        }
-    }
-
-    /// R18: the staged directory is removed when it is dropped without being renamed into
-    /// place, so no error path after it exists leaves it behind; its links are unlinked, not
-    /// followed.
-    #[test]
-    fn a_staged_directory_is_removed_unless_committed() {
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("shared");
-        fs::create_dir_all(&shared).unwrap();
-        let a = source_home(dir.path(), "a");
-        let source_before = tree(&a);
-        let claude = owned::Dir::open(&shared).unwrap();
-        let staged = Staged::build(&claude, &a).unwrap();
-        let path = staged.path.clone();
-        assert!(path.starts_with(&shared) && path.is_dir());
-        assert_eq!(names(&path), ["CLAUDE.md", "agents", "skills"]);
-        drop(staged);
-        assert!(!path.exists());
-        assert_eq!(names(&shared), Vec::<String>::new());
-        assert_eq!(tree(&a), source_before);
-
-        let staged = Staged::build(&claude, &a).unwrap();
-        let path = staged.path.clone();
-        staged.commit();
-        assert!(path.is_dir());
-    }
-
-    /// R18: a process killed between removing the old link and the rename leaves no `.claude`
-    /// and a stale temporary directory; the next launch creates `.claude` and leaves the stale
-    /// directory alone.
-    #[test]
-    fn a_migration_killed_midway_is_completed_by_the_next_launch() {
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("shared");
-        fs::create_dir_all(&shared).unwrap();
-        let a = source_home(dir.path(), "a");
-        let claude = owned::Dir::open(&shared).unwrap();
-        let stale = Staged::build(&claude, &a).unwrap();
-        let stale_path = stale.path.clone();
-        stale.commit();
-        let stale_before = tree(&stale_path);
-        assert!(!shared.join(".claude").exists());
-        ensure_links(&shared, &a).unwrap();
-        assert_eq!(
-            names(&shared.join(".claude")),
-            ["CLAUDE.md", "agents", "skills"]
-        );
-        assert_eq!(tree(&stale_path), stale_before);
-    }
-
-    /// R18: `rules/**/*.md` regular files, symlinks followed, sorted; a link back into the
+    /// R18, R22: `rules/**/*.md` regular files, symlinks followed, sorted; a link back into the
     /// tree ends the walk there; other files are not rules.
     #[test]
     fn rule_files_are_the_markdown_files_below_rules() {
@@ -2531,7 +1216,7 @@ mod tests {
         assert!(rule_files(&rules.join("b.md")).is_empty());
     }
 
-    /// R18: a rule is limited to paths when its frontmatter has a top-level `paths` key.
+    /// R22: a rule is limited to paths when its frontmatter has a top-level `paths` key.
     #[test]
     fn rules_limited_to_paths() {
         assert!(rule_has_paths(b"---\npaths:\n  - \"**/*.rs\"\n---\nbody"));
@@ -2545,501 +1230,6 @@ mod tests {
         assert!(!rule_has_paths(b"paths: x\n"));
         assert!(!rule_has_paths(b"---\npaths: never ends\n"));
         assert!(!rule_has_paths(b""));
-
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("always.md"), "always").unwrap();
-        fs::write(dir.path().join("rust.md"), "---\npaths: \"**/*.rs\"\n---\n").unwrap();
-        assert_eq!(scoped_rules(dir.path()), [PathBuf::from("rust.md")]);
-    }
-
-    /// The source's rules for the copy tests: two rules, one nested, one through a link, and
-    /// a file that is not a rule.
-    fn with_rules(home: &Path) {
-        fs::create_dir_all(home.join("rules/lang")).unwrap();
-        fs::write(home.join("rules/style.md"), "be terse").unwrap();
-        fs::write(home.join("rules/lang/rust.md"), "no unwrap").unwrap();
-        fs::write(home.join("rules/README"), "not a rule").unwrap();
-        fs::write(home.join("elsewhere.md"), "linked rule").unwrap();
-        symlink(home.join("elsewhere.md"), home.join("rules/linked.md")).unwrap();
-    }
-
-    /// R18, R13: the source's rules are shared as copies, regular files of mode 0600 in a real
-    /// `rules` directory, also when `.claude` is created or migrated; a second call writes
-    /// nothing; a changed rule is copied again, one the source lost is removed with the
-    /// directories that leaves empty, and `rules` goes when the source has none. What remuda
-    /// did not put there stays.
-    #[test]
-    fn the_rules_are_copied_and_kept_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("remuda/shared/claude");
-        let a = source_home(dir.path(), "a");
-        with_rules(&a);
-        let source_before = tree(&a);
-        ensure_links(&shared, &a).unwrap();
-        let rules = shared.join(".claude/rules");
-        let copies = |rules: &Path| -> Vec<(PathBuf, String)> {
-            rule_copies(rules)
-                .into_iter()
-                .map(|rel| {
-                    let path = rules.join(&rel);
-                    let meta = fs::symlink_metadata(&path).unwrap();
-                    assert!(meta.file_type().is_file(), "{}", path.display());
-                    assert_eq!(meta.mode() & 0o777, 0o400, "{}", path.display());
-                    (rel, fs::read_to_string(&path).unwrap())
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect()
-        };
-        let want = |pairs: &[(&str, &str)]| -> Vec<(PathBuf, String)> {
-            pairs
-                .iter()
-                .map(|(rel, text)| (PathBuf::from(rel), text.to_string()))
-                .collect()
-        };
-        assert!(fs::symlink_metadata(&rules).unwrap().file_type().is_dir());
-        assert_eq!(
-            copies(&rules),
-            want(&[
-                ("lang/rust.md", "no unwrap"),
-                ("linked.md", "linked rule"),
-                ("style.md", "be terse"),
-            ])
-        );
-        assert_eq!(names(&rules), ["lang", "linked.md", "style.md"]);
-        assert_eq!(
-            links(&shared),
-            [
-                ("CLAUDE.md", a.join("CLAUDE.md")),
-                ("skills", a.join("skills")),
-                ("agents", a.join("agents")),
-            ]
-        );
-        assert_eq!(tree(&a), source_before, "the source is only read");
-
-        // Already right: nothing is written.
-        let before = tree(&shared);
-        let stamps = |dir: &Path| -> Vec<_> {
-            tree(dir)
-                .into_iter()
-                .map(|(path, _)| {
-                    let m = fs::symlink_metadata(&path).unwrap();
-                    (path, m.ino(), m.modified().unwrap())
-                })
-                .collect()
-        };
-        let stamped = stamps(&shared);
-        std::thread::sleep(Duration::from_millis(20));
-        ensure_links(&shared, &a).unwrap();
-        assert_eq!(tree(&shared), before);
-        assert_eq!(stamps(&shared), stamped);
-
-        // A changed rule, a new one, and one the source lost (with its directory); entries
-        // remuda did not put there stay, except what looks like a copy or like the temporary
-        // file of a write cut short.
-        fs::write(rules.join("mine.txt"), "kept").unwrap();
-        symlink("/somewhere", rules.join("theirs.md")).unwrap();
-        fs::write(rules.join("stray.md"), "not the source's").unwrap();
-        // Under the lock every temporary file there is a leftover, whoever made it: one of
-        // this process, and one named as earlier versions named theirs.
-        let hex = uuid::Uuid::new_v4().simple();
-        let leftover = format!(".remuda-{}-{hex}.tmp", std::process::id());
-        assert!(owned::is_temp_name(OsStr::new(&leftover)));
-        fs::write(rules.join("lang").join(&leftover), "half").unwrap();
-        fs::write(rules.join(format!(".{hex}.tmp")), "half").unwrap();
-        fs::write(rules.join(".keep.tmp"), "not remuda's name").unwrap();
-        fs::write(a.join("rules/style.md"), "be very terse").unwrap();
-        fs::write(a.join("rules/new.md"), "new").unwrap();
-        fs::remove_dir_all(a.join("rules/lang")).unwrap();
-        ensure_links(&shared, &a).unwrap();
-        assert_eq!(
-            copies(&rules),
-            want(&[
-                ("linked.md", "linked rule"),
-                ("new.md", "new"),
-                ("style.md", "be very terse"),
-            ])
-        );
-        assert_eq!(
-            names(&rules),
-            [
-                ".keep.tmp",
-                "linked.md",
-                "mine.txt",
-                "new.md",
-                "style.md",
-                "theirs.md"
-            ]
-        );
-        assert_eq!(fs::read_to_string(rules.join("mine.txt")).unwrap(), "kept");
-        fs::remove_file(rules.join(".keep.tmp")).unwrap();
-
-        // No rules in the source any more: the copies go, and `rules` with them once nothing
-        // else is in it.
-        fs::remove_dir_all(a.join("rules")).unwrap();
-        ensure_links(&shared, &a).unwrap();
-        assert_eq!(names(&rules), ["mine.txt", "theirs.md"]);
-        fs::remove_file(rules.join("mine.txt")).unwrap();
-        fs::remove_file(rules.join("theirs.md")).unwrap();
-        with_rules(&a);
-        ensure_links(&shared, &a).unwrap();
-        fs::remove_dir_all(a.join("rules")).unwrap();
-        ensure_links(&shared, &a).unwrap();
-        assert_eq!(
-            names(&shared.join(".claude")),
-            ["CLAUDE.md", "agents", "skills"]
-        );
-
-        // The earlier whole-home link is migrated with the rules in place.
-        with_rules(&a);
-        fs::remove_dir_all(shared.join(".claude")).unwrap();
-        symlink(&a, shared.join(".claude")).unwrap();
-        ensure_links(&shared, &a).unwrap();
-        assert_eq!(copies(&rules).len(), 3);
-        assert_eq!(names(&shared), [".claude"]);
-    }
-
-    /// R18: `rules`, a directory on the way to a copy, or a copy's place that is not what
-    /// remuda would have put there is never replaced, and then nothing is changed, the item
-    /// links included.
-    #[test]
-    fn rule_entries_remuda_did_not_make_are_left_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("remuda/shared/claude");
-        let a = source_home(dir.path(), "a");
-        with_rules(&a);
-        let root = shared.join(".claude");
-        let check = |what: &str| {
-            let before = tree(&shared);
-            let e = ensure_links(&shared, &a).unwrap_err().to_string();
-            assert!(e.contains(what), "{e}");
-            assert_eq!(tree(&shared), before);
-        };
-
-        // `rules` a symlink, then a file.
-        fs::create_dir_all(&root).unwrap();
-        symlink(a.join("rules"), root.join("rules")).unwrap();
-        check("rules is not a directory; remuda does not replace it");
-        fs::remove_file(root.join("rules")).unwrap();
-        fs::write(root.join("rules"), "what").unwrap();
-        check("rules is not a directory; remuda does not replace it");
-
-        // A link where a subdirectory would be; a directory that holds something of the
-        // user's, and a link, where a copy would go.
-        fs::remove_file(root.join("rules")).unwrap();
-        fs::create_dir(root.join("rules")).unwrap();
-        symlink(a.join("rules/lang"), root.join("rules/lang")).unwrap();
-        check("lang is not a directory; remuda does not replace it");
-        fs::remove_file(root.join("rules/lang")).unwrap();
-        fs::create_dir(root.join("rules/style.md")).unwrap();
-        fs::write(root.join("rules/style.md/mine.txt"), "kept").unwrap();
-        check("style.md is not a regular file; remuda does not replace it");
-        fs::remove_dir_all(root.join("rules/style.md")).unwrap();
-        symlink(a.join("rules/style.md"), root.join("rules/style.md")).unwrap();
-        check("style.md is not a regular file; remuda does not replace it");
-
-        // Out of the way: everything is made.
-        fs::remove_file(root.join("rules/style.md")).unwrap();
-        ensure_links(&shared, &a).unwrap();
-        assert_eq!(
-            fs::read_to_string(root.join("rules/style.md")).unwrap(),
-            "be terse"
-        );
-        assert_eq!(links(&shared).len(), 3);
-    }
-
-    /// R18: a rule that becomes a directory of rules, or the reverse, replaces remuda's own
-    /// copy of the other kind; a directory holding anything that is not remuda's stays, and
-    /// that is an error.
-    #[test]
-    fn a_rule_and_a_directory_of_rules_swap_places() {
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("remuda/shared/claude");
-        let a = source_home(dir.path(), "a");
-        let rules = shared.join(".claude/rules");
-        fs::create_dir_all(a.join("rules/topic.md/deep")).unwrap();
-        fs::write(a.join("rules/topic.md/part.md"), "part").unwrap();
-        fs::write(a.join("rules/topic.md/deep/more.md"), "more").unwrap();
-        ensure_links(&shared, &a).unwrap();
-        assert!(rules.join("topic.md/deep/more.md").is_file());
-
-        // The directory becomes a file.
-        fs::remove_dir_all(a.join("rules/topic.md")).unwrap();
-        fs::write(a.join("rules/topic.md"), "one rule").unwrap();
-        ensure_links(&shared, &a).unwrap();
-        assert_eq!(
-            fs::read_to_string(rules.join("topic.md")).unwrap(),
-            "one rule"
-        );
-        assert_eq!(names(&rules), ["topic.md"]);
-
-        // And back.
-        fs::remove_file(a.join("rules/topic.md")).unwrap();
-        fs::create_dir(a.join("rules/topic.md")).unwrap();
-        fs::write(a.join("rules/topic.md/part.md"), "part").unwrap();
-        ensure_links(&shared, &a).unwrap();
-        assert_eq!(names(&rules.join("topic.md")), ["part.md"]);
-
-        // Something of the user's in the directory: it stays, and nothing changes.
-        fs::write(rules.join("topic.md/mine.txt"), "kept").unwrap();
-        fs::remove_dir_all(a.join("rules/topic.md")).unwrap();
-        fs::write(a.join("rules/topic.md"), "one rule").unwrap();
-        let before = tree(&shared);
-        let e = ensure_links(&shared, &a).unwrap_err().to_string();
-        assert!(e.contains("topic.md is not a regular file"), "{e}");
-        assert_eq!(tree(&shared), before);
-    }
-
-    /// R18: where the file system ignores case, a rule renamed only in case keeps its copy.
-    #[test]
-    fn a_rule_renamed_in_case_only_keeps_its_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("Probe"), "").unwrap();
-        if !dir.path().join("probe").exists() {
-            return;
-        }
-        let shared = dir.path().join("remuda/shared/claude");
-        let a = source_home(dir.path(), "a");
-        fs::create_dir(a.join("rules")).unwrap();
-        fs::write(a.join("rules/Style.md"), "be terse").unwrap();
-        ensure_links(&shared, &a).unwrap();
-        fs::rename(a.join("rules/Style.md"), a.join("rules/style.md")).unwrap();
-        ensure_links(&shared, &a).unwrap();
-        let rules = shared.join(".claude/rules");
-        assert_eq!(names(&rules).len(), 1);
-        assert_eq!(
-            fs::read_to_string(rules.join("style.md")).unwrap(),
-            "be terse"
-        );
-    }
-
-    /// R18: at most [`MAX_RULES`] rules are shared, the first in name order.
-    #[test]
-    fn the_number_of_rules_is_capped() {
-        let dir = tempfile::tempdir().unwrap();
-        for n in 0..MAX_RULES + 5 {
-            fs::write(dir.path().join(format!("r{n:04}.md")), "").unwrap();
-        }
-        let rules = rule_files(dir.path());
-        assert_eq!(rules.len(), MAX_RULES);
-        assert_eq!(rules[0], PathBuf::from("r0000.md"));
-        assert_eq!(rules[MAX_RULES - 1], PathBuf::from("r0999.md"));
-    }
-
-    /// R18: launches at the same time agree on the copies while the source's rules change
-    /// under them: none fails, and the next launch leaves exactly the source's rules.
-    #[test]
-    fn concurrent_launches_agree_on_the_rules() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, Barrier};
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("remuda/shared/claude");
-        let a = source_home(dir.path(), "a");
-        fs::create_dir_all(a.join("rules/lang")).unwrap();
-        fs::write(a.join("rules/lang/p.md"), "p").unwrap();
-        ensure_links(&shared, &a).unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let flipper = {
-            let (a, stop) = (a.clone(), stop.clone());
-            std::thread::spawn(move || {
-                let (p, q) = (a.join("rules/lang/p.md"), a.join("rules/lang/q.md"));
-                while !stop.load(Ordering::Relaxed) {
-                    let _ = fs::rename(&p, &q);
-                    let _ = fs::rename(&q, &p);
-                }
-            })
-        };
-        let barrier = Arc::new(Barrier::new(4));
-        let threads: Vec<_> = (0..4)
-            .map(|_| {
-                let (shared, a, barrier) = (shared.clone(), a.clone(), barrier.clone());
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    for round in 0..300 {
-                        ensure_links(&shared, &a)
-                            .unwrap_or_else(|e| panic!("round {round}: {e:#}"));
-                    }
-                })
-            })
-            .collect();
-        for t in threads {
-            t.join().unwrap();
-        }
-        stop.store(true, Ordering::Relaxed);
-        flipper.join().unwrap();
-        ensure_links(&shared, &a).unwrap();
-        assert_eq!(names(&shared.join(".claude/rules/lang")), ["p.md"]);
-        assert_eq!(names(&shared), [".claude"]);
-    }
-
-    /// R18: the variable an outer remuda launch set (the source's home) is decided again, not
-    /// inherited: removed for the source, an opted-out account and a member that gets no
-    /// auto-memory injected, set again for a member that does. A value of the user's own is
-    /// left as it is.
-    #[test]
-    fn an_inherited_memory_variable_is_decided_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (source_home, max, solo) = (root.join("src"), root.join("max"), root.join("solo"));
-        for d in [&source_home, &max, &solo] {
-            fs::create_dir_all(d.join("projects")).unwrap();
-        }
-        let source = named("src", &source_home);
-        let sharing = Sharing {
-            source: Some(source.clone()),
-            opted_out: vec!["claude:solo".into()],
-        };
-        let config = root.join("remuda/config.toml");
-        let inherited: Env = [(
-            MEMORY_DIR_VAR.to_string(),
-            source_home.display().to_string(),
-        )]
-        .into();
-        let run = |account: &Account, args: &[&str], env: &Env| {
-            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-            inject(&sharing, account, &args, Some(&root), env, &config).unwrap()
-        };
-        let var = |shared: &Shared| shared.env.iter().any(|(k, _)| k == MEMORY_DIR_VAR);
-        let unset = [MEMORY_DIR_VAR.to_string()];
-
-        let got = run(&named("max", &max), &[], &inherited);
-        assert!(var(&got) && got.unset.is_empty(), "{got:?}");
-        for (account, args) in [
-            (&source, &[][..]),
-            (&named("solo", &solo), &[][..]),
-            (&named("max", &max), &["--settings", "/mine.json"][..]),
-        ] {
-            let got = run(account, args, &inherited);
-            assert!(!var(&got), "{got:?}");
-            assert_eq!(got.unset, unset, "{}", account.qualified());
-        }
-
-        // The settings file cannot be written: no variable without it.
-        let blocked = root.join("blocked/config.toml");
-        fs::create_dir_all(root.join("blocked/state")).unwrap();
-        fs::write(root.join("blocked/state/settings"), "in the way").unwrap();
-        for env in [&inherited, &Env::new()] {
-            let got = inject(
-                &sharing,
-                &named("max", &max),
-                &[],
-                Some(&root),
-                env,
-                &blocked,
-            )
-            .unwrap();
-            assert!(!var(&got), "{got:?}");
-            assert_eq!(got.unset.is_empty(), env.is_empty());
-            assert!(got.notices[0].contains("settings from claude:src are not shared"));
-        }
-
-        // The user's own value: neither set nor removed, for anyone.
-        let users: Env = [(MEMORY_DIR_VAR.to_string(), "/theirs".to_string())].into();
-        for account in [&source, &named("max", &max), &named("solo", &solo)] {
-            let got = run(account, &[], &users);
-            assert!(!var(&got) && got.unset.is_empty(), "{got:?}");
-        }
-        // Without a source there is nothing to compare it with.
-        let alone = super::inject(
-            &Sharing::default(),
-            &named("max", &max),
-            &[],
-            Some(&root),
-            &inherited,
-            &config,
-        )
-        .unwrap();
-        assert_eq!(alone, Shared::default());
-    }
-
-    /// R18: the memory of user-scope subagents is redirected to the source's home only
-    /// together with the injected auto-memory location: not when `projects` or `agent-memory`
-    /// is the source's already, when the user passes `--settings`, when a settings file
-    /// chooses the auto-memory location, or when the variable is already set. A linked
-    /// `projects` is the exception: the variable is set without `autoMemoryDirectory`.
-    #[test]
-    fn agent_memory_follows_the_injected_auto_memory() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (source_home, max) = (root.join("src"), root.join("max"));
-        for d in [&source_home, &max] {
-            fs::create_dir_all(d.join("projects")).unwrap();
-        }
-        fs::create_dir_all(source_home.join(AGENT_MEMORY)).unwrap();
-        let sharing = Sharing {
-            source: Some(named("src", &source_home)),
-            opted_out: vec![],
-        };
-        let config = root.join("remuda/config.toml");
-        let account = named("max", &max);
-        let var = |args: &[&str], env: &Env| {
-            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-            let plan = plan(&sharing, &account, &args, Some(&root), env).unwrap();
-            let shared = apply(&plan, &config).unwrap();
-            let var = shared
-                .env
-                .iter()
-                .find(|(k, _)| k == MEMORY_DIR_VAR)
-                .map(|(_, v)| v.clone());
-            assert_eq!(var.is_some(), plan.agent_memory.is_some());
-            assert!(var.is_none() || plan.memory.is_some() || plan.items.linked(Id::Projects));
-            var
-        };
-        let env = Env::new();
-        assert_eq!(var(&[], &env), Some(source_home.display().to_string()));
-
-        // The user's own settings: no auto-memory is injected, so no variable either.
-        assert_eq!(var(&["--settings", "/mine.json"], &env), None);
-        assert_eq!(var(&["--setting-sources=user"], &env), None);
-        // Already set by the user.
-        let set: Env = [(MEMORY_DIR_VAR.to_string(), "/theirs".to_string())].into();
-        assert_eq!(var(&[], &set), None);
-        // A settings file chooses the auto-memory location.
-        fs::write(max.join("settings.json"), r#"{"autoMemoryDirectory":"/m"}"#).unwrap();
-        assert_eq!(var(&[], &env), None);
-        fs::remove_file(max.join("settings.json")).unwrap();
-        assert!(var(&[], &env).is_some());
-
-        // `agent-memory` is the source's already.
-        symlink(source_home.join(AGENT_MEMORY), max.join(AGENT_MEMORY)).unwrap();
-        let got = plan(&sharing, &account, &[], Some(&root), &env).unwrap();
-        assert!(got.items.linked(Id::AgentMemory) && got.agent_memory.is_none());
-        assert!(got.memory.is_some());
-        fs::remove_file(max.join(AGENT_MEMORY)).unwrap();
-
-        // `projects` is the source's: auto-memory is not injected, but the variable is set, so
-        // that claude reaches the memory directory by a path without the link.
-        fs::remove_dir(max.join("projects")).unwrap();
-        symlink(source_home.join("projects"), max.join("projects")).unwrap();
-        assert_eq!(var(&[], &env), Some(source_home.display().to_string()));
-        let got = plan(&sharing, &account, &[], Some(&root), &env).unwrap();
-        assert!(
-            got.items.linked(Id::Projects) && got.memory.is_none(),
-            "{got:?}"
-        );
-        assert!(!got.settings.contains_key(MEMORY_KEY), "{got:?}");
-        // Still the user's call: their own `--settings` or variable, or a chosen location.
-        assert_eq!(var(&["--settings", "/mine.json"], &env), None);
-        assert_eq!(var(&[], &set), None);
-        fs::write(max.join("settings.json"), r#"{"autoMemoryDirectory":"/m"}"#).unwrap();
-        assert_eq!(var(&[], &env), None);
-        fs::remove_file(max.join("settings.json")).unwrap();
-
-        // Everything linked and the source's settings malformed: set, and no error.
-        fs::write(source_home.join("settings.json"), "{not json").unwrap();
-        fs::create_dir_all(source_home.join("plugins")).unwrap();
-        for item in ["settings.json", "plugins"] {
-            symlink(source_home.join(item), max.join(item)).unwrap();
-        }
-        assert_eq!(var(&[], &env), Some(source_home.display().to_string()));
-    }
-
-    fn named(name: &str, home: &Path) -> Account {
-        Account {
-            provider: CLAUDE,
-            name: name.into(),
-            home: Home::Path(home.display().to_string()),
-        }
     }
 
     /// R11, R18: a member whose `settings.json` is the source's reads all of it, so a session
@@ -3056,8 +1246,7 @@ mod tests {
         fs::create_dir_all(source_home.join("plugins")).unwrap();
         let settings = source_home.join("settings.json");
         fs::write(&settings, r#"{"model": "opus"}"#).unwrap();
-        // `max` links everything the source has: nothing is injected, and before this no file
-        // was read.
+        // `max` links everything the source has.
         fs::remove_dir(max.join("projects")).unwrap();
         for item in ["settings.json", "projects", "plugins"] {
             symlink(source_home.join(item), max.join(item)).unwrap();
@@ -3067,11 +1256,8 @@ mod tests {
             opted_out: vec![],
         };
         let env = Env::new();
-        let notices = |home: &Path, name: &str| {
-            plan(&sharing, &named(name, home), &[], None, &env)
-                .unwrap()
-                .notices
-        };
+        let notices =
+            |home: &Path, name: &str| plan(&sharing, &named(name, home), &[], None, &env).notices;
         assert_eq!(notices(&max, "max"), Vec::<String>::new());
 
         fs::write(
@@ -3087,265 +1273,12 @@ mod tests {
               settings.json link: apiKeyHelper, env.ANTHROPIC_API_KEY"
             ]
         );
-        // `team` gets its settings injected, without them: nothing to say.
+        // `team` keeps its own settings: nothing to say.
         assert_eq!(notices(&team, "team"), Vec::<String>::new());
-        // A file that cannot be read is R11's to report, and a fully linked home still starts.
+        // A file that cannot be read is the source's account card's to report (R22), and a
+        // fully linked home still starts.
         fs::write(&settings, "[]").unwrap();
         assert_eq!(notices(&max, "max"), Vec::<String>::new());
-    }
-
-    /// R18: members get the injection, in `--option=value` form; the source, an opted-out
-    /// account and codex accounts get nothing, nor does anyone when the source home is gone.
-    #[test]
-    fn only_members_get_the_injection() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (source_home, max, solo) = (root.join("src"), root.join("max"), root.join("solo"));
-        for d in [&source_home, &max, &solo] {
-            fs::create_dir_all(d).unwrap();
-        }
-        fs::write(source_home.join("CLAUDE.md"), "x").unwrap();
-        fs::write(source_home.join("settings.json"), r#"{"model":"opus"}"#).unwrap();
-        let source = named("src", &source_home);
-        let sharing = Sharing {
-            source: Some(source.clone()),
-            opted_out: vec!["claude:solo".into()],
-        };
-        let config = root.join("remuda/config.toml");
-        let shared_dir = super::dir(&config);
-        let env: Env = [("PATH".to_string(), std::env::var("PATH").unwrap())].into();
-        let inject =
-            |account: &Account| inject(&sharing, account, &[], Some(&root), &env, &config).unwrap();
-        let got = inject(&named("max", &max));
-        let want = json!({
-            "autoMemoryDirectory": format!(
-                "{}/projects/{}/memory",
-                source_home.display(),
-                encode_project(root.to_str().unwrap()).unwrap()
-            ),
-            "model": "opus",
-        })
-        .to_string();
-        let file = settings_dir(&config).join(format!("{:x}.json", Sha256::digest(&want)));
-        assert_eq!(
-            got.args,
-            [
-                format!("--add-dir={}", shared_dir.display()),
-                format!("--settings={}", file.display()),
-            ]
-        );
-        assert_eq!(fs::read_to_string(&file).unwrap(), want);
-        assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, 0o600);
-        assert_eq!(
-            got.env,
-            [
-                (CLAUDE_MD_VAR.to_string(), "1".to_string()),
-                (
-                    MEMORY_DIR_VAR.to_string(),
-                    source_home.display().to_string()
-                ),
-            ]
-        );
-        assert_eq!(got.notices, Vec::<String>::new());
-        assert_eq!(
-            links(&shared_dir),
-            [("CLAUDE.md", source_home.join("CLAUDE.md"))]
-        );
-        let logged = got.logged();
-        assert_eq!(logged[0].option, "--add-dir");
-        assert_eq!(logged[0].bytes, shared_dir.display().to_string().len());
-        assert_eq!(logged[1].option, "--settings");
-        assert_eq!(logged[1].bytes, file.display().to_string().len());
-
-        assert_eq!(inject(&source), Shared::default());
-        assert_eq!(inject(&named("solo", &solo)), Shared::default());
-        let codex = Account {
-            provider: CODEX,
-            ..named("cx", &max)
-        };
-        assert_eq!(inject(&codex), Shared::default());
-        let gone = Sharing {
-            source: Some(named("src", &root.join("gone"))),
-            ..sharing.clone()
-        };
-        assert_eq!(
-            super::inject(&gone, &named("max", &max), &[], None, &env, &config).unwrap(),
-            Shared::default()
-        );
-    }
-
-    /// R18: authentication settings never travel to a member, whatever the home defines: the
-    /// listed keys, and `env` names by prefix, by secret-like part, or exactly; model names are
-    /// shared. R11 lists them.
-    #[test]
-    fn authentication_is_never_injected() {
-        let source = map(json!({
-            "apiKeyHelper": "/bin/key",
-            "proxyAuthHelper": "/bin/proxy",
-            "forceLoginOrgUUID": "org",
-            "model": "opus",
-            "env": {
-                "ANTHROPIC_API_KEY": "sk",
-                "ANTHROPIC_AWS_API_KEY": "k",
-                "ANTHROPIC_MODEL": "opus",
-                "ANTHROPIC_SMALL_FAST_MODEL": "haiku",
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": "s",
-                "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "o",
-                "ANTHROPIC_DEFAULT_OPUS_MODEL_TOKEN": "t",
-                "AWS_BEARER_TOKEN_BEDROCK": "b",
-                "AWS_REGION": "us-east-1",
-                "CLAUDE_CODE_USE_MANTLE": "1",
-                "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
-                "_CLAUDE_CODE_X": "1",
-                "GOOGLE_CLOUD_PROJECT": "p",
-                "CLOUD_ML_REGION": "r",
-                "github_token": "gh",
-                "MY_SERVICE_BASE_URL": "https://x",
-                "CLAUDE_CONFIG_DIR": "/c",
-                "DISABLE_TELEMETRY": "1",
-                "BASH_DEFAULT_TIMEOUT_MS": "1000",
-            },
-        }));
-        assert_eq!(
-            withheld(&source),
-            [
-                "apiKeyHelper",
-                "proxyAuthHelper",
-                "forceLoginOrgUUID",
-                "env.ANTHROPIC_API_KEY",
-                "env.ANTHROPIC_AWS_API_KEY",
-                "env.ANTHROPIC_DEFAULT_OPUS_MODEL_TOKEN",
-                "env.AWS_BEARER_TOKEN_BEDROCK",
-                "env.AWS_REGION",
-                "env.CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-                "env.CLAUDE_CODE_USE_MANTLE",
-                "env.CLAUDE_CONFIG_DIR",
-                "env.CLOUD_ML_REGION",
-                "env.GOOGLE_CLOUD_PROJECT",
-                "env.MY_SERVICE_BASE_URL",
-                "env._CLAUDE_CODE_X",
-                "env.github_token",
-            ]
-        );
-        let mut injected = missing_from(&source, &Map::new());
-        strip_auth(&mut injected);
-        assert_eq!(
-            Value::Object(injected),
-            json!({"model": "opus", "env": {
-                "ANTHROPIC_MODEL": "opus",
-                "ANTHROPIC_SMALL_FAST_MODEL": "haiku",
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": "s",
-                "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "o",
-                "DISABLE_TELEMETRY": "1",
-                "BASH_DEFAULT_TIMEOUT_MS": "1000",
-            }})
-        );
-        let mut only_auth = map(json!({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}));
-        strip_auth(&mut only_auth);
-        assert_eq!(only_auth, Map::new(), "an emptied env goes too");
-    }
-
-    /// R18: where claude's merge replaces (`fallbackModel`, `modelPicker`), the other side's
-    /// value wins whole; where it merges one level deep (`extraKnownMarketplaces` and its alias
-    /// `additionalMarketplaces`, `managedMcpServers`), each entry the other side has wins whole.
-    #[test]
-    fn keys_claude_does_not_merge_deeply_are_compared_whole() {
-        let source = map(json!({
-            "fallbackModel": ["opus", "sonnet"],
-            "modelPicker": {"options": [{"id": "opus"}]},
-            "extraKnownMarketplaces": {
-                "shared": {"source": {"source": "github", "repo": "a/b"}},
-                "mine": {"source": {"source": "github", "repo": "src/m"}},
-                "aliased": {"source": {"source": "github", "repo": "src/x"}},
-            },
-            "managedMcpServers": {
-                "db": {"command": "db", "args": ["--src"]},
-                "web": {"command": "web"},
-            },
-        }));
-        let home = map(json!({
-            "fallbackModel": ["haiku"],
-            "modelPicker": {"default": "sonnet"},
-            "extraKnownMarketplaces": {"mine": {"source": {"source": "directory"}}},
-            "additionalMarketplaces": {"aliased": {"source": {"source": "directory"}}},
-            "managedMcpServers": {"db": {"command": "db", "env": {"A": "1"}}},
-        }));
-        assert_eq!(
-            Value::Object(missing_from(&source, &home)),
-            json!({
-                "extraKnownMarketplaces": {
-                    "shared": {"source": {"source": "github", "repo": "a/b"}},
-                },
-                "managedMcpServers": {"web": {"command": "web"}},
-            })
-        );
-        // Not defined on the other side: everything goes, as for any key.
-        assert_eq!(missing_from(&source, &Map::new()), source);
-        // Every entry taken: the key goes.
-        let all = map(json!({"managedMcpServers": {"db": {}, "web": {}}}));
-        assert_eq!(missing_from(&source, &all).get("managedMcpServers"), None);
-        // The source's alias against the home's canonical spelling.
-        let alias = map(json!({"additionalMarketplaces": {"mine": {}, "new": {}}}));
-        let canonical = map(json!({"extraKnownMarketplaces": {"mine": {}}}));
-        assert_eq!(
-            Value::Object(missing_from(&alias, &canonical)),
-            json!({"additionalMarketplaces": {"new": {}}})
-        );
-    }
-
-    /// R18: settings travel as `<sha256>.json`, mode 0600; the same content reuses its file
-    /// and marks it used; writing a new one removes files unused for 30 days, and nothing else.
-    #[test]
-    fn settings_files_are_content_addressed_and_pruned() {
-        let dir = tempfile::tempdir().unwrap();
-        let settings = dir.path().join("state/settings");
-        let day = Duration::from_secs(24 * 60 * 60);
-        let now = SystemTime::now();
-        let age = |path: &Path, ago: Duration| {
-            let file = fs::File::options().write(true).open(path).unwrap();
-            file.set_modified(now - ago).unwrap();
-        };
-        let a = write_settings(&settings, r#"{"a":1}"#, now).unwrap();
-        age(&a, 40 * day);
-        assert_eq!(
-            a.file_name().unwrap().to_str().unwrap(),
-            format!("{:x}.json", Sha256::digest(br#"{"a":1}"#))
-        );
-        assert_eq!(fs::read_to_string(&a).unwrap(), r#"{"a":1}"#);
-        assert_eq!(fs::metadata(&a).unwrap().mode() & 0o777, 0o600);
-        assert_eq!(fs::metadata(&settings).unwrap().mode() & 0o777, 0o700);
-        let b = write_settings(&settings, r#"{"b":1}"#, now).unwrap();
-        age(&b, 40 * day);
-        // Reused 35 days ago: `b` is marked used, `a` is not.
-        assert_eq!(
-            write_settings(&settings, r#"{"b":1}"#, now - 35 * day).unwrap(),
-            b
-        );
-        assert_eq!(
-            fs::metadata(&b).unwrap().modified().unwrap(),
-            now - 35 * day
-        );
-        let recent = write_settings(&settings, r#"{"c":1}"#, now).unwrap();
-        age(&recent, 10 * day);
-        fs::write(settings.join("notes.json"), "mine").unwrap();
-        age(&settings.join("notes.json"), 90 * day);
-        age(&settings.join(SETTINGS_LOCK), 90 * day);
-        // A new file now: `a` (40 days) and `b` (35 days) go; `recent`, `notes.json` and the
-        // lock file stay.
-        let d = write_settings(&settings, r#"{"d":1}"#, now).unwrap();
-        let mut left: Vec<PathBuf> = fs::read_dir(&settings)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .collect();
-        left.sort();
-        let mut want = vec![
-            recent,
-            d,
-            settings.join("notes.json"),
-            settings.join(SETTINGS_LOCK),
-        ];
-        want.sort();
-        assert_eq!(left, want);
     }
 
     /// R18, R22: settings and plugin lists are read only from regular files, so a FIFO (or a
@@ -3377,375 +1310,9 @@ mod tests {
         );
     }
 
-    /// R18: the injected settings also yield to the project's `.claude/settings.json` and
-    /// `.claude/settings.local.json` of the start directory, and to the local settings of the
-    /// project root when claude reads those; nothing that turns out empty is passed.
-    #[test]
-    fn project_settings_keep_precedence() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (source_home, max) = (root.join("src"), root.join("max"));
-        fs::create_dir_all(&source_home).unwrap();
-        fs::create_dir_all(&max).unwrap();
-        fs::write(
-            source_home.join("settings.json"),
-            json!({
-                "model": "opus",
-                "effort": "high",
-                "theme": "dark",
-                "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "say"}]}]},
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let repo = root.join("repo");
-        let start = repo.join("app");
-        fs::create_dir_all(start.join(".claude")).unwrap();
-        fs::create_dir_all(repo.join(".claude")).unwrap();
-        run_git(&repo, &["init", "-q"]);
-        fs::write(start.join(".claude/settings.json"), r#"{"model": "haiku"}"#).unwrap();
-        fs::write(
-            start.join(".claude/settings.local.json"),
-            json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "say"}]}]}})
-                .to_string(),
-        )
-        .unwrap();
-        fs::write(
-            repo.join(".claude/settings.local.json"),
-            r#"{"effort": "low"}"#,
-        )
-        .unwrap();
-        // An invalid project file counts as absent.
-        fs::write(repo.join(".claude/settings.json"), "{").unwrap();
-        let sharing = Sharing {
-            source: Some(named("src", &source_home)),
-            opted_out: vec![],
-        };
-        let config = root.join("remuda/config.toml");
-        let env: Env = [
-            ("PATH".to_string(), std::env::var("PATH").unwrap()),
-            ("HOME".to_string(), root.join("home").display().to_string()),
-        ]
-        .into();
-        let got = inject(
-            &sharing,
-            &named("max", &max),
-            &[],
-            Some(&start),
-            &env,
-            &config,
-        )
-        .unwrap();
-        let settings = got
-            .args
-            .iter()
-            .find_map(|a| a.strip_prefix("--settings="))
-            .unwrap();
-        let settings: Value = serde_json::from_str(&fs::read_to_string(settings).unwrap()).unwrap();
-        assert_eq!(settings["theme"], json!("dark"));
-        for gone in ["model", "effort", "hooks"] {
-            assert!(settings.get(gone).is_none(), "{gone}: {settings}");
-        }
-        assert!(settings.get(MEMORY_KEY).is_some());
-
-        // The project's local settings choose the memory location: none is injected.
-        fs::write(
-            start.join(".claude/settings.local.json"),
-            json!({"autoMemoryDirectory": "/mine"}).to_string(),
-        )
-        .unwrap();
-        let got = inject(
-            &sharing,
-            &named("max", &max),
-            &[],
-            Some(&start),
-            &env,
-            &config,
-        )
-        .unwrap();
-        let settings = got
-            .args
-            .iter()
-            .find_map(|a| a.strip_prefix("--settings="))
-            .unwrap();
-        let settings: Value = serde_json::from_str(&fs::read_to_string(settings).unwrap()).unwrap();
-        assert!(settings.get(MEMORY_KEY).is_none(), "{settings}");
-    }
-
-    /// R18: plugins the home turns off, or installed itself, are not injected again.
-    #[test]
-    fn plugins_the_home_turns_off_or_has_are_skipped() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (source_home, max) = (root.join("src"), root.join("max"));
-        let cache = source_home.join("plugins/cache");
-        for p in ["a", "b", "c"] {
-            fs::create_dir_all(cache.join(p)).unwrap();
-        }
-        fs::create_dir_all(max.join("plugins")).unwrap();
-        fs::write(
-            source_home.join("settings.json"),
-            json!({"enabledPlugins": {"a@m": true, "b@m": true, "c@m": true}}).to_string(),
-        )
-        .unwrap();
-        let install = |p: &str| json!([{"scope": "user", "installPath": cache.join(p)}]);
-        fs::write(
-            source_home.join("plugins/installed_plugins.json"),
-            json!({"version": 2, "plugins": {"a@m": install("a"), "b@m": install("b"),
-                                             "c@m": install("c")}})
-            .to_string(),
-        )
-        .unwrap();
-        fs::write(
-            max.join("settings.json"),
-            json!({"enabledPlugins": {"b@m": false}}).to_string(),
-        )
-        .unwrap();
-        fs::write(
-            max.join("plugins/installed_plugins.json"),
-            json!({"version": 2, "plugins": {"c@m": [{"scope": "user", "installPath": "/own/c"}]}})
-                .to_string(),
-        )
-        .unwrap();
-        let sharing = Sharing {
-            source: Some(named("src", &source_home)),
-            opted_out: vec![],
-        };
-        let config = root.join("remuda/config.toml");
-        let got = inject(
-            &sharing,
-            &named("max", &max),
-            &["--settings".into(), "/x".into()],
-            Some(&root),
-            &Env::new(),
-            &config,
-        )
-        .unwrap();
-        assert_eq!(
-            got.args,
-            [format!("--plugin-dir={}", cache.join("a").display())]
-        );
-    }
-
-    /// R18: a plugin is not injected when the project turns it off, or when the home installed
-    /// it for this directory (`project` / `local` scope); a home install for another directory
-    /// does not count.
-    #[test]
-    fn project_disables_and_scoped_home_installs() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (source_home, max, work) = (root.join("src"), root.join("max"), root.join("work"));
-        let cache = source_home.join("plugins/cache");
-        for p in ["a", "b", "c", "d"] {
-            fs::create_dir_all(cache.join(p)).unwrap();
-        }
-        fs::create_dir_all(max.join("plugins")).unwrap();
-        fs::create_dir_all(work.join(".claude")).unwrap();
-        fs::write(
-            source_home.join("settings.json"),
-            json!({"enabledPlugins": {"a@m": true, "b@m": true, "c@m": true, "d@m": true}})
-                .to_string(),
-        )
-        .unwrap();
-        let install = |p: &str| json!([{"scope": "user", "installPath": cache.join(p)}]);
-        fs::write(
-            source_home.join("plugins/installed_plugins.json"),
-            json!({"version": 2, "plugins": {"a@m": install("a"), "b@m": install("b"),
-                                             "c@m": install("c"), "d@m": install("d")}})
-            .to_string(),
-        )
-        .unwrap();
-        // The project turns `a` off (local settings) ...
-        fs::write(
-            work.join(".claude/settings.local.json"),
-            json!({"enabledPlugins": {"a@m": false}}).to_string(),
-        )
-        .unwrap();
-        // ... the home installed `b` for this directory, `c` for another one.
-        fs::write(
-            max.join("plugins/installed_plugins.json"),
-            json!({"version": 2, "plugins": {
-                "b@m": [{"scope": "project", "installPath": "/own/b", "projectPath": work}],
-                "c@m": [{"scope": "local", "installPath": "/own/c", "projectPath": "/elsewhere"}],
-            }})
-            .to_string(),
-        )
-        .unwrap();
-        let sharing = Sharing {
-            source: Some(named("src", &source_home)),
-            opted_out: vec![],
-        };
-        let config = root.join("remuda/config.toml");
-        let got = inject(
-            &sharing,
-            &named("max", &max),
-            &["--setting-sources=user".into()],
-            Some(&work),
-            &Env::new(),
-            &config,
-        )
-        .unwrap();
-        assert_eq!(
-            got.args,
-            [
-                format!("--plugin-dir={}", cache.join("c").display()),
-                format!("--plugin-dir={}", cache.join("d").display()),
-            ]
-        );
-        // `--setting-sources` (either form), like `--settings`: no settings, a notice.
-        assert_eq!(
-            got.notices,
-            ["--setting-sources given: settings and auto-memory from claude:src are not injected"]
-        );
-        let got = inject(
-            &sharing,
-            &named("max", &max),
-            &["--setting-sources".into(), "user".into()],
-            Some(&work),
-            &Env::new(),
-            &config,
-        )
-        .unwrap();
-        assert!(!got.args.iter().any(|a| a.starts_with("--settings")));
-        assert_eq!(got.notices.len(), 1);
-        // Neither is a prefix match: `--settingsx` is not `--settings`.
-        let got = inject(
-            &sharing,
-            &named("max", &max),
-            &["--settingsx".into()],
-            Some(&work),
-            &Env::new(),
-            &config,
-        )
-        .unwrap();
-        assert!(
-            got.args.iter().any(|a| a.starts_with("--settings=")),
-            "{:?}",
-            got.args
-        );
-    }
-
-    /// A process that has exited and been waited for: its temporary files are leftovers.
-    fn dead_pid() -> u32 {
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        pid
-    }
-
-    fn temp_of(pid: u32) -> String {
-        format!(".remuda-{pid}-{}.tmp", uuid::Uuid::new_v4().simple())
-    }
-
-    /// R13, R18: `state/settings` is a directory of remuda's own, the user's alone: remuda
-    /// removes files there, so one that is a symlink is refused, and nothing is written or
-    /// removed where it points. One from before is tightened, like `state/`.
-    #[test]
-    fn a_settings_directory_that_is_a_symlink_is_not_written_through() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("remuda/state");
-        let settings = state.join("settings");
-        let outside = dir.path().join("outside");
-        fs::create_dir_all(&state).unwrap();
-        fs::create_dir(&outside).unwrap();
-        // What remuda would remove in a directory of its own: a settings file unused for long.
-        let old = outside.join(format!("{}.json", "a".repeat(64)));
-        fs::write(&old, "{}").unwrap();
-        let long_ago = SystemTime::now() - Duration::from_secs(90 * 24 * 60 * 60);
-        let file = fs::File::options().write(true).open(&old).unwrap();
-        file.set_modified(long_ago).unwrap();
-        symlink(&outside, &settings).unwrap();
-        let before = tree(dir.path());
-        let e = write_settings(&settings, r#"{"a":1}"#, SystemTime::now()).unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            format!(
-                "{} is a symlink; remuda does not write through it",
-                settings.display()
-            )
-        );
-        assert_eq!(tree(dir.path()), before);
-        assert!(old.exists());
-
-        fs::remove_file(&settings).unwrap();
-        fs::create_dir(&settings).unwrap();
-        fs::set_permissions(&settings, fs::Permissions::from_mode(0o755)).unwrap();
-        write_settings(&settings, r#"{"a":1}"#, SystemTime::now()).unwrap();
-        assert_eq!(fs::metadata(&settings).unwrap().mode() & 0o7777, 0o700);
-        assert_eq!(fs::metadata(&state).unwrap().mode() & 0o7777, 0o700);
-    }
-
-    /// R3, R18: a settings file whose write was killed leaves its temporary file; the next
-    /// new settings file removes it, and not that of a process still running.
-    #[test]
-    fn a_settings_write_cut_short_is_cleaned_up_by_the_next() {
-        let dir = tempfile::tempdir().unwrap();
-        let settings = dir.path().join("state/settings");
-        let now = SystemTime::now();
-        let first = write_settings(&settings, r#"{"a":1}"#, now).unwrap();
-        let (gone, running) = (temp_of(dead_pid()), temp_of(std::process::id()));
-        fs::write(settings.join(&gone), "{\"hal").unwrap();
-        fs::write(settings.join(&running), "{\"hal").unwrap();
-        // Reusing a file writes nothing, and removes nothing.
-        write_settings(&settings, r#"{"a":1}"#, now).unwrap();
-        assert!(settings.join(&gone).exists());
-        let second = write_settings(&settings, r#"{"b":1}"#, now).unwrap();
-        let mut want = vec![
-            SETTINGS_LOCK.to_string(),
-            running,
-            first.file_name().unwrap().to_str().unwrap().to_string(),
-            second.file_name().unwrap().to_str().unwrap().to_string(),
-        ];
-        want.sort();
-        assert_eq!(names(&settings), want);
-    }
-
-    /// R18: an item link whose replacement was killed between the temporary link and the
-    /// rename leaves that link in `.claude`; the next launch removes it, and nothing else
-    /// that it did not make.
-    #[test]
-    fn a_link_replacement_cut_short_is_cleaned_up_by_the_next_launch() {
-        let dir = tempfile::tempdir().unwrap();
-        let shared = dir.path().join("remuda/shared/claude");
-        let a = source_home(dir.path(), "a");
-        ensure_links(&shared, &a).unwrap();
-        let root = shared.join(".claude");
-        let gone = temp_of(dead_pid());
-        symlink(a.join("skills"), root.join(&gone)).unwrap();
-        fs::write(root.join("mine.txt"), "kept").unwrap();
-        symlink("/somewhere", root.join(".mine.tmp")).unwrap();
-        ensure_links(&shared, &a).unwrap();
-        assert_eq!(
-            names(&root),
-            [".mine.tmp", "CLAUDE.md", "agents", "mine.txt", "skills"]
-        );
-        assert_eq!(links(&shared).len(), 3);
-    }
-
-    /// R18: the settings lock is `.lock`, a regular 0600 file, and excludes a second holder
-    /// until the first is dropped; pruning never removes it.
-    #[test]
-    fn the_settings_lock_is_exclusive_and_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let settings = owned::Dir::open(dir.path()).unwrap();
-        let held = settings
-            .lock_file(SETTINGS_LOCK, &owned::Flock, owned::Lockless::Proceed)
-            .unwrap();
-        assert!(held.is_held());
-        let lock = dir.path().join(SETTINGS_LOCK);
-        let meta = fs::symlink_metadata(&lock).unwrap();
-        assert!(meta.is_file());
-        assert_eq!(meta.mode() & 0o777, 0o600);
-        let other = fs::File::open(&lock).unwrap();
-        // SAFETY: the descriptor is open for the call.
-        let try_lock = || unsafe { libc::flock(other.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(try_lock(), -1, "held elsewhere");
-        drop(held);
-        assert_eq!(try_lock(), 0);
-    }
-
     /// R18 (third review): the env rules with claude's host-auth, metadata and Vertex groups,
-    /// proxies and telemetry headers; token counts and model names are kept.
+    /// proxies and telemetry headers count as authentication; token counts and model names do
+    /// not.
     #[test]
     fn the_env_rules_withhold_by_group_and_keep_counts() {
         for name in [
@@ -3796,275 +1363,9 @@ mod tests {
         );
     }
 
-    /// R18: a home install counts as the home's own when claude loads it here: `user` or
-    /// `managed` scope, `projectPath` equal to the start directory, or both in git repositories
-    /// of the same root (claude's `wb`); outside git, only the same path.
-    #[test]
-    fn home_installs_count_when_claude_would_load_them() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let repo = root.join("repo");
-        fs::create_dir_all(repo.join(".git")).unwrap();
-        fs::create_dir_all(repo.join("a")).unwrap();
-        fs::create_dir_all(repo.join("b")).unwrap();
-        let other = root.join("other");
-        fs::create_dir_all(other.join(".git")).unwrap();
-        let (plain1, plain2) = (root.join("p1"), root.join("p2"));
-        fs::create_dir_all(&plain1).unwrap();
-        fs::create_dir_all(&plain2).unwrap();
-        let install = |scope: &str, project: Option<&Path>| Install {
-            scope: Some(scope.into()),
-            path: Some(PathBuf::from("/i")),
-            project: project.map(Path::to_path_buf),
-            version: None,
-        };
-        let with = |i: Install| Installs::Known([("x@m".to_string(), vec![i])].into());
-        let start = repo.join("a");
-        let cases = [
-            (install("user", None), true),
-            (install("managed", None), true),
-            (install("project", Some(&start)), true),
-            (install("local", Some(&repo.join("b"))), true),
-            (install("project", Some(&repo)), true),
-            (install("project", Some(&other)), false),
-            (install("project", None), false),
-            (install("weird", Some(&plain1)), false),
-        ];
-        for (i, want) in cases {
-            assert_eq!(
-                with(i.clone()).installed_for("x@m", Some(&start)),
-                want,
-                "{i:?}"
-            );
-        }
-        // Outside git only the same path counts.
-        let plain = with(install("local", Some(&plain2)));
-        assert!(!plain.installed_for("x@m", Some(&plain1)));
-        assert!(plain.installed_for("x@m", Some(&plain2)));
-        assert!(!plain.installed_for("y@m", Some(&plain2)));
-        assert!(!Installs::Missing.installed_for("x@m", Some(&plain2)));
-        assert_eq!(git_root(&plain1), None);
-        assert_eq!(project_root(&plain1), plain1);
-    }
-
-    /// R18: an `enabledPlugins` array counts as enabled; a home whose own
-    /// `installed_plugins.json` cannot be read gets no plugin at all.
-    #[test]
-    fn plugin_arrays_and_an_unreadable_home_list() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (source_home, max) = (root.join("src"), root.join("max"));
-        let cache = source_home.join("plugins/cache");
-        fs::create_dir_all(cache.join("a")).unwrap();
-        fs::create_dir_all(max.join("plugins")).unwrap();
-        fs::write(
-            source_home.join("settings.json"),
-            json!({"enabledPlugins": {"a@m": ["skill-one"]}}).to_string(),
-        )
-        .unwrap();
-        fs::write(
-            source_home.join("plugins/installed_plugins.json"),
-            json!({"version": 2, "plugins": {
-                "a@m": [{"scope": "user", "installPath": cache.join("a")}]}})
-            .to_string(),
-        )
-        .unwrap();
-        let sharing = Sharing {
-            source: Some(named("src", &source_home)),
-            opted_out: vec![],
-        };
-        let config = root.join("remuda/config.toml");
-        let run = || {
-            inject(
-                &sharing,
-                &named("max", &max),
-                &["--settings=/x".into()],
-                Some(&root),
-                &Env::new(),
-                &config,
-            )
-            .unwrap()
-            .args
-        };
-        assert_eq!(
-            run(),
-            [format!("--plugin-dir={}", cache.join("a").display())]
-        );
-        fs::write(
-            max.join("plugins/installed_plugins.json"),
-            r#"{"version": 9}"#,
-        )
-        .unwrap();
-        assert_eq!(run(), Vec::<String>::new());
-    }
-
-    /// R18, R22: the plan decides what a launch gets without writing anything; `inject` then
-    /// writes exactly what it decided.
-    #[test]
-    fn plan_decides_without_writing() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (source_home, max) = (root.join("src"), root.join("max"));
-        for d in [&source_home, &max] {
-            fs::create_dir_all(d).unwrap();
-        }
-        fs::write(source_home.join("CLAUDE.md"), "x").unwrap();
-        fs::write(source_home.join("settings.json"), r#"{"model":"opus"}"#).unwrap();
-        let sharing = Sharing {
-            source: Some(named("src", &source_home)),
-            opted_out: vec![],
-        };
-        let config = root.join("remuda/config.toml");
-        let env: Env = [("PATH".to_string(), std::env::var("PATH").unwrap())].into();
-        let memory = format!(
-            "{}/projects/{}/memory",
-            source_home.display(),
-            encode_project(root.to_str().unwrap()).unwrap()
-        );
-
-        let got = plan(&sharing, &named("max", &max), &[], Some(&root), &env).unwrap();
-        assert_eq!(
-            got.source,
-            Some(("claude:src".to_string(), source_home.clone()))
-        );
-        assert_eq!(got.items.instructions().unlinked, ["CLAUDE.md"]);
-        assert_eq!(
-            Value::Object(got.settings.clone()),
-            json!({"autoMemoryDirectory": memory, "model": "opus"})
-        );
-        assert_eq!(got.memory.as_deref(), Some(memory.as_str()));
-        assert_eq!(got.plugins, []);
-        assert!(!super::dir(&config).exists());
-        assert!(!settings_dir(&config).exists());
-
-        let shared = inject(
-            &sharing,
-            &named("max", &max),
-            &[],
-            Some(&root),
-            &env,
-            &config,
-        )
-        .unwrap();
-        let want = Value::Object(got.settings).to_string();
-        let file = settings_dir(&config).join(format!("{:x}.json", Sha256::digest(&want)));
-        assert_eq!(
-            shared.args,
-            [
-                format!("--add-dir={}", super::dir(&config).display()),
-                format!("--settings={}", file.display()),
-            ]
-        );
-    }
-
-    /// R18, R22: the plan records, for each plugin the source enables and in its order, the
-    /// install injected or why none is.
-    #[test]
-    fn plan_records_why_each_plugin_is_or_is_not_injected() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let (source_home, max, work) = (root.join("src"), root.join("max"), root.join("work"));
-        let cache = source_home.join("plugins/cache");
-        for p in ["a", "b", "c", "d"] {
-            fs::create_dir_all(cache.join(p)).unwrap();
-        }
-        fs::create_dir_all(max.join("plugins")).unwrap();
-        fs::create_dir_all(work.join(".claude")).unwrap();
-        fs::write(
-            source_home.join("settings.json"),
-            json!({"enabledPlugins": {"a@m": true, "b@m": true, "c@m": true, "d@m": true,
-                                      "e@builtin": true, "f@builtin": true}})
-            .to_string(),
-        )
-        .unwrap();
-        let install =
-            |p: &str| json!([{"scope": "user", "installPath": cache.join(p), "version": "1.0.0"}]);
-        let list = source_home.join("plugins/installed_plugins.json");
-        fs::write(
-            &list,
-            json!({"version": 2, "plugins": {"a@m": install("a"), "b@m": install("b"),
-                                             "c@m": install("c"), "d@m": install("d")}})
-            .to_string(),
-        )
-        .unwrap();
-        fs::write(
-            work.join(".claude/settings.json"),
-            json!({"enabledPlugins": {"e@builtin": false}}).to_string(),
-        )
-        .unwrap();
-        // The local settings sit above the project's: `e` is on again.
-        fs::write(
-            work.join(".claude/settings.local.json"),
-            json!({"enabledPlugins": {"a@m": false, "e@builtin": true, "f@builtin": false}})
-                .to_string(),
-        )
-        .unwrap();
-        let own_list = max.join("plugins/installed_plugins.json");
-        fs::write(
-            &own_list,
-            json!({"version": 2, "plugins": {
-                "b@m": [{"scope": "project", "installPath": "/own/b", "projectPath": work}],
-                "c@m": [{"scope": "local", "installPath": "/own/c", "projectPath": "/elsewhere"}],
-            }})
-            .to_string(),
-        )
-        .unwrap();
-        let sharing = Sharing {
-            source: Some(named("src", &source_home)),
-            opted_out: vec![],
-        };
-        let outcomes = || {
-            plan(&sharing, &named("max", &max), &[], Some(&work), &Env::new())
-                .unwrap()
-                .plugins
-                .into_iter()
-                .map(|p| (p.name, p.outcome))
-                .collect::<Vec<_>>()
-        };
-        let installed = |p: &str| {
-            Ok(PluginDir {
-                path: cache.join(p),
-                version: Some("1.0.0".into()),
-            })
-        };
-        assert_eq!(
-            outcomes(),
-            [
-                ("a@m".to_string(), Err(Skip::TurnedOff)),
-                ("b@m".to_string(), Err(Skip::OwnInstall)),
-                ("c@m".to_string(), installed("c")),
-                ("d@m".to_string(), installed("d")),
-                // Bundled with claude: nothing to inject, and no install to look for; one
-                // the project turned off is said to be (the highest layer decides).
-                ("e@builtin".to_string(), Err(Skip::Builtin)),
-                ("f@builtin".to_string(), Err(Skip::TurnedOff)),
-            ]
-        );
-
-        // The source's install of `d` is gone.
-        fs::remove_dir_all(cache.join("d")).unwrap();
-        assert_eq!(outcomes()[3], ("d@m".to_string(), Err(Skip::NotInstalled)));
-
-        // The home's list cannot be read: none is injected (the bundled one needs no list).
-        fs::write(&own_list, r#"{"version": 9}"#).unwrap();
-        assert_eq!(
-            outcomes()
-                .into_iter()
-                .map(|(_, outcome)| outcome)
-                .collect::<Vec<_>>(),
-            [
-                Err(Skip::UnrecognizedList),
-                Err(Skip::UnrecognizedList),
-                Err(Skip::UnrecognizedList),
-                Err(Skip::UnrecognizedList),
-                Err(Skip::Builtin),
-                Err(Skip::TurnedOff),
-            ]
-        );
-    }
-
     /// R22: of the installs of one plugin, a session uses the most specific that claude loads
-    /// there and whose path exists; `user_install` is what a launch injects (R18).
+    /// there and whose path exists; `user_install` is the source's install a member's own
+    /// install is compared with.
     #[test]
     fn the_effective_install_is_the_most_specific_that_loads() {
         let dir = tempfile::tempdir().unwrap();
@@ -4095,6 +1396,261 @@ mod tests {
         assert_eq!(installs.count("y@m"), 0);
         assert_eq!(Installs::Missing.count("x@m"), 0);
         assert_eq!(installs.user_install("x@m"), Some(&records[0]));
-        assert_eq!(installs.install_path("x@m"), Some(v1.as_path()));
+    }
+
+    fn named(name: &str, home: &Path) -> Account {
+        Account {
+            provider: CLAUDE,
+            name: name.into(),
+            home: Home::Path(home.display().to_string()),
+        }
+    }
+
+    /// Every entry below `root`, not following symlinks: path, kind and size.
+    fn tree(root: &Path) -> Vec<(PathBuf, String)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for e in fs::read_dir(&dir).unwrap().flatten() {
+                let meta = fs::symlink_metadata(e.path()).unwrap();
+                out.push((e.path(), format!("{:?} {}", meta.file_type(), meta.len())));
+                if meta.is_dir() {
+                    stack.push(e.path());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// R18: the variable an outer remuda launch set (the source's home) is decided again, not
+    /// inherited: removed for the source, an opted-out account, a member whose `projects` is
+    /// its own and a member that passes its own `--settings`; set again for a member whose
+    /// `projects` is the source's. A value of the user's own is left as it is.
+    #[test]
+    fn an_inherited_memory_variable_is_decided_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (source_home, max, solo, own) = (
+            root.join("src"),
+            root.join("max"),
+            root.join("solo"),
+            root.join("own"),
+        );
+        for d in [&source_home, &solo, &own] {
+            fs::create_dir_all(d.join("projects")).unwrap();
+        }
+        fs::create_dir_all(&max).unwrap();
+        symlink(source_home.join("projects"), max.join("projects")).unwrap();
+        let source = named("src", &source_home);
+        let sharing = Sharing {
+            source: Some(source.clone()),
+            opted_out: vec!["claude:solo".into()],
+        };
+        let inherited: Env = [(
+            MEMORY_DIR_VAR.to_string(),
+            source_home.display().to_string(),
+        )]
+        .into();
+        let run = |account: &Account, args: &[&str], env: &Env| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            at_launch(&sharing, account, &args, Some(&root), env)
+        };
+        let var = |shared: &Shared| shared.env.iter().any(|(k, _)| k == MEMORY_DIR_VAR);
+        let unset = [MEMORY_DIR_VAR.to_string()];
+
+        let got = run(&named("max", &max), &[], &inherited);
+        assert!(var(&got) && got.unset.is_empty(), "{got:?}");
+        for (account, args) in [
+            (&source, &[][..]),
+            (&named("solo", &solo), &[][..]),
+            (&named("own", &own), &[][..]),
+            (&named("max", &max), &["--settings", "/mine.json"][..]),
+        ] {
+            let got = run(account, args, &inherited);
+            assert!(!var(&got), "{got:?}");
+            assert_eq!(got.unset, unset, "{}", account.qualified());
+        }
+
+        // The user's own value: neither set nor removed, for anyone, and nothing to say.
+        let users: Env = [(MEMORY_DIR_VAR.to_string(), "/theirs".to_string())].into();
+        for account in [&source, &named("max", &max), &named("solo", &solo)] {
+            let got = run(account, &[], &users);
+            assert_eq!(got, Shared::default(), "{}", account.qualified());
+            let got = run(account, &["--settings", "/mine.json"], &users);
+            assert_eq!(got, Shared::default(), "{}", account.qualified());
+        }
+        // Without a source there is nothing to compare it with.
+        let alone = at_launch(
+            &Sharing::default(),
+            &named("max", &max),
+            &[],
+            Some(&root),
+            &inherited,
+        );
+        assert_eq!(alone, Shared::default());
+    }
+
+    /// R18: a member whose `projects` is the source's gets the variable, whether or not
+    /// `agent-memory` is linked too, and whatever the source's settings file is; not when the
+    /// user passes `--settings` or `--setting-sources` (said in a notice), sets the variable
+    /// themselves, or a settings file (the source's, the home's, the project's) chooses the
+    /// auto-memory location; never for a member whose `projects` is its own.
+    #[test]
+    fn the_memory_variable_follows_a_linked_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (source_home, max, work) = (root.join("src"), root.join("max"), root.join("work"));
+        fs::create_dir_all(source_home.join("projects")).unwrap();
+        fs::create_dir_all(source_home.join(AGENT_MEMORY)).unwrap();
+        fs::create_dir_all(max.join("projects")).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        let sharing = Sharing {
+            source: Some(named("src", &source_home)),
+            opted_out: vec![],
+        };
+        let account = named("max", &max);
+        let launch = |args: &[&str], env: &Env| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let plan = plan(&sharing, &account, &args, Some(&work), env);
+            let shared = plan.shared();
+            let var = shared
+                .env
+                .iter()
+                .find(|(k, _)| k == MEMORY_DIR_VAR)
+                .map(|(_, v)| v.clone());
+            assert_eq!(var.is_some(), plan.agent_memory.is_some());
+            assert!(var.is_none() || plan.items.linked(Id::Projects));
+            (var, shared.notices)
+        };
+        let var = |args: &[&str], env: &Env| launch(args, env).0;
+        let env = Env::new();
+        let set = Some(source_home.display().to_string());
+
+        // Its own `projects`: nothing, and nothing to say about the user's `--settings`.
+        assert_eq!(launch(&[], &env), (None, vec![]));
+        assert_eq!(launch(&["--settings", "/mine.json"], &env), (None, vec![]));
+
+        fs::remove_dir(max.join("projects")).unwrap();
+        symlink(source_home.join("projects"), max.join("projects")).unwrap();
+        assert_eq!(var(&[], &env), set);
+        // The user's own settings: remuda does not know whether they choose the location.
+        let notice = |option: &str| {
+            vec![format!(
+                "{option} given: {MEMORY_DIR_VAR} is not set for this session"
+            )]
+        };
+        assert_eq!(
+            launch(&["--settings", "/mine.json"], &env),
+            (None, notice("--settings"))
+        );
+        assert_eq!(
+            launch(&["-p", "hi", "--settings={\"a\":1}"], &env),
+            (None, notice("--settings"))
+        );
+        assert_eq!(
+            launch(&["--setting-sources", "user"], &env),
+            (None, notice("--setting-sources"))
+        );
+        assert_eq!(
+            launch(&["--setting-sources=user,local"], &env),
+            (None, notice("--setting-sources"))
+        );
+        // An option that only begins like one is the user's business, not a `--settings`.
+        assert_eq!(var(&["--settingsx"], &env), set);
+        // Already set by the user: theirs, silently.
+        let users: Env = [(MEMORY_DIR_VAR.to_string(), "/theirs".to_string())].into();
+        assert_eq!(launch(&[], &users), (None, vec![]));
+        assert_eq!(
+            launch(&["--settings", "/mine.json"], &users),
+            (None, vec![])
+        );
+        // A settings file chooses the auto-memory location: the home's own ...
+        fs::write(max.join("settings.json"), r#"{"autoMemoryDirectory":"/m"}"#).unwrap();
+        assert_eq!(launch(&[], &env), (None, vec![]));
+        fs::remove_file(max.join("settings.json")).unwrap();
+        assert_eq!(var(&[], &env), set);
+        // ... the source's, linked or not ...
+        let settings = source_home.join("settings.json");
+        fs::write(&settings, r#"{"autoMemoryDirectory":"/m"}"#).unwrap();
+        assert_eq!(var(&[], &env), None);
+        symlink(&settings, max.join("settings.json")).unwrap();
+        assert_eq!(var(&[], &env), None);
+        fs::remove_file(max.join("settings.json")).unwrap();
+        // ... or the project's.
+        fs::write(&settings, r#"{"model":"opus"}"#).unwrap();
+        assert_eq!(var(&[], &env), set);
+        fs::create_dir_all(work.join(".claude")).unwrap();
+        let project = work.join(".claude/settings.local.json");
+        fs::write(&project, r#"{"autoMemoryDirectory":"/m"}"#).unwrap();
+        assert_eq!(var(&[], &env), None);
+        fs::remove_file(&project).unwrap();
+        assert_eq!(var(&[], &env), set);
+
+        // `agent-memory` linked too: still set (the same directory either way).
+        symlink(source_home.join(AGENT_MEMORY), max.join(AGENT_MEMORY)).unwrap();
+        let got = plan(&sharing, &account, &[], Some(&work), &env);
+        assert!(got.items.linked(Id::AgentMemory) && got.agent_memory.is_some());
+        // The source's settings malformed, or a directory in their place: no location is
+        // seen, and no error.
+        fs::write(&settings, "{not json").unwrap();
+        assert_eq!(var(&[], &env), set);
+        fs::remove_file(&settings).unwrap();
+        fs::create_dir(&settings).unwrap();
+        symlink(&settings, max.join("settings.json")).unwrap();
+        assert_eq!(var(&[], &env), set);
+        // A non-session gets nothing (R6): decided by the launch, not here.
+        assert_eq!(var(&["auth", "status"], &env), set);
+    }
+
+    /// R18: only a member gets the variable; the source, an opted-out account, a codex
+    /// account and a member of a source whose home is gone get nothing, whatever their
+    /// `projects` links. Nothing is written anywhere by deciding it (R13).
+    #[test]
+    fn only_members_get_the_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (source_home, max, solo) = (root.join("src"), root.join("max"), root.join("solo"));
+        fs::create_dir_all(source_home.join("projects")).unwrap();
+        fs::write(source_home.join("CLAUDE.md"), "x").unwrap();
+        fs::write(source_home.join("settings.json"), r#"{"model":"opus"}"#).unwrap();
+        for home in [&max, &solo] {
+            fs::create_dir_all(home).unwrap();
+            symlink(source_home.join("projects"), home.join("projects")).unwrap();
+        }
+        let source = named("src", &source_home);
+        let sharing = Sharing {
+            source: Some(source.clone()),
+            opted_out: vec!["claude:solo".into()],
+        };
+        let env: Env = [("PATH".to_string(), std::env::var("PATH").unwrap())].into();
+        let before = tree(&root);
+        let launch = |account: &Account| at_launch(&sharing, account, &[], Some(&root), &env);
+        assert_eq!(
+            launch(&named("max", &max)),
+            Shared {
+                env: vec![(
+                    MEMORY_DIR_VAR.to_string(),
+                    source_home.display().to_string()
+                )],
+                ..Shared::default()
+            }
+        );
+        assert_eq!(launch(&source), Shared::default());
+        assert_eq!(launch(&named("solo", &solo)), Shared::default());
+        let codex = Account {
+            provider: CODEX,
+            ..named("cx", &max)
+        };
+        assert_eq!(launch(&codex), Shared::default());
+        let gone = Sharing {
+            source: Some(named("src", &root.join("gone"))),
+            ..sharing.clone()
+        };
+        assert_eq!(
+            at_launch(&gone, &named("max", &max), &[], Some(&root), &env),
+            Shared::default()
+        );
+        assert_eq!(tree(&root), before, "nothing is written");
     }
 }

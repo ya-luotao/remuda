@@ -713,16 +713,19 @@ fn tui_handover_lines_come_after_the_log_and_before_claude() {
     assert_eq!(sb.launches().len(), 1);
 }
 
-/// R16, R18: the TUI launches through the same path as `run`: shared configuration from the
-/// registry as it is at launch goes before the arguments, and its notices come back as
-/// warnings.
+/// R16, R18: the TUI launches through the same path as `run`: the shared configuration of the
+/// registry as it is at launch decides the memory variable for a member whose `projects` is
+/// the source's, nothing goes before the arguments, and the notice about a `--settings` of
+/// the user's own comes back as a warning.
 #[test]
 fn tui_launches_get_shared_configuration() {
     let sb = Sandbox::new();
     let source = ClaudeHome::at(sb.home().join(".claude"))
         .claude_md("be brief")
+        .dir("projects")
         .into_path();
     let max = sb.make_claude_home("max");
+    std::os::unix::fs::symlink(source.join("projects"), max.join("projects")).unwrap();
     sb.write_config(&format!(
         "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{}\"\n\
          [share.claude]\nfrom = \"default\"\n",
@@ -730,31 +733,39 @@ fn tui_launches_get_shared_configuration() {
     ));
     let dir = project(&sb);
     let account = named("max", max.to_str().unwrap());
+    let event = tui_launch(&sb, &account, &[], Some(&dir));
+    let Event::Launched { warnings, .. } = &event else {
+        panic!("{event:?}")
+    };
+    assert_eq!(warnings, &Vec::<String>::new());
+    let inv = sb.only_invocation();
+    assert_eq!(inv.args[0], "--session-id");
+    assert_eq!(inv.args.len(), 2, "{:?}", inv.args);
+    assert_eq!(inv.memory_dir.as_deref(), source.to_str());
+    assert_eq!(inv.add_dir_claude_md, None);
+    assert!(!sb.remuda_home().join("shared").exists());
+    assert!(!sb.remuda_home().join("state/settings").exists());
+    assert!(sb.launches()[0].get("shared").is_none());
+
+    // The user's own `--settings`: the variable stays unset, and the launch says so.
+    fs::remove_file(sb.claude_out()).unwrap();
     let event = tui_launch(&sb, &account, &["--settings", "/x.json"], Some(&dir));
     let Event::Launched { warnings, .. } = &event else {
         panic!("{event:?}")
     };
     assert_eq!(
         warnings,
-        &["--settings given: settings and auto-memory from claude:default are not injected"]
+        &["--settings given: CLAUDE_CODE_REMOTE_MEMORY_DIR is not set for this session"]
     );
     let inv = sb.only_invocation();
-    let shared = sb.remuda_home().join("shared/claude");
+    assert_eq!(inv.args[..2], ["--settings", "/x.json"]);
+    // Neither set nor removed: a launch from the TUI runs claude in this process's own
+    // environment, and whatever it holds passes through as it is.
     assert_eq!(
-        inv.args[..3],
-        [
-            format!("--add-dir={}", shared.display()),
-            "--settings".to_string(),
-            "/x.json".to_string()
-        ]
+        inv.memory_dir,
+        std::env::var("CLAUDE_CODE_REMOTE_MEMORY_DIR").ok()
     );
-    assert_eq!(inv.add_dir_claude_md.as_deref(), Some("1"));
-    assert_eq!(
-        fs::read_link(shared.join(".claude/CLAUDE.md")).unwrap(),
-        source.join("CLAUDE.md"),
-        "the shared directory holds one link per item the source has"
-    );
-    assert_eq!(sb.launches()[0]["shared"][0]["option"], json!("--add-dir"));
+    assert_ne!(inv.memory_dir.as_deref(), source.to_str());
 
     // A registry that cannot be read now: the launch does not happen.
     let deps = deps(&sb);
@@ -773,64 +784,6 @@ fn tui_launches_get_shared_configuration() {
     };
     assert!(e.contains("names no claude account"), "{e}");
     assert_eq!(sb.invocations().len(), 1);
-}
-
-/// R18: a directory typed into the TUI's new-session form is made real before it names the
-/// project: a symlink with a trailing slash and a `..` give the same memory location.
-#[test]
-fn tui_memory_uses_the_real_start_directory() {
-    let sb = Sandbox::new();
-    fs::create_dir_all(sb.home().join(".claude")).unwrap();
-    let max = sb.make_claude_home("max");
-    sb.write_config(&format!(
-        "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{}\"\n\
-         [share.claude]\nfrom = \"default\"\n",
-        max.display()
-    ));
-    let real = project(&sb).canonicalize().unwrap();
-    fs::create_dir_all(real.join("sub")).unwrap();
-    std::os::unix::fs::symlink(&real, sb.root().join("link")).unwrap();
-    let account = named("max", max.to_str().unwrap());
-    let mut deps = deps(&sb);
-    deps.env.insert("PATH".into(), sb.path_var());
-    let mut memories = Vec::new();
-    for typed in [
-        format!("{}/", sb.root().join("link").display()),
-        format!("{}/sub/..", real.display()),
-    ] {
-        let _ = fs::remove_file(sb.claude_out());
-        let request = LaunchRequest {
-            account: account.clone(),
-            args: vec![],
-            cwd: Some(typed.clone().into()),
-            what: "test".into(),
-        };
-        let mut screen = FakeScreen::default();
-        tui::launch_in_foreground(&mut screen, &deps, request, &quiet()).unwrap();
-        let inv = sb.only_invocation();
-        let path = inv.args[0]
-            .strip_prefix("--settings=")
-            .expect("settings injected");
-        let settings: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        memories.push(
-            settings["autoMemoryDirectory"]
-                .as_str()
-                .unwrap()
-                .to_string(),
-        );
-    }
-    let encoded: String = real
-        .to_str()
-        .unwrap()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let want = format!(
-        "{}/projects/{encoded}/memory",
-        sb.home().join(".claude").display()
-    );
-    assert_eq!(memories, [want.clone(), want]);
 }
 
 // --- codex from the TUI (R17) ---------------------------------------------------------------

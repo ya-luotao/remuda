@@ -29,7 +29,6 @@ use super::{privacy, timeline};
 use crate::live::Control;
 use crate::provider::Provider;
 use crate::registry::{Account, Home};
-use crate::share::Skip;
 
 /// From this width on, the preview sits beside the list instead of below it.
 pub const WIDE: u16 = 120;
@@ -1171,18 +1170,19 @@ fn role_text(v: &ConfigView) -> (String, Style) {
             DIM,
         ),
         ConfigRole::Source => (
-            "the source: other Claude accounts get this at launch".to_string(),
+            "the source: the other Claude accounts link to this home".to_string(),
             Style::new(),
         ),
-        ConfigRole::OptedOut { .. } => {
-            (format!("share = false: gets nothing from {src_short}"), DIM)
-        }
+        ConfigRole::OptedOut { .. } => (
+            format!("share = false: shares nothing with {src_short}"),
+            DIM,
+        ),
         ConfigRole::SourceMissing { .. } => (
             format!("{src_short}'s home does not exist: nothing is shared"),
             WARN,
         ),
         ConfigRole::Member { .. } => (
-            format!("gets {src_short}'s configuration at launch"),
+            format!("member of {src_short}: shares what its home links to it"),
             Style::new(),
         ),
     }
@@ -1371,13 +1371,7 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
     let enabled = v
         .plugins
         .iter()
-        .filter(|p| {
-            (p.path.is_some() && !p.off)
-                || matches!(
-                    p.origin,
-                    Origin::NotShared(Skip::Builtin | Skip::OwnInstall)
-                )
-        })
+        .filter(|p| (p.path.is_some() || p.origin == Origin::Bundled) && !p.off)
         .count();
     let mut plugins = format!("Plugins · {enabled} enabled");
     if v.disabled_plugins > 0 {
@@ -1401,11 +1395,11 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
                 }
                 out.line(&line, if p.off { DIM } else { Style::new() });
             }
-            (None, Origin::NotShared(Skip::Builtin)) => {
-                out.line(&format!("  {} · {origin}", p.name), Style::new());
+            (None, Origin::Bundled) if p.off => {
+                out.line(&format!("  {} · {origin} · turned off here", p.name), DIM);
             }
-            (None, Origin::NotShared(_)) => {
-                out.line(&format!("  {} · {origin}", p.name), DIM);
+            (None, Origin::Bundled) => {
+                out.line(&format!("  {} · {origin}", p.name), Style::new());
             }
             (None, _) => out.line(
                 &format!("  {} · {origin} · not installed here", p.name),
@@ -1432,21 +1426,15 @@ fn config_view_lines(app: &App, v: &ConfigView, out: &mut ConfigLines) {
         Style::new(),
     );
     summary_lines(&v.own_settings, out);
-    if !v.shared_settings.is_empty() {
-        out.line(
-            &format!("  injected · {}", origin_label(&Origin::Shared, src)),
-            Style::new(),
-        );
-        summary_lines(&v.shared_settings, out);
-    }
     if !v.withheld.is_empty() {
         let (prefix, style) = match v.role {
-            ConfigRole::Source => ("  withheld from injected settings (authentication): ", DIM),
+            // What keeps `setup` from linking the file into a new member's home (R18).
+            ConfigRole::Source => ("  authentication settings (not linked by setup): ", DIM),
             // The home's `settings.json` is the source's: it reads all of it (R11 warns).
             _ if v.settings_origin == Origin::AlreadySource => {
                 ("  read through the link (authentication): ", WARN)
             }
-            _ => ("  not shared (authentication): ", DIM),
+            _ => ("  authentication settings: ", DIM),
         };
         out.wrapped(prefix, &v.withheld.join(", "), style);
     }
@@ -1659,16 +1647,10 @@ fn origin_label(origin: &Origin, src: Option<&str>) -> String {
     let src = src.map(short).unwrap_or("the source");
     match origin {
         Origin::Own => "own".to_string(),
-        Origin::Shared => format!("shared from {src}"),
         Origin::AlreadySource => format!("already {src}'s"),
         Origin::Project => "set by the project".to_string(),
-        Origin::NotShared(Skip::TurnedOff) => "not shared: turned off here".to_string(),
-        Origin::NotShared(Skip::OwnInstall) => "not shared: installed by this home".to_string(),
-        Origin::NotShared(Skip::NotInstalled) => "not shared: no user install".to_string(),
-        Origin::NotShared(Skip::UnrecognizedList) => {
-            "not shared: installed_plugins.json not recognized".to_string()
-        }
-        Origin::NotShared(Skip::Builtin) => "bundled with claude".to_string(),
+        Origin::Bundled => "bundled with claude".to_string(),
+        Origin::Launch => "set at launch".to_string(),
     }
 }
 

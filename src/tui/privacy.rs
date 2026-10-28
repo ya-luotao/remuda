@@ -20,7 +20,6 @@ use crate::launch;
 use crate::live::{LiveId, LiveSession};
 use crate::privacy::{Aliases, Piece, alias_words};
 use crate::registry::{Account, DEFAULT_NAME, Home};
-use crate::share::Skip;
 use crate::stats::{self, ModelRow, Project, ProjectTable, Report, Section, Table};
 use crate::transcript::Message;
 use crate::usage::{CachedUsage, Resets, UsageRow};
@@ -921,7 +920,6 @@ impl Redactor<'_> {
             disabled_plugins,
             settings_origin,
             own_settings,
-            shared_settings,
             withheld,
             memory,
             agent_memory,
@@ -964,7 +962,6 @@ impl Redactor<'_> {
             disabled_plugins: *disabled_plugins,
             settings_origin: origin_copy(settings_origin),
             own_settings: summary(own_settings),
-            shared_settings: summary(shared_settings),
             withheld: withheld.clone(),
             memory: redact(memory),
             agent_memory: redact(agent_memory),
@@ -1109,16 +1106,10 @@ impl Redactor<'_> {
 fn origin_copy(origin: &Origin) -> Origin {
     match origin {
         Origin::Own => Origin::Own,
-        Origin::Shared => Origin::Shared,
         Origin::AlreadySource => Origin::AlreadySource,
-        Origin::NotShared(skip) => Origin::NotShared(match skip {
-            Skip::TurnedOff => Skip::TurnedOff,
-            Skip::OwnInstall => Skip::OwnInstall,
-            Skip::NotInstalled => Skip::NotInstalled,
-            Skip::UnrecognizedList => Skip::UnrecognizedList,
-            Skip::Builtin => Skip::Builtin,
-        }),
         Origin::Project => Origin::Project,
+        Origin::Bundled => Origin::Bundled,
+        Origin::Launch => Origin::Launch,
     }
 }
 

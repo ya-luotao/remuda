@@ -7771,9 +7771,10 @@ fn private_snapshot_follows_every_change() {
 
 // ---- Configuration (R22) ------------------------------------------------------------------
 
-/// A member's configuration: an agent with its frontmatter, a linked skill, shared
-/// instructions, a shared plugin, own settings with many hook events, withheld
-/// authentication, injected auto-memory, an MCP server.
+/// A member's configuration: an agent with its frontmatter, a linked skill, a `CLAUDE.md`
+/// that is the source's through a link, a plugin of its own, the source's settings read
+/// through the `settings.json` link with many hook events and authentication in them, the
+/// auto-memory of a linked `projects`, an MCP server.
 fn config_view() -> crate::account_config::ConfigView {
     use crate::account_config::{
         ConfigView, Content, Entry, Item, Mcp, Memory, Origin, Plugin, PluginContents, Role,
@@ -7809,7 +7810,7 @@ fn config_view() -> crate::account_config::ConfigView {
             },
             Item {
                 name: "CLAUDE.md",
-                origin: Origin::Shared,
+                origin: Origin::AlreadySource,
                 link: None,
                 content: Content::File {
                     bytes: 812,
@@ -7819,7 +7820,7 @@ fn config_view() -> crate::account_config::ConfigView {
         ],
         plugins: vec![Plugin {
             name: "ctx7@market".into(),
-            origin: Origin::Shared,
+            origin: Origin::Own,
             version: Some("1.2.0".into()),
             scope: Some("user".into()),
             installs: 1,
@@ -7831,6 +7832,7 @@ fn config_view() -> crate::account_config::ConfigView {
             }),
             off: false,
         }],
+        settings_origin: Origin::AlreadySource,
         own_settings: Summary {
             model: Some("opus".into()),
             env: vec!["DISABLE_TELEMETRY".into()],
@@ -7840,7 +7842,7 @@ fn config_view() -> crate::account_config::ConfigView {
         withheld: vec!["env.ANTHROPIC_API_KEY".into()],
         memory: Memory {
             dir: Some("/Users/you/.claude/projects/-Users-you-space-remuda/memory".into()),
-            origin: Origin::Shared,
+            origin: Origin::AlreadySource,
             files: Some(3),
         },
         mcp: Mcp {
@@ -7863,7 +7865,7 @@ fn zq_config_view() -> crate::account_config::ConfigView {
         instructions: vec![
             Item {
                 name: "agents",
-                origin: Origin::Shared,
+                origin: Origin::AlreadySource,
                 link: None,
                 content: Content::Entries(vec![Entry {
                     name: "helper".into(),
@@ -7886,7 +7888,7 @@ fn zq_config_view() -> crate::account_config::ConfigView {
         ],
         memory: Memory {
             dir: Some(format!("{ZQ_HOME}/.zqhomes/zqalpha/projects/-x/memory")),
-            origin: Origin::Shared,
+            origin: Origin::AlreadySource,
             files: Some(2),
         },
         problems: vec![
@@ -8310,7 +8312,7 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     assert!(!all.contains("does not exist"), "{all}");
     let (_, shares) = line_with(&lines, "Shares     ");
     assert!(
-        shares.contains("gets default's configuration at launch"),
+        shares.contains("member of default: shares what its home links to it"),
         "{shares}"
     );
 
@@ -8358,18 +8360,19 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     let body = config_text(&app, 200);
     for shown in [
         "Instructions\n  agents · own · 1\n    reviewer\n  skills · own · 1\n    pdf\n",
-        "CLAUDE.md · shared from default · 20 lines · 812 B",
-        "Plugins · 1 enabled\n  ctx7@market · 1.2.0 · user · shared from default",
+        "CLAUDE.md · already default's · 20 lines · 812 B",
+        "Plugins · 1 enabled\n  ctx7@market · 1.2.0 · user · own",
         "    hooks: PreToolUse 2",
         "    mcp: ctx",
-        "not shared (authentication): env.ANTHROPIC_API_KEY",
-        "~/.claude/projects/-Users-you-space-remuda/memory · shared from default · 3 files",
+        "settings.json · already default's",
+        "read through the link (authentication): env.ANTHROPIC_API_KEY",
+        "~/.claude/projects/-Users-you-space-remuda/memory · already default's · 3 files",
         "  user: github",
     ] {
         assert!(body.contains(shown), "{shown}:\n{body}");
     }
     assert!(
-        !body.contains("gets default's configuration at launch"),
+        !body.contains("member of default: shares what its home links to it"),
         "{body}"
     );
 
@@ -8445,14 +8448,12 @@ fn the_account_card_shows_the_facts_above_the_configuration() {
     assert_eq!(next, first + 1, "{}", lines.join("\n"));
 }
 
-/// R22: the Plugins heading counts what loads here, the source's plugin the home installed
-/// itself among them; a bundled plugin the project turns off, an enabled one with no install
-/// and an installed one the project turns off are rows, not part of the count; those set to
-/// `false` are counted apart.
+/// R22: the Plugins heading counts what loads here, a bundled plugin among them; a bundled
+/// plugin the project turns off, an enabled one with no install and an installed one the
+/// project turns off are rows, not part of the count; those set to `false` are counted apart.
 #[test]
 fn the_plugins_heading_counts_what_loads() {
     use crate::account_config::{Origin, Plugin};
-    use crate::share::Skip;
     let mut app = app();
     update(&mut app, Event::Resize(120, 40));
     keys(&mut app, &[Key::Char('p')]);
@@ -8467,11 +8468,12 @@ fn the_plugins_heading_counts_what_loads() {
         contents: None,
         off: false,
     };
-    view.plugins
-        .push(row("f@builtin", Origin::NotShared(Skip::TurnedOff)));
+    view.plugins.push(row("e@builtin", Origin::Bundled));
+    view.plugins.push(Plugin {
+        off: true,
+        ..row("f@builtin", Origin::Bundled)
+    });
     view.plugins.push(row("gone@market", Origin::Own));
-    view.plugins
-        .push(row("mine@market", Origin::NotShared(Skip::OwnInstall)));
     view.plugins.push(Plugin {
         path: Some(PathBuf::from("/h/plugins/cache/proj")),
         off: true,
@@ -8481,10 +8483,10 @@ fn the_plugins_heading_counts_what_loads() {
     answer_config(&mut app, "default", view);
     let body = config_text(&app, 200);
     for shown in [
-        "Plugins · 2 enabled · 2 disabled\n  ctx7@market · 1.2.0 · user · shared from default",
-        "  f@builtin · not shared: turned off here",
+        "Plugins · 2 enabled · 2 disabled\n  ctx7@market · 1.2.0 · user · own",
+        "  e@builtin · bundled with claude\n",
+        "  f@builtin · bundled with claude · turned off here",
         "  gone@market · own · not installed here",
-        "  mine@market · not shared: installed by this home",
         "  proj@market · own · turned off here",
     ] {
         assert!(body.contains(shown), "{shown}:\n{body}");
@@ -8555,7 +8557,7 @@ fn d_in_the_account_card_shows_the_details() {
         "    reviewer · sonnet · effort low ·\n    tools Read, Grep\n      reviews diffs\n",
         "    pdf -> ../../lib/skills/pdf\n",
         "  skills · already default's · 2 (1 off)\n  -> /h/default/skills\n",
-        "  ctx7@market · 1.2.0 · user · shared\n  from default\n",
+        "  ctx7@market · 1.2.0 · user · own\n",
     ] {
         assert!(body.contains(shown), "{shown}:\n{body}");
     }
@@ -8629,28 +8631,25 @@ fn the_account_card_acts_on_the_account() {
     );
 }
 
-/// R18, R22: the source's authentication settings are "not shared" only where settings are
-/// injected. A member whose `settings.json` is the source's reads them through the link, and
-/// the source's own pane says where they are withheld.
+/// R18, R22: a member whose `settings.json` is the source's reads the source's authentication
+/// settings through the link, and is warned so; the source's own card lists them as what
+/// keeps `setup` from linking its file.
 #[test]
 fn the_pane_says_who_reads_the_sources_authentication() {
     use crate::account_config::{Origin, Role};
     let mut app = app();
     keys(&mut app, &[Key::Char('j'), Key::Char('p')]);
-    let linked = crate::account_config::ConfigView {
-        settings_origin: Origin::AlreadySource,
-        ..config_view()
-    };
-    answer_config(&mut app, "max", linked);
+    answer_config(&mut app, "max", config_view());
     let body = config_text(&app, 200);
     assert!(
         body.contains("read through the link (authentication): env.ANTHROPIC_API_KEY"),
         "{body}"
     );
-    assert!(!body.contains("not shared (authentication)"), "{body}");
+    assert!(!body.contains("not linked by setup"), "{body}");
 
     let source = crate::account_config::ConfigView {
         role: Role::Source,
+        settings_origin: Origin::Own,
         ..config_view()
     };
     // Read again: an answer belongs to one read.
@@ -8658,9 +8657,10 @@ fn the_pane_says_who_reads_the_sources_authentication() {
     answer_config(&mut app, "max", source);
     let body = config_text(&app, 200);
     assert!(
-        body.contains("withheld from injected settings (authentication): env.ANTHROPIC_API_KEY"),
+        body.contains("authentication settings (not linked by setup): env.ANTHROPIC_API_KEY"),
         "{body}"
     );
+    assert!(!body.contains("read through the link"), "{body}");
 }
 
 /// R22: the movement keys scroll the configuration; `[` / `]` move to the previous / next

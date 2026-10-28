@@ -1,7 +1,7 @@
-//! The files remuda owns: every write below `$REMUDA_HOME` (SPEC R3, R13, R18).
+//! The files remuda owns: every write below `$REMUDA_HOME` (SPEC R3, R13).
 //!
-//! `config.toml`, `state/`, `shared/claude/` and `homes/<provider>/<name>` are written through
-//! this module and nowhere else. It owns what those writes have in common:
+//! `config.toml`, `state/` and `homes/<provider>/<name>` are written through this module and
+//! nowhere else. It owns what those writes have in common:
 //!
 //! - the way down from `$REMUDA_HOME`: one directory descriptor at a time, never through a
 //!   symlink, except where the SPEC promises to write through one (`config.toml`, `state`, a
@@ -27,12 +27,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
-/// A directory that is the user's alone: `state/`, `state/settings/`, a new home (R3, R13).
+/// A directory that is the user's alone: `state/`, a new home (R3, R13).
 const PRIVATE_DIR: u32 = 0o700;
-/// A file that is the user's alone: the caches, the launch log, the injected settings (R3).
+/// A file that is the user's alone: the caches and the launch log (R3).
 const PRIVATE_FILE: u32 = 0o600;
-/// A copy that is not to be edited: the source's rules (R18).
-const READ_ONLY_FILE: u32 = 0o400;
 /// Left to the umask: the directories between `$REMUDA_HOME` and what is private.
 const DEFAULT_DIR: u32 = 0o777;
 /// Left to the umask: a new `config.toml` (R3).
@@ -49,16 +47,6 @@ pub fn state_dir(config: &Path) -> PathBuf {
 /// The launch log of the state directory `state` (R6).
 pub fn launch_log(state: &Path) -> PathBuf {
     state.join("launches.jsonl")
-}
-
-/// `$REMUDA_HOME/state/settings`: the injected settings, one file per content (R18).
-pub fn settings_dir(config: &Path) -> PathBuf {
-    state_dir(config).join("settings")
-}
-
-/// `$REMUDA_HOME/shared/claude`, next to `config.toml` (R13, R18).
-pub fn shared_dir(config: &Path) -> PathBuf {
-    config.with_file_name("shared").join("claude")
 }
 
 /// What an entry of a directory is, without following it.
@@ -171,9 +159,6 @@ impl std::error::Error for Blocked {
 pub enum FileMode {
     /// The user's alone (mode 0600), and on disk before it is renamed into place.
     Private,
-    /// Read-only, for the user alone (mode 0400). Not synced: a copy is compared with its
-    /// source again before every use.
-    ReadOnly,
 }
 
 /// The file `path` names in its directory, and that directory (`.` for a bare name).
@@ -453,14 +438,6 @@ impl Dir {
         }
     }
 
-    /// A new directory `name` with the default mode; fails where `name` exists.
-    pub fn create_new(&self, name: impl AsRef<OsStr>) -> Result<Dir, Blocked> {
-        let name = name.as_ref();
-        self.make(name, DEFAULT_DIR)
-            .map_err(|e| Blocked::new(&self.path.join(name), Why::Create(e)))?;
-        self.sub(name)
-    }
-
     /// A new directory `name` that is the user's alone (mode 0700, whatever the umask);
     /// fails where `name` exists (R13: the home `setup` creates).
     pub fn create_private(&self, name: impl AsRef<OsStr>) -> Result<Dir, Blocked> {
@@ -476,14 +453,9 @@ impl Dir {
     }
 
     /// The directory `name` as one that is the user's alone: made with mode 0700 or, where it
-    /// exists, what the group and others may do with it taken away (R3). Never loosened, and
-    /// never through a symlink.
-    pub fn private(&self, name: impl AsRef<OsStr>) -> Result<Dir, Blocked> {
-        self.private_dir(name.as_ref(), false)
-    }
-
-    /// [`Dir::private`]; with `through`, a `name` that is a symlink is used as it is: the
-    /// directory it points at is where the user put it, and keeps its mode (R3: `state`).
+    /// exists, what the group and others may do with it taken away (R3). Never loosened. With
+    /// `through`, a `name` that is a symlink is used as it is: the directory it points at is
+    /// where the user put it, and keeps its mode (R3: `state`); without, never through one.
     fn private_dir(&self, name: &OsStr, through: bool) -> Result<Dir, Blocked> {
         if let Err(e) = self.make(name, PRIVATE_DIR)
             && e.kind() != io::ErrorKind::AlreadyExists
@@ -620,7 +592,6 @@ impl Dir {
     pub fn write(&self, name: impl AsRef<OsStr>, bytes: &[u8], mode: FileMode) -> io::Result<()> {
         match mode {
             FileMode::Private => self.put(name.as_ref(), bytes, PRIVATE_FILE, None, true),
-            FileMode::ReadOnly => self.put(name.as_ref(), bytes, READ_ONLY_FILE, None, false),
         }
     }
 
@@ -659,17 +630,6 @@ impl Dir {
         self.symlink(&entry_name(name.as_ref())?, target)
     }
 
-    /// A symlink `name` pointing at `target`, created or replaced atomically: a temporary
-    /// link in this directory, renamed into place.
-    pub fn replace_link(&self, name: impl AsRef<OsStr>, target: &Path) -> io::Result<()> {
-        let name = entry_name(name.as_ref())?;
-        let temp = temp_name();
-        self.symlink(&temp, target)?;
-        self.rename_entry(&temp, &name).inspect_err(|_| {
-            let _ = self.unlink(&temp, 0);
-        })
-    }
-
     fn symlink(&self, name: &CStr, target: &Path) -> io::Result<()> {
         let target = c_string(target.as_os_str().as_bytes())?;
         // SAFETY: two NUL-terminated strings and an open directory descriptor.
@@ -688,11 +648,6 @@ impl Dir {
         check(unsafe { libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), flags) }).map(drop)
     }
 
-    /// Renames the entry `from` to `to`, both in this directory.
-    pub fn rename(&self, from: impl AsRef<OsStr>, to: impl AsRef<OsStr>) -> io::Result<()> {
-        self.rename_entry(&entry_name(from.as_ref())?, &entry_name(to.as_ref())?)
-    }
-
     /// Removes the entry `name`: a file, or a symlink itself. Never a directory.
     pub fn remove_file(&self, name: impl AsRef<OsStr>) -> io::Result<()> {
         self.unlink(&entry_name(name.as_ref())?, 0)
@@ -703,47 +658,11 @@ impl Dir {
         self.unlink(&entry_name(name.as_ref())?, libc::AT_REMOVEDIR)
     }
 
-    /// Removes the entry `name` and, when it is a directory, everything in it. Symlinks are
-    /// removed, not followed. Nothing there is not an error.
-    pub fn remove_tree(&self, name: impl AsRef<OsStr>) -> io::Result<()> {
-        let name = name.as_ref();
-        match self.kind(name)? {
-            None => Ok(()),
-            Some(Kind::Dir) => {
-                let dir = self.sub(name).map_err(io::Error::other)?;
-                for entry in dir.names()? {
-                    dir.remove_tree(&entry)?;
-                }
-                self.remove_dir(name)
-            }
-            Some(_) => self.remove_file(name),
-        }
-    }
-
-    /// Sets when the regular file `name` was last modified.
-    pub fn touch(&self, name: impl AsRef<OsStr>, modified: SystemTime) -> io::Result<()> {
-        let flags = libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-        self.open_at(&entry_name(name.as_ref())?, flags, 0)?
-            .set_modified(modified)
-    }
-
     /// An exclusive lock on this directory itself, held until the result is dropped; nothing
-    /// is created for it. Waits for whoever holds it.
-    pub fn lock(&self, locks: &dyn Locks, lockless: Lockless) -> io::Result<Held> {
-        Held::take(self.reopen()?, locks, lockless)
-    }
-
-    /// [`Dir::lock`] on the file `name` in this directory: a regular file that is the user's
-    /// alone, made when missing, where a directory holds files that come and go.
-    pub fn lock_file(
-        &self,
-        name: impl AsRef<OsStr>,
-        locks: &dyn Locks,
-        lockless: Lockless,
-    ) -> io::Result<Held> {
-        let flags = libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW;
-        let file = self.open_at(&entry_name(name.as_ref())?, flags, PRIVATE_FILE)?;
-        Held::take(file, locks, lockless)
+    /// is created for it. Waits for whoever holds it. On a file system that has no locks it
+    /// is refused: what a lock protects here (the registry, R3) is not worth losing.
+    pub fn lock(&self, locks: &dyn Locks) -> io::Result<Held> {
+        Held::take(self.reopen()?, locks)
     }
 
     /// Removes the temporary files and links in this directory that a remuda which is gone
@@ -802,80 +721,39 @@ impl Locks for Flock {
     }
 }
 
-/// What to do on a file system that has no locks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lockless {
-    /// Fail: what the lock protects is not worth losing (the registry, R3).
-    Refuse,
-    /// Go on without the lock (the injected settings and the shared instructions, R18).
-    Proceed,
-}
-
 /// An exclusive lock, released when dropped.
 #[derive(Debug)]
 #[must_use = "the lock is released when this is dropped"]
-pub struct Held(Option<fs::File>);
+pub struct Held(fs::File);
 
 impl Held {
-    fn take(file: fs::File, locks: &dyn Locks, lockless: Lockless) -> io::Result<Held> {
+    fn take(file: fs::File, locks: &dyn Locks) -> io::Result<Held> {
         if locks.exclusive(&file)? {
-            return Ok(Held(Some(file)));
+            return Ok(Held(file));
         }
-        match lockless {
-            Lockless::Proceed => Ok(Held(None)),
-            Lockless::Refuse => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the file system has no locks",
-            )),
-        }
-    }
-
-    /// Whether there is a lock: `false` on a file system without locks ([`Lockless::Proceed`]).
-    pub fn is_held(&self) -> bool {
-        self.0.is_some()
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the file system has no locks",
+        ))
     }
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        if let Some(file) = &self.0 {
-            // Released here, not left to the close: a child process started meanwhile holds
-            // a copy of the descriptor until it execs, and the lock would last as long.
-            // SAFETY: the descriptor is still open.
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        }
+        // Released here, not left to the close: a child process started meanwhile holds a
+        // copy of the descriptor until it execs, and the lock would last as long.
+        // SAFETY: the descriptor is still open.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
-/// The state directory `dir` (`$REMUDA_HOME/state`), the user's alone ([`Dir::private`]).
-/// What is above it is `$REMUDA_HOME`, the user's path: taken as given, and created as
-/// needed. A `state` that is a symlink is written through, and the directory it points at
-/// keeps its mode (R3, R13).
+/// The state directory `dir` (`$REMUDA_HOME/state`), the user's alone (mode 0700, tightened,
+/// never loosened). What is above it is `$REMUDA_HOME`, the user's path: taken as given, and
+/// created as needed. A `state` that is a symlink is written through, and the directory it
+/// points at keeps its mode (R3, R13).
 pub fn state(dir: &Path) -> Result<Dir, Blocked> {
     let (above, name) = split(dir).map_err(|e| Blocked::new(dir, Why::Open(e)))?;
     Dir::root(above)?.private_dir(name, true)
-}
-
-/// The directory `dir` (`state/settings`) of the injected settings, the user's alone, in the
-/// state directory ([`state`]). remuda removes files there, so it is a directory of its own:
-/// a symlink in its place is refused (R18).
-pub fn settings(dir: &Path) -> Result<Dir, Blocked> {
-    let (above, name) = split(dir).map_err(|e| Blocked::new(dir, Why::Open(e)))?;
-    state(above)?.private(name)
-}
-
-/// `dir` (`shared/claude`) and the directory it is in (`shared`), each a directory of
-/// remuda's own, made when missing (R13, R18). One that is a symlink is refused, like one
-/// that is anything else: every write below it, and the removal of rule copies the source no
-/// longer has, would happen where the link points. What is above `shared` is `$REMUDA_HOME`:
-/// taken as given, and created as needed.
-pub fn shared(dir: &Path) -> Result<Dir, Blocked> {
-    let failed = |e| Blocked::new(dir, Why::Open(e));
-    let (above, claude) = split(dir).map_err(failed)?;
-    let (home, shared) = split(above).map_err(failed)?;
-    Dir::root(home)?
-        .sub_or_create(shared)?
-        .sub_or_create(claude)
 }
 
 /// `homes/<provider>` below `root` (`$REMUDA_HOME`, taken as given and created as needed):
@@ -965,7 +843,7 @@ pub fn update_registry(
         Some((there, file)) => (there, file.as_os_str()),
         None => (&home, name),
     };
-    let _lock = dir.lock(locks, Lockless::Refuse).with_context(|| {
+    let _lock = dir.lock(locks).with_context(|| {
         format!(
             "cannot lock {} to change {}",
             dir.path().display(),
@@ -1161,18 +1039,9 @@ mod tests {
     #[test]
     fn a_directory_of_remudas_own_is_never_opened_through_a_symlink() {
         type Open = fn(&Path) -> Result<Dir, Blocked>;
-        let roots: [(&str, &str, Open); 6] = [
-            ("shared", "shared/claude", |home| {
-                shared(&home.join("shared/claude"))
-            }),
-            ("shared/claude", "shared/claude", |home| {
-                shared(&home.join("shared/claude"))
-            }),
+        let roots: [(&str, &str, Open); 3] = [
             ("homes", "homes/claude", |home| homes(home, "claude")),
             ("homes/claude", "homes/claude", |home| homes(home, "claude")),
-            ("state/settings", "state/settings", |home| {
-                settings(&home.join("state/settings"))
-            }),
             ("x", "x", |home| Dir::open(home).unwrap().sub_or_create("x")),
         ];
         for (level, whole, open) in roots {
@@ -1254,37 +1123,31 @@ mod tests {
     #[test]
     fn a_write_lands_in_the_directory_that_was_opened() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("remuda/shared/claude");
-        let opened = shared(&path).unwrap();
-        opened
-            .write("stale.md", b"old", FileMode::ReadOnly)
-            .unwrap();
+        let path = dir.path().join("remuda/homes/claude");
+        let opened = homes(&dir.path().join("remuda"), "claude").unwrap();
+        opened.write("stale", b"old", FileMode::Private).unwrap();
 
         let moved = dir.path().join("moved");
         let outside = dir.path().join("outside");
         fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("stale.md"), "the user's").unwrap();
+        fs::write(outside.join("stale"), "the user's").unwrap();
         fs::rename(&path, &moved).unwrap();
         symlink(&outside, &path).unwrap();
         let before = tree(&outside);
 
+        opened.write("file", b"new", FileMode::Private).unwrap();
+        opened.link("link", Path::new("/source/link")).unwrap();
         opened
-            .write("rule.md", b"be terse", FileMode::ReadOnly)
-            .unwrap();
-        opened
-            .replace_link("skills", Path::new("/source/skills"))
-            .unwrap();
-        opened.link("agents", Path::new("/source/agents")).unwrap();
-        opened
-            .sub_or_create("rules")
+            .sub_or_create("sub")
             .unwrap()
-            .write("deep.md", b"deep", FileMode::ReadOnly)
+            .write("deep", b"deep", FileMode::Private)
             .unwrap();
-        opened.remove_file("stale.md").unwrap();
+        opened.create_private("home").unwrap();
+        opened.remove_file("stale").unwrap();
         opened.sweep();
         assert_eq!(tree(&outside), before);
-        assert_eq!(entries(&moved), ["agents", "rule.md", "rules", "skills"]);
-        assert_eq!(fs::read(moved.join("rules/deep.md")).unwrap(), b"deep");
+        assert_eq!(entries(&moved), ["file", "home", "link", "sub"]);
+        assert_eq!(fs::read(moved.join("sub/deep")).unwrap(), b"deep");
     }
 
     /// An entry is named by one name: never a path, which could lead out of the directory.
@@ -1298,17 +1161,12 @@ mod tests {
                 |e: io::Error| assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{name:?}");
             invalid(opened.write(name, b"x", FileMode::Private).unwrap_err());
             invalid(opened.link(name, Path::new("/t")).unwrap_err());
-            invalid(opened.replace_link(name, Path::new("/t")).unwrap_err());
             invalid(opened.remove_file(name).unwrap_err());
             invalid(opened.remove_dir(name).unwrap_err());
-            invalid(opened.remove_tree(name).unwrap_err());
-            invalid(opened.rename("a", name).unwrap_err());
             invalid(opened.meta(name).unwrap_err());
-            invalid(opened.touch(name, SystemTime::now()).unwrap_err());
             assert!(opened.sub(name).is_err(), "{name:?}");
             assert!(opened.sub_or_create(name).is_err(), "{name:?}");
-            assert!(opened.create_new(name).is_err(), "{name:?}");
-            assert!(opened.private(name).is_err(), "{name:?}");
+            assert!(opened.create_private(name).is_err(), "{name:?}");
         }
         assert_eq!(entries(dir.path()), ["a"]);
         assert_eq!(entries(&dir.path().join("a")), ["b"]);
@@ -1345,12 +1203,7 @@ mod tests {
                 .modified()
                 .unwrap()
         );
-        let then = SystemTime::now() - Duration::from_secs(40 * 24 * 60 * 60);
-        opened.touch("f", then).unwrap();
-        assert_eq!(opened.meta("f").unwrap().unwrap().modified, then);
         // Never through a link, and never a directory.
-        assert!(opened.touch("to-dir", then).is_err());
-        assert!(opened.touch("dangling", then).is_err());
         assert!(matches!(
             opened.sub("to-dir").unwrap_err().why,
             Why::Symlink
@@ -1383,11 +1236,12 @@ mod tests {
             before,
             "a new file, renamed"
         );
-        // A read-only copy is replaced all the same: the rename does not write to it.
-        opened.write("f", b"three", FileMode::ReadOnly).unwrap();
-        assert_eq!(mode(&file), 0o400);
-        opened.write("f", b"four", FileMode::ReadOnly).unwrap();
+        // A file the user made read-only is replaced all the same: the rename does not write
+        // to it.
+        chmod(&file, 0o400);
+        opened.write("f", b"four", FileMode::Private).unwrap();
         assert_eq!(fs::read(&file).unwrap(), b"four");
+        assert_eq!(mode(&file), 0o600);
         // A symlink in the file's place is replaced, not followed.
         let target = dir.path().join("target");
         fs::write(&target, "kept").unwrap();
@@ -1402,44 +1256,18 @@ mod tests {
         fs::create_dir(dir.path().join("d")).unwrap();
         fs::write(dir.path().join("d/keep"), "x").unwrap();
         assert!(opened.write("d", b"x", FileMode::Private).is_err());
-        assert!(opened.replace_link("d", Path::new("/t")).is_err());
         assert_eq!(entries(dir.path()), ["d", "f", "target"]);
         assert_eq!(entries(&dir.path().join("d")), ["keep"]);
 
-        // A link is replaced the same way; `link` never replaces.
-        opened.replace_link("l", Path::new("/one")).unwrap();
-        opened.replace_link("l", Path::new("/two")).unwrap();
+        // `link` never replaces.
+        opened.link("l", Path::new("/one")).unwrap();
+        let e = opened.link("l", Path::new("/two")).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(
             fs::read_link(dir.path().join("l")).unwrap(),
-            Path::new("/two")
+            Path::new("/one")
         );
-        let e = opened.link("l", Path::new("/three")).unwrap_err();
-        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(entries(dir.path()), ["d", "f", "l", "target"]);
-    }
-
-    /// A tree is removed without following its links: what they point at stays.
-    #[test]
-    fn a_tree_is_removed_without_following_links() {
-        let dir = tempfile::tempdir().unwrap();
-        let outside = dir.path().join("outside");
-        fs::create_dir(&outside).unwrap();
-        fs::write(outside.join("keep"), "x").unwrap();
-        let built = dir.path().join("built");
-        fs::create_dir_all(built.join("rules/lang")).unwrap();
-        fs::write(built.join("rules/lang/rust.md"), "x").unwrap();
-        chmod(&built.join("rules/lang/rust.md"), 0o400);
-        symlink(&outside, built.join("skills")).unwrap();
-        symlink(outside.join("keep"), built.join("CLAUDE.md")).unwrap();
-        let opened = Dir::open(dir.path()).unwrap();
-        opened.remove_tree("built").unwrap();
-        opened.remove_tree("built").unwrap();
-        assert_eq!(entries(dir.path()), ["outside"]);
-        assert_eq!(entries(&outside), ["keep"]);
-        // A link itself is removed as an entry.
-        symlink(&outside, dir.path().join("link")).unwrap();
-        opened.remove_tree("link").unwrap();
-        assert_eq!(entries(&outside), ["keep"]);
     }
 
     /// R13: a new directory is made once. The private one is the user's alone whatever the
@@ -1452,25 +1280,21 @@ mod tests {
         assert_eq!(home.path(), dir.path().join("work"));
         assert_eq!(mode(&dir.path().join("work")), 0o700);
         assert!(home.is_empty().unwrap());
-        opened.create_new("staged").unwrap();
+        fs::create_dir(dir.path().join("plain")).unwrap();
         symlink(dir.path(), dir.path().join("link")).unwrap();
         fs::write(dir.path().join("file"), "").unwrap();
-        for name in ["work", "staged", "link", "file"] {
-            for blocked in [
-                opened.create_private(name).unwrap_err(),
-                opened.create_new(name).unwrap_err(),
-            ] {
-                assert!(
-                    matches!(&blocked.why, Why::Create(e) if e.kind() == io::ErrorKind::AlreadyExists),
-                    "{name}: {blocked:?}"
-                );
-                assert_eq!(
-                    blocked.to_string(),
-                    format!("cannot create {}", dir.path().join(name).display())
-                );
-            }
+        for name in ["work", "plain", "link", "file"] {
+            let blocked = opened.create_private(name).unwrap_err();
+            assert!(
+                matches!(&blocked.why, Why::Create(e) if e.kind() == io::ErrorKind::AlreadyExists),
+                "{name}: {blocked:?}"
+            );
+            assert_eq!(
+                blocked.to_string(),
+                format!("cannot create {}", dir.path().join(name).display())
+            );
         }
-        assert_eq!(entries(dir.path()), ["file", "link", "staged", "work"]);
+        assert_eq!(entries(dir.path()), ["file", "link", "plain", "work"]);
     }
 
     /// R3: a file of `state/` is written with mode 0600 in a directory of mode 0700, whatever
@@ -1505,16 +1329,6 @@ mod tests {
         state(&state_path).unwrap();
         assert_eq!(mode(&state_path), 0o500);
         chmod(&state_path, 0o700);
-
-        // The settings directory in it is private the same way.
-        let settings_path = state_path.join("settings");
-        settings(&settings_path).unwrap();
-        assert_eq!(mode(&settings_path), 0o700);
-        chmod(&settings_path, 0o755);
-        chmod(&state_path, 0o755);
-        settings(&settings_path).unwrap();
-        assert_eq!((mode(&settings_path), mode(&state_path)), (0o700, 0o700));
-        fs::remove_dir(&settings_path).unwrap();
 
         let config = home.join("config.toml");
         fs::write(&config, "").unwrap();
@@ -1724,7 +1538,7 @@ mod tests {
     }
 
     /// A lock excludes a second holder until it is dropped, between descriptors of one
-    /// process too; the lock file is a regular file that is the user's alone, and stays.
+    /// process too; nothing is created for it.
     #[test]
     fn a_lock_is_exclusive_until_dropped() {
         let dir = tempfile::tempdir().unwrap();
@@ -1734,8 +1548,7 @@ mod tests {
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }
         };
 
-        let held = opened.lock(&Flock, Lockless::Refuse).unwrap();
-        assert!(held.is_held());
+        let held = opened.lock(&Flock).unwrap();
         assert_eq!(
             entries(dir.path()),
             [] as [&str; 0],
@@ -1747,27 +1560,14 @@ mod tests {
         assert_eq!(try_lock(&other), 0);
         drop(other);
 
-        let held = opened
-            .lock_file(".lock", &Flock, Lockless::Proceed)
-            .unwrap();
-        assert!(held.is_held());
-        let lock = dir.path().join(".lock");
-        assert!(fs::symlink_metadata(&lock).unwrap().is_file());
-        assert_eq!(mode(&lock), 0o600);
-        let other = fs::File::open(&lock).unwrap();
-        assert_eq!(try_lock(&other), -1, "held elsewhere");
-        drop(held);
-        assert_eq!(try_lock(&other), 0);
-        assert_eq!(entries(dir.path()), [".lock"]);
-
         // Waited for, not skipped: a second taker gets it only after the first let go.
         let order = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let first = opened.lock(&Flock, Lockless::Refuse).unwrap();
+        let first = opened.lock(&Flock).unwrap();
         let waiter = {
             let (path, order) = (dir.path().to_path_buf(), order.clone());
             std::thread::spawn(move || {
                 let dir = Dir::open(&path).unwrap();
-                let _held = dir.lock(&Flock, Lockless::Refuse).unwrap();
+                let _held = dir.lock(&Flock).unwrap();
                 order.lock().unwrap().push("second");
             })
         };
@@ -1778,25 +1578,15 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), ["first", "second"]);
     }
 
-    /// On a file system without locks, a lock that must be had is refused, and one that is
-    /// only wanted is gone without (R3, R18).
+    /// On a file system without locks, a lock is refused (R3).
     #[test]
-    fn without_locks_a_lock_is_refused_or_gone_without() {
+    fn without_locks_a_lock_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let opened = Dir::open(dir.path()).unwrap();
-        let e = opened.lock(&NoLocks, Lockless::Refuse).unwrap_err();
+        let e = opened.lock(&NoLocks).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::Unsupported);
         assert_eq!(e.to_string(), "the file system has no locks");
-        assert!(
-            opened
-                .lock_file(".lock", &NoLocks, Lockless::Refuse)
-                .is_err()
-        );
-        assert!(!opened.lock(&NoLocks, Lockless::Proceed).unwrap().is_held());
-        let held = opened
-            .lock_file(".lock", &NoLocks, Lockless::Proceed)
-            .unwrap();
-        assert!(!held.is_held());
+        assert_eq!(entries(dir.path()), [] as [&str; 0]);
     }
 
     /// R3 (review #9): the registry is not changed without its lock. On a file system that
@@ -2083,19 +1873,11 @@ mod tests {
             save_cache(&through.join("index.json"), b"{}").unwrap();
             assert_eq!(mode(&state_path), 0o300);
         }
-        // What is in it is private as anywhere, and a directory made in it is too.
-        let settings_dir = settings(&state_path.join("settings")).unwrap();
-        settings_dir
-            .write("s.json", b"{}", FileMode::Private)
-            .unwrap();
-        assert!(settings_dir.names().is_ok());
+        // What is in it is private as anywhere.
         let opened = state(&state_path).unwrap();
         assert_eq!(opened.kind("index.json").unwrap(), Some(Kind::File));
         assert!(opened.names().is_err(), "it cannot be listed");
-        assert!(
-            opened.lock(&Flock, Lockless::Proceed).is_err(),
-            "nor locked"
-        );
+        assert!(opened.lock(&Flock).is_err(), "nor locked");
         assert_eq!(mode(&state_path), 0o300);
 
         drop(unreadable);
@@ -2103,7 +1885,6 @@ mod tests {
         assert_eq!(fs::read_to_string(&log).unwrap(), "old\nnew\nnew\n");
         assert_eq!(mode(&log), 0o600);
         assert_eq!(mode(&state_path.join("index.json")), 0o600);
-        assert_eq!(mode(&state_path.join("settings")), 0o700);
         assert!(
             leftover.exists(),
             "not removed while the directory could not be listed"
@@ -2111,25 +1892,19 @@ mod tests {
         // Readable again: the next write there removes it.
         append_log(&log, "last\n").unwrap();
         assert!(!leftover.exists());
-        assert_eq!(
-            entries(&state_path),
-            ["index.json", "launches.jsonl", "settings"]
-        );
+        assert_eq!(entries(&state_path), ["index.json", "launches.jsonl"]);
 
-        // The directories remuda only makes links and copies in are opened the same way.
-        let shared_path = home.join("shared/claude");
-        shared(&shared_path).unwrap();
+        // The directories of the homes `setup` makes are opened the same way.
+        let homes_path = home.join("homes/claude");
+        homes(&home, "claude").unwrap();
         let unreadable = (
-            Unreadable::new(&shared_path),
-            Unreadable::new(&home.join("shared")),
+            Unreadable::new(&homes_path),
+            Unreadable::new(&home.join("homes")),
         );
-        let opened = shared(&shared_path).unwrap();
-        opened
-            .replace_link("skills", Path::new("/source/skills"))
-            .unwrap();
-        opened.sub_or_create("rules").unwrap();
+        let opened = homes(&home, "claude").unwrap();
+        opened.create_private("work").unwrap();
         drop(unreadable);
-        assert_eq!(entries(&shared_path), ["rules", "skills"]);
+        assert_eq!(entries(&homes_path), ["work"]);
 
         // The registry needs its lock, and the lock a directory that can be read: refused,
         // and nothing is changed.
@@ -2249,7 +2024,5 @@ mod tests {
             launch_log(&state_dir(config)),
             Path::new("/r/state/launches.jsonl")
         );
-        assert_eq!(settings_dir(config), Path::new("/r/state/settings"));
-        assert_eq!(shared_dir(config), Path::new("/r/shared/claude"));
     }
 }

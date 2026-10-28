@@ -147,71 +147,34 @@ fn write(path: &Path, text: &str) {
     fs::write(path, text).unwrap();
 }
 
-/// R21, R22: a settings file that is not a JSON object fails the launch, and the pane says
-/// so. In private mode the file is masked as the path it is and what is wrong with it stays
-/// readable: for the source's file, for the home's own, said once when the launch fails on it
-/// too, and for one that cannot be read, whose reason is the system's.
+/// R21, R22: a `settings.json` that is not a JSON object is a problem of the card, and in
+/// private mode the file is masked as the path it is while what is wrong with it stays
+/// readable: for the home's own file, whether or not it is the source's through a link, and
+/// for one that cannot be read, whose reason is the system's. The source's file alone is no
+/// problem of a member whose settings are its own.
 #[test]
 fn a_settings_problem_keeps_its_reason_in_private_mode() {
     let h = Homes::new();
     let source_settings = h.source_home().join("settings.json");
     let own_settings = h.member_home().join("settings.json");
 
-    // The source's.
+    // The source's: the member's settings are its own.
     write(&source_settings, "[]");
-    let (mut app, view) = h.with_config(&h.sharing);
-    assert_eq!(
-        view.problems,
-        [format!(
-            "sessions of this account fail to start: {} is not a JSON object",
-            source_settings.display()
-        )]
-    );
-    // With private mode off the file shows (the line is wrapped at the card's width, the
-    // path kept whole).
-    let open = screen(&app);
-    assert!(open.contains(".claude/settings.json"), "{open}");
-    app.private = true;
-    assert_eq!(
-        private_problems(&app),
-        ["sessions of this account fail to start: ~/•••/••• is not a JSON object"]
-    );
-    let private = screen(&app);
-    assert!(
-        private
-            .contains("! sessions of this account fail to start: ~/•••/••• is not a JSON object"),
-        "{private}"
-    );
-    leaks_nothing(&private);
+    let (_, view) = h.with_config(&h.sharing);
+    assert!(view.problems.is_empty(), "{:?}", view.problems);
 
-    // The home's own, which the launch fails on too: said once.
-    write(&source_settings, "{}");
-    write(&own_settings, "[]");
+    // Through a link, it is the member's own file.
+    std::os::unix::fs::symlink(&source_settings, &own_settings).unwrap();
     let (mut app, view) = h.with_config(&h.sharing);
-    assert_eq!(
-        view.problems,
-        [format!(
-            "sessions of this account fail to start: {} is not a JSON object",
-            own_settings.display()
-        )]
-    );
-    app.private = true;
-    assert_eq!(
-        private_problems(&app),
-        ["sessions of this account fail to start: ~/•••/•••/••• is not a JSON object"]
-    );
-    let private = screen(&app);
-    assert!(
-        private.contains("~/•••/•••/••• is not a JSON object"),
-        "{private}"
-    );
-    leaks_nothing(&private);
-
-    // The home's own, for an account that shares nothing: the problem is the error itself.
-    let (mut app, view) = h.with_config(&Sharing::default());
     assert_eq!(
         view.problems,
         [format!("{} is not a JSON object", own_settings.display())]
+    );
+    // With private mode off the file shows (the line is wrapped at the card's width).
+    let open = screen(&app);
+    assert!(
+        open.contains("x: y/settings.json is not a JSON object"),
+        "{open}"
     );
     app.private = true;
     assert_eq!(
@@ -225,17 +188,36 @@ fn a_settings_problem_keeps_its_reason_in_private_mode() {
     );
     leaks_nothing(&private);
 
+    // The home's own, with a source and without.
+    fs::remove_file(&own_settings).unwrap();
+    write(&source_settings, "{}");
+    write(&own_settings, "[]");
+    for sharing in [&h.sharing, &Sharing::default()] {
+        let (mut app, view) = h.with_config(sharing);
+        assert_eq!(
+            view.problems,
+            [format!("{} is not a JSON object", own_settings.display())]
+        );
+        app.private = true;
+        assert_eq!(
+            private_problems(&app),
+            ["~/•••/•••/••• is not a JSON object"]
+        );
+        let private = screen(&app);
+        assert!(
+            private.contains("! ~/•••/•••/••• is not a JSON object"),
+            "{private}"
+        );
+        leaks_nothing(&private);
+    }
+
     // One that cannot be read (a directory): the file is masked whole, and the reason, which
     // the system gives, follows it.
     fs::remove_file(&own_settings).unwrap();
-    fs::remove_file(&source_settings).unwrap();
-    fs::create_dir(&source_settings).unwrap();
+    fs::create_dir(&own_settings).unwrap();
     let (mut app, view) = h.with_config(&h.sharing);
     let problem = view.problems[0].to_string();
-    let said = format!(
-        "sessions of this account fail to start: cannot read {}: ",
-        source_settings.display()
-    );
+    let said = format!("cannot read {}: ", own_settings.display());
     let reason = problem
         .strip_prefix(&said)
         .unwrap_or_else(|| panic!("{problem}"));
@@ -243,16 +225,15 @@ fn a_settings_problem_keeps_its_reason_in_private_mode() {
     app.private = true;
     assert_eq!(
         private_problems(&app),
-        [format!(
-            "sessions of this account fail to start: cannot read ~/•••/•••: {reason}"
-        )]
+        [format!("cannot read ~/•••/•••/•••: {reason}")]
     );
     leaks_nothing(&screen(&app));
 }
 
 /// R11, R21: the checks of the accounts view, from the files to the screen. In private mode
-/// each path of a check is masked whole (a home, a store, both ends of a link), what the
-/// check says around them stays, and so does the slash command its own words name.
+/// each path of a check is masked whole (a home, a store, both ends of the link to make, the
+/// `<item>` placeholder with them), what the check says around them stays, and so does the
+/// slash command its own words name.
 #[test]
 fn checks_keep_what_they_say_around_their_paths_in_private_mode() {
     let h = Homes::new();
@@ -269,18 +250,18 @@ fn checks_keep_what_they_say_around_their_paths_in_private_mode() {
     let mut found = checks::run(&accounts, &env, &stores);
     found.extend(checks::sharing(&accounts, &env, &h.sharing));
     let said: Vec<String> = found.iter().map(|c| c.message.to_string()).collect();
-    let projects = h.source_home().join("projects");
+    let source = h.source_home();
     assert_eq!(
         said,
         [
             "ANTHROPIC_API_KEY is set: it overrides every account's /login".to_string(),
             format!("home {} does not exist", gone.display()),
             format!(
-                "not sharing sessions with claude:default: it does not see the sessions in {} \
-                 and cannot resume them; link projects to share them ({} -> {})",
-                projects.display(),
-                h.member_home().join("projects").display(),
-                projects.display()
+                "does not share projects with claude:default: it does not see the sessions in \
+                 {} and cannot resume them; to share an item: ln -s {}/<item> {}/<item>",
+                source.join("projects").display(),
+                source.display(),
+                h.member_home().display()
             ),
         ]
     );
@@ -302,9 +283,9 @@ fn checks_keep_what_they_say_around_their_paths_in_private_mode() {
         [
             "ANTHROPIC_API_KEY is set: it overrides every account's /login",
             "home ~/••• does not exist",
-            "not sharing sessions with claude:default: it does not see the sessions in \
-             ~/•••/••• and cannot resume them; link projects to share them (~/•••/•••/••• -> \
-             ~/•••/•••)",
+            "does not share projects with claude:default: it does not see the sessions in \
+             ~/•••/••• and cannot resume them; to share an item: ln -s ~/•••/••• \
+             ~/•••/•••/•••",
         ]
     );
     let private = screen(&app);
@@ -312,9 +293,9 @@ fn checks_keep_what_they_say_around_their_paths_in_private_mode() {
         "! ANTHROPIC_API_KEY is set: it overrides every account's /login",
         "! account-2: home ~/••• does not exist",
         // Wrapped at this width.
-        "! account-1: not sharing sessions with claude:default: it does not see the sessions in \
-         ~/•••/••• and cannot resume them; link projects to share them",
-        "(~/•••/•••/••• -> ~/•••/•••)",
+        "! account-1: does not share projects with claude:default: it does not see the \
+         sessions in ~/•••/••• and cannot resume them",
+        "~/•••/•••/•••",
     ] {
         assert!(private.contains(said), "{said}:\n{private}");
     }
@@ -433,15 +414,11 @@ fn checks_worded_by_the_item_catalog_keep_their_words_in_private_mode() {
         [
             said(
                 "claude:account-1",
-                "not sharing sessions with claude:default: it does not see the sessions in \
-                 ~/•••/••• and cannot resume them; link projects to share them (~/•••/•••/••• -> \
-                 ~/•••/•••)"
-            ),
-            said(
-                "claude:account-2",
-                "shares CLAUDE.md with claude:default through symlinks but not skills: the \
-                 shared ones load twice (with the injected --add-dir); link the others too, or \
-                 none"
+                "does not share projects, file-history, CLAUDE.md, skills, agent-memory with \
+                 claude:default: it does not see the sessions in ~/•••/••• and cannot resume \
+                 them; to share an item: ln -s ~/•••/••• ~/•••/•••/•••; settings.json is not \
+                 shared: that of claude:default sets authentication settings (apiKeyHelper, \
+                 env.ANTHROPIC_AUTH_TOKEN), so this account needs one of its own"
             ),
             said(
                 "claude:account-2",
@@ -463,15 +440,15 @@ fn checks_worded_by_the_item_catalog_keep_their_words_in_private_mode() {
             ),
             said(
                 "claude:account-2",
-                "settings.json is that of claude:default through a symlink, and it sets \
-                 authentication settings (apiKeyHelper, env.ANTHROPIC_AUTH_TOKEN): this account \
-                 reads them through the link; remove the link (the rest is then injected at \
-                 launch), or move them out of that settings.json"
+                "does not share skills with claude:default; to share an item: ln -s ~/•••/••• \
+                 ~/•••/•••/•••"
             ),
             said(
-                "claude:default",
-                "settings keys withheld from the accounts that get settings at launch \
-                 (authentication is never injected): apiKeyHelper, env.ANTHROPIC_AUTH_TOKEN"
+                "claude:account-2",
+                "settings.json is that of claude:default through a symlink, and it sets \
+                 authentication settings (apiKeyHelper, env.ANTHROPIC_AUTH_TOKEN): this account \
+                 reads them through the link; give it a settings.json of its own instead of the \
+                 link, or move them out of that settings.json"
             ),
         ]
     );
@@ -485,7 +462,7 @@ fn checks_worded_by_the_item_catalog_keep_their_words_in_private_mode() {
     };
     assert_eq!(
         found.iter().map(paths).collect::<Vec<_>>(),
-        [3, 0, 0, 2, 2, 0, 0]
+        [3, 0, 2, 2, 2, 0]
     );
     // On screen (the long ones are wrapped at this width).
     let private = screen(&app);
@@ -496,8 +473,9 @@ fn checks_worded_by_the_item_catalog_keep_their_words_in_private_mode() {
          (~/•••/•••/••• -> ~/•••/•••)",
         "! account-2: history.jsonl is a symlink to that of claude:account-1: sessions in a \
          shared store lose their attribution; each account needs its own",
-        "reads them through the link; remove the link (the rest is then injected at launch), \
-         or move them out of that settings.json",
+        "so this account needs one of its own",
+        "give it a settings.json of its own instead of the link, or move them out of that \
+         settings.json",
     ] {
         assert!(private.contains(said), "{said}:\n{private}");
     }

@@ -303,8 +303,7 @@ fn exec_as(
         || uuid::Uuid::new_v4().to_string(),
         &registry.sharing,
         &ctx.env,
-        config,
-    )?;
+    );
     exec_plan(config, &program, &plan, ctx)
 }
 
