@@ -464,8 +464,8 @@ fn read_input(wait: Duration) -> io::Result<Vec<Event>> {
     Ok(events)
 }
 
-/// Runs a [`LaunchRequest`] the way `remuda run` would (R6: same env change, injection and
-/// launch log), in the foreground with the TUI suspended (R16), and reports how it ended.
+/// Runs a [`LaunchRequest`] the way `remuda run` would (R6: same env change, `--session-id`
+/// and launch log), in the foreground with the TUI suspended (R16), and reports how it ended.
 /// The registry is read again first (a change is told through `tx`): nothing runs as an
 /// account it no longer lists, or while it cannot be read.
 /// Only a failure to take the terminal back is an error: the TUI cannot go on without it.
@@ -501,7 +501,7 @@ fn run_launch(
         return Ok((Err(missing), Vec::new()));
     };
     let cwd = request.cwd.as_deref().or(deps.cwd.as_deref());
-    let planned = launch::plan(
+    let plan = launch::plan(
         &request.account,
         request.args.clone(),
         cwd,
@@ -509,12 +509,7 @@ fn run_launch(
         || uuid::Uuid::new_v4().to_string(),
         &reading.sharing,
         &deps.env,
-        deps.listing.config(),
     );
-    let plan = match planned {
-        Ok(plan) => plan,
-        Err(e) => return Ok((Err(format!("{e:#}")), Vec::new())),
-    };
     // A directory that does not exist ends the launch before the terminal is handed over, as a
     // missing executable does: nothing is printed, logged or run, so nothing is warned about.
     if let Err(e) = launch::check_cwd(cwd) {

@@ -32,7 +32,7 @@ commands, and launches them with the right environment and options.
    ┌────────────────┐ ┌───────────────┐ ┌──────────────────────────┐
    │ account homes  │ │ claude, codex │ │ $REMUDA_HOME             │
    │ ~/.claude      │ │ (auth status, │ │   config.toml            │
-   │ ~/.claude-work │ │  agents,      │ │   state/  shared/        │
+   │ ~/.claude-work │ │  agents,      │ │   state/                 │
    │ ~/.codex …     │ │  -p /usage,   │ │   homes/<provider>/<name>│
    │ (transcripts,  │ │  app-server,  │ └──────────────────────────┘
    │  rollouts,     │ │  exec on      │
@@ -48,10 +48,11 @@ Three rules shape the whole design and are worth knowing before reading any modu
 - **Writes are confined** (R13). Everything remuda writes is under `$REMUDA_HOME`, and all of
   it is written by one module, `owned`. The one write inside a home is the set of symlinks
   `setup` makes in the directory it has just created, before the login (R12, R18); nothing is
-  written into a home after that, or into a home registered with `add`. `owned` reaches every
-  directory it creates, replaces, or removes in without following a symlink below
-  `$REMUDA_HOME`, and writes into it through its descriptor; the symlinks it writes through
-  are the ones R3 names (`config.toml`, `state`, a file in `state/`).
+  written into a home after that, or into a home registered with `add`. A launch writes its
+  line in the launch log and nothing else. `owned` reaches every directory it creates in
+  without following a symlink below `$REMUDA_HOME`, and writes into it through its
+  descriptor; the symlinks it writes through are the ones R3 names (`config.toml`, `state`, a
+  file in `state/`).
 - **The library never reads the process environment.** `main.rs` captures the command line, the
   environment, the current directory, the clock, the time zone and whether the standard streams
   are terminals into a `cli::Context` once, and everything below receives an `Env` snapshot.
@@ -98,7 +99,7 @@ The exceptions, all for a type or a small helper:
 | `main.rs` | Parse arguments, capture the process context, call `cli::run` | – |
 | `cli` | Every subcommand; the `run` fast path and `exec`; plain-text output | R5, R6, R14, R14a, R20, R23 |
 | `registry` | `config.toml`: load and validate strictly, resolve `name` / `provider:name`, add, remove, comment-preserving edits (written by `owned`, under its lock); `[share.claude]` and `[prices]` | R1, R3, R14, R14a |
-| `owned` | Every write below `$REMUDA_HOME`: the way down without following a symlink (`Dir`), private modes and tightening, temporary file + rename and the cleanup of leftovers, exclusive locks (`Locks`), the registry's locked update, the caches, the launch log's rules; where things are (`state_dir`, `launch_log`, …) | R3, R13, R18 |
+| `owned` | Every write below `$REMUDA_HOME`: the way down without following a symlink (`Dir`), private modes and tightening, temporary file + rename and the cleanup of leftovers, exclusive locks (`Locks`), the registry's locked update, the caches, the launch log's rules; where things are (`state_dir`, `launch_log`, …) | R3, R13 |
 | `paths` | `$REMUDA_HOME`, `~` expansion, home string checks, the native login's directory | R2, R3 |
 | `provider` | What differs between claude and codex: isolation variable, stores, launch arguments, login | R4 |
 | `provider::codex` | Rollout parsing: head/tail windows, titles from `session_index.jsonl`, preview, cached rate limits | R10, R17 |
@@ -107,8 +108,8 @@ The exceptions, all for a type or a small helper:
 | `account_command` | Run an agent's command for an account: pick the provider's program, set or remove the home variable (and remove the variables a caller names), run it, and word the failure (`Runner`, `OnPath`); the shape of a parse that may be partial (`Parsed`) | R2, R4, R10, R10a |
 | `interrupt` | The terminal's signals and SIGTERM, owned in one place: Ctrl-C and Ctrl-\ sat out while a foreground child has the terminal, passed on to the process groups of running commands and of commands being started, before remuda ends by them; a place for each of at most 1024 commands at a time, which one more waits for | R4, R6 |
 | `launch` | Classify arguments, inject `--session-id`, set or unset the home variable, the launch record, `exec` and foreground runs | R2, R6, R16, R17 |
-| `share` | Shared configuration injected at launch, the fallback for what a home does not link: `plan` (reads only; a `Plan` carries the relation of every shared item) and `apply` (item links, rule copies, settings file: what they are; `owned` writes them) | R18 |
-| `home_items` | The items of a claude home, once: the catalog (each item's name, whether `setup` links it and on what condition, whether the launch's `--add-dir` carries it, when the source's counts as one to share, what breaks when it is another account's) and how a member's home relates to the source's right now (`Source::relate`, `linked_elsewhere`, `membership`) | R11, R12, R18 |
+| `share` | What a member's launch gets from the shared configuration: `plan` (reads only; a `Plan` carries the relation of every shared item and where the launch points the memory) and `Plan::shared` (the environment changes: the memory variable, its removal, the notices); the readers of a home's files (settings, authentication settings, rule files, plugin installs, claude's project name) that `setup`, the checks and the account card use | R18, R22 |
+| `home_items` | The items of a claude home, once: the catalog (each item's name, whether `setup` links it and on what condition, whether the card lists it as an instruction item, when the source's counts as one to share, what breaks when it is another account's) and how a member's home relates to the source's right now (`Source::relate`, `Relations::unlinked_items`, `linked_elsewhere`, `membership`) | R11, R12, R18 |
 | `setup` | Create the new home (through `owned`), link a member's to the source's session store and configuration (`share_links`, over the catalog of `home_items`), and register it; the login command | R5, R12, R13, R17, R18 |
 | `identity` | Parses `claude auth status --json`, `codex login status` and `account/read`; the `.claude.json` fallback | R10a |
 | `usage` | Cached and live usage for both providers as rows (what the agent said; a partly read answer is not used), window labels, the text of `remuda usage` | R10 |
@@ -140,8 +141,8 @@ The exceptions, all for a type or a small helper:
 ## Launching an agent
 
 `remuda run` and the TUI decide a launch through the same function, `launch::plan`, so that the
-environment, the `--session-id` injection, the shared configuration and the launch log cannot
-differ between them (R6, R16, R18).
+environment, the `--session-id` injection, what the shared configuration adds and the launch log
+cannot differ between them (R6, R16, R18).
 
 ```text
  remuda run work -p "hi"
@@ -153,38 +154,37 @@ differ between them (R6, R16, R18).
  Registry::load(config.toml) ── resolve "work" ──► Account { claude, work, home }
         │
         ▼
- launch::plan(account, args, cwd, ts, new_uuid, sharing, env, config)
+ launch::plan(account, args, cwd, ts, new_uuid, sharing, env)
         │
         ├─ env_change      CLAUDE_CONFIG_DIR=<home, byte-for-byte>  (or unset for default)
         ├─ classify(args)  NewSession │ Fork{of} │ Existing{id} │ NotASession
-        ├─ share::inject   only for sessions of claude members of [share.claude]
-        │     ├─ share::plan   reads settings, plugins, links (no writes)
-        │     └─ share::apply  ensures shared/claude/.claude links and rule copies,
-        │                      writes state/settings/<sha>.json
-        └─ record          LaunchRecord { ts, account, cwd, args, session_id, fork_of, shared }
+        ├─ share::at_launch   only for sessions of claude members of [share.claude]:
+        │     ├─ share::plan      reads the links, three settings files at most (no writes)
+        │     └─ Plan::shared     CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home> for a linked
+        │                         projects (or its removal), the notices
+        └─ record          LaunchRecord { ts, account, cwd, args, session_id, fork_of }
         │
         ▼
  append_log(state/launches.jsonl)      the session ID is on disk before the agent starts;
         │                              state/ is 0700 and the log 0600 (R3, owned::append_log)
         │
         ▼
- exec(claude, [shared options…] + [user args with --session-id <uuid>])
+ exec(claude, [user args with --session-id <uuid>])
 ```
 
-The final argument vector puts the injected options first, in `--option=value` form, so that a
-variadic option cannot swallow the user's arguments; `--session-id` goes before a `--` terminator,
-if there is one:
+The argument vector is the user's, with `--session-id` added before a `--` terminator, if there
+is one; nothing of the shared configuration goes into it (until 2026-10-28 a launch put the
+injected `--add-dir`, `--settings` and `--plugin-dir` options first; that fallback is gone, R18):
 
 ```text
- claude --add-dir=$REMUDA_HOME/shared/claude  --settings=…/state/settings/3f2a….json
-        --plugin-dir=<install> …               -p hi --session-id 1b4e…
-        └──────────── shared (R18) ──────────┘ └──── user args + injected ID (R6) ──┘
+ claude -p hi --session-id 1b4e…          CLAUDE_CONFIG_DIR=<home>
+        └─ user args + injected ID (R6) ─┘ CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home> (R18)
 ```
 
-`run` is a fast path: it reads only `config.toml` and the few files shared configuration needs,
-starts no agent command and scans no sessions. From the TUI, `tui::launch_in_foreground` leaves
-the alternate screen, runs the same plan as a child with `launch::perform`, waits, restores the
-terminal and refreshes.
+`run` is a fast path: it reads only `config.toml` and the few settings files the memory decision
+needs, starts no agent command and scans no sessions. From the TUI, `tui::launch_in_foreground`
+leaves the alternate screen, runs the same plan as a child with `launch::perform`, waits,
+restores the terminal and refreshes.
 
 ## Reading: index, attribution, statistics
 
@@ -406,7 +406,8 @@ What a home holds, and what a member's home has of the source's, is answered in 
    linked_elsewhere a per-account item that is a link to another account's
    membership       Alone │ Source │ OptedOut │ SourceMissing │ Member
         │
-        ├─► share::plan       what is linked is not injected; Plan.items keeps the table
+        ├─► share::plan       Plan.items keeps the table; a linked projects decides the
+        │        │            memory variable
         │        └─► account_config::read   origins in the account card (R22)
         ├─► checks::sharing   what is not linked, in words (R11)
         └─► setup             share_links and its notes (R18)
@@ -415,40 +416,31 @@ What a home holds, and what a member's home has of the source's, is answered in 
 None of these spells an item's name or decides by itself whether a home has the source's, so
 they cannot disagree about what is linked. Paths are always the home as registered with the
 item's name appended (R2); realpaths are compared inside `home_items` and never leave it.
-The catalog does not say how a launch injects the settings, the plugins or the memory
-locations: `share::plan` decides that, item by item, from the relations. Of injection the
-catalog knows only which items the one `--add-dir` carries, as links or as copies, because
-`share` builds its directory from that list.
 
-Injection is the fallback for what a member's home does not link. `share::plan` decides, for
-one account, one directory and one argument list, what the source's configuration adds;
-`share::apply` makes it real. The account card (R22) calls `plan` only, which is why the
-pane cannot disagree with a launch.
+A member shares exactly what its home links; what it does not link is reported, not made up
+for (until 2026-10-28 a launch injected the rest, writing item links, rule copies and a
+settings file below `$REMUDA_HOME`; that fallback is gone, R18). `share::plan` decides, for one
+account, one directory and one argument list, what a launch adds to the environment:
 
 ```text
  [share.claude] from = "default"                 member account "work"
  source home ~/.claude                           home ~/.claude-work
  ───────────────────────                         ───────────────────────────────
- CLAUDE.md skills/ commands/ agents/  ──links──► --add-dir=$REMUDA_HOME/shared/claude
-                                                   (.claude/{CLAUDE.md,skills,commands,agents})
-                                                   + CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1
- rules/**/*.md  ──copies──────────────────────►   (.claude/rules/**, the same --add-dir)
- settings.json  − home − project − local  ─────► --settings=state/settings/<sha256>.json (0600)
-                − authentication keys              { …source-only keys…, autoMemoryDirectory }
- enabledPlugins + installed_plugins.json  ─────► --plugin-dir=<install path>  (one per plugin)
- projects/<project>/memory  ───────────────────► autoMemoryDirectory (inside the same --settings)
- agent-memory/  ───────────────────────────────► CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>
-                                                   (with autoMemoryDirectory, or when the
-                                                   member's projects/ is a link to the source's:
-                                                   claude then writes memory by the source's
-                                                   path, not through the link, without asking)
+ projects/  ◄──link── projects/  ──────────────► CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>
+                                                   claude then writes auto-memory and
+                                                   user-scope agent memory by the source's
+                                                   path, not through the link, without asking;
+                                                   not with the user's --settings or
+                                                   --setting-sources, their own variable, or
+                                                   a settings file choosing autoMemoryDirectory
+ settings.json  ◄──link── settings.json  ──────► warning: reads the authentication settings
+                                                   of default through its settings.json link
+ CLAUDE.md skills/ … rules/ plugins/ (links)   ► nothing: claude loads them as the home's own
 ```
 
-Each row is skipped when the member's home already resolves to the source's item by realpath
-(linked, in the relations above: R12), so nothing loads twice; a fully linked home gets
-nothing injected. Sessions have no row: they are shared only through the `projects` link, and
-so are `file-history`, `hooks`, `output-styles` and `keybindings.json`, which no launch option
-carries.
+The account card (R22) calls `plan` only, which is why the card cannot disagree with a launch.
+Sessions, `file-history`, `hooks`, `output-styles` and `keybindings.json` are shared through
+their links alone.
 
 ## Files remuda owns
 
@@ -457,19 +449,16 @@ carries.
  ├── config.toml                  registry; written by add / setup / remove      registry
  ├── homes/<provider>/<name>/     homes created by setup: empty, or holding      setup
  │                                the links to the source's home (R18)
- ├── shared/claude/.claude/       one symlink per shared instruction item,       share
- │                                copies of the source's rules; never written
- │                                through a shared or shared/claude symlink
  └── state/                       caches and logs (0700, files 0600; R3); safe
      │                            to delete
      ├── index.json               session index cache                            index
      ├── stats.json               token statistics cache                         stats
      ├── launches.jsonl           one line per launch (append-only)              launch
-     ├── usage-history.jsonl      one line per usage window read (45 days)       usage::history
-     └── settings/                injected settings                              share
-         ├── <sha256>.json        one per content (0600), pruned after 30 days
-         └── .lock                taken while choosing or pruning a file
+     └── usage-history.jsonl      one line per usage window read (45 days)       usage::history
 ```
+
+(`shared/claude/` and `state/settings/`, which the injection removed on 2026-10-28 wrote, are
+left alone where they exist; the user may delete them.)
 
 `launches.jsonl` and `usage-history.jsonl` are the files in `state/` whose loss costs
 information: attribution of sessions started through remuda falls back to `history.jsonl`, and
@@ -485,14 +474,14 @@ What every write there has in common lives in that module and is tested there on
 ```text
  owned::Dir            an open directory of remuda's own: each level opened from the one
                        above with O_NOFOLLOW, every operation an *at call on one entry name
-   state / settings    private (0700, tightened, never loosened); `state` may be a symlink
-   shared / homes      real directories or refused (Blocked: Symlink, NotADirectory)
-   write, replace_link `.remuda-<pid>-<32 hex>.tmp` in the same directory, then rename
+   state               private (0700, tightened, never loosened); `state` may be a symlink
+   homes               real directories or refused (Blocked: Symlink, NotADirectory)
+   write               `.remuda-<pid>-<32 hex>.tmp` in the same directory, then rename
    sweep               removes the temporary files of processes that are gone
    (a directory that can be searched and written but not read is opened for that alone:
     written in by name, not listed, so not swept and not locked)
-   lock, lock_file     flock through the `Locks` seam; Lockless::Refuse (the registry)
-                       or Lockless::Proceed (settings, shared instructions)
+   lock                flock through the `Locks` seam; refused on a file system without
+                       locks (the registry, the usage history)
  owned::update_registry  lock the directory of the file that is replaced ($REMUDA_HOME, or
                          where a symlinked config points), run the edit, write it there
  owned::save_cache       0600 whatever was there; through a symlinked cache file
@@ -551,9 +540,9 @@ cargo run --release --example codex_timing -- [<codex home>]
 | To … | Start in |
 | --- | --- |
 | Add or change a subcommand | SPEC R5, `cli`, a `tests/*_cli.rs` file |
-| Change what a launch passes to the agent | SPEC R6 / R18, `launch::prepare_with` or `share::plan` |
+| Change what a launch passes to the agent, or sets in its environment | SPEC R6 / R18, `launch::prepare_with` or `share::plan` |
 | Change what `setup` links in a new home | SPEC R12 / R13 / R18, the catalog in `home_items` (`ITEMS`, read through `Source::setup_links`) and `setup::share_links`, `tests/setup_cli.rs`; it is the write boundary |
-| Add an item of a home, or change how one is shared or kept per account | SPEC R11 / R18, its entry in `home_items::ITEMS`; then `share::plan` if a launch injects it, `checks::sharing` if the Accounts view warns about it |
+| Add an item of a home, or change how one is shared or kept per account | SPEC R11 / R18, its entry in `home_items::ITEMS`; then `share::plan` if a launch acts on it, `checks::sharing` if the Accounts view says something about it, `account_config` if the card lists it |
 | Write a new file below `$REMUDA_HOME`, or change a mode, a lock, or how a file is replaced | SPEC R3 / R13, `owned` (and its tests, which cover what all writes share); never `std::fs` writes elsewhere |
 | Support another agent CLI | SPEC R4, `provider` (every `match Provider`), `index`, `usage`, `identity` |
 | Run another agent command for an account | `account_command` runs it (`runner.run_ok(account, ARGS, timeout)`); the caller only parses, and tests its parsing with `account_command::Scripted` |

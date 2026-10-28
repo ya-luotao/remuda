@@ -134,15 +134,14 @@ switching to a different, logged-out account.
   longer exists are removed by a later write, and each write cleans one directory: a change
   to the registry and a cache being saved, the directory their file is replaced in (their
   own or, for a symlink, where it points); a line appended to the launch log, `state/`, the
-  directory the log is named in, and not where a log that is a symlink points; a new
-  settings file, `state/settings`; a launch that needs the shared instructions of R18,
-  `shared/claude/.claude`. So what a cache that is a symlink left where it points is removed
-  by the next cache saved there, not by a launch. One whose process may still be running is
-  being written and stays, whatever its age. A directory that cannot be listed (below)
-  keeps them until it can. This is the one name for everything
-  remuda writes and renames into place: the registry, the caches, the settings files, the
-  item links, and the rule copies of R18. A process ID that has since been given to another
-  process keeps its leftover until that one exits.
+  directory the log is named in, and not where a log that is a symlink points. So what a
+  cache that is a symlink left where it points is removed by the next cache saved there, not
+  by a launch. One whose process may still be running is being written and stays, whatever
+  its age. A directory that cannot be listed (below) keeps them until it can. This is the one
+  name for everything remuda writes and renames into place: the registry and the caches
+  (until 2026-10-28 also the settings files, item links and rule copies of the injection
+  R18 no longer does; a leftover of those is not touched). A process ID that has since been
+  given to another process keeps its leftover until that one exits.
 - Loading validates strictly: an invalid name, a duplicate name, a claimed `default`, a named
   account whose `home` is not an absolute path, `share` on a codex account, a `[share.claude] from`
   that names no claude account, a `[prices."<model>"]` that is not a table, has a key other than
@@ -166,8 +165,8 @@ switching to a different, logged-out account.
   among them (R6), and the caches hold titles and directories. `state/` is created with mode
   0700 and its files with mode 0600. A `state/` or a launch log from before that the group or
   others could access is tightened by the next write there, and a cache is always replaced by a
-  file of mode 0600; nothing is ever loosened. `state/settings` (R18) is created and
-  tightened like `state/`. A `state/` the user can search and write but not read (mode 0300,
+  file of mode 0600; nothing is ever loosened. A `state/` the user can search and write but
+  not read (mode 0300,
   say) is written in by name all the same, and keeps its mode: remuda opens it for that
   alone, and only what needs to list it, the cleanup of leftovers above, waits. Two modes are left as the user has them: that of
   the directory a `state` symlink points at, and that of the file a symlink in `state/` points
@@ -360,14 +359,17 @@ remuda help [<command>]                            help for remuda or a command
   sent, so the launch log may contain IDs with no corresponding index row; this is expected. Also,
   a `--resume` that sends no message still appends several bookkeeping records to the original
   transcript (verified on 2.1.281), so "resuming just to look" is not a read-only operation.
-- Shared configuration (R18) is injected into session invocations only, using the classification
-  above: any subcommand name, `--help` / `-h`, or `--version` / `-v` means "not a session". New
-  sessions, resumes, continues, forks, and `-p` runs are sessions.
+- What shared configuration adds to the environment of a member's launch (R18: the memory
+  variable, the authentication warning) goes with session invocations only, using the
+  classification above: any subcommand name, `--help` / `-h`, or `--version` / `-v` means
+  "not a session". New sessions, resumes, continues, forks, and `-p` runs are sessions.
 - Launch log `state/launches.jsonl`: one line per launch, containing time, account, home, cwd,
   args, and session ID (or unknown). Besides attribution (R9), `pick` reads it to find the
   account that last ran a session it is asked to resume (R23, **Resuming**). `args` are the user's arguments as the agent got them,
-  without what remuda injected: a prompt given on the command line is in the log, which is why
-  the log is readable by the user alone (R3).
+  without the `--session-id` remuda adds: a prompt given on the command line is in the log,
+  which is why the log is readable by the user alone (R3). Lines from before 2026-10-28 may
+  carry a `shared` field (the options of the shared configuration a launch then injected,
+  R18); every reader of the log ignores fields it does not know.
 - Launching from within a claude session. A claude session gives the processes of its tools and
   hooks `CLAUDECODE`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ID`,
   `CLAUDE_CODE_SESSION_ATTENDED`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_MESSAGING_SOCKET`,
@@ -785,19 +787,7 @@ appeared in no `history.jsonl`.
   `cleanupPeriodDays`: warning (the default 30-day cleanup deletes everyone's sessions in the
   shared store).
 - A registered home does not exist, or appears not to be logged in.
-- Shared configuration (R18): the source account does not exist or its home is missing; a home
-  shares some but not all of `CLAUDE.md`, `skills`, `commands`, `agents`, `rules` with the source
-  through symlinks (those items may load twice); a home that shares `projects` with the source
-  through a symlink but not `agent-memory`, when the source has one and a settings file of the
-  source or the home chooses `autoMemoryDirectory` (a launch then does not redirect memory, so
-  the memory of user-scope subagents is not shared); rules of the source whose frontmatter has
-  `paths`, when some member gets
-  the rules at launch (they are not applied there); an enabled plugin whose install path does not
-  exist (not one of the `builtin` marketplace, which claude bundles and never installs); an
-  `installed_plugins.json` whose format is not recognized; authentication keys in the
-  source's settings that are withheld from the settings injected at launch (said of the
-  accounts that get their settings that way when some member links `settings.json` instead,
-  and not said when every member does).
+- Shared configuration (R18): the source account does not exist, or its home is missing.
 - The links of a member's home (R18), for members only (an account with `share = false` and the
   source are not checked):
   - `.claude.json`, `history.jsonl`, or `sessions` is a symlink that resolves to the same item
@@ -811,59 +801,63 @@ appeared in no `history.jsonl`.
   - The home shares `projects` with the source but not `file-history`, when the source has one:
     after resuming another account's session, `/rewind` does not find its file backups. The
     message says how to link it.
-  - The home does not share `projects` with the source, when the source has one: the account
-    does not see the sessions of the source's store and cannot resume them (R16). This is a
-    notice that the account is not sharing sessions, not an error: the injected memory
-    locations (R18) still apply. The message says to link `projects`.
+  - The home shares `projects` with the source but not `agent-memory`, when the source has one
+    and a settings file of the source or the home chooses `autoMemoryDirectory`: a launch then
+    does not set the memory variable (R18), so the memory of user-scope subagents is not
+    shared. The message says how to link it. (Without such a settings file the variable
+    shares it, and nothing is said.)
+  - The items of R18's list that the source has and the home does not link, in one notice per
+    member, in the list's order, with the link that shares an item (`ln -s <source
+    home>/<item> <home>/<item>`). The source has `projects`, `file-history` and `agent-memory`
+    when they are directories, `rules` when it holds a rule file (R22's `rules/**/*.md`), and
+    any other item when it exists. `file-history` and `agent-memory` are left out of it where
+    `projects` is linked (the two messages above say what is lost). When `projects` is among
+    them, the notice also says that the account does not see the sessions of the source's
+    store and cannot resume them (R16). A `settings.json` of the source that sets
+    authentication settings (R18) is not an item to link: the notice says instead, while the
+    home has no `settings.json`, that the file is not shared, naming the keys and never their
+    values, and that the account needs one of its own; a home that has its own hears nothing
+    of it. This is a notice that the account does not share those items, not an error.
   - The source's `installed_plugins.json` records an `installPath` under `<home>/plugins/` (the
     home's path as registered) while the home's `plugins` resolves to the source's: that link
     cannot be removed without breaking those plugins for every account. The message gives
-    their number. Nothing is reported when the file is not recognized (reported above).
-  - The home's `settings.json` resolves to the source's, and the source's settings have keys
-    that R18 never injects (authentication): warning that this account reads them through the
-    link, naming the keys, never their values (each session launch says it too, R18). The
-    message says to remove the link, so that the rest is injected, or to move those settings
-    out of the source's `settings.json`.
-  The messages about items shared in part (`CLAUDE.md` and the other instruction items,
-  `file-history`, `agent-memory`) suggest linking the rest.
+    their number. Nothing is reported when the file is not recognized.
+  - The home's `settings.json` resolves to the source's, and the source's settings have
+    authentication settings (R18): warning that this account reads them through the link,
+    naming the keys, never their values (each session launch says it too, R18). The message
+    says to give the account a `settings.json` of its own instead of the link, or to move
+    those settings out of the source's `settings.json`.
 
 ## R12. Symlinks in homes
 
 - remuda detects symlinks in a home that point elsewhere and displays them as `-> <target>`.
 - remuda does not create, delete, or modify any symlink in a home, with one exception: the links
-  `setup` makes in the home it has just created, before the first login (R18). (The item links
-  remuda keeps under `$REMUDA_HOME/shared/`, R18, are its own.) Any future write operation that
-  encounters a symlink must either write through it or refuse; it must never replace the symlink
-  with a private copy.
+  `setup` makes in the home it has just created, before the first login (R18). Any future write
+  operation that encounters a symlink must either write through it or refuse; it must never
+  replace the symlink with a private copy.
 - Accounts share one session store and their configuration through symlinks in their homes:
   `setup` makes them in a home it creates, and the user makes them in any other home (R18). What
-  a member's home does not link is injected at launch instead, as a fallback (R18); what it
-  links is detected so that nothing is injected twice.
+  a member's home does not link it does not share: R11 says which items those are and how to
+  link them; what it links is detected by realpath, so that the checks, the launch and the
+  account card (R22) agree.
 
 ## R13. Write boundary
 
 The complete set of remuda's write operations:
 
-- `$REMUDA_HOME/config.toml`, `$REMUDA_HOME/state/**`, `$REMUDA_HOME/shared/**` (R18).
+- `$REMUDA_HOME/config.toml` and `$REMUDA_HOME/state/**`.
   Where the user put a symlink: a `config.toml`, a `state`, or a file in `state/` that is a
   symlink (a cache, the launch log, the usage history of R24) is written through (R3); where it
   points, remuda touches only its own files (the registry, the caches, the launch log, the usage
-  history, the settings files of R18). Modes there (R3): the
+  history). Modes there (R3): the
   directory a `state` symlink points at keeps its mode, and so does the file that a
   `config.toml` or a file in `state/` that is itself a symlink points at; a regular file
   remuda owns by name in a directory reached through a `state` symlink is still created with
   mode 0600, and the launch log there tightened to it. A launch log that is a symlink to a
   file others can access, or that is not a regular file, is not appended to (R3).
-  Below `shared` and in `state/settings`, remuda also replaces and removes what it keeps
-  there (links, rule copies, settings files), so it writes there only below real directories:
-  a `shared`, `shared/claude`, or `state/settings` that is a symlink, or that exists and is
-  not a directory, is refused before anything is created, replaced, or removed, and the
-  launch goes on without shared instructions, or without shared settings (R18). These
-  directories are reached as `setup` reaches a new home (below): `$REMUDA_HOME` is opened as
-  given (and `state` as R3 says), each level below is opened relative to the directory above
-  without following a symlink, and every file or link is created, replaced, or removed by
-  its name through the descriptor of the directory it is in. A symlink put at one of these
-  paths after remuda opened the directory redirects nothing (R18).
+  `$REMUDA_HOME/shared/**` and `$REMUDA_HOME/state/settings/**`, which a launch wrote until
+  2026-10-28 (R18), are written no more: a launch writes its line in the launch log and
+  nothing else. What is left there is not touched.
 - `$REMUDA_HOME/homes/<provider>/<name>/` created by `setup`: the directory itself and, for a
   claude account that is a member of `[share.claude]`, the symlinks of R18 in it, made once,
   while the directory is still empty, before the account is registered and logged in (login is
@@ -1108,18 +1102,26 @@ each pointing at that item of the source's home: `setup` makes them in a home it
 below), and the user makes them in any other home. The login stays per account: the
 credentials, `.claude.json`, `history.jsonl`, and `sessions` are never linked. A linked
 `settings.json` is the source's file, shared whole, authentication settings in it included
-(**Never injected: authentication**, below). Injection at
-launch fills in what a member's home does not link, and is skipped for each component the home
-already shares; it writes nothing into any home (R13). It is the fallback for a home without
-the links, and it cannot share sessions: an account whose `projects` is not the source's does
-not see the sessions in the source's store (R11, R16).
+(**Authentication**, below). What a member's home does not link it does not share: R11 names
+those items and the link that would share each. A launch adds no option for sharing and writes
+nothing (R13): for a member whose `projects` is the source's it sets one environment variable
+(**Memory**, below), and it warns when the member reads the source's authentication settings
+through its `settings.json` link.
+
+Until 2026-10-28 a launch injected what a member's home did not link (the source's instructions
+through an added directory, its settings minus the home's, its enabled plugins, the auto-memory
+location) as a fallback for homes without links. It was removed on that date: in 1065 real
+launches it had run once, and the linked layout is the one model of sharing. The directories it
+wrote, `$REMUDA_HOME/shared` and `$REMUDA_HOME/state/settings`, are neither written nor read any
+more; what is there can be deleted by hand.
 
 - **Source.** `[share.claude] from = "<account>"` in `config.toml` names the account whose home is
   the source of shared configuration (typically `default`, whose home is `~/.claude`). Without this
   table nothing is shared. The source must be a claude account; loading fails otherwise (R3).
-- **Members.** Every other claude account, unless it sets `share = false`. The source account itself
-  gets no injection. Codex accounts are not affected; `share` on a codex account is a load error
-  (R3).
+- **Members.** Every other claude account, unless it sets `share = false`: an opted-out account
+  is not a member, nothing is shared with it, and R11 does not check it. The source account
+  itself is no member of its own. Codex accounts are not affected; `share` on a codex account is
+  a load error (R3).
 - **Links made by `setup`.** For a new claude account that will be a member (`[share.claude]`
   is set: a new account has no `share = false` and cannot be the source), `setup` makes
   symlinks in the home it has just created, after creating the directory and before registering
@@ -1131,23 +1133,24 @@ not see the sessions in the source's store (R11, R16).
     reports the ones that matter once the source has them.
   - `settings.json` is linked only when it sets no authentication at that moment. A home
     that links it reads all of it, so `setup` reads the source's `settings.json` first, and
-    when it has any key that injection withholds (**Never injected: authentication**, below:
-    the same rules), or cannot be read as a JSON object, it is not linked. `setup` says so,
-    naming the keys, never their values. The other items are linked as usual, and the account
-    gets the source's settings by injection, without the authentication. This is a default
-    for the new home, checked once, and not a boundary: a linked `settings.json` stays the
-    source's file, so authentication settings added to it later are read by every home that
-    links it. remuda says so then (below) but does not prevent it.
+    when it has any authentication setting (**Authentication**, below), or cannot be read as a
+    JSON object, it is not linked. `setup` says so as a warning, naming the keys, never their
+    values, and that the account then has no shared settings at all: the user gives that home
+    a `settings.json` of its own (the command line names the home, the TUI's notice does not,
+    R21). The other items are linked as usual. This is a default for the new home, checked
+    once, and not a boundary: a linked `settings.json` stays the source's file, so
+    authentication settings added to it later are read by every home that links it. remuda
+    says so then (below) but does not prevent it.
   - A home that shares `projects` and has no `settings.json` of its own (the source's was not
     linked, or the source had none) has no `cleanupPeriodDays` where R11 looks for one:
-    `setup` says so.
+    `setup` says so, as a warning, asking for a `settings.json` of its own that sets it.
   - Never linked, whatever the source has: `.claude.json` (the login's identity and the
     account's caches), `history.jsonl` (attribution, R9), `sessions` (running sessions, R7),
     `remote-settings.json` and `policy-limits.json` (what an organization sets for its
     accounts), and everything else that is not in the list.
   - A link is `<home>/<item>` and points at `<source home>/<item>`: an absolute path, written
     from the source home's path as registered (`$HOME/.claude` for `default`), not
-    canonicalized, as for the item links under `$REMUDA_HOME/shared/` below.
+    canonicalized.
   - Only in the directory this `setup` created (R13): the home is made with `mkdirat` below
     `homes/<provider>`, which fails where the name exists, and opened without following a
     symlink; the links are made with `symlinkat` through that descriptor, and before the first
@@ -1160,7 +1163,7 @@ not see the sessions in the source's store (R11, R16).
     nothing is rolled back.
   - Once: remuda never adds, changes, or removes a link in that home afterwards, and never
     makes one in a home registered with `add` or in the native login's. What such a home does
-    not link is reported (R11) and injected at launch (below).
+    not link is not shared: R11 reports it, with the link to make.
   - When the source's home is not a directory, nothing is linked and `setup` says so. Without
     `[share.claude]`, and for codex, the home is created empty.
   - `setup` reports what it linked on stderr; from the TUI, the notice after the login gives
@@ -1186,171 +1189,25 @@ not see the sessions in the source's store (R11, R16).
   `commands`, `agents`, `hooks`, and `plugins` linked is the one observed in daily use
   (2.1.286); the other five links are not. A plugin installed from a member's home is recorded
   in the shared `installed_plugins.json` with an `installPath` through that home's `plugins`
-  link (observed), which then cannot be removed (R11).
-- **When.** Injection happens only for session invocations (R6), from `run` and from the TUI
-  alike.
-- **What is injected**, component by component. A component is skipped for a home that already
-  shares it with the source, detected by comparing realpaths (existing symlink layouts, R12):
-
-  | Component | Skipped when | Injection |
-  | --- | --- | --- |
-  | Instructions: `CLAUDE.md`, `skills/`, `commands/`, `agents/`, `rules/` | every one the source has resolves to the source's | `--add-dir=$REMUDA_HOME/shared/claude` (whose `.claude/` holds one link per item of the source's first four, and copies of its rules) and `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` in the child environment |
-  | Settings | `settings.json` resolves to the source's | the part of the source's `settings.json` that neither the home nor the project defines, in the single `--settings` |
-  | Plugins | `plugins/` resolves to the source's | `--plugin-dir=<install path>` for each plugin enabled in the source's settings |
-  | Auto-memory | `projects/` resolves to the source's: `CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>` is set instead (below) | `autoMemoryDirectory`, in the single `--settings` |
-  | Agent memory | `agent-memory/` resolves to the source's, neither `autoMemoryDirectory` is injected nor `projects/` resolves to the source's, or the user set the variable | `CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>` in the child environment |
-
-- **Instructions.** `$REMUDA_HOME/shared/claude/.claude` is a directory in which remuda keeps
-  copies of the source's rules (below) and
-  symlinks named `CLAUDE.md`, `skills`, `commands`, and `agents`, each pointing at that item of
-  the source home (`<source home>/<item>`, written from the home's path as registered, not
-  canonicalized; an existing link is compared with it as a path); an item the
-  source does not have (missing, or a dangling link) gets no entry. remuda brings the directory to
-  that state before a launch that needs it, and writes nothing when it already is: a missing link
-  is created, one with another target is replaced atomically (a temporary link in the same
-  directory, renamed into place; one that a killed remuda left behind is removed by the next
-  launch, R3), and one for an item the source no longer has is removed. An
-  entry named like an item that is not a symlink, or a `.claude` that is neither a directory nor
-  a symlink, is never replaced: nothing is changed, and the launch goes on without shared
-  instructions and says so. `shared` and `shared/claude` are directories of remuda's own, made
-  when missing: one that is a symlink, or that exists and is not a directory, is treated the same
-  way, checked before anything else: nothing is created, replaced, or removed below it (so
-  nothing where a link points), and the launch goes on without shared instructions and says so.
-  Nothing else in `shared/claude/` or in `.claude/` is touched, apart
-  from `.claude/rules/` (below).
-  A `.claude` that is a symlink (the earlier layout: one link to the whole source home) is
-  migrated in place: the directory is built under a temporary name in `shared/claude/`, the link
-  (only a link, never a directory or a file) is removed, and the directory is renamed into place.
-  A directory cannot be renamed over a symlink, so for an instant there is no `.claude`: a
-  remuda launch never misses it (it prepares `.claude` itself before starting claude), but a
-  session already running may not find the shared items if it reads them in that instant. When
-  two remudas migrate at the same time, the one whose rename finds a directory already in place
-  removes its own temporary directory and checks the items of the one in place; a temporary
-  directory is removed on every failure remuda sees. A process killed between removing the link
-  and the rename leaves no `.claude` (and an inert temporary directory, which is not touched)
-  until the next member launch creates it. A remuda from before this layout, still running,
-  refuses the directory ("is not a symlink") and launches without shared instructions, saying
-  so, until it is restarted. Residual: none by path below `$REMUDA_HOME`. A `shared`,
-  `shared/claude`, or `.claude` that is a symlink is refused (or, for `.claude`, migrated),
-  and so is `rules` or a directory of the copies that is one; each is opened relative to the
-  directory above without following a symlink, and the links and the copies are created,
-  replaced, and removed through the descriptor of the directory they are in (R13). A process
-  of the same user that puts a symlink at one of these paths, or moves the directory away,
-  after remuda opened it redirects no write: the write lands in the directory remuda opened,
-  and the next launch treats the symlink as it does any it finds there (refused; migrated
-  for `.claude`). What remains is `$REMUDA_HOME`
-  itself, opened as the path the user gave; the source's items, whose existence is read by
-  path a moment before each link is made; and the reading that decides what to copy or
-  remove under `rules`, which is by path: a path replaced at that moment can make remuda copy
-  a rule again or give up with an error, not write or remove anything elsewhere.
-  Basis (verified on 2.1.282): with the environment variable set, `--add-dir=<dir>` loads
-  `<dir>/.claude/CLAUDE.md` and the skills, commands, and agents under `<dir>/.claude/` with their
-  plain names, through per-item symlinks exactly as through a whole-home `.claude` symlink: a
-  skill that is itself a relative symlink inside the source's `skills/` loads, and a nested
-  command `commands/probe/nested.md` loads as `probe:nested`; it does not load
-  `<dir>/.claude/settings.json` (2.1.281). Plugins were rejected for this component because plugin
-  items are namespaced (`name:item`), which would rename every agent and skill. Why per-item links
-  (verified on 2.1.282, `-p`, default permission mode): through a whole-home link,
-  `<dir>/.claude/…` reached every file of the source home (transcripts, a leftover
-  `.credentials.json`), and Read, Grep, and Glob of such paths were refused pending permission
-  ("resolves through a symlink to <source>, which is outside the allowed working directories"),
-  the same as reading the source home directly; through per-item links,
-  `<dir>/.claude/.credentials.json`, `<dir>/.claude/projects/…`, and even
-  `<dir>/.claude/agents/../.credentials.json` do not exist (paths are normalized lexically), and
-  Glob and Grep of `<dir>/.claude` find nothing. claude grants silent access in neither layout;
-  the per-item layout bounds what one approved prompt can expose to the four items instead of the
-  whole source home, and does not depend on that check of claude's. Side effects, documented
-  rather than prevented: tools may access the four items like any `--add-dir`, and the variable
-  also loads `CLAUDE.md` from other `--add-dir` directories the user passes.
-- **Rules.** The source's rules are its `rules/**/*.md` regular files, down to 16 directory
-  levels, symlinks followed and a directory reached twice read once; at most the first 1000 in
-  name order, directory by directory; a `rules` without such a file is not an item. They are
-  shared as copies, not links: `.claude/rules/` under `$REMUDA_HOME/shared/claude/` is a
-  directory holding a regular file for each rule, at the rule's path below `rules/`. remuda
-  brings it to that state together with the item links, before a launch that needs it, and
-  writes nothing when it already is:
-  - a copy that is missing or whose content differs is written read-only (mode 0400) under a
-    temporary name in its directory (R3: `.remuda-<pid>-<32 hex digits>.tmp`, not a rule's
-    name) and renamed into place; directories are made one level at a time, never through a
-    link;
-  - a regular `*.md` file there that the source no longer has is removed, and so is a temporary
-    file a write cut short left behind (every one there is, under the lock below, whichever
-    process made it; `.<32 hex digits>.tmp`, the name earlier versions used, counts as one),
-    and then the directories that leaves empty, `rules` included. A file reached under another spelling of a rule's name (a file system that
-    ignores case) is that rule's copy and stays;
-  - a rule that became a directory of rules, or the reverse, replaces the copy of the other
-    kind: the removals come first, and a directory in a copy's place goes when they leave it
-    without files;
-  - `rules`, or a directory on the way to a copy, that is not a directory, and a copy's place
-    taken by a link, or by a directory holding anything that is not removed above, are never
-    replaced: as for the item links, nothing is changed, and the launch goes on without shared
-    instructions and says so. Other files and links in that directory are left alone;
-  - a rule that cannot be read is not shared;
-  - one remuda at a time changes `.claude` (an exclusive lock on the directory itself, where
-    the file system has locks), so launches at the same time agree on the copies even while
-    the source's rules change.
-
-  A copy is a snapshot taken at launch, and is the wrong place to change a rule: the source's
-  file is, and the copy is read-only so that an edit to it fails rather than being overwritten
-  at the next launch.
-  Basis (verified on 2.1.286, `-p`): from an added directory, `.claude/rules/**/*.md` loads
-  when it is made of regular files, a hard link included, and a nested directory too; nothing
-  loads through a `rules` that is a symlink, nor through a rule file or a subdirectory that is
-  one. Read from the 2.1.286 bundle: a link out of an added directory's `rules` is followed only
-  with the project's `hasClaudeMdExternalIncludesApproved` in the account's `.claude.json`, a
-  per-project, per-account approval remuda cannot rely on. Known limitation (verified on
-  2.1.286): a rule whose frontmatter has `paths` is not applied from an added directory,
-  whatever file the session reads, in the project or in the added directory; R11 names such
-  rules. A home whose `rules` is a symlink to the source's loads them as its own user rules,
-  `paths` included; like any other item, it gets none injected only when every other item it
-  has not linked is absent from the source (R11's warning about items loading twice applies to
-  `rules` as to the others).
-- **Settings.** claude merges settings sources in the order user, project, local, flag, policy
-  (lowest to highest; read from the 2.1.281 bundle), and `--settings` is the flag source: injected
-  keys win over the home's own `settings.json` and over the project's `.claude/settings.json` and
-  `.claude/settings.local.json`, and hook lists from all of them run (verified on 2.1.281). The
-  shared settings must behave as if they were user settings, and nothing may run twice, so remuda
-  injects the source's settings **minus what the home, the project, and the local project settings
-  already define**, computed recursively against each of them in turn:
-  - a key the other side does not define: the source's value is kept;
-  - a key where both values are objects: recurse;
-  - a key where both values are arrays: the source's elements that are not equal (as JSON) to any
-    element of the other array are kept, so identical hook entries are not duplicated;
-  - any other key the other side defines: dropped (the other side wins).
-  claude's merge replaces rather than combines a few keys (read from the 2.1.281 bundle: every
-  array is concatenated and deduplicated except `fallbackModel`, which is replaced; `modelPicker` is
-  replaced; `extraKnownMarketplaces` and `managedMcpServers` are merged one level deep). These are
-  compared as whole values: `fallbackModel` and `modelPicker` are dropped if the other side defines
-  them at all, and each entry of `extraKnownMarketplaces` (and its alias `additionalMarketplaces`)
-  and `managedMcpServers` is dropped if the other side defines that entry.
-  Project settings are read as claude reads them (from the 2.1.281 bundle): `.claude/settings.json`
-  from the start directory; `.claude/settings.local.json` from the start directory and, when the
-  project root differs from it, is not the real home directory, and it, its `.git`, and its
-  `.claude` belong to the current user, also from the project root. Unreadable or invalid project
-  files are treated as absent. If the user's arguments contain `--setting-sources`, remuda injects
-  no settings and no auto-memory and says so on stderr, as for `--settings`.
-- **Never injected: authentication.** Settings that choose credentials, provider, endpoint, or
-  organization are removed from the injected settings, whatever the home defines: remuda never
-  injects them, so a member that gets its settings at launch does not authenticate or bill as
-  the source through them, and none of them reaches that member's tools. This is a property of
-  injection only. A member whose `settings.json` is a symlink to the source's reads the file
-  whole, these settings included, as its own user settings. `setup` does not make that link
-  when the source's settings have any of these at that moment (above). When the source's
-  settings have them and a member's `settings.json` resolves to the source's, remuda says so
-  and does not prevent it: R11 warns in the accounts view, and each session launch of that
-  member (R6, from `run` and from the TUI alike) gives a warning on stderr, or among the TUI
-  launch's warnings, naming the settings and never their values: `warning: <account> reads
+  link (observed), which then cannot be removed (R11). A home whose `rules` is a symlink to
+  the source's loads them as its own user rules, `paths` included (verified on 2.1.286).
+- **Authentication.** Settings that choose credentials, provider, endpoint, or organization
+  stay per account: `setup` does not link a `settings.json` that sets any of them (above), and
+  a member whose `settings.json` resolves to the source's reads them through the link, which
+  remuda says and does not prevent: R11 warns in the accounts view, and each session launch of
+  that member (R6, from `run` and from the TUI alike) gives a warning on stderr, or among the
+  TUI launch's warnings, naming the settings and never their values: `warning: <account> reads
   the authentication settings of <source> through its settings.json link: <keys>`. For this
-  the source's `settings.json` is read even when the home shares every component; a file that
-  cannot be read is not reported there (R11 reports it) and does not fail the launch.
-  The credentials of a login are not settings: they are in the Keychain, or in the home's
-  `.credentials.json`, which is never linked. Settings that should apply to one account only,
-  authentication among them, belong outside the source's `settings.json`: in a home that does
-  not link it (an account that gets its settings by injection, or one with `share = false`).
+  the source's `settings.json` is read at every such launch; a file that cannot be read is not
+  reported there (R11 reports it) and does not fail the launch. The credentials of a login are
+  not settings: they are in the Keychain, or in the home's `.credentials.json`, which is never
+  linked. Settings that should apply to one account only, authentication among them, belong
+  outside the source's `settings.json`: in a home that does not link it (one with a
+  `settings.json` of its own, or one with `share = false`).
   The settings concerned:
   - the keys `apiKeyHelper`, `proxyAuthHelper`, `otelHeadersHelper`, `awsAuthRefresh`,
     `awsCredentialExport`, `gcpAuthRefresh`, `forceLoginMethod`, `forceLoginOrgUUID`;
-  - in `env`, names are matched case-insensitively and withheld if any rule matches:
+  - in `env`, names are matched case-insensitively and count if any rule matches:
     - prefix `ANTHROPIC_`, `AWS_`, `AZURE_`, `GOOGLE_`, `GCLOUD_`, `GCE_`, `CLOUDSDK_`,
       `CLOUD_ML_`, `VERTEX_`, `METADATA_`, `IDENTITY_`, `IMDS_`, `MSI_`, `CLAUDE_CODE_USE_`,
       `CLAUDE_CODE_SKIP_`, `CLAUDE_CODE_HOST_`, `CLAUDE_CODE_PROVIDER_`,
@@ -1361,131 +1218,58 @@ not see the sessions in the source's store (R11, R16).
       `GIT_AUTHOR_NAME` does not);
     - exactly `CLAUDE_CONFIG_DIR`, `CLAUDE_SECURESTORAGE_CONFIG_DIR`, `HTTP_PROXY`, `HTTPS_PROXY`,
       or `ALL_PROXY` (a proxy URL can carry credentials).
-    Exceptions, shared unless a prefix rule or another substring rule matches: the model-name
-    variables `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`,
+    Exceptions, not authentication unless a prefix rule or another substring rule matches: the
+    model-name variables `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`,
     `ANTHROPIC_DEFAULT_*_MODEL*`, and `ANTHROPIC_CUSTOM_MODEL_OPTION*`, and names ending in
     `_TOKENS` (counts such as `MAX_THINKING_TOKENS`, not secrets).
   The rules cover claude's own groupings of provider, credential, endpoint, and host-auth variables
-  in the 2.1.281 bundle, widened to prefixes so that new variables are withheld by default. The accounts
-  view (R11) lists the settings withheld this way.
-- **Passing settings.** claude uses only the last `--settings` option (verified on 2.1.281), so
-  remuda passes exactly one, as a file path, never inline: the injected JSON is written with mode
-  0600 to `$REMUDA_HOME/state/settings/<sha256 of the content>.json` (written atomically, reused
-  when the content is unchanged; files not used for 30 days are removed when a new one is written,
-  under an exclusive lock on `state/settings/.lock` (a regular file) that reuse also takes, so a
-  file is never removed between being chosen and being passed; on a filesystem that does not
-  support locking, remuda proceeds without the lock). `state/settings` is a directory of
-  remuda's own, the user's alone (R3): remuda removes files there, so one that is a symlink,
-  or that exists and is not a directory, is refused as a `shared` that is one is (R13):
-  nothing is written or removed where it points, and the launch goes on without shared
-  settings and says so. claude reads the file once at startup and keeps its
-  content (2.1.281 bundle).
-  This keeps settings values out of the process list and away from per-argument size limits.
-  `autoMemoryDirectory` is added to the same JSON when auto-memory is injected. If the user's
-  arguments already contain `--settings`, remuda injects no settings and no auto-memory and says so
-  on stderr. A settings file of the source or home that is not a JSON object, or not a regular
-  file (a FIFO or a device would block), is an error for the launch.
-  Note: claude treats a settings file passed with `--settings` like repository settings in one
-  check: a cloud or teleport git-bundle upload refuses if such a file sets `env.PATH`, `env.HOME`,
-  or similar variables (2.1.281 bundle). remuda shares them anyway; the case is rare.
-- **Plugins.** Enabled plugins are the keys whose value in the source settings' `enabledPlugins` is
-  `true` or an array (claude treats both as enabled), except those set to `false` in the
-  `enabledPlugins` of the home or of the project settings above (the highest layer that sets the
-  key decides, as claude merges it), and those the home has installed
-  itself in a way claude loads here, which would otherwise load twice, and those of the `builtin`
-  marketplace (`<name>@builtin`), which claude bundles and loads from its own bundle (2.1.296):
-  they have no install, and none is injected for them. claude loads an install
-  (2.1.281 bundle) when its scope is `user` or `managed`, or when its `projectPath` equals the start
-  directory, or when both the `projectPath` and the start directory are inside git repositories
-  with the same project root (auto-memory rule below). If the home's own `installed_plugins.json`
-  exists but is not recognized, remuda injects no plugins (R11 warns).
-  Their install paths come from the source's `plugins/installed_plugins.json` (format version 2:
-  `plugins.<name@marketplace>` is a list of installs; the first `user`-scoped install with an
-  existing `installPath` is used). Basis (verified on 2.1.281): `enabledPlugins` alone does nothing
-  in a home that has not installed the plugin, while `--plugin-dir=<install path>` loads it under
-  the same `name:item` names as an installed plugin, including the plugin's MCP servers. An
-  unrecognized file means no plugin injection and an R11 warning, never a failed launch.
-- **Auto-memory.** Memory belongs with configuration, not with sessions: its default location is
-  `<home>/projects/<project>/memory/`. remuda points it at the source's copy:
-  `<source home>/projects/<project>/memory`, and must compute `<project>` exactly as claude does
-  (read from the 2.1.281 bundle and checked against the path claude reports):
-  - The start directory is the launch cwd (for a resume, `cwd_last`), made absolute,
-    canonicalized (realpath), and NFC-normalized, as claude does with its own cwd.
-  - The project root is found as claude finds it, without running git (read from the 2.1.281
-    bundle): walk up from the start directory to the first directory containing a `.git` entry
-    (file or directory). If that `.git` is a file of the form `gitdir: <path>` whose git dir has a
-    `commondir`, and the git dir's `gitdir` file points back (by realpath) at that `.git` file, the
-    root is the parent of the common dir when the common dir is named `.git`, and the common dir
-    itself otherwise (a linked worktree, including a worktree of a bare repository); on any other
-    outcome the root is the directory containing `.git` (a plain repository, a submodule, a
-    separate git dir, a moved worktree). With no `.git` entry up to `/`, the root is the start
-    directory. Not replicated: claude refuses to follow a `.git` symlink, `gitdir`, or `commondir`
-    into network locations (on macOS, paths under `/net`, `/Network`, `/home/<user>`, `/.vol`,
-    `/.file`, and `//` UNC paths) and keeps walking up; in those rare layouts remuda may choose a
-    different project name.
-  - The root is NFC-normalized. `<project>` replaces every UTF-16 code unit that is not an ASCII
-    letter or digit with `-` (so a character outside the Basic Multilingual Plane becomes `--`).
-  - If the root has more than 200 UTF-16 code units, claude truncates and hashes the name
-    (**[unverified]** details), so remuda does not inject auto-memory.
-  - remuda does not inject `autoMemoryDirectory` if the source, the home, or the project's local
-    settings already set it.
-- **Agent memory.** A subagent with `memory: user` keeps its memory in
-  `<home>/agent-memory/<agent>/`. No setting moves it; with `CLAUDE_CODE_REMOTE_MEMORY_DIR=<dir>`
-  in its environment claude keeps it in `<dir>/agent-memory/<agent>/` instead. remuda sets the
-  variable to the source's home, as registered, exactly when it injects `autoMemoryDirectory`
-  and the settings file carrying it was written, unless the home's `agent-memory` resolves to
-  the source's; or when the home's `projects` resolves to the source's (next bullet). The
-  condition is not optional: the variable also moves the default auto-memory location, to
-  `<dir>/projects/<project>/memory`, so remuda sets it only where it has itself decided where
-  auto-memory goes, or where that is already the place. remuda creates nothing: claude makes
-  the directory when a subagent first writes.
-  - **A linked `projects`.** A home whose `projects` resolves to the source's keeps its
-    auto-memory in the source's store already, but by a path through the link. claude grants
-    its memory directory write access by that literal path and then checks the resolved one,
-    which is under the source's `.claude/` and outside the working directories: every memory
-    write asks for permission, in every mode, and no `Edit(//…)` allow rule or
-    `additionalDirectories` entry avoids it (observed on 2.1.288). With the variable set to the
-    source's home claude names the directory by the source's path, the same directory without
-    the link, and writes freely; `autoMemoryDirectory` is not injected (it would be the same
-    place). Not set when the user passes `--settings` or `--setting-sources`, sets the variable
-    themselves, or a settings file (the source's, the home's, the project's) chooses
-    `autoMemoryDirectory`: remuda does not know which of the two claude would follow. In this
-    case a malformed settings file of the source means no `autoMemoryDirectory` seen, not a
-    failed launch, as for any launch that injects nothing.
+  in the 2.1.281 bundle, widened to prefixes so that new variables count by default. The account
+  card (R22) lists the source's by name.
+- **Memory.** Memory belongs with configuration, not with sessions: auto-memory lives in
+  `<home>/projects/<project>/memory/` (`<project>` as R22 computes it), and a subagent with
+  `memory: user` keeps its memory in `<home>/agent-memory/<agent>/`. A member whose `projects`
+  resolves to the source's keeps its auto-memory in the source's store already, but by a path
+  through the link. claude grants its memory directory write access by that literal path and
+  then checks the resolved one, which is under the source's `.claude/` and outside the working
+  directories: every memory write asks for permission, in every mode, and no `Edit(//…)` allow
+  rule or `additionalDirectories` entry avoids it (observed on 2.1.288). So every session
+  launch (R6, from `run` and from the TUI alike) of such a member sets
+  `CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>` (the home as registered) in the child's
+  environment: with it claude names its memory directory by the source's path, the same
+  directory without the link, and writes freely; and it keeps user-scope agent memory in
+  `<source home>/agent-memory/<agent>/`, the source's, whether or not `agent-memory` is linked
+  too. remuda creates nothing: claude makes the directories when it first writes.
+  - Not set when the user passes `--settings` or `--setting-sources` (either form): remuda does
+    not know whether they choose `autoMemoryDirectory`, so the user decides, and a notice on
+    stderr, or among the TUI launch's warnings, says the variable is not set and memory is
+    written through the link. Not set when the user set the variable themselves: it is theirs,
+    neither set nor removed, and nothing is said. Not set when a settings file chooses
+    `autoMemoryDirectory` (the source's, the home's, or the project's `.claude/settings.json`
+    and `.claude/settings.local.json`, read as R22 reads them): remuda does not know which of
+    the two claude would follow, and only a link shares `agent-memory` then (R11 warns). A
+    settings file that cannot be read chooses nothing: no failed launch. Never set for a member
+    whose `projects` is its own, for the source, an opted-out account, a codex account, or a
+    call that is not a session (R6).
   - **A variable already in remuda's environment.** With the source's home as its value, it was
     set by an outer remuda launch (a member's session that starts remuda again): it is decided
     again for this launch, and removed from the child's environment when this launch does not
-    set it, so the source, an opted-out account, or a member that gets no auto-memory injected
-    never inherits it. With any other value it is the user's: remuda neither sets nor removes
-    it. Not covered: a `claude` started inside a member's session without remuda inherits the
-    variable but not the settings, and keeps its memory under the source's home.
+    set it, so the source, an opted-out account, or a member whose `projects` is its own never
+    inherits it. With any other value it is the user's: remuda neither sets nor removes it. Not
+    covered: a `claude` started inside a member's session without remuda inherits the variable
+    and keeps its memory under the source's home.
   - Basis (verified on 2.1.286, `-p`, with an agent given by `--agents`, and again through
-    `remuda run`): the agent's `MEMORY.md` and notes were written under
-    `<dir>/agent-memory/<agent>/`, the home got no `agent-memory`, and auto-memory stayed at the
-    injected `autoMemoryDirectory`. The variable is not documented and was made for claude's
-    remote sessions (2.1.286 bundle), so it is the least stable part of R18.
+    `remuda run`): with the variable set, the agent's `MEMORY.md` and notes were written under
+    `<dir>/agent-memory/<agent>/`, the home got no `agent-memory`, and auto-memory stayed in
+    the source's store. The variable is not documented and was made for claude's remote
+    sessions (2.1.286 bundle), so it is the least stable part of R18.
   - Side effects, documented rather than prevented (2.1.286 bundle): a subagent with
     `memory: local` keeps its memory in `<dir>/projects/<project>/agent-memory-local/<agent>/`
     instead of the project's `.claude/agent-memory-local/`, so for such an agent the members
     and the source, which has no variable, no longer read the same directory; and where claude
     tidies memory files under `projects/` (`tiny_memory`, `memory/proposals`) it looks under
     `<dir>/projects/`, the source's store. `memory: project` is not affected.
-  - A member that shares `projects` with the source through a symlink gets the variable, so
-    its agent memory is the source's whether or not `agent-memory` is linked too; where a
-    settings file chooses `autoMemoryDirectory` the variable is not set, and only a link
-    shares it (R11 warns).
-- **Order.** Injected options come before the user's arguments, each in the `--option=value` form,
-  so that a variadic option (such as `--add-dir`) cannot consume the user's arguments.
-
-  ```text
-  claude --add-dir=$REMUDA_HOME/shared/claude --settings=<file> --plugin-dir=<install> …  <user args>
-         └─ instructions ──────────────────┘ └─ settings, ───┘ └─ one per plugin ──┘  └─ with R6's
-                                               auto-memory                               --session-id
-  ```
- The launch
-  log (R6) records the injected option names and the byte size of each value, not the values.
-- `run` stays a fast path (R6): injection reads a handful of settings files and
-  `installed_plugins.json`, runs no subprocess, and scans no sessions.
+- `run` stays a fast path (R6): deciding this reads at most the source's, the home's and the
+  project's settings files, runs no subprocess, and scans no sessions.
 
 ## R19. Relay (removed)
 
@@ -1920,9 +1704,9 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   problems first. The configuration lists by name: the entries of an item
   (agents, skills, commands, rules, synced skills) flow on wrapped lines, those turned off marked
   so, and the headings carry the counts (an item's entries and how many are off; the plugins
-  that load here, installed by the source's injection or by the home itself, or bundled and
-  not turned off, and those set to `false`). An item or plugin of a member that is already
-  the source's is one
+  that load here, installed by the home itself (through a link, the source's installs) or
+  bundled, and not turned off, and those set to `false`). An item or plugin of a member that
+  is already the source's is one
   line, naming the target, without its entries. `d` lists the entries one per line with their
   details, those of the source's items and of the installed plugins too. A fact wider than the
   card goes on as many lines as it needs, its parts (a usage window, the login's organization)
@@ -1941,26 +1725,53 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   plugins installed for a project, the auto-memory project, project MCP servers). The card
   describes a new session started in the directory remuda was started in (the default of R16's
   new session), and its title names both: `Configuration · <account> · for <directory>`.
-- **The same plan as a launch.** What shared configuration adds (R18) is decided by the very
-  step that decides a launch's injection for a new session in that directory, without the
-  launch's writes (the `.claude` item links and the settings file), so the card cannot disagree
-  with a launch. A settings file that would fail the launch (not a JSON object) is shown as a
-  problem, in the words of the launch's own error (R18); private mode masks the file in it and
-  keeps the rest (R21).
-- **Origins.** Each item is tagged *own* (in the account's home), *shared from <source>*
-  (injected at launch, R18), *already the source's* (the home's item, or a plugin's install,
-  resolves by realpath to the source's, so nothing is injected for it, R12), or *not shared*
-  with the reason (authentication where settings are injected, turned off by the home or the
-  project, installed by the home itself, no user install, an unrecognized
-  `installed_plugins.json`), or *bundled with claude* (a plugin of the `builtin` marketplace,
-  loaded by claude itself: no install, nothing injected). An account that is the
-  source, has `share = false`, or whose source home is missing says so once instead of listing
-  the source's items. A symlink shows as `-> <target>`; one whose target does not exist, as
-  broken.
+  (Until 2026-10-28 the card also listed what a launch injected from the source, R18; a member
+  now loads what its home links, and the card lists that as its own or already the source's.)
+- **The same plan as a launch.** What the home has of the source's, and where a launch points
+  the memory (R18), is decided by the very step that decides a launch of a new session in that
+  directory, so the card cannot disagree with a launch. A `settings.json` of the home that is
+  not a JSON object, or cannot be read, is shown as a problem (the source's, for a member that
+  reads it through a link); private mode masks the file in it and keeps the rest (R21).
+- **The project.** What a session loads depends on the directory it starts in, and the card
+  computes the project as claude does (read from the 2.1.281 bundle and checked against the
+  path claude reports):
+  - The start directory is the launch cwd, made absolute, canonicalized (realpath), and
+    NFC-normalized, as claude does with its own cwd.
+  - The project root is found as claude finds it, without running git: walk up from the start
+    directory to the first directory containing a `.git` entry (file or directory). If that
+    `.git` is a file of the form `gitdir: <path>` whose git dir has a `commondir`, and the git
+    dir's `gitdir` file points back (by realpath) at that `.git` file, the root is the parent
+    of the common dir when the common dir is named `.git`, and the common dir itself otherwise
+    (a linked worktree, including a worktree of a bare repository); on any other outcome the
+    root is the directory containing `.git` (a plain repository, a submodule, a separate git
+    dir, a moved worktree). With no `.git` entry up to `/`, the root is the start directory.
+    Not replicated: claude refuses to follow a `.git` symlink, `gitdir`, or `commondir` into
+    network locations (on macOS, paths under `/net`, `/Network`, `/home/<user>`, `/.vol`,
+    `/.file`, and `//` UNC paths) and keeps walking up; in those rare layouts remuda may
+    choose a different project name.
+  - The root is NFC-normalized. `<project>` replaces every UTF-16 code unit that is not an
+    ASCII letter or digit with `-` (so a character outside the Basic Multilingual Plane
+    becomes `--`). If the root has more than 200 UTF-16 code units, claude truncates and
+    hashes the name (**[unverified]** details), so the card does not know the memory
+    directory.
+  - The project's settings are read as claude reads them (from the 2.1.281 bundle):
+    `.claude/settings.json` from the start directory; `.claude/settings.local.json` from the
+    start directory and, when the project root differs from it, is not the real home
+    directory, and it, its `.git`, and its `.claude` belong to the current user, also from the
+    project root. Unreadable or invalid project files are treated as absent.
+- **Origins.** Each item is tagged *own* (in the account's home), *already the source's* (the
+  home's item, or a plugin's install, resolves by realpath to the source's: shared through a
+  link, R12), *set by the project*, *bundled with claude* (a plugin of the `builtin`
+  marketplace, loaded by claude itself: no install), or *set at launch* (the memory of
+  user-scope subagents where a launch points it, R18). An account that is the source, has
+  `share = false`, or whose source home is missing says so once. A symlink shows as
+  `-> <target>`; one whose target does not exist, as broken.
 - **Instructions.** `CLAUDE.md` (size and lines); `agents/*.md` (top level), by the `name` of their
   frontmatter or else the file name, with its `description`, `model`, `effort`, and `tools`;
   `skills/<dir>/SKILL.md`, by `name` or the directory name, with its `description`;
-  `commands/**/*.md` (at most 4 levels), a subdirectory shown as `dir:name`; `rules/**/*.md` (R18),
+  `commands/**/*.md` (at most 4 levels), a subdirectory shown as `dir:name`; `rules/**/*.md`
+  (the rule files: regular files down to 16 directory levels, symlinks followed and a
+  directory reached twice read once, the first 1000 in name order, directory by directory),
   by path without the extension, one whose frontmatter has `paths` marked as limited to paths.
   Symlinks are followed; only regular files are opened; frontmatter is read from a file's first 8
   KB; at most 500 entries are listed per directory.
@@ -1971,37 +1782,40 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   ids it says that the bucket cannot be matched. `synced` is never listed as a skill, and bucket
   names are never shown.
 - **Skill overrides.** A skill set to `"off"` in `skillOverrides` of the settings a session gets
-  (the home's, the project's, the injected) is shown as off; an override naming no skill the card
-  lists (own, shared, synced, or a plugin's, as `<skill>` or `<plugin>:<skill>`) is listed as
-  stale.
-- **Plugins.** The home's enabled plugins (`enabledPlugins` `true` or an array), each with the
-  install claude loads for that directory (R18's load rule; when several do, one made for the
-  directory, `local` then `project`, before `user` then `managed`, else the first in the file),
-  its version and scope, and the number of install records, marked turned off here when the
-  project's settings set it to `false` (the highest layer decides, R18); or marked not
-  installed; or, for one of the `builtin` marketplace, marked bundled with claude (turned off,
-  when the project's settings set it to `false`), and listed once when the source enables it
-  too. Plugins set to `false` are counted, not listed. Then the source's enabled plugins,
-  injected or not with the reason. For each installed plugin: its agents, skills, and
-  commands (as above, in its install
-  directory), its hook events with counts (`hooks/hooks.json`, or `hooks` in
-  `.claude-plugin/plugin.json`), and the names of its MCP servers (`.mcp.json`, or `mcpServers`
-  in `.claude-plugin/plugin.json`).
-- **Settings.** The home's `settings.json` and the injected part of the source's, each
-  summarized as: model; permission rule counts (allow, ask, deny); hook events with the number of
-  hooks of each; `env` names; whether a status line is set; the names of other keys. The
-  source's authentication settings (R18) are listed by name: for a member that gets settings
-  at launch as not shared; for a member whose `settings.json` resolves to the source's as
-  read through the link, since nothing is withheld there (R11 warns); for the source as
-  withheld from injected settings.
-- **Auto-memory.** The directory a session there uses, `autoMemoryDirectory` as injected, else
-  as set by the project's settings, else by the home's, else `<home>/projects/<project>/memory`
-  (R18's project name), and how many `*.md` files it holds. And the directory for the memory of
-  user-scope subagents: the source's `agent-memory` where a launch redirects it (R18), else the
-  home's own, marked as already the source's when it resolves there, with the number of agents
-  that have one.
+  (the home's, the project's over them) is shown as off; an override naming no skill the card
+  lists (own, synced, or a plugin's, as `<skill>` or `<plugin>:<skill>`) is listed as stale.
+- **Plugins.** The home's enabled plugins (`enabledPlugins` `true` or an array; the source's,
+  through a linked `settings.json`), each with the install claude loads for that directory
+  (read from the 2.1.281 bundle: an install with `user` or `managed` scope, or whose
+  `projectPath` equals the start directory, or whose `projectPath` and the start directory are
+  inside git repositories with the same project root; when several do, one made for the
+  directory, `local` then `project`, before `user` then `managed`, else the first in the
+  file), its version and scope, and the number of install records, marked turned off here when
+  the project's settings set it to `false` (the highest layer that sets the key decides, as
+  claude merges it); or marked not installed; or, for one of the `builtin` marketplace, marked
+  bundled with claude (turned off, when the project's settings set it to `false`). An install
+  that resolves by realpath to the source's `user` install is already the source's. Plugins
+  set to `false` are counted, not listed. The install paths come from the home's
+  `plugins/installed_plugins.json` (format version 2: `plugins.<name@marketplace>` is a list
+  of installs); a file in another format is a problem of the card. For each installed plugin:
+  its agents, skills, and commands (as above, in its install directory), its hook events with
+  counts (`hooks/hooks.json`, or `hooks` in `.claude-plugin/plugin.json`), and the names of
+  its MCP servers (`.mcp.json`, or `mcpServers` in `.claude-plugin/plugin.json`).
+- **Settings.** The home's `settings.json` (the source's, through a link), summarized as:
+  model; permission rule counts (allow, ask, deny); hook events with the number of hooks of
+  each; `env` names; whether a status line is set; the names of other keys. The authentication
+  settings of R18 are listed by name: for the source, as what keeps `setup` from linking its
+  file; for a member whose `settings.json` resolves to the source's, as read through the link
+  (R11 warns). A member whose settings are its own hears nothing of them.
+- **Auto-memory.** The directory a session there uses, `autoMemoryDirectory` as set by the
+  project's settings, else by the home's, else `<home>/projects/<project>/memory` (the
+  project above; the source's `projects`, by the source's path, where the home's resolves to it
+  and a launch sets the memory variable, R18), and how many `*.md` files it holds. And the
+  directory for the memory of user-scope subagents: the source's `agent-memory` where a launch
+  points it (R18), marked as set at launch; else the home's own, marked as already the source's
+  when it resolves there; with the number of agents that have one.
 - **MCP servers.** The names in `mcpServers` of the account's `.claude.json` (user scope) and of
-  its `projects` entry for the project, whose key is the project root of R18 (read from the
+  its `projects` entry for the project, whose key is the project root above (read from the
   2.1.281 bundle). They belong to the account: shared configuration does not include
   `.claude.json`.
 - **No values.** Settings are summarized by key names and counts: no `env` value, hook command,

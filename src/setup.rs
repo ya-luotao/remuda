@@ -219,12 +219,19 @@ pub fn link_notes(plan: &Plan, linked: Option<&Linked>, paths: bool) -> Vec<Note
         });
     }
     match &linked.settings {
+        // Nothing stands in for the link: the account has no shared settings at all (R18).
         Some(Unlinked::Authentication(keys)) => notes.push(Note {
-            warning: false,
+            warning: true,
             text: format!(
-                "{SETTINGS} not linked: {source} sets authentication settings ({}); they stay \
-                 per account, and the rest is injected at launch",
-                keys.join(", ")
+                "{SETTINGS} not linked: {source} sets authentication settings ({}), which stay \
+                 per account; this account has no shared settings, so give {} a {SETTINGS} \
+                 of its own",
+                keys.join(", "),
+                if paths {
+                    plan.account.home.to_string()
+                } else {
+                    "it".to_string()
+                }
             ),
         }),
         Some(Unlinked::Unreadable) => notes.push(Note {
@@ -236,10 +243,9 @@ pub fn link_notes(plan: &Plan, linked: Option<&Linked>, paths: bool) -> Vec<Note
         }),
         None => {}
     }
-    // Settings injected at launch do not reach the agent's other runs (a login, a usage
-    // query), and the cleanup period is read from the home's own file (R11): a home that
-    // shares `projects` and has no `settings.json` of its own, because the source's was left
-    // out or there was none, needs one.
+    // The cleanup period is read from the home's own file (R11): a home that shares
+    // `projects` and has no `settings.json` of its own, because the source's was left out or
+    // there was none, needs one that sets it.
     let no_settings = linked.settings.is_some() || linked.absent.contains(&SETTINGS);
     if no_settings && linked.linked.contains(&Id::Projects.name()) {
         notes.push(Note {
@@ -593,20 +599,36 @@ mod tests {
         let cleanup = "this account shares projects without a settings.json of its own: give \
                        it one that sets cleanupPeriodDays, or the default 30-day cleanup may \
                        delete the shared sessions";
-        let rest = [
-            (false, "not linked (claude:default has none): rules"),
-            (
-                false,
+        // The account gets no shared settings at all: said as a warning, with the home on
+        // the command line and without it in the TUI (R21).
+        let auth = |home: &str| {
+            format!(
                 "settings.json not linked: claude:default sets authentication settings \
-                 (apiKeyHelper, env.ANTHROPIC_API_KEY); they stay per account, and the rest is \
-                 injected at launch",
-            ),
-            (true, cleanup),
-            (
-                true,
-                "could not link to claude:default: skills (File exists (os error 17))",
-            ),
-        ];
+                 (apiKeyHelper, env.ANTHROPIC_API_KEY), which stay per account; this account \
+                 has no shared settings, so give {home} a settings.json of its own"
+            )
+        };
+        let rest = |home: &str| {
+            vec![
+                (
+                    false,
+                    "not linked (claude:default has none): rules".to_string(),
+                ),
+                (true, auth(home)),
+                (true, cleanup.to_string()),
+                (
+                    true,
+                    "could not link to claude:default: skills (File exists (os error 17))"
+                        .to_string(),
+                ),
+            ]
+        };
+        let owned = |notes: &[Note]| -> Vec<(bool, String)> {
+            texts(notes)
+                .into_iter()
+                .map(|(w, t)| (w, t.to_string()))
+                .collect()
+        };
         let notes = link_notes(&plan, Some(&linked), true);
         assert_eq!(
             texts(&notes)[0],
@@ -616,7 +638,7 @@ mod tests {
                  projects, CLAUDE.md"
             )
         );
-        assert_eq!(texts(&notes)[1..], rest);
+        assert_eq!(owned(&notes)[1..], rest("/r/homes/claude/work"));
         let notes = link_notes(&plan, Some(&linked), false);
         assert_eq!(
             texts(&notes)[0],
@@ -625,7 +647,7 @@ mod tests {
                 "linked 2 items to claude:default: projects, CLAUDE.md"
             )
         );
-        assert_eq!(texts(&notes)[1..], rest);
+        assert_eq!(owned(&notes)[1..], rest("it"));
         assert!(notes.iter().all(|n| !n.text.contains('/')), "{notes:?}");
 
         let one = Linked {

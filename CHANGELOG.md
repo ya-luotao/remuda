@@ -74,6 +74,35 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   the latter is independently validated as nonempty `[a-z]+` and, for Claude, must not be a
   Claude subcommand. `TYPESAFE_API_KEY` is no longer used by remuda and can be
   removed from its setup. Tests no longer need a fake `curl` transport.
+- **Breaking:** the injection of shared configuration at launch, the fallback for a member
+  whose home did not link the source's items (SPEC R18, with R3, R6, R11, R13, R22). A launch
+  no longer passes `--add-dir=$REMUDA_HOME/shared/claude` (with
+  `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD`), a `--settings` file made of the source's
+  settings, `--plugin-dir` per enabled plugin, or an `autoMemoryDirectory`; it writes nothing
+  below `$REMUDA_HOME/shared` or `$REMUDA_HOME/state/settings`, and its launch log line has no
+  `shared` field (old lines that have one still parse). The symlinks `remuda setup` makes, or
+  that you make by hand, are the one way accounts share configuration. What stays: the
+  `[share.claude]` source and members, `setup`'s links and their safety rules,
+  `CLAUDE_CODE_REMOTE_MEMORY_DIR=<source home>` for a member whose `projects` is linked (with
+  its exceptions: a `--settings` or `--setting-sources` of your own, now said to keep the
+  variable unset; a variable you set; a settings file that chooses `autoMemoryDirectory`), the
+  warning when a member reads the source's authentication settings through its `settings.json`
+  link, and the account card. The Accounts view no longer warns about instruction items loading
+  twice, rules limited to paths, keys withheld from injected settings, or plugins without an
+  install: a member that does not link an item simply does not share it, and one notice per
+  member lists those items with the `ln -s` to make. When `remuda setup` does not link
+  `settings.json` because the source's sets authentication settings, the new account has no
+  shared settings at all; `setup` says so and asks for a `settings.json` of its own.
+  **Migration:** link the items a member should share by hand, as `remuda setup` would:
+  `ln -s <source home>/<item> <home>/<item>` for `projects`, `file-history`, `settings.json`,
+  `CLAUDE.md`, `skills`, `commands`, `agents`, `hooks`, `plugins`, `rules`, `agent-memory`,
+  `output-styles` and `keybindings.json` (never `.claude.json`, `history.jsonl` or
+  `sessions`); the Accounts view lists what each member does not link. A member whose
+  `settings.json` is not the source's keeps its own settings: give it a `settings.json`
+  (`cleanupPeriodDays` among its keys when it shares `projects`). A home that keeps its own
+  `projects` no longer gets the source's memory: auto-memory and user-scope agent memory stay
+  in that home. `$REMUDA_HOME/shared` and `$REMUDA_HOME/state/settings` are no longer used and
+  can be deleted by hand.
 
 ## [0.3.0] - 2026-10-13
 

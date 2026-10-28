@@ -48,6 +48,8 @@ fn history_line(session_id: &str) -> String {
     )
 }
 
+/// R9, and R18: a line from before 2026-10-28 carries a `shared` field (the options of the
+/// shared configuration then injected); it still counts.
 #[test]
 fn launch_log_alone() {
     let tmp = tempfile::tempdir().unwrap();
@@ -62,6 +64,7 @@ fn launch_log_alone() {
             r#"{"session_id":"s-no-account"}"#,
             "garbage",
             r#"{"ts":"2026-09-20T10:03:00Z","account":"claude:default","home":"default","cwd":null,"args":[],"session_id":"s-3","injected":true}"#,
+            r#"{"ts":"2026-10-01T10:04:00Z","account":"claude:alt","home":"/p/alt","cwd":"/w","args":["-p","hi"],"session_id":"s-4","injected":true,"shared":[{"option":"--add-dir","bytes":24},{"option":"--settings","bytes":90}]}"#,
         ]
         .join("\n")
             + "\n",
@@ -71,9 +74,10 @@ fn launch_log_alone() {
     a.add_launch_log(&log);
     assert_eq!(a.accounts("s-1"), ["claude:max", "claude:team"]);
     assert_eq!(a.accounts("s-3"), ["claude:default"]);
+    assert_eq!(a.accounts("s-4"), ["claude:alt"]);
     assert!(a.accounts("s-2").is_empty());
     assert!(a.accounts("s-no-account").is_empty());
-    assert_eq!(a.len(), 2);
+    assert_eq!(a.len(), 3);
 }
 
 #[test]

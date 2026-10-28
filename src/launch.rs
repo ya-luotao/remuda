@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::interrupt;
 use crate::provider::Provider;
 use crate::registry::{Account, Home, Sharing};
-use crate::share::{self, Injected, Shared};
+use crate::share::{self, Shared};
 use crate::{Env, owned};
 
 pub const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
@@ -309,18 +309,16 @@ pub struct LaunchRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fork_of: Option<String>,
     pub injected: bool,
-    /// Shared configuration injected before `args` (R18): option names and value sizes;
-    /// absent when nothing was.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub shared: Vec<Injected>,
 }
 
-/// A fully decided launch: what to exec and what to log.
+/// A fully decided launch: what to exec and what to log. (Lines of the launch log from before
+/// 2026-10-28 carry a `shared` field, the options of the shared configuration then injected;
+/// every reader of the log ignores fields it does not know, so they still parse.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
     pub args: Vec<String>,
     pub env: EnvChange,
-    /// Variables added on top of `env` (shared configuration, R18).
+    /// Variables added on top of `env` (the memory variable of a member, R18).
     pub extra_env: Vec<(String, String)>,
     /// Variables removed from what the child inherits (R18).
     pub unset_env: Vec<String>,
@@ -346,15 +344,13 @@ pub fn prepare(
     new_session_id: impl FnOnce() -> String,
 ) -> Launch {
     prepare_with(account, user_args, cwd, ts, new_session_id, |_| {
-        Ok(Shared::default())
+        Shared::default()
     })
-    .expect("nothing to share cannot fail")
 }
 
-/// The launch path of `remuda run` and the TUI alike (R6, R16, R18): [`prepare`],
-/// plus the shared configuration of `sharing` for session invocations of claude accounts.
-/// `config` is `$REMUDA_HOME/config.toml`.
-#[allow(clippy::too_many_arguments)]
+/// The launch path of `remuda run` and the TUI alike (R6, R16, R18): [`prepare`], plus what
+/// the shared configuration of `sharing` adds to the environment of a session invocation of
+/// a claude member.
 pub fn plan(
     account: &Account,
     user_args: Vec<String>,
@@ -363,25 +359,23 @@ pub fn plan(
     new_session_id: impl FnOnce() -> String,
     sharing: &Sharing,
     env: &Env,
-    config: &Path,
-) -> Result<Launch> {
+) -> Launch {
     prepare_with(account, user_args, cwd, ts, new_session_id, |args| {
-        share::inject(sharing, account, args, cwd, env, config)
+        share::at_launch(sharing, account, args, cwd, env)
     })
 }
 
-/// [`prepare`], with `shared` asked for what to inject only for a claude session invocation:
-/// anything but a subcommand, help or version (R6, R18). Its options go before the user's
-/// arguments, so a variadic option cannot swallow them; its variables are added to the
-/// child's environment.
+/// [`prepare`], with `shared` asked what a claude session invocation gets from the shared
+/// configuration: anything but a subcommand, help or version (R6, R18). The arguments are
+/// never changed by it; its variables are added to, or removed from, the child's environment.
 pub fn prepare_with(
     account: &Account,
     user_args: Vec<String>,
     cwd: Option<&Path>,
     ts: String,
     new_session_id: impl FnOnce() -> String,
-    shared: impl FnOnce(&[String]) -> Result<Shared>,
-) -> Result<Launch> {
+    shared: impl FnOnce(&[String]) -> Shared,
+) -> Launch {
     let env = env_change(account);
     let intent = match account.provider {
         Provider::Claude => classify(&user_args),
@@ -392,7 +386,7 @@ pub fn prepare_with(
         && !is_print(&user_args);
     let shared = match (account.provider, &intent) {
         (Provider::Claude, Intent::NewSession | Intent::Fork { .. } | Intent::Existing { .. }) => {
-            shared(&user_args)?
+            shared(&user_args)
         }
         _ => Shared::default(),
     };
@@ -420,17 +414,16 @@ pub fn prepare_with(
         session_id,
         fork_of,
         injected,
-        shared: shared.logged(),
     };
-    Ok(Launch {
-        args: [shared.args, args].concat(),
+    Launch {
+        args,
         env,
         extra_env: shared.env,
         unset_env: shared.unset,
         notices: shared.notices,
         record,
         interactive_claude,
-    })
+    }
 }
 
 /// Appends one JSON line to the launch log, the user's alone (R3): what may be appended to,
@@ -1067,7 +1060,6 @@ mod tests {
                 session_id: Some("U".into()),
                 fork_of: None,
                 injected: true,
-                shared: vec![],
             }
         );
     }
@@ -1121,19 +1113,18 @@ mod tests {
         assert!(!l.record.injected);
     }
 
-    /// R6, R18: shared configuration is asked for only for claude session invocations; its
-    /// options go before the user's arguments (and `--session-id` after them), its variables
-    /// into the child's environment, and the log keeps only option names and value sizes.
+    /// R6, R18: shared configuration is asked for only for claude session invocations; it
+    /// changes the child's environment and never the arguments (`--session-id` is the one
+    /// option added), and the log keeps no record of it.
     #[test]
-    fn shared_configuration_goes_before_the_users_arguments() {
+    fn shared_configuration_changes_the_environment_and_not_the_arguments() {
         let acc = account("max", Home::Path("/p/max".into()));
-        let shared = |_: &[String]| -> Result<Shared> {
-            Ok(Shared {
-                args: args(&["--add-dir=/r/shared/claude", "--settings={\"a\":1}"]),
+        let shared = |_: &[String]| -> Shared {
+            Shared {
                 env: vec![("V".into(), "1".into())],
                 unset: vec!["W".into()],
                 notices: vec!["note".into()],
-            })
+            }
         };
         let l = prepare_with(
             &acc,
@@ -1142,33 +1133,14 @@ mod tests {
             "T".into(),
             || "U".into(),
             shared,
-        )
-        .unwrap();
-        assert_eq!(
-            l.args,
-            args(&[
-                "--add-dir=/r/shared/claude",
-                "--settings={\"a\":1}",
-                "-p",
-                "hi",
-                "--session-id",
-                "U",
-                "--",
-                "x"
-            ])
         );
+        assert_eq!(l.args, args(&["-p", "hi", "--session-id", "U", "--", "x"]));
         assert_eq!(l.extra_env, [("V".to_string(), "1".to_string())]);
         assert_eq!(l.unset_env, ["W"]);
         assert_eq!(l.notices, ["note"]);
         assert_eq!(l.record.args, args(&["-p", "hi", "--", "x"]));
         let v = serde_json::to_value(&l.record).unwrap();
-        assert_eq!(
-            v["shared"],
-            serde_json::json!([
-                {"option": "--add-dir", "bytes": 16},
-                {"option": "--settings", "bytes": 7},
-            ])
-        );
+        assert!(v.get("shared").is_none(), "{v}");
 
         // Resumes, continues and forks are sessions too.
         for user in [
@@ -1176,12 +1148,16 @@ mod tests {
             args(&["-c"]),
             args(&["--resume", "abc", "--fork-session"]),
         ] {
-            let l =
-                prepare_with(&acc, user.clone(), None, "T".into(), || "U".into(), shared).unwrap();
-            assert_eq!(l.args[0], "--add-dir=/r/shared/claude", "{user:?}");
+            let l = prepare_with(&acc, user.clone(), None, "T".into(), || "U".into(), shared);
+            assert_eq!(
+                l.extra_env,
+                [("V".to_string(), "1".to_string())],
+                "{user:?}"
+            );
+            assert!(l.args.starts_with(&user), "{user:?}: {:?}", l.args);
         }
         // Subcommands, help and version are not; nor is anything codex runs.
-        let never = |_: &[String]| -> Result<Shared> { panic!("must not inject") };
+        let never = |_: &[String]| -> Shared { panic!("must not be asked") };
         for user in [
             args(&["agents", "--json"]),
             args(&["--help"]),
@@ -1190,10 +1166,9 @@ mod tests {
             args(&["-v"]),
             args(&["-p", "update"]),
         ] {
-            let l =
-                prepare_with(&acc, user.clone(), None, "T".into(), || "U".into(), never).unwrap();
+            let l = prepare_with(&acc, user.clone(), None, "T".into(), || "U".into(), never);
             assert_eq!(l.args, user);
-            assert!(l.extra_env.is_empty() && l.record.shared.is_empty());
+            assert!(l.extra_env.is_empty() && l.unset_env.is_empty() && l.notices.is_empty());
         }
         let codex = Account {
             provider: CODEX,
@@ -1206,12 +1181,8 @@ mod tests {
             "T".into(),
             || "U".into(),
             never,
-        )
-        .unwrap();
+        );
         assert_eq!(l.args, args(&["-p", "hi"]));
-        // A failure (a settings file that is not an object) fails the launch.
-        let failing = |_: &[String]| -> Result<Shared> { anyhow::bail!("bad settings") };
-        assert!(prepare_with(&acc, vec![], None, "T".into(), || "U".into(), failing).is_err());
     }
 
     /// R17: `codex resume <id>` names the session it runs, `codex fork <id>` the session it
@@ -1295,7 +1266,6 @@ mod tests {
                 session_id: Some(id.into()),
                 fork_of: None,
                 injected: false,
-                shared: vec![],
             }
         );
     }
@@ -1365,7 +1335,6 @@ mod tests {
             session_id: None,
             fork_of: None,
             injected: false,
-            shared: vec![],
         };
 
         // No reader: the open fails at once instead of blocking.
@@ -1399,7 +1368,6 @@ mod tests {
             session_id: None,
             fork_of: None,
             injected: false,
-            shared: vec![],
         };
         append_log(&log, &rec).unwrap();
         append_log(&log, &rec).unwrap();

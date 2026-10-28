@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use common::Sandbox;
 use common::homes::ClaudeHome;
 use predicates::prelude::*;
-use serde_json::Value;
 
 fn new_home(sb: &Sandbox, name: &str) -> PathBuf {
     sb.remuda_home().join("homes").join("claude").join(name)
@@ -47,10 +46,9 @@ fn names(dir: &Path) -> Vec<String> {
     names
 }
 
-/// A source home at `dir` with everything a session loads, so that a home linked to all of it
-/// gets nothing injected (R18): the session store, settings, instructions and plugins, and
-/// what is never linked. `commands`, `rules`, `agent-memory` and `output-styles` are missing,
-/// and `agents` is a dangling link.
+/// A source home at `dir` with everything a session loads (R18): the session store, settings,
+/// instructions and plugins, and what is never linked. `commands`, `rules`, `agent-memory`
+/// and `output-styles` are missing, and `agents` is a dangling link.
 fn source_home(dir: &Path) {
     ClaudeHome::at(dir)
         .dir("projects")
@@ -270,7 +268,7 @@ fn setup_refuses_relative_remuda_home() {
 /// R12, R13, R18: with `[share.claude]`, the new claude home gets one link for each listed item
 /// the source has, made before the login; what is never linked, what the source lacks, and a
 /// dangling item are left out, and the latter two are reported. Sessions of the account then
-/// get nothing injected: everything resolves to the source's.
+/// get the memory variable for the linked `projects`, and nothing else.
 #[test]
 fn setup_links_a_members_home_to_the_source() {
     let sb = Sandbox::new();
@@ -326,8 +324,8 @@ fn setup_links_a_members_home_to_the_source() {
         .collect();
     assert_eq!(login.entries, expected);
 
-    // R18: a session of the new account gets nothing injected but the memory variable, which
-    // lets claude write its auto-memory by the source's path instead of through the link.
+    // R18: a session of the new account gets the memory variable, which lets claude write its
+    // auto-memory by the source's path instead of through the link, and no option.
     sb.remuda()
         .args(["run", "work", "-p", "hi"])
         .assert()
@@ -345,8 +343,9 @@ fn setup_links_a_members_home_to_the_source() {
 }
 
 /// R18: a source whose `settings.json` sets authentication keeps it to itself: `setup` does
-/// not link it, says which settings are the reason (never their values), and links the rest.
-/// The account's sessions then get the source's settings injected without the authentication.
+/// not link it, says which settings are the reason (never their values) and that the account
+/// has no shared settings, to be given a `settings.json` of its own, and links the rest. The
+/// account's sessions then get no settings from the source, only the memory variable.
 #[test]
 fn setup_does_not_link_settings_that_set_authentication() {
     let sb = Sandbox::new();
@@ -366,11 +365,13 @@ fn setup_does_not_link_settings_that_set_authentication() {
     let assert = sb.remuda().args(["setup", "work"]).assert().success();
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
     assert!(
-        stderr.contains(
-            "remuda: settings.json not linked: claude:default sets authentication settings \
-             (apiKeyHelper, forceLoginOrgUUID, env.ANTHROPIC_API_KEY); they stay per account, \
-             and the rest is injected at launch\n"
-        ),
+        stderr.contains(&format!(
+            "remuda: warning: settings.json not linked: claude:default sets authentication \
+             settings (apiKeyHelper, forceLoginOrgUUID, env.ANTHROPIC_API_KEY), which stay per \
+             account; this account has no shared settings, so give {} a settings.json of its \
+             own\n",
+            home.display()
+        )),
         "{stderr}"
     );
     assert!(stderr.contains("remuda: linked 7 items of "), "{stderr}");
@@ -398,21 +399,19 @@ fn setup_does_not_link_settings_that_set_authentication() {
             .all(|(name, _)| name != "settings.json")
     );
 
+    // No settings from the source reach a session: no `--settings`, nothing written for one.
     sb.remuda()
         .args(["run", "work", "-p", "hi"])
         .assert()
-        .success();
+        .success()
+        .stderr(predicate::str::contains("authentication").not());
     let [_, inv] = sb.invocations().try_into().unwrap();
-    let path = inv.args[0].strip_prefix("--settings=").expect("--settings");
-    assert_eq!(inv.args[1..4], ["-p", "hi", "--session-id"]);
-    assert_eq!(inv.args.len(), 5, "{:?}", inv.args);
-    let text = fs::read_to_string(path).unwrap();
-    assert!(!text.contains("zz-"), "{text}");
-    let injected: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(
-        injected,
-        serde_json::json!({"model": "opus", "cleanupPeriodDays": 365, "env": {"EDITOR": "vi"}})
-    );
+    assert_eq!(inv.args[..3], ["-p", "hi", "--session-id"]);
+    assert_eq!(inv.args.len(), 4, "{:?}", inv.args);
+    assert_eq!(inv.memory_dir.as_deref(), Some(source_str.as_str()));
+    assert!(!sb.remuda_home().join("state/settings").exists());
+    assert!(!sb.remuda_home().join("shared").exists());
+    assert!(!home.join("settings.json").exists());
     assert_links(&home, &source_str, &linked);
 }
 

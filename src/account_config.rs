@@ -1,5 +1,6 @@
 //! What a claude account's sessions load and where each part comes from (SPEC R22), read on
-//! top of the launch's own plan ([`share::plan`]). Read-only: nothing is written, nothing
+//! top of the launch's own plan ([`share::plan`]: what the home has of the source's through
+//! its links, and where a launch points the memory). Read-only: nothing is written, nothing
 //! runs, credentials are never opened.
 
 use std::collections::BTreeMap;
@@ -16,7 +17,7 @@ use crate::Env;
 use crate::home_items::{self, Id, Membership};
 use crate::privacy::Marked;
 use crate::registry::{Account, Sharing};
-use crate::share::{self, Installs, MEMORY_KEY, Plan, Skip};
+use crate::share::{self, Installs, MEMORY_KEY};
 
 /// Frontmatter is read from this many bytes at the start of a file.
 pub const FRONTMATTER_BYTES: u64 = 8192;
@@ -31,7 +32,7 @@ const MAX_DESCRIPTION: usize = 300;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigView {
     pub role: Role,
-    /// The home's instruction items, then those `--add-dir` injects from the source.
+    /// The home's instruction items, its own and those that are the source's through a link.
     pub instructions: Vec<Item>,
     pub synced: Synced,
     /// `skillOverrides` keys that name no skill listed here.
@@ -43,11 +44,10 @@ pub struct ConfigView {
     /// `Own`, or `AlreadySource` when `settings.json` resolves to the source's.
     pub settings_origin: Origin,
     pub own_settings: Summary,
-    /// The injected part of the source's settings, without `autoMemoryDirectory`.
-    pub shared_settings: Summary,
-    /// Authentication settings of the source (`key` / `env.NAME`): never injected (R18). A
-    /// member whose `settings.json` is the source's (`settings_origin`) reads them through
-    /// that link instead, and they are shown as such.
+    /// Authentication settings (`key` / `env.NAME`, R18): for the source, those of its own
+    /// `settings.json`, which keep `setup` from linking it; for a member whose `settings.json`
+    /// is the source's (`settings_origin`), those it reads through the link. Empty for
+    /// everyone else: their settings are their own.
     pub withheld: Vec<String>,
     pub memory: Memory,
     /// Where the memory of user-scope subagents goes; `files` counts the agents that have one.
@@ -97,14 +97,15 @@ pub enum Origin {
     /// In the account's home.
     #[default]
     Own,
-    /// Injected from the source at launch (R18).
-    Shared,
-    /// The home's item resolves to the source's (R12): nothing is injected for it.
+    /// The home's item resolves to the source's (R12): shared through a link.
     AlreadySource,
-    /// The source's, not injected, and why.
-    NotShared(Skip),
     /// Set by the project's settings.
     Project,
+    /// A plugin of the `builtin` marketplace: claude loads it from its own bundle, there is
+    /// no install.
+    Bundled,
+    /// Where a launch points it (the memory variable of R18).
+    Launch,
 }
 
 /// `CLAUDE.md`, `agents`, `skills`, `commands` or `rules` of a home.
@@ -305,31 +306,17 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
     }
     let project = share::Project::locate(cwd);
     let layers = project.settings(env);
-    let plan = match share::plan(sharing, account, &[], cwd, env) {
-        Ok(plan) => plan,
-        Err(e) => {
-            view.problems.insert(
-                0,
-                Marked::default()
-                    .words("sessions of this account fail to start: ")
-                    .join(&Marked::from_error(&e)),
-            );
-            Plan::default()
-        }
-    };
+    let plan = share::plan(sharing, account, &[], cwd, env);
     let from = plan.source.as_ref().map(|(_, from)| from.clone());
 
-    // Own settings.
+    // Own settings (the source's, through the link, for a member whose file is the
+    // source's).
     let own_path = Id::Settings.at(&home);
-    let own = if is_file(&own_path) {
+    let own = if fs::symlink_metadata(&own_path).is_ok() {
         match share::read_settings(&own_path) {
             Ok(own) => own,
             Err(e) => {
-                let problem = Marked::from_error(&e);
-                // A launch fails on it too: said once.
-                if !view.problems.iter().any(|p| p.ends_with(problem.as_str())) {
-                    view.problems.push(problem);
-                }
+                view.problems.push(Marked::from_error(&e));
                 Map::new()
             }
         }
@@ -342,14 +329,11 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         Origin::Own
     };
     view.own_settings = Summary::of(&own);
-    let mut injected = plan.settings.clone();
-    injected.remove(MEMORY_KEY);
-    view.shared_settings = Summary::of(&injected);
 
-    // The source's authentication: withheld from what is injected, read by a home that links
-    // the file.
+    // The source's authentication settings: what keeps `setup` from linking its file, read
+    // all the same by a member whose file is the source's (R11 warns).
     view.withheld = match &membership {
-        Membership::Member { home, .. } => home.withheld(),
+        Membership::Member { home, .. } if plan.items.linked(Id::Settings) => home.withheld(),
         Membership::Source => share::withheld(&own),
         _ => Vec::new(),
     };
@@ -382,7 +366,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         Some(format!("{}_{}", org.as_str()?, account.as_str()?))
     });
 
-    // Instructions: the home's, then the source's that `--add-dir` injects.
+    // Instructions: the home's, those that are the source's through a link marked so.
     for item in home_items::instruction_items() {
         let origin = if plan.items.linked(item.id) {
             Origin::AlreadySource
@@ -391,18 +375,6 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         };
         if let Some(item) = instruction(&home, item.id, origin) {
             view.instructions.push(item);
-        }
-    }
-    if let Some(from) = &from
-        && plan.items.instructions().needs_injection()
-    {
-        for item in home_items::instruction_items() {
-            // As a launch counts them: rules only when there is one.
-            if plan.items.source_has(item.id)
-                && let Some(item) = instruction(from, item.id, Origin::Shared)
-            {
-                view.instructions.push(item);
-            }
         }
     }
 
@@ -430,7 +402,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         };
     }
 
-    // Plugins: the home's, then the source's.
+    // Plugins: the home's enabled ones (the source's, through a linked `settings.json`).
     let installs = share::installed_plugins(&home);
     if let Installs::Unrecognized(path) = &installs {
         view.problems.push(
@@ -439,7 +411,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
                 .words(" is not in a recognized format"),
         );
     }
-    // The source's, when the launch injects from it (a member).
+    // The source's installs, which an install of the home's own may resolve to (a member).
     let source_installs = match &from {
         Some(from) => share::installed_plugins(from),
         None => Installs::Missing,
@@ -450,13 +422,13 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
             let off = share::turned_off(&name, &own, &layers);
             view.plugins.push(Plugin {
                 name,
-                origin: Origin::NotShared(if off { Skip::TurnedOff } else { Skip::Builtin }),
+                origin: Origin::Bundled,
                 version: None,
                 scope: None,
                 installs: 0,
                 path: None,
                 contents: None,
-                off: false,
+                off,
             });
             continue;
         }
@@ -492,57 +464,20 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         .map_or(0, |p| {
             p.values().filter(|on| **on == Value::Bool(false)).count()
         });
-    for p in &plan.plugins {
-        let plugin = match &p.outcome {
-            Ok(dir) => Plugin {
-                name: p.name.clone(),
-                origin: Origin::Shared,
-                version: dir.version.clone(),
-                scope: Some("user".to_string()),
-                installs: source_installs.count(&p.name),
-                path: Some(dir.path.clone()),
-                contents: Some(plugin_contents(&dir.path)),
-                off: false,
-            },
-            Err(Skip::OwnInstall) if view.plugins.iter().any(|own| own.name == p.name) => {
-                continue;
-            }
-            // A bundled plugin the home enables too: its row above says whether it loads.
-            Err(Skip::Builtin | Skip::TurnedOff)
-                if share::bundled(&p.name) && view.plugins.iter().any(|own| own.name == p.name) =>
-            {
-                continue;
-            }
-            Err(skip) => Plugin {
-                name: p.name.clone(),
-                origin: Origin::NotShared(*skip),
-                version: None,
-                scope: None,
-                installs: 0,
-                path: None,
-                contents: None,
-                off: false,
-            },
-        };
-        view.plugins.push(plugin);
-    }
 
-    // Skill overrides: the home's, the project's over it, then the injected ones it lacks.
+    // Skill overrides: the home's, the project's over it.
     let mut overrides: BTreeMap<String, Value> = BTreeMap::new();
-    let mut overlay = |settings: &Map<String, Value>, replace: bool| {
+    let mut overlay = |settings: &Map<String, Value>| {
         if let Some(Value::Object(o)) = settings.get("skillOverrides") {
             for (k, v) in o {
-                if replace || !overrides.contains_key(k) {
-                    overrides.insert(k.clone(), v.clone());
-                }
+                overrides.insert(k.clone(), v.clone());
             }
         }
     };
-    overlay(&own, true);
+    overlay(&own);
     for layer in &layers {
-        overlay(layer, true);
+        overlay(layer);
     }
-    overlay(&plan.settings, false);
     mark_overrides(&mut view, &overrides);
 
     // Auto-memory.
@@ -552,9 +487,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
             .and_then(Value::as_str)
             .map(str::to_string)
     };
-    let (dir, origin) = if let Some(dir) = memory_of(&plan.settings) {
-        (Some(dir), Origin::Shared)
-    } else if let Some(dir) = layers.iter().rev().find_map(memory_of) {
+    let (dir, origin) = if let Some(dir) = layers.iter().rev().find_map(memory_of) {
         (Some(dir), Origin::Project)
     } else if let Some(dir) = memory_of(&own) {
         let origin = if plan.items.linked(Id::Settings) {
@@ -565,7 +498,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         (Some(dir), origin)
     } else if plan.items.linked(Id::Projects) {
         // Through a linked `projects`, a launch names the directory by the source's path
-        // (R18); the home's path resolves to it.
+        // (R18) where it sets the variable; the home's path resolves to it.
         let dir = match (&plan.agent_memory, &plan.source) {
             (Some(_), Some((_, from))) => project.memory_dir(from),
             _ => project.memory_dir(&home),
@@ -591,7 +524,7 @@ pub fn read(account: &Account, sharing: &Sharing, cwd: Option<&Path>, env: &Env)
         _ if plan.items.linked(Id::AgentMemory) => {
             (Id::AgentMemory.at(&home), Origin::AlreadySource)
         }
-        (Some(from), _) => (Id::AgentMemory.at(from), Origin::Shared),
+        (Some(from), _) => (Id::AgentMemory.at(from), Origin::Launch),
         (None, None) => (Id::AgentMemory.at(&home), Origin::Own),
     };
     view.agent_memory = Memory {
@@ -1388,10 +1321,11 @@ mod tests {
         entries.iter().map(|e| e.name.as_str()).collect()
     }
 
-    fn shared_items(view: &ConfigView) -> Vec<&str> {
+    /// The instruction items that are the source's through a link.
+    fn linked_items(view: &ConfigView) -> Vec<&str> {
         view.instructions
             .iter()
-            .filter(|i| i.origin == Origin::Shared)
+            .filter(|i| i.origin == Origin::AlreadySource)
             .map(|i| i.name)
             .collect()
     }
@@ -1614,14 +1548,17 @@ mod tests {
         );
     }
 
-    /// R18, R22: a member sees what the launch injects and from where: shared instructions,
-    /// the settings it lacks without authentication, the injected auto-memory; its own
-    /// symlinked skills are already the source's.
+    /// R18, R22: a member sees what is the source's through its links and what is its own:
+    /// linked skills are already the source's, a `CLAUDE.md` of the source that is not
+    /// linked is not the member's, its settings are its own and nothing of the source's is
+    /// listed as authentication for them, and through a linked `projects` the auto-memory is
+    /// the source's, by the source's path.
     #[test]
-    fn a_member_sees_what_is_shared_and_from_where() {
+    fn a_member_sees_what_is_the_sources_and_what_is_its_own() {
         let f = Root::new();
         let (src, max, work) = (f.root.join("src"), f.root.join("max"), f.root.join("work"));
         fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(src.join("projects")).unwrap();
         write(&src.join("CLAUDE.md"), "be brief\n");
         write(&src.join("skills/s1/SKILL.md"), "");
         write(
@@ -1629,10 +1566,6 @@ mod tests {
             &json!({
                 "model": "opus",
                 "env": {"ANTHROPIC_API_KEY": "zqsecret", "DISABLE_TELEMETRY": "1"},
-                "permissions": {"allow": ["Read", "Bash(ls)"]},
-                "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "a"},
-                                              {"type": "command", "command": "b"}]}]},
-                "statusLine": {"type": "command", "command": "s"},
             })
             .to_string(),
         );
@@ -1641,6 +1574,7 @@ mod tests {
             &json!({"model": "sonnet", "env": {"FOO": "1"}}).to_string(),
         );
         symlink(src.join("skills"), max.join("skills")).unwrap();
+        symlink(src.join("projects"), max.join("projects")).unwrap();
         let source = named("src", &src);
         let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
         assert_eq!(
@@ -1653,37 +1587,34 @@ mod tests {
             names(entries(&view, "skills", Origin::AlreadySource)),
             ["s1"]
         );
-        assert_eq!(shared_items(&view), ["CLAUDE.md", "skills"]);
+        assert_eq!(linked_items(&view), ["skills"]);
+        assert!(
+            !view.instructions.iter().any(|i| i.name == "CLAUDE.md"),
+            "{:?}",
+            view.instructions
+        );
+        assert_eq!(view.settings_origin, Origin::Own);
         assert_eq!(view.own_settings.model.as_deref(), Some("sonnet"));
         assert_eq!(view.own_settings.env, ["FOO"]);
-        let shared = &view.shared_settings;
-        assert_eq!(shared.model, None);
-        assert_eq!(shared.env, ["DISABLE_TELEMETRY"]);
-        assert_eq!(shared.hooks, [("Stop".to_string(), 2)]);
-        assert_eq!(shared.permissions, [2, 0, 0]);
-        assert!(shared.status_line);
-        assert_eq!(shared.other, Vec::<String>::new());
-        assert!(view.withheld.contains(&"env.ANTHROPIC_API_KEY".to_string()));
-        assert_eq!(view.memory.origin, Origin::Shared);
-        assert!(
-            view.memory
-                .dir
-                .as_deref()
-                .is_some_and(|d| d.starts_with(&src.display().to_string())),
-            "{:?}",
-            view.memory
+        assert_eq!(view.withheld, Vec::<String>::new());
+        assert_eq!(view.memory.origin, Origin::AlreadySource);
+        assert_eq!(
+            view.memory.dir,
+            share::Project::locate(Some(&work)).memory_dir(&src)
         );
         assert_eq!(view.memory.files, None);
         assert!(!format!("{view:?}").contains("zqsecret"));
     }
 
-    /// R22: the rules are an instruction item, named by path, those limited to paths marked;
-    /// the memory of user-scope subagents is the source's where a launch redirects it.
+    /// R22: the rules are an instruction item, named by path, those limited to paths marked,
+    /// the source's through a link listed as already the source's; the memory of user-scope
+    /// subagents is the source's where a launch points it (a linked `projects`, R18).
     #[test]
     fn rules_and_agent_memory_are_shown() {
         let f = Root::new();
         let (src, max, work) = (f.root.join("src"), f.root.join("max"), f.root.join("work"));
         fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(src.join("projects")).unwrap();
         write(&src.join("rules/style.md"), "be terse\n");
         write(
             &src.join("rules/lang/rust.md"),
@@ -1694,15 +1625,31 @@ mod tests {
         let source = named("src", &src);
         let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
         assert_eq!(names(entries(&view, "rules", Origin::Own)), ["own"]);
-        let shared = entries(&view, "rules", Origin::Shared);
-        assert_eq!(names(shared), ["lang/rust", "style"]);
-        assert_eq!(shared[0].description.as_deref(), Some("limited to paths"));
-        assert_eq!(shared[1].description, None);
+        // Its own `projects`: the memory stays its own.
+        assert_eq!(
+            view.agent_memory,
+            Memory {
+                dir: Some(max.join("agent-memory").display().to_string()),
+                origin: Origin::Own,
+                files: None,
+            }
+        );
+
+        // The source's rules through a link, and its agent memory through a linked
+        // `projects`: where the launch points it.
+        fs::remove_dir_all(max.join("rules")).unwrap();
+        symlink(src.join("rules"), max.join("rules")).unwrap();
+        symlink(src.join("projects"), max.join("projects")).unwrap();
+        let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
+        let rules = entries(&view, "rules", Origin::AlreadySource);
+        assert_eq!(names(rules), ["lang/rust", "style"]);
+        assert_eq!(rules[0].description.as_deref(), Some("limited to paths"));
+        assert_eq!(rules[1].description, None);
         assert_eq!(
             view.agent_memory,
             Memory {
                 dir: Some(src.join("agent-memory").display().to_string()),
-                origin: Origin::Shared,
+                origin: Origin::Launch,
                 files: Some(1),
             }
         );
@@ -1714,10 +1661,6 @@ mod tests {
         symlink(src.join("agent-memory"), max.join("agent-memory")).unwrap();
         let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
         assert_eq!(view.agent_memory.origin, Origin::AlreadySource);
-        // Linked, with `projects` linked too (a launch sets the variable): still the link.
-        symlink(src.join("projects"), max.join("projects")).unwrap();
-        let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
-        assert_eq!(view.agent_memory.origin, Origin::AlreadySource);
         // The user's own variable wins over the link, as it does for claude.
         let mut env = f.env.clone();
         env.insert(share::MEMORY_DIR_VAR.to_string(), "/theirs".to_string());
@@ -1727,8 +1670,10 @@ mod tests {
             view.agent_memory.dir,
             Some("/theirs/agent-memory".to_string())
         );
+        // Linked without a linked `projects`: still the link.
         fs::remove_file(max.join("projects")).unwrap();
         let view = read(&named("max", &max), &sharing(&source), Some(&work), &f.env);
+        assert_eq!(view.agent_memory.origin, Origin::AlreadySource);
         assert_eq!(
             view.agent_memory.dir,
             Some(max.join("agent-memory").display().to_string())
@@ -1920,8 +1865,8 @@ mod tests {
     }
 
     /// R18, R22: a member whose `settings.json` is a symlink to the source's gets no settings
-    /// injected and reads the file whole: the source's authentication settings are listed
-    /// for it, with the origin that says they are not withheld there.
+    /// of its own and reads the file whole: the source's authentication settings are listed
+    /// for it, as read through the link (R11 warns).
     #[test]
     fn a_member_that_links_settings_reads_the_sources_authentication() {
         let f = Root::new();
@@ -1937,17 +1882,15 @@ mod tests {
         let source = named("src", &src);
         let view = read(&named("max", &max), &sharing(&source), None, &f.env);
         assert_eq!(view.settings_origin, Origin::AlreadySource);
-        assert!(
-            view.shared_settings.is_empty(),
-            "{:?}",
-            view.shared_settings
-        );
         assert_eq!(view.withheld, ["apiKeyHelper", "env.ANTHROPIC_API_KEY"]);
         assert_eq!(view.own_settings.model.as_deref(), Some("opus"));
+        assert_eq!(view.own_settings.env, ["ANTHROPIC_API_KEY"]);
+        assert!(!format!("{view:?}").contains("zqsecret"));
     }
 
-    /// R18, R22: the source (its authentication listed as withheld), an opted-out account and
-    /// a member of a missing source get nothing shared.
+    /// R18, R22: the source (its authentication settings listed: what keeps `setup` from
+    /// linking its file), an opted-out account and a member of a missing source have nothing
+    /// of a source's.
     #[test]
     fn roles() {
         let f = Root::new();
@@ -1965,7 +1908,7 @@ mod tests {
         let view = read(&source, &sharing(&source), None, &f.env);
         assert_eq!(view.role, Role::Source);
         assert_eq!(view.withheld, ["apiKeyHelper"]);
-        assert_eq!(shared_items(&view), Vec::<&str>::new());
+        assert_eq!(linked_items(&view), Vec::<&str>::new());
 
         let opted = Sharing {
             opted_out: vec!["claude:max".into()],
@@ -1979,7 +1922,7 @@ mod tests {
             }
         );
         assert_eq!(view.role.source(), Some("claude:src"));
-        assert_eq!(shared_items(&view), Vec::<&str>::new());
+        assert_eq!(linked_items(&view), Vec::<&str>::new());
         assert_eq!(view.withheld, Vec::<String>::new());
 
         let gone = sharing(&named("gone", &f.root.join("gone")));
@@ -1990,8 +1933,8 @@ mod tests {
                 source: "claude:gone".into()
             }
         );
-        assert_eq!(shared_items(&view), Vec::<&str>::new());
-        assert_eq!(view.shared_settings, Summary::default());
+        assert_eq!(linked_items(&view), Vec::<&str>::new());
+        assert_eq!(view.withheld, Vec::<String>::new());
     }
 
     /// R22: MCP servers by name only: the user's and those of the project's entry, keyed by
@@ -2047,8 +1990,9 @@ mod tests {
         );
     }
 
-    /// R18, R22: a settings file that would fail the launch is the first problem, and nothing
-    /// is shown as shared.
+    /// R22: a `settings.json` that is not a JSON object is a problem of the card: the home's
+    /// own, or the source's for a member that reads it through a link; said once. The source's
+    /// file alone is no problem of a member's.
     #[test]
     fn settings_problems_are_shown() {
         let f = Root::new();
@@ -2056,36 +2000,35 @@ mod tests {
         write(&src.join("CLAUDE.md"), "x");
         write(&src.join("settings.json"), "[]");
         fs::create_dir_all(&max).unwrap();
-        let view = read(
-            &named("max", &max),
-            &sharing(&named("src", &src)),
-            None,
-            &f.env,
-        );
-        assert!(
-            view.problems[0].contains("is not a JSON object"),
-            "{:?}",
-            view.problems
-        );
-        assert!(view.problems[0].starts_with("sessions of this account fail to start: "));
+        let source = named("src", &src);
+        let view = read(&named("max", &max), &sharing(&source), None, &f.env);
+        assert!(view.problems.is_empty(), "{:?}", view.problems);
         assert_eq!(
             view.role,
             Role::Member {
                 source: "claude:src".into()
             }
         );
-        assert_eq!(shared_items(&view), Vec::<&str>::new());
         assert!(view.plugins.is_empty());
+        let view = read(&source, &sharing(&source), None, &f.env);
+        assert_eq!(view.problems.len(), 1, "{:?}", view.problems);
+        assert!(view.problems[0].contains("is not a JSON object"));
+        assert_eq!(view.withheld, Vec::<String>::new());
+
+        // Through a link it is the member's own file, and nothing of it is read as
+        // authentication.
+        symlink(src.join("settings.json"), max.join("settings.json")).unwrap();
+        let view = read(&named("max", &max), &sharing(&source), None, &f.env);
+        assert_eq!(view.problems.len(), 1, "{:?}", view.problems);
+        assert!(view.problems[0].contains("is not a JSON object"));
+        assert_eq!(view.settings_origin, Origin::AlreadySource);
+        assert_eq!(view.withheld, Vec::<String>::new());
 
         // The home's own: said once.
+        fs::remove_file(max.join("settings.json")).unwrap();
         write(&src.join("settings.json"), "{}");
         write(&max.join("settings.json"), "1");
-        let view = read(
-            &named("max", &max),
-            &sharing(&named("src", &src)),
-            None,
-            &f.env,
-        );
+        let view = read(&named("max", &max), &sharing(&source), None, &f.env);
         assert_eq!(view.problems.len(), 1, "{:?}", view.problems);
     }
 
@@ -2128,11 +2071,13 @@ mod tests {
         );
         assert_eq!(paths(&view), [list.display().to_string()]);
 
-        // What fails a launch keeps the pieces `share` gave it, after remuda's own words: a
-        // settings file of the source that is not a JSON object is a path, and what is wrong
-        // with it stays readable.
+        // A settings file keeps the pieces `share` gave it: one that is not a JSON object is
+        // a path, and what is wrong with it stays readable. The source's is a member's
+        // problem through a link only, as the member's own file.
         let src = f.root.join("src, (old)");
         write(&src.join("settings.json"), "[]");
+        let own = max.join("settings.json").display().to_string();
+        symlink(src.join("settings.json"), max.join("settings.json")).unwrap();
         let view = read(
             &named("max", &max),
             &sharing(&named("src", &src)),
@@ -2140,22 +2085,17 @@ mod tests {
             &f.env,
         );
         assert_eq!(
-            shapes(&view)[0],
-            "sessions of this account fail to start: <> is not a JSON object"
+            shapes(&view),
+            [
+                "<> is not a JSON object",
+                ".claude.json is not in a recognized format",
+                "<> is not in a recognized format"
+            ]
         );
-        assert_eq!(
-            view.problems[0],
-            format!(
-                "sessions of this account fail to start: {} is not a JSON object",
-                src.join("settings.json").display()
-            )
-        );
-        assert_eq!(
-            paths(&view)[0],
-            src.join("settings.json").display().to_string()
-        );
-        // The home's own settings: said once when a launch fails on them too, and by
-        // themselves otherwise. The file is a path either way.
+        assert_eq!(view.problems[0], format!("{own} is not a JSON object"));
+        assert_eq!(paths(&view)[0], own);
+        // The home's own file likewise, with or without a source.
+        fs::remove_file(max.join("settings.json")).unwrap();
         write(&src.join("settings.json"), "{}");
         write(&max.join("settings.json"), "1");
         let view = read(
@@ -2164,15 +2104,7 @@ mod tests {
             None,
             &f.env,
         );
-        let own = max.join("settings.json").display().to_string();
-        assert_eq!(
-            shapes(&view),
-            [
-                "sessions of this account fail to start: <> is not a JSON object",
-                ".claude.json is not in a recognized format",
-                "<> is not in a recognized format"
-            ]
-        );
+        assert_eq!(shapes(&view)[0], "<> is not a JSON object");
         assert_eq!(paths(&view)[0], own);
         let view = read(&named("max", &max), &Sharing::default(), None, &f.env);
         assert_eq!(
@@ -2183,23 +2115,16 @@ mod tests {
         );
         assert_eq!(paths(&view)[0], own);
         // One that cannot be read: the file is a path, the system's reason a text of its own.
-        fs::remove_file(src.join("settings.json")).unwrap();
-        fs::create_dir(src.join("settings.json")).unwrap();
         fs::remove_file(max.join("settings.json")).unwrap();
+        fs::create_dir(max.join("settings.json")).unwrap();
         let view = read(
             &named("max", &max),
             &sharing(&named("src", &src)),
             None,
             &f.env,
         );
-        assert_eq!(
-            shapes(&view)[0],
-            "sessions of this account fail to start: cannot read <>: {}"
-        );
-        assert_eq!(
-            paths(&view)[0],
-            src.join("settings.json").display().to_string()
-        );
+        assert_eq!(shapes(&view)[0], "cannot read <>: {}");
+        assert_eq!(paths(&view)[0], own);
 
         // Without `$HOME` the native login has no home.
         let view = read(
@@ -2211,52 +2136,49 @@ mod tests {
         assert_eq!(shapes(&view), ["HOME is not set"]);
     }
 
-    /// R18, R22: the pane shows what the launch injects: `--add-dir`, each `--plugin-dir`,
-    /// the settings keys and the auto-memory directory of the `--settings` file.
+    /// R18, R22: the card and a launch read one plan: a linked `projects` is where a launch
+    /// points the memory, and the card says so, by the source's path; what the home links is
+    /// already the source's, a plugin of the home's own whose install is the source's
+    /// included; a bundled plugin loads unless the project turns it off; the home's own
+    /// plugin the project turns off is marked; nothing of the source's that is not linked is
+    /// the member's.
     #[test]
-    fn the_pane_agrees_with_inject() {
+    fn the_card_agrees_with_the_launch_plan() {
         let f = Root::new();
         let (src, max, work) = (f.root.join("src"), f.root.join("max"), f.root.join("work"));
         fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(src.join("projects")).unwrap();
         write(&src.join("CLAUDE.md"), "x");
         write(&src.join("skills/s/SKILL.md"), "");
         write(&src.join("agents/a.md"), "");
         fs::create_dir_all(&max).unwrap();
         symlink(src.join("skills"), max.join("skills")).unwrap();
+        symlink(src.join("projects"), max.join("projects")).unwrap();
         let cache = src.join("plugins/cache");
-        for p in ["a", "b", "c"] {
+        for p in ["a", "b"] {
             fs::create_dir_all(cache.join(p)).unwrap();
         }
         let install = |p: &str| json!([{"scope": "user", "installPath": cache.join(p)}]);
         write(
             &src.join("plugins/installed_plugins.json"),
-            &json!({"version": 2, "plugins": {"a@m": install("a"), "b@m": install("b"),
-                                             "c@m": install("c")}})
-            .to_string(),
+            &json!({"version": 2, "plugins": {"a@m": install("a"), "b@m": install("b")}})
+                .to_string(),
         );
-        write(
-            &src.join("settings.json"),
-            &json!({
-                "model": "opus",
-                "theme": "dark",
-                "env": {"DISABLE_TELEMETRY": "1", "ANTHROPIC_API_KEY": "k"},
-                "enabledPlugins": {"a@m": true, "b@m": true, "c@m": true, "e@builtin": true,
-                                   "f@builtin": true},
-            })
-            .to_string(),
-        );
-        // The member's own install of `g`, which the project turns off.
+        // The member's own list: `a` installed in the source's cache (the same directory),
+        // `g` its own, which the project turns off; `b` enabled and not installed here.
         let own_cache = max.join("plugins/cache/g");
         fs::create_dir_all(&own_cache).unwrap();
         write(
             &max.join("plugins/installed_plugins.json"),
-            &json!({"version": 2, "plugins": {"g@m": [{"scope": "user", "installPath": own_cache}]}})
-                .to_string(),
+            &json!({"version": 2, "plugins": {
+                "a@m": install("a"),
+                "g@m": [{"scope": "user", "installPath": own_cache}]}})
+            .to_string(),
         );
         write(
             &max.join("settings.json"),
-            &json!({"enabledPlugins": {"c@m": false, "e@builtin": true, "f@builtin": true,
-                                       "g@m": true}})
+            &json!({"enabledPlugins": {"a@m": true, "b@m": true, "e@builtin": true,
+                                       "f@builtin": true, "g@m": true}})
             .to_string(),
         );
         write(
@@ -2271,70 +2193,77 @@ mod tests {
         );
         let (source, member) = (named("src", &src), named("max", &max));
         let sharing = sharing(&source);
-        let shared = share::inject(&sharing, &member, &[], Some(&work), &f.env, &f.config).unwrap();
+        let plan = share::plan(&sharing, &member, &[], Some(&work), &f.env);
         let view = read(&member, &sharing, Some(&work), &f.env);
 
-        assert!(shared.args.iter().any(|a| a.starts_with("--add-dir=")));
-        assert!(view.instructions.iter().any(|i| i.origin == Origin::Shared));
-        let mut dirs: Vec<PathBuf> = shared
-            .args
-            .iter()
-            .filter_map(|a| a.strip_prefix("--plugin-dir="))
-            .map(PathBuf::from)
-            .collect();
-        dirs.sort();
-        let mut shown: Vec<PathBuf> = view
-            .plugins
-            .iter()
-            .filter(|p| p.origin == Origin::Shared)
-            .filter_map(|p| p.path.clone())
-            .collect();
-        shown.sort();
-        assert_eq!(dirs, [cache.join("a"), cache.join("b")]);
-        assert_eq!(shown, dirs);
-        assert!(
+        // Instructions: the linked `skills` are the source's; its `CLAUDE.md` and `agents`,
+        // not linked, are not the member's.
+        assert_eq!(linked_items(&view), ["skills"]);
+        let listed: Vec<&str> = view.instructions.iter().map(|i| i.name).collect();
+        assert_eq!(listed, ["skills"]);
+
+        // Plugins.
+        let plugin = |name: &str| {
             view.plugins
                 .iter()
-                .any(|p| p.name == "c@m" && p.origin == Origin::NotShared(Skip::TurnedOff))
-        );
-        // A plugin bundled with claude: enabled by both, listed once, no install looked for;
-        // one the project turns off is listed once as turned off.
-        let bundled = |name: &str| {
-            let rows: Vec<_> = view.plugins.iter().filter(|p| p.name == name).collect();
-            assert_eq!(rows.len(), 1, "{name}");
-            assert_eq!(rows[0].path, None, "{name}");
-            rows[0].origin
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name}: {:?}", view.plugins))
         };
-        assert_eq!(bundled("e@builtin"), Origin::NotShared(Skip::Builtin));
-        assert_eq!(bundled("f@builtin"), Origin::NotShared(Skip::TurnedOff));
-        // The home's own plugin the project turns off: its install is shown, marked off.
-        let g = view.plugins.iter().find(|p| p.name == "g@m").unwrap();
+        let a = plugin("a@m");
+        assert_eq!(
+            (a.origin, a.path.as_deref(), a.off),
+            (
+                Origin::AlreadySource,
+                Some(cache.join("a").as_path()),
+                false
+            )
+        );
+        let b = plugin("b@m");
+        assert_eq!((b.origin, b.path.as_deref()), (Origin::Own, None));
+        let bundled = |name: &str| {
+            (
+                plugin(name).origin,
+                plugin(name).path.clone(),
+                plugin(name).off,
+            )
+        };
+        assert_eq!(bundled("e@builtin"), (Origin::Bundled, None, false));
+        assert_eq!(bundled("f@builtin"), (Origin::Bundled, None, true));
+        let g = plugin("g@m");
         assert_eq!(
             (g.origin, g.path.as_deref(), g.off),
             (Origin::Own, Some(own_cache.as_path()), true)
         );
-        assert!(view.plugins.iter().filter(|p| p.off).count() == 1);
+        assert_eq!(view.plugins.len(), 5, "{:?}", view.plugins);
 
-        let file = shared
-            .args
-            .iter()
-            .find_map(|a| a.strip_prefix("--settings="))
-            .unwrap();
-        let mut file = share::read_settings(Path::new(file)).unwrap();
-        let memory = file.remove(MEMORY_KEY).unwrap();
-        assert_eq!(view.memory.dir.as_deref(), memory.as_str());
-        assert_eq!(view.memory.origin, Origin::Shared);
-        let plan = share::plan(&sharing, &member, &[], Some(&work), &f.env).unwrap();
-        let mut planned = plan.settings.clone();
-        planned.remove(MEMORY_KEY);
+        // Memory: where the launch points it.
+        assert_eq!(plan.agent_memory.as_deref(), Some(src.as_path()));
+        assert_eq!(view.memory.origin, Origin::AlreadySource);
         assert_eq!(
-            file.keys().collect::<Vec<_>>(),
-            planned.keys().collect::<Vec<_>>()
+            view.memory.dir,
+            share::Project::locate(Some(&work)).memory_dir(&src)
         );
-        assert_eq!(view.shared_settings, Summary::of(&file));
-        assert_eq!(view.shared_settings.env, ["DISABLE_TELEMETRY"]);
-        assert_eq!(view.shared_settings.model.as_deref(), Some("opus"));
-        assert_eq!(view.shared_settings.other, ["theme"]);
+        assert_eq!(
+            view.agent_memory,
+            Memory {
+                dir: Some(src.join("agent-memory").display().to_string()),
+                origin: Origin::Launch,
+                files: None,
+            }
+        );
+        // No variable where a settings file chooses the location: the card follows.
+        write(
+            &max.join("settings.json"),
+            &json!({"autoMemoryDirectory": "/m"}).to_string(),
+        );
+        let plan = share::plan(&sharing, &member, &[], Some(&work), &f.env);
+        let view = read(&member, &sharing, Some(&work), &f.env);
+        assert_eq!(plan.agent_memory, None);
+        assert_eq!(
+            (view.memory.dir.as_deref(), view.memory.origin),
+            (Some("/m"), Origin::Own)
+        );
+        assert_eq!(view.agent_memory.origin, Origin::Own);
     }
 
     /// Every entry under `root` (not following symlinks): path, size, mtime.
@@ -2354,7 +2283,7 @@ mod tests {
         out
     }
 
-    /// R13, R22: reading writes nothing (not even the launch's link or settings file), and
+    /// R13, R22: reading writes nothing (nothing of remuda's own comes into being either), and
     /// never opens credentials: a FIFO there, or in place of an agent, would block forever.
     #[test]
     fn reading_writes_nothing_and_never_opens_credentials() {
@@ -2379,9 +2308,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("read blocked");
         assert_eq!(names(entries(&view, "agents", Origin::Own)), ["ok"]);
-        assert_eq!(shared_items(&view), ["CLAUDE.md"]);
+        assert_eq!(linked_items(&view), Vec::<&str>::new());
         assert_eq!(tree(&f.root), before);
-        assert!(!share::dir(&f.config).exists());
-        assert!(!share::settings_dir(&f.config).exists());
+        assert!(
+            !f.config.parent().unwrap().exists(),
+            "nothing of remuda's is made"
+        );
     }
 }
