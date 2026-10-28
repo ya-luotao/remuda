@@ -82,8 +82,6 @@ pub struct Registry {
     pub sharing: Sharing,
     /// `[prices."<model>"]` overrides (R3, R20).
     pub prices: crate::pricing::Prices,
-    /// `[pick]`: what `remuda pick` may recommend and how (R3, R23).
-    pub pick: crate::pick::Config,
 }
 
 /// Shared configuration (R18): whose configuration other claude accounts get.
@@ -117,6 +115,13 @@ impl Registry {
 
     /// Parses and validates a config document.
     pub fn from_document(doc: &DocumentMut) -> Result<Self> {
+        // The configuration of `remuda pick`, removed on 2026-10-28, in whatever form (`[pick]`,
+        // `[pick.claude]` alone, a `pick` value): an error, neither ignored nor rewritten (R3).
+        if doc.contains_key("pick") {
+            bail!(
+                "`remuda pick` was removed: remove its [pick] and [pick.<provider>] tables by hand"
+            );
+        }
         let mut registry = Registry::default();
         if let Some(item) = doc.get("account") {
             let Some(tables) = item.as_array_of_tables() else {
@@ -126,7 +131,6 @@ impl Registry {
         }
         registry.sharing.source = registry.share_source(doc)?;
         registry.prices = crate::pricing::Prices::from_document(doc)?;
-        registry.pick = crate::pick::Config::from_document(doc, &registry)?;
         Ok(registry)
     }
 
@@ -397,7 +401,7 @@ pub fn check_registrable(config: &Path, account: &Account) -> Result<()> {
 }
 
 /// `doc` with `account` appended, after [`Registry::check_available`]; refused when the result
-/// would not load, as when a bare name in `[pick]` would become ambiguous (R1, R3).
+/// would not load (R3).
 fn with_account(doc: &DocumentMut, config: &Path, account: &Account) -> Result<DocumentMut> {
     Registry::from_document(doc)
         .with_context(|| format!("invalid {}", config.display()))?
@@ -416,9 +420,8 @@ fn with_account(doc: &DocumentMut, config: &Path, account: &Account) -> Result<D
 
 /// `remuda remove` (R14a): deletes `account`'s `[[account]]` table from `config`, atomically
 /// and keeping every other comment and unknown key (R3). The home is not touched (R2).
-/// `default` is implicit, and an account cannot go while `[share.claude] from` (its source of
-/// shared configuration) or `[pick]` (`exclude`, `prefer`) names it: the registry would no
-/// longer load.
+/// `default` is implicit, and the source of shared configuration cannot go while
+/// `[share.claude] from` names it: the registry would no longer load.
 pub fn unregister(config: &Path, account: &Account) -> Result<()> {
     let q = account.qualified();
     if account.home == Home::Default {
@@ -1276,60 +1279,89 @@ mod tests {
         assert_eq!(parse(&out).unwrap().accounts, [acc("claude", "max", "/m")]);
     }
 
-    /// R3, R14, R14a, R23: adding and removing accounts keeps `[pick]` and its comments; its
-    /// names are resolved against the accounts.
-    #[test]
-    fn append_and_remove_preserve_the_pick_table() {
-        let pick = "# how to pick\n[pick]\nexclude = [\"claude:team\"] # the company's\n\
-                    min_headroom = 20 # keep room for refactors\n\n\
-                    [pick.claude]\nmodels = [\"claude-opus-5-5\"] # first is the default\n";
-        let original = format!(
-            "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n\n\
-             [[account]]\nprovider = \"claude\"\nname = \"team\"\nhome = \"/t\"\n\n{pick}"
-        );
-        let mut doc: DocumentMut = original.parse().unwrap();
-        append_account(&mut doc, &acc("codex", "cx", "/c")).unwrap();
-        let out = doc.to_string();
-        assert!(out.ends_with(pick), "{out}");
-        let reg = parse(&out).unwrap();
-        assert_eq!(reg.pick, parse(&original).unwrap().pick);
-        assert_eq!(reg.pick.exclude, ["claude:team"]);
-        assert_eq!(reg.pick.min_headroom, 20);
+    /// What loading a `config.toml` that still configures the removed `remuda pick` says.
+    const PICK_REMOVED: &str =
+        "`remuda pick` was removed: remove its [pick] and [pick.<provider>] tables by hand";
 
-        let out = removed(&original, 0);
-        assert!(out.ends_with(pick), "{out}");
-        assert_eq!(parse(&out).unwrap().pick.claude.models, ["claude-opus-5-5"]);
-        // The excluded account itself cannot go while `[pick]` names it: the file would not load.
-        let err = format!("{:#}", parse(&removed(&original, 1)).unwrap_err());
-        assert!(
-            err.contains("[pick]: exclude = \"claude:team\": unknown account"),
-            "{err}"
-        );
-    }
-
-    /// R1, R3, R14: an account whose name would make a bare name in `[pick]` ambiguous is not
-    /// registered; the file is left as it was.
+    /// R3: `[pick]` and `[pick.<provider>]`, the configuration of the removed `remuda pick`, are
+    /// a load error in every form a top-level `pick` can take, empty or not, alone or beside
+    /// valid accounts; never ignored. The file is named and left as it was. Another name is
+    /// an unknown key, kept and ignored as ever, and so is a `pick` inside an account's table.
     #[test]
-    fn register_refuses_what_would_not_load() {
+    fn a_pick_table_is_a_load_error() {
+        let account = "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n";
+        let tables = [
+            "[pick]\n",
+            "# how to pick\n[pick]\nmin_headroom = 10 # mine\nexclude = [\"claude:max\"]\n",
+            "[pick.claude]\nmodels = [\"claude-opus-5-5\"]\n",
+            "[pick.codex]\n",
+            "[pick]\nstrategy = \"pace\"\n\n[pick.claude]\ndefault_effort = \"high\"\n",
+            "[\"pick\"]\n",
+            "[[pick]]\n",
+        ];
+        // Values go before the first table header, or they would belong to that table.
+        let values = ["pick = 1\n", "pick = {}\n", "pick.claude.models = []\n"];
+        let texts = tables
+            .iter()
+            .flat_map(|t| {
+                [
+                    t.to_string(),
+                    format!("{account}\n{t}"),
+                    format!("{t}\n{account}"),
+                ]
+            })
+            .chain(
+                values
+                    .iter()
+                    .flat_map(|v| [v.to_string(), format!("{v}\n{account}")]),
+            );
+        for text in texts {
+            let err = format!("{:#}", parse(&text).unwrap_err());
+            assert_eq!(err, PICK_REMOVED, "{text}");
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
-        let text = "[[account]]\nprovider = \"claude\"\nname = \"personal\"\nhome = \"/p\"\n\n\
-                    [pick]\nprefer = [\"personal\"]\n";
-        fs::write(&config, text).unwrap();
-        let codex = acc("codex", "personal", "/c");
+        let text = format!("{account}\n# mine\n[pick]\nmin_headroom = 20\n");
+        fs::write(&config, &text).unwrap();
+        let err = format!("{:#}", Registry::load(&config).unwrap_err());
+        assert_eq!(err, format!("invalid {}: {PICK_REMOVED}", config.display()));
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+
+        for other in ["[picker]\nx = 1\n", "picks = 2\n"] {
+            let reg = parse(&format!("{other}\n{account}")).unwrap();
+            assert_eq!(reg.accounts, [acc("claude", "max", "/m")], "{other}");
+        }
+        let reg = parse(&format!("{account}pick = 1\n")).unwrap();
+        assert_eq!(reg.accounts, [acc("claude", "max", "/m")]);
+    }
+
+    /// R3, R14, R14a: a `config.toml` with `[pick]` does not load, so nothing changes it: no
+    /// account is registered (nor found registrable, as `setup` asks before it creates a home)
+    /// or removed, and the file is left as it was. Once the table is removed by hand, both
+    /// work as before.
+    #[test]
+    fn a_pick_table_blocks_registry_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let accounts = "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"/m\"\n";
+        let text = format!("{accounts}\n[pick.claude]\nmodels = [\"claude-opus-5-5\"]\n");
+        fs::write(&config, &text).unwrap();
+        let (max, team) = (acc("claude", "max", "/m"), acc("claude", "team", "/t"));
         for err in [
-            register(&config, &codex).unwrap_err(),
-            check_registrable(&config, &codex).unwrap_err(),
+            register(&config, &team).unwrap_err(),
+            check_registrable(&config, &team).unwrap_err(),
+            unregister(&config, &max).unwrap_err(),
         ] {
-            let err = format!("{err:#}");
-            assert!(
-                err.contains("adding codex:personal would leave") && err.contains("invalid"),
-                "{err}"
-            );
-            assert!(err.contains("exists under several providers"), "{err}");
+            let want = format!("invalid {}: {PICK_REMOVED}", config.display());
+            assert_eq!(format!("{err:#}"), want);
         }
         assert_eq!(fs::read_to_string(&config).unwrap(), text);
-        register(&config, &acc("codex", "work", "/w")).unwrap();
+
+        fs::write(&config, accounts).unwrap();
+        register(&config, &team).unwrap();
+        unregister(&config, &max).unwrap();
+        assert_eq!(Registry::load(&config).unwrap().accounts, [team]);
     }
 
     /// R3 (review #9): registrations and removals at the same time are all kept. Each reads,

@@ -1,4 +1,4 @@
-//! R5: bare `remuda` opens the TUI, which needs a terminal.
+//! R5: bare `remuda` opens the TUI, which needs a terminal; the commands R5 lists, and no other.
 
 mod common;
 
@@ -24,4 +24,39 @@ fn help_still_works() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Usage: remuda"));
+}
+
+/// R5, R23: `remuda pick` was removed on 2026-10-28: it is a command clap does not know, a
+/// usage error (exit 2) whatever follows it, that runs and writes nothing, also with a
+/// registered account whose usage it would have read. The help lists no such command.
+#[test]
+fn pick_is_not_a_command() {
+    let sb = Sandbox::new();
+    let max = sb.make_claude_home("h/max");
+    sb.register(&[("max", &max)]);
+    for args in [
+        &["pick"][..],
+        &["pick", "--json"],
+        &["pick", "--live", "--wait", "--max-wait", "0"],
+        &["pick", "--run", "--", "-p", "hi"],
+        &["help", "pick"],
+    ] {
+        sb.remuda()
+            .args(args)
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(predicate::str::starts_with(
+                "error: unrecognized subcommand 'pick'\n",
+            ));
+    }
+    assert!(sb.invocations().is_empty());
+    assert!(!sb.remuda_home().join("state").exists());
+    let help = sb.remuda().arg("--help").assert().success();
+    let help = String::from_utf8(help.get_output().stdout.clone()).unwrap();
+    assert!(help.contains("\n  run "), "{help}");
+    assert!(
+        !help.lines().any(|l| l.trim_start().starts_with("pick ")),
+        "{help}"
+    );
 }

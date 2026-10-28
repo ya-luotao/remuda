@@ -60,20 +60,19 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
 
 ### Removed
 
-- **Breaking:** Jev recommendations, TypeSafe API-key handling and the `curl` transport
-  (SPEC R3, R23). `pick` always selects the first ranked feasible candidate and its provider's
-  `default_effort` (none when unset or on resume/fork). Models, deterministic headroom/pace
-  ranking, session affinity, `--live`, `--wait`, and `--run` remain. Text `decided by` is `rules`
-  or `rules, strategy pace`. JSON keeps `decided_by = "rules"` and `effort_by = "rules"`
-  (null without an effort; both null with no feasible recommendation), removes top-level
-  `reason` and `jev` and candidate `jev_probability`, and retains the other fields.
-  **Migration:** remove `--offline` and `--print-request` from invocations and scripts; remove
-  `[pick] notes` and `[pick.<provider>] efforts` from `config.toml` by hand, and update JSON
-  consumers for the removed fields. Old config keys are errors, not ignored; remuda does not
-  automatically rewrite any configuration. Keep `models` and optional `default_effort`:
-  the latter is independently validated as nonempty `[a-z]+` and, for Claude, must not be a
-  Claude subcommand. `TYPESAFE_API_KEY` is no longer used by remuda and can be
-  removed from its setup. Tests no longer need a fake `curl` transport.
+- **Breaking:** `remuda pick`, its `[pick]` and `[pick.<provider>]` configuration, and
+  `remuda usage --wait` / `--max-wait` (SPEC R3, R5, R10, R23). The recommendation of an account,
+  model and effort goes whole: the headroom and pace ranking, resume affinity, `--json`, `--run`,
+  `--wait` and `--live`, and the Jev recommendations, TypeSafe API-key handling and `curl`
+  transport it had in 0.3.0. `remuda pick` is now an unrecognized command and `--wait` or
+  `--max-wait` an unexpected argument of `remuda usage` (exit 2). A `config.toml` that still has
+  a top-level `pick` key or table no longer loads: every command stops with an error that names
+  the file and says to remove the tables by hand; Remuda neither ignores them nor rewrites the
+  file.
+  **Migration:** delete the `[pick]` and `[pick.<provider>]` tables from `config.toml` by hand.
+  Scripts that used `remuda pick` or `remuda usage --wait` must choose the account themselves,
+  for example from `remuda usage`. `TYPESAFE_API_KEY` is unused and can be removed from your
+  setup.
 
 ## [0.3.0] - 2026-10-13
 

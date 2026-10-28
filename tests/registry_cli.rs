@@ -461,26 +461,57 @@ fn add_and_remove_keep_price_overrides() {
     sb.remuda().arg("stats").assert().success();
 }
 
-/// R1, R3, R14, R23: an account that would make a bare name in `[pick]` ambiguous is refused,
-/// and the registry keeps loading.
+/// R3, R5, R14, R14a: a `config.toml` that still configures the removed `remuda pick`
+/// (`[pick]`, or a `[pick.<provider>]` alone) loads for no command: each exits 1 with one line
+/// that names the file and says to remove the tables by hand. Nothing is run or written, and
+/// the file is left as it was, the table included; once it is removed, the accounts load.
 #[test]
-fn add_refuses_a_name_that_would_leave_the_config_invalid() {
+fn a_pick_table_is_a_load_error_for_every_command() {
     let sb = Sandbox::new();
-    let personal = sb.make_claude_home("h/personal");
-    let codex = sb.make_codex_home("c/personal");
-    sb.write_config(&format!(
-        "[[account]]\nprovider = \"claude\"\nname = \"personal\"\nhome = \"{}\"\n\n\
-         [pick]\nprefer = [\"personal\"]\n",
-        personal.display()
-    ));
-    assert_add_fails(
-        &sb,
-        &["--provider", "codex", "personal", codex.to_str().unwrap()],
-        "adding codex:personal would leave",
+    let max = sb.make_claude_home("h/max");
+    let team = sb.make_claude_home("h/team");
+    let accounts = format!(
+        "[[account]]\nprovider = \"claude\"\nname = \"max\"\nhome = \"{}\"\n",
+        max.display()
     );
+    let error = format!(
+        "remuda: invalid {}: `remuda pick` was removed: remove its [pick] and \
+         [pick.<provider>] tables by hand\n",
+        sb.config_path().display()
+    );
+    for pick in [
+        "# what to recommend\n[pick]\nexclude = [\"claude:team\"]\nmin_headroom = 10\n",
+        "[pick.claude]\nmodels = [\"claude-opus-5-5\"]\ndefault_effort = \"high\"\n",
+        "[pick]\n",
+    ] {
+        let text = format!("{accounts}\n{pick}");
+        sb.write_config(&text);
+        for args in [
+            &["list"][..],
+            &["usage"],
+            &["usage", "max", "--live"],
+            &["usage", "--history"],
+            &["sessions"],
+            &["stats"],
+            &["run", "max", "-p", "hi"],
+            &["add", "team", team.to_str().unwrap()],
+            &["remove", "max"],
+        ] {
+            sb.remuda()
+                .args(args)
+                .assert()
+                .code(1)
+                .stdout("")
+                .stderr(error.clone());
+        }
+        assert_eq!(sb.read_config(), text, "{pick}");
+    }
+    assert!(sb.invocations().is_empty());
+    assert!(!sb.remuda_home().join("state").exists());
+    sb.write_config(&accounts);
     assert_eq!(
         list_rows(&sb)[1],
-        row("claude", "personal", personal.to_str().unwrap())
+        row("claude", "max", max.to_str().unwrap())
     );
 }
 

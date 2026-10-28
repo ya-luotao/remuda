@@ -43,8 +43,8 @@ with one of those directories selected. By design ([SPEC.md](SPEC.md), R2, R13 a
   endpoint or organization settings, and secret-like `env` entries) into a launch, and does not
   link a `settings.json` that sets them at the moment `remuda setup` creates a home;
 - never moves, renames or deletes a home directory;
-- makes no network requests of its own: `remuda pick` selects locally. Network use by agent
-  commands, including live usage queries, is the agent's own (R10, R13).
+- makes no network requests of its own. Network use by agent commands, including live usage
+  queries, is the agent's own (R10, R13).
 
 One thing these guarantees do not cover, by design: a linked `settings.json` is the source
 account's file, shared whole. Authentication settings added to it after `remuda setup` are
