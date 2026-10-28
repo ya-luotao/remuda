@@ -52,9 +52,11 @@ fn pick_is_not_a_command() {
     }
     assert!(sb.invocations().is_empty());
     assert!(!sb.remuda_home().join("state").exists());
-    sb.remuda()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("pick").not());
+    let help = sb.remuda().arg("--help").assert().success();
+    let help = String::from_utf8(help.get_output().stdout.clone()).unwrap();
+    assert!(help.contains("\n  run "), "{help}");
+    assert!(
+        !help.lines().any(|l| l.trim_start().starts_with("pick ")),
+        "{help}"
+    );
 }
