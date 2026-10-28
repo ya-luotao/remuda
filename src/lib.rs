@@ -17,7 +17,6 @@ pub mod launch;
 pub mod live;
 pub mod owned;
 pub mod paths;
-pub mod pick;
 pub mod pricing;
 pub mod privacy;
 pub mod probe;
@@ -31,7 +30,6 @@ mod tracking;
 pub mod transcript;
 pub mod tui;
 pub mod usage;
-pub mod wait;
 
 use std::collections::BTreeMap;
 

@@ -27,7 +27,7 @@ use std::time::Duration;
 const SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGTERM];
 
 /// How many commands remuda runs at a time, each in a watched process group. Nothing else
-/// bounds them: there is one per account at once (`list`, `usage --live`, `pick`, the TUI's
+/// bounds them: there is one per account at once (`list`, `usage --live`, the TUI's
 /// refreshes), and in the fallback of R7 a `ps` per file of every `sessions/` directory, and
 /// neither the registry nor a directory has a limit. One more waits for a place
 /// ([`State::place`]), so that no command ever runs without being watched: a place is

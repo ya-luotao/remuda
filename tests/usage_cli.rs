@@ -1,4 +1,5 @@
-//! R10, R24: `remuda usage [<account>] [--live]`, its usage history and `--history`.
+//! R10: `remuda usage [<account>] [--live]` and its notes; R24: the usage history it no
+//! longer keeps.
 
 mod common;
 
@@ -137,8 +138,9 @@ fn cached_usage_past_a_reset_says_so() {
     let at = |offset_secs: i64| {
         jiff::Timestamp::from_second((now_ms() / 1000) as i64 + offset_secs).unwrap()
     };
-    // Cached two hours ago: the session, then critical, reset an hour ago.
-    let (session, week) = (at(-3600), at(2 * 86_400));
+    // Cached two hours ago: the session, then critical, reset an hour ago. The week, with a
+    // day to go, is behind an even pace: no pace note.
+    let (session, week) = (at(-3600), at(86_400));
     let limits = format!(
         r#"{{"limits": [
             {{"kind": "session", "percent": 97, "severity": "critical", "resets_at": "{session}"}},
@@ -261,8 +263,8 @@ fn live_usage_runs_claude_per_account_with_its_env() {
         !sb.launch_log().exists(),
         "live usage must not log launches"
     );
-    // What it read is recorded (R24), and nothing else is written.
-    assert_eq!(state_entries(&sb), ["usage-history.jsonl"]);
+    // Nothing is recorded (R24), and nothing else is written.
+    assert!(!sb.remuda_home().join("state").exists());
 }
 
 /// R10: with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` set, claude's `/usage` asks for no new
@@ -708,9 +710,9 @@ fn an_interrupt_reaches_a_running_codex_query() {
     assert_eq!(got, (Some(libc::SIGINT), true, true));
 }
 
-/// One `remuda <args>` (`usage --live`, or a command that waits with `--live`) over 60 claude
-/// and 60 codex accounts (and the two `default` ones), each query a fake agent that hangs, sent
-/// `signal` `after` remuda was started: whether any process remuda had started outlived it.
+/// One `remuda <args>` (`usage --live`) over 60 claude and 60 codex accounts (and the two
+/// `default` ones), each query a fake agent that hangs, sent `signal` `after` remuda was
+/// started: whether any process remuda had started outlived it.
 ///
 /// remuda is given the writing end of a pipe, which every process it starts inherits: the
 /// reading end sees the end of the pipe when the last of them is gone, and not before. That
@@ -814,27 +816,7 @@ fn an_interrupt_while_queries_are_starting_reaches_them_all() {
     }
 }
 
-// --- history (R24) and the reset note (R10) -------------------------------------------------
-
-/// The names in `state/`, sorted.
-fn state_entries(sb: &Sandbox) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(sb.remuda_home().join("state"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect();
-    names.sort();
-    names
-}
-
-/// The lines of the usage history, as JSON.
-fn history(sb: &Sandbox) -> Vec<serde_json::Value> {
-    let path = sb.remuda_home().join("state/usage-history.jsonl");
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect()
-}
+// --- the notes (R10) ------------------------------------------------------------------------
 
 /// Now, to the minute: times written into fixtures print as they are.
 fn minute() -> jiff::Timestamp {
@@ -859,217 +841,6 @@ fn cache_at(fetched_ms: i64, utilization: &str) -> String {
         r#"{{"oauthAccount": {{"emailAddress": "x@example.com"}},
   "cachedUsageUtilization": {{"fetchedAtMs": {fetched_ms}, "utilization": {utilization}}}}}"#
     )
-}
-
-/// R24: `remuda usage` records each window it read, at the time the cache was written (not
-/// when it ran): the same cache read again adds nothing. `state/` holds the history alone, the
-/// user's (0600).
-#[test]
-fn cached_usage_is_recorded_at_the_cache_time() {
-    use std::os::unix::fs::PermissionsExt;
-    let Setup { sb, max, .. } = setup();
-    let fetched = now_ms() as i64 - 200_000;
-    sb.write_claude_json(Some(&max), &cache_at(fetched, LIMITS));
-    let ts = jiff::Timestamp::from_millisecond(fetched)
-        .unwrap()
-        .to_string();
-    for _ in 0..2 {
-        sb.remuda().arg("usage").assert().success().stderr("");
-    }
-    assert_eq!(
-        history(&sb),
-        [
-            serde_json::json!({"ts": ts, "account": "claude:max", "label": "Session",
-                "model": null, "percent": 34.0, "resets_at": "2099-09-23T15:39:59.632347Z",
-                "source": "cached"}),
-            serde_json::json!({"ts": ts, "account": "claude:max", "label": "Week (all models)",
-                "model": null, "percent": 77.0, "resets_at": "2099-09-25T04:59:59.632368Z",
-                "source": "cached"}),
-            serde_json::json!({"ts": ts, "account": "claude:max", "label": "Week (Fable)",
-                "model": "Fable", "percent": 100.0, "resets_at": "2099-09-25T04:59:59.632532Z",
-                "source": "cached"}),
-        ]
-    );
-    assert_eq!(state_entries(&sb), ["usage-history.jsonl"]);
-    let mode = std::fs::metadata(sb.remuda_home().join("state/usage-history.jsonl"))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600);
-    // A new cache is a new reading; the windows that reset since it was written are not.
-    let session_passed = format!(
-        r#"{{"limits": [{{"kind": "session", "percent": 50, "resets_at": "{}"}},
-            {{"kind": "weekly_all", "percent": 78, "resets_at": "2099-09-25T04:59:59Z"}}]}}"#,
-        plus(minute(), -60)
-    );
-    sb.write_claude_json(Some(&max), &cache_at(fetched + 1000, &session_passed));
-    sb.remuda().args(["usage", "max"]).assert().success();
-    let got = history(&sb);
-    assert_eq!(got.len(), 4, "{got:?}");
-    assert_eq!(got[3]["label"], "Week (all models)");
-    assert_eq!(got[3]["percent"], 78.0);
-}
-
-/// R24: a live answer is recorded at the time it arrived; a failure or an answer that tells
-/// no usage is not.
-#[test]
-fn live_usage_is_recorded_when_it_answers() {
-    let Setup { sb, max, team } = setup();
-    sb.set_live_usage(Some(&max), LIVE_SAMPLE);
-    sb.set_live_usage(
-        Some(&team),
-        "You are currently using your subscription to power your Claude Code usage\n",
-    );
-    let before = jiff::Timestamp::now();
-    // The default account has no fixture: its query fails (exit 1).
-    sb.remuda().args(["usage", "--live"]).assert().code(1);
-    let after = jiff::Timestamp::now();
-    let got = history(&sb);
-    let labels: Vec<(&str, &str)> = got
-        .iter()
-        .map(|p| (p["account"].as_str().unwrap(), p["label"].as_str().unwrap()))
-        .collect();
-    // Max's three windows; neither the default's failure nor team's answer without usage.
-    assert_eq!(
-        labels,
-        [
-            ("claude:max", "Session"),
-            ("claude:max", "Week (all models)"),
-            ("claude:max", "Week (Fable)"),
-        ]
-    );
-    for p in &got {
-        assert_eq!(p["source"], "live");
-        let ts: jiff::Timestamp = p["ts"].as_str().unwrap().parse().unwrap();
-        assert!(before <= ts && ts <= after, "{p}");
-    }
-    assert_eq!(got[2]["model"], "Fable");
-    // Claude's wording, read as an instant ahead of the answer.
-    for p in &got {
-        let reset: jiff::Timestamp = p["resets_at"].as_str().unwrap().parse().unwrap();
-        assert!(reset > before, "{p}");
-    }
-    assert!(!sb.launch_log().exists());
-}
-
-/// R24: `--history` lists each window of an account in time order: the current one point by
-/// point, with its pace from the latest point; the windows before a line each; nothing older
-/// than `--days`. It records nothing itself.
-#[test]
-fn history_shows_the_current_window_and_its_pace() {
-    let Setup { sb, max, .. } = setup();
-    let now = minute();
-    let h = |n: i64| plus(now, n * 3600);
-    let line = |at: jiff::Timestamp, label: &str, percent: f64, reset: Option<jiff::Timestamp>| {
-        format!(
-            "{}\n",
-            serde_json::json!({"ts": at.to_string(), "account": "claude:max", "label": label,
-                "model": null, "percent": percent, "resets_at": reset.map(|r| r.to_string()),
-                "source": "cached"})
-        )
-    };
-    let state = sb.remuda_home().join("state");
-    std::fs::create_dir_all(&state).unwrap();
-    let text = [
-        line(h(-240), "Session", 5.0, Some(h(-239))),
-        line(h(-8), "Session", 40.0, Some(h(-6))),
-        line(h(-7), "Session", 88.0, Some(h(-6))),
-        line(h(-2), "Session", 12.0, Some(h(2))),
-        line(h(-1), "Session", 30.0, Some(h(2))),
-    ]
-    .concat();
-    std::fs::write(state.join("usage-history.jsonl"), &text).unwrap();
-    // A cache that `--history` does not record.
-    sb.write_claude_json(Some(&max), &cache_json(60, LIMITS));
-
-    let out = stdout_of(
-        sb.remuda()
-            .args(["usage", "--history"])
-            .assert()
-            .success()
-            .stderr(""),
-    );
-    assert_eq!(
-        out,
-        format!(
-            "claude:default  no usage history in the last 7 days\n\n\
-             claude:max\n  Session\n    window ended {}: peaked 88%\n    \
-             {}  12%  resets {}\n    {}  30%  resets {}\n    \
-             used 30% with 40% of the window elapsed: behind an even pace; \
-             at this pace 75% at reset\n\n\
-             claude:team  no usage history in the last 7 days\n",
-            utc(h(-6)),
-            utc(h(-2)),
-            utc(h(2)),
-            utc(h(-1)),
-            utc(h(2)),
-        )
-    );
-    let out = stdout_of(
-        sb.remuda()
-            .args(["usage", "--history", "max", "--days", "30"])
-            .assert()
-            .success(),
-    );
-    assert!(
-        out.starts_with(&format!(
-            "claude:max\n  Session\n    window ended {}: peaked 5%\n",
-            utc(h(-239))
-        )),
-        "{out}"
-    );
-    assert_eq!(
-        std::fs::read_to_string(state.join("usage-history.jsonl")).unwrap(),
-        text,
-        "--history records nothing"
-    );
-}
-
-/// R24: no history yet: a line, exit 0, nothing created. `--history` does not combine with
-/// `--live`, and `--days` needs it.
-#[test]
-fn history_without_a_history_and_its_options() {
-    let Setup { sb, .. } = setup();
-    let out = stdout_of(sb.remuda().args(["usage", "--history"]).assert().success());
-    assert!(out.starts_with("no usage history yet ("), "{out}");
-    assert_eq!(out.lines().count(), 1, "{out}");
-    assert!(!sb.remuda_home().join("state").exists());
-    sb.remuda()
-        .args(["usage", "--history", "--live"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("cannot be used with"));
-    sb.remuda()
-        .args(["usage", "--days", "3"])
-        .assert()
-        .code(2)
-        .stderr(predicate::str::contains("--history"));
-    sb.remuda()
-        .args(["usage", "--history", "--days", "0"])
-        .assert()
-        .code(2);
-    sb.remuda()
-        .args(["usage", "--history", "nobody"])
-        .assert()
-        .code(1);
-}
-
-/// R24: a history that exists but cannot be read is an error for `--history`.
-#[test]
-fn history_that_cannot_be_read_is_an_error() {
-    use std::os::unix::fs::PermissionsExt;
-    let Setup { sb, .. } = setup();
-    let state = sb.remuda_home().join("state");
-    std::fs::create_dir_all(&state).unwrap();
-    let path = state.join("usage-history.jsonl");
-    std::fs::write(&path, "").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-    sb.remuda()
-        .args(["usage", "--history"])
-        .assert()
-        .code(1)
-        .stderr(predicate::str::contains("cannot read"));
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 /// R10: a window that resets within the hour with at least 25% left gets a note under it, in
@@ -1116,531 +887,73 @@ fn a_reset_within_the_hour_with_much_left_gets_a_note() {
     assert!(out.contains("with 90% left"), "{out}");
 }
 
-/// R24, R3: a `$REMUDA_HOME` remuda cannot write in: `remuda usage` prints as always, exits 0,
-/// says nothing of the history, and creates nothing.
+/// R10: a window on pace to be used up before its reset gets a note under it, in cached and in
+/// live output. Cached: a session read 10 minutes ago, 2 h 50 min into its 5 h, with 85% used:
+/// at that pace 100% 20 minutes from now, 1 h 40 min before its reset. Live: a codex window of
+/// 90 minutes with 40% used, 25 minutes of it elapsed when the answer arrives: 100% about 27
+/// minutes before its reset, 65 minutes away (no reset note).
 #[test]
-fn usage_without_a_writable_state_still_succeeds() {
-    use std::os::unix::fs::PermissionsExt;
+fn a_window_on_pace_to_be_used_up_gets_a_note() {
     let Setup { sb, max, .. } = setup();
-    sb.write_claude_json(Some(&max), &cache_json(60, LIMITS));
-    let home = sb.remuda_home();
-    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
-    let out = stdout_of(sb.remuda().arg("usage").assert().success().stderr(""));
-    assert!(out.contains("claude:max  cached"), "{out}");
-    assert!(!home.join("state").exists());
-    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
-    // A `state` that is a file: the same.
-    std::fs::write(home.join("state"), "").unwrap();
-    sb.remuda().arg("usage").assert().success().stderr("");
-    assert_eq!(std::fs::read_to_string(home.join("state")).unwrap(), "");
-}
-
-/// R24, R3: `remuda usage`s at the same time lose no point. Each compacts the history: the
-/// first to take the lock drops the old points and replaces the file, while the others append;
-/// without the lock of `state/` over the reading and the writing, a point appended between a
-/// compaction's reading and its rename would go to the file being replaced.
-#[test]
-fn concurrent_usage_runs_lose_no_point() {
-    const ACCOUNTS: usize = 16;
-    const ROUNDS: usize = 6;
-    const OLD: usize = 3000;
-    let sb = Sandbox::new();
-    let homes: Vec<PathBuf> = (0..ACCOUNTS)
-        .map(|n| sb.make_claude_home(&format!("profiles/a{n}")))
-        .collect();
-    let names: Vec<String> = (0..ACCOUNTS).map(|n| format!("a{n}")).collect();
-    let pairs: Vec<(&str, &std::path::Path)> = names
-        .iter()
-        .zip(&homes)
-        .map(|(n, h)| (n.as_str(), h.as_path()))
-        .collect();
-    sb.register(&pairs);
-    let state = sb.remuda_home().join("state");
-    std::fs::create_dir_all(&state).unwrap();
-    let path = state.join("usage-history.jsonl");
-    let old_line = format!(
-        "{}\n",
-        serde_json::json!({"ts": "2020-01-01T00:00:00Z", "account": "claude:gone",
-            "label": "Session", "model": null, "percent": 1.0, "resets_at": null,
-            "source": "cached"})
+    let now = minute();
+    let reset = plus(now, 2 * 3600);
+    let limits =
+        format!(r#"{{"limits": [{{"kind": "session", "percent": 85, "resets_at": "{reset}"}}]}}"#);
+    sb.write_claude_json(
+        Some(&max),
+        &cache_at(plus(now, -600).as_millisecond(), &limits),
     );
-    let start = now_ms() as i64 - 600_000;
-    for round in 0..ROUNDS {
-        // Points too old to keep, for the round's first compaction to drop.
-        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-        text.push_str(&old_line.repeat(OLD));
-        std::fs::write(&path, text).unwrap();
-        for home in &homes {
-            let limits = r#"{"limits": [{"kind": "session", "percent": 5,
-                "resets_at": "2099-01-01T00:00:00Z"}]}"#;
-            sb.write_claude_json(Some(home), &cache_at(start + round as i64 * 1000, limits));
-        }
-        let barrier = std::sync::Barrier::new(ACCOUNTS);
-        std::thread::scope(|scope| {
-            for name in &names {
-                let (sb, barrier) = (&sb, &barrier);
-                scope.spawn(move || {
-                    barrier.wait();
-                    sb.remuda()
-                        .args(["usage", name])
-                        .assert()
-                        .success()
-                        .stderr("");
-                });
-            }
-        });
-        let got = history(&sb);
-        assert!(
-            got.iter().all(|p| p["account"] != "claude:gone"),
-            "round {round}: old points kept"
-        );
-        for name in &names {
-            let account = format!("claude:{name}");
-            let mine = got.iter().filter(|p| p["account"] == account).count();
-            assert_eq!(mine, round + 1, "round {round}: {account} lost a point");
-        }
-    }
+    let out = stdout_of(sb.remuda().args(["usage", "max"]).assert().success());
     assert_eq!(
-        state_entries(&sb),
-        ["usage-history.jsonl"],
-        "no temporary file"
+        blocks(&out)[0].1,
+        [
+            format!("Session 85% ! resets {}", utc(reset)),
+            format!(
+                "note: at this pace 100% by {}, 1h40m before the reset",
+                utc(plus(now, 20 * 60))
+            ),
+        ],
+        "{out}"
     );
-}
 
-/// R24, R3: two `$REMUDA_HOME`s whose `state/usage-history.jsonl` are symlinks to one file
-/// share its lock (that of the directory of the file replaced): `remuda usage`s through both at
-/// the same time, each compacting, lose no point. With a lock on each state directory, each
-/// compaction replaced the shared file with what it alone had read.
-#[test]
-fn usage_through_histories_linked_to_one_file_loses_no_point() {
-    use std::os::unix::fs::{PermissionsExt, symlink};
-    const ACCOUNTS: usize = 12;
-    const ROUNDS: usize = 5;
-    const OLD: usize = 2000;
     let sb = Sandbox::new();
-    let homes: Vec<PathBuf> = (0..ACCOUNTS)
-        .map(|n| sb.make_claude_home(&format!("profiles/a{n}")))
-        .collect();
-    let names: Vec<String> = (0..ACCOUNTS).map(|n| format!("a{n}")).collect();
-    let pairs: Vec<(&str, &std::path::Path)> = names
-        .iter()
-        .zip(&homes)
-        .map(|(n, h)| (n.as_str(), h.as_path()))
-        .collect();
-    sb.register(&pairs);
-    // A second `$REMUDA_HOME` with the same accounts.
-    let second = sb.root().join("second-remuda");
-    std::fs::create_dir_all(second.join("state")).unwrap();
-    std::fs::copy(sb.config_path(), second.join("config.toml")).unwrap();
-    let shared = sb.root().join("shared/usage-history.jsonl");
-    std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
-    std::fs::write(&shared, "").unwrap();
-    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o600)).unwrap();
-    for home in [sb.remuda_home(), second.clone()] {
-        std::fs::create_dir_all(home.join("state")).unwrap();
-        symlink(&shared, home.join("state/usage-history.jsonl")).unwrap();
-    }
-    let old_line = format!(
-        "{}\n",
-        serde_json::json!({"ts": "2020-01-01T00:00:00Z", "account": "claude:gone",
-            "label": "Session", "model": null, "percent": 1.0, "resets_at": null,
-            "source": "cached"})
-    );
-    let start = now_ms() as i64 - 600_000;
-    let read = || -> Vec<serde_json::Value> {
-        std::fs::read_to_string(&shared)
-            .unwrap()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
-    };
-    for round in 0..ROUNDS {
-        let mut text = std::fs::read_to_string(&shared).unwrap();
-        text.push_str(&old_line.repeat(OLD));
-        std::fs::write(&shared, text).unwrap();
-        for home in &homes {
-            let limits = r#"{"limits": [{"kind": "session", "percent": 5,
-                "resets_at": "2099-01-01T00:00:00Z"}]}"#;
-            sb.write_claude_json(Some(home), &cache_at(start + round as i64 * 1000, limits));
-        }
-        let barrier = std::sync::Barrier::new(ACCOUNTS);
-        std::thread::scope(|scope| {
-            for (n, name) in names.iter().enumerate() {
-                // Half the accounts through each `$REMUDA_HOME`.
-                let remuda_home = if n % 2 == 0 {
-                    sb.remuda_home()
-                } else {
-                    second.clone()
-                };
-                let (sb, barrier) = (&sb, &barrier);
-                scope.spawn(move || {
-                    barrier.wait();
-                    sb.remuda()
-                        .env("REMUDA_HOME", &remuda_home)
-                        .args(["usage", name])
-                        .assert()
-                        .success()
-                        .stderr("");
-                });
-            }
-        });
-        let got = read();
-        assert!(
-            got.iter().all(|p| p["account"] != "claude:gone"),
-            "round {round}: old points kept"
-        );
-        for name in &names {
-            let account = format!("claude:{name}");
-            let mine = got.iter().filter(|p| p["account"] == account).count();
-            assert_eq!(mine, round + 1, "round {round}: {account} lost a point");
-        }
-    }
-    for home in [sb.remuda_home(), second] {
-        let link = home.join("state/usage-history.jsonl");
-        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
-    }
-    let mode = std::fs::metadata(&shared).unwrap().permissions().mode();
-    assert_eq!(mode & 0o777, 0o600);
-}
-
-/// R24, R10: a limit of a kind remuda does not know is shown and recorded under its own name,
-/// whatever that is; `--history` lists it without a pace (its length is unknown) and does not
-/// fail on it.
-#[test]
-fn history_of_windows_of_unknown_length() {
-    let Setup { sb, max, .. } = setup();
-    let reset = plus(minute(), 3600);
-    let limits = format!(
-        r#"{{"limits": [
-            {{"kind": "额度 window", "percent": 30, "resets_at": "{reset}"}},
-            {{"kind": "153722867280912931m window", "percent": 40, "resets_at": "{reset}"}}]}}"#
-    );
-    sb.write_claude_json(Some(&max), &cache_json(60, &limits));
-    sb.remuda().args(["usage", "max"]).assert().success();
-    assert_eq!(history(&sb).len(), 2);
+    sb.install_codex();
+    let work = sb.make_codex_home("c/work");
+    sb.write_config(&format!(
+        "[[account]]\nprovider = \"codex\"\nname = \"work\"\nhome = \"{}\"\n",
+        work.display()
+    ));
+    let reset = (now_ms() / 1000) as i64 + 65 * 60;
+    let limits = serde_json::json!({"rateLimits": {"limitId": "codex", "limitName": null,
+        "primary": {"usedPercent": 40, "windowDurationMins": 90, "resetsAt": reset},
+        "secondary": null}});
+    sb.set_codex_rate_limits(Some(&work), &limits.to_string());
     let out = stdout_of(
         sb.remuda()
-            .args(["usage", "--history", "max"])
+            .args(["usage", "codex:work", "--live"])
             .assert()
-            .success()
-            .stderr(""),
+            .success(),
     );
-    assert!(out.contains("\n  额度 window\n"), "{out}");
-    assert!(out.contains("\n  153722867280912931m window\n"), "{out}");
-    assert!(!out.contains("elapsed"), "{out}");
-}
-
-/// R24, R10: a live answer is recorded at the time it arrived, not when the command started:
-/// the query is held until after a time taken once it has started.
-#[test]
-fn live_usage_is_recorded_at_the_answer_not_the_start() {
-    let Setup { sb, max, .. } = setup();
-    sb.set_live_usage(Some(&max), LIVE_SAMPLE);
-    let gate = sb.root().join("gate");
-    std::fs::create_dir_all(&gate).unwrap();
-    let (started, open) = (gate.join("started"), gate.join("open"));
-    common::write_executable(
-        &gate.join("claude"),
-        &format!(
-            "#!/bin/sh\n: > '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexec '{}' \"$@\"\n",
-            started.display(),
-            open.display(),
-            sb.bin().join("claude").display()
-        ),
-    );
-    let mut remuda = sb.remuda_process();
-    remuda
-        .env("PATH", format!("{}:{}", gate.display(), sb.path_var()))
-        .args(["usage", "--live", "max"])
-        .stdout(std::process::Stdio::null());
-    let mut child = remuda.spawn().unwrap();
-    let waited = Instant::now();
-    while !started.exists() {
-        assert!(
-            waited.elapsed() < Duration::from_secs(20),
-            "claude never ran"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    std::thread::sleep(Duration::from_millis(1100));
-    let bound = jiff::Timestamp::now();
-    std::thread::sleep(Duration::from_millis(100));
-    std::fs::write(&open, "").unwrap();
-    assert!(child.wait().unwrap().success());
-    let got = history(&sb);
-    assert_eq!(got.len(), 3, "{got:?}");
-    for p in &got {
-        let ts: jiff::Timestamp = p["ts"].as_str().unwrap().parse().unwrap();
-        assert!(
-            ts > bound,
-            "recorded at {ts}, before the answer could arrive ({bound})"
-        );
-    }
-}
-
-/// R4, R10 (lane review round 1): SIGTERM, which `kill` or a supervisor sends remuda alone, is
-/// passed on like Ctrl-C: the live query that `usage --wait --live` has under way (in a process
-/// group of its own, which no timeout of remuda's ends once remuda is gone) ends with remuda.
-#[test]
-fn a_sigterm_reaches_the_query_of_a_live_usage_wait() {
-    let Setup { sb, .. } = setup();
-    let got = interrupted(
-        &sb,
-        "claude",
-        &["usage", "max", "--wait", "--live", "--timeout", "60"],
-        libc::SIGTERM,
-    );
-    assert_eq!(got, (Some(libc::SIGTERM), true, true));
-    let sb = Sandbox::new();
-    let got = interrupted(
-        &sb,
-        "codex",
-        &[
-            "usage",
-            "codex:default",
-            "--wait",
-            "--live",
-            "--timeout",
-            "60",
-        ],
-        libc::SIGTERM,
-    );
-    assert_eq!(got, (Some(libc::SIGTERM), true, true));
-}
-
-/// R4, R23 (lane review round 1): the same for the queries of `pick --wait --live` (and of
-/// `usage --live`), started in parallel: SIGTERM among the starts reaches every one of them,
-/// the ones running and the ones being started, and so it does once they all run.
-#[test]
-fn a_sigterm_while_queries_are_starting_reaches_them_all() {
-    for args in [
-        &["pick", "--wait", "--live", "--timeout", "60"][..],
-        &["usage", "--live", "--timeout", "60"],
-    ] {
-        // Among the starts, and once they all run.
-        let moments = (0..120)
-            .step_by(12)
-            .chain([1000])
-            .map(Duration::from_millis);
-        for after in moments {
-            assert!(
-                !outlived_by_a_query(after, libc::SIGTERM, args),
-                "{args:?}: terminated after {after:?}: a query outlived remuda"
-            );
-        }
-    }
-}
-
-// --- wait --------------------------------------------------------------------------------
-
-/// `remuda <args>`: exit code, stdout, stderr, and how long it took.
-fn timed(sb: &Sandbox, args: &[&str]) -> (Option<i32>, String, String, Duration) {
-    let start = Instant::now();
-    let out = sb.remuda().args(args).output().unwrap();
-    (
-        out.status.code(),
-        String::from_utf8(out.stdout).unwrap(),
-        String::from_utf8(out.stderr).unwrap(),
-        start.elapsed(),
-    )
-}
-
-/// R10 `usage --wait`: it waits for one account; without one it is a usage error that points
-/// to `pick --wait`. `--max-wait` needs `--wait`.
-#[test]
-fn usage_wait_needs_an_account() {
-    let Setup { sb, .. } = setup();
-    let (code, stdout, stderr, _) = timed(&sb, &["usage", "--wait"]);
-    assert_eq!(code, Some(2), "{stderr}");
-    assert_eq!(stdout, "");
-    assert!(
-        stderr.contains("to wait for any account use `remuda pick --wait`"),
-        "{stderr}"
-    );
-    for args in [
-        &["usage", "max", "--max-wait", "5"][..],
-        &["usage", "max", "--wait", "--max-wait", "-1"],
-    ] {
-        let (code, _, stderr, _) = timed(&sb, args);
-        assert_eq!(code, Some(2), "{args:?}: {stderr}");
-    }
-    assert!(sb.invocations().is_empty());
-}
-
-/// R10 `usage --wait`: an account with no window used up (less than `[pick] min_headroom`
-/// percent left) is done at once, printed as `usage` prints it: also when the only window that
-/// was used up has reset since it was cached (unknown, never used up; no `--live` is implied),
-/// and when there is no cached usage at all.
-#[test]
-fn usage_wait_is_done_at_once_when_nothing_is_used_up() {
-    let Setup { sb, max, .. } = setup();
-    let at = |offset_secs: i64| {
-        jiff::Timestamp::from_second((now_ms() / 1000) as i64 + offset_secs).unwrap()
+    let b = blocks(&out);
+    assert_eq!(b[0].0, "codex:work live", "{out}");
+    let [row, note] = b[0].1.as_slice() else {
+        panic!("{out}")
     };
-    let (session, week) = (at(-3600), at(2 * 86_400));
-    let limits = format!(
-        r#"{{"limits": [
-            {{"kind": "session", "percent": 100, "severity": "critical", "resets_at": "{session}"}},
-            {{"kind": "weekly_all", "percent": 77, "severity": "warning", "resets_at": "{week}"}}]}}"#
+    assert!(row.starts_with("2h window 40% resets "), "{out}");
+    // The second the answer arrives decides the minute: 25 to 27 minutes before the reset.
+    assert!(note.starts_with("note: at this pace 100% by "), "{out}");
+    assert!(
+        ["25m", "26m", "27m"]
+            .iter()
+            .any(|d| note.ends_with(&format!(", {d} before the reset"))),
+        "{out}"
     );
-    sb.write_claude_json(Some(&max), &cache_json(7200, &limits));
-    for account in ["max", "team"] {
-        let plain = stdout_of(sb.remuda().args(["usage", account]).assert().success());
-        let (code, stdout, stderr, took) = timed(&sb, &["usage", account, "--wait"]);
-        assert_eq!(code, Some(0), "{account}: {stderr}");
-        assert_eq!(stdout, plain);
-        assert_eq!(stderr, "", "{account}: no status line on a pipe");
-        assert!(took < Duration::from_secs(30), "{account}: {took:?}");
-    }
-    let max_out = stdout_of(sb.remuda().args(["usage", "max"]).assert().success());
-    assert!(max_out.contains("reset since cached"), "{max_out}");
-    assert!(sb.invocations().is_empty(), "--wait never queries live");
 }
 
-/// R10 `usage --wait --max-wait`: a window used up whose reset is later than the deadline:
-/// remuda gives up at once (no check would come before it) with the account's usage, exit 1.
-/// `--max-wait 0` is one look.
-#[test]
-fn usage_wait_gives_up_when_the_next_check_is_after_max_wait() {
-    let Setup { sb, max, .. } = setup();
-    // The Fable window is at 100% until 2099.
-    sb.write_claude_json(Some(&max), &cache_json(200, LIMITS));
-    let plain = stdout_of(sb.remuda().args(["usage", "max"]).assert().success());
-    for max_wait in ["0", "1", "3600"] {
-        let (code, stdout, stderr, took) =
-            timed(&sb, &["usage", "max", "--wait", "--max-wait", max_wait]);
-        assert_eq!(code, Some(1), "{max_wait}: {stderr}");
-        assert_eq!(stdout, plain);
-        assert!(
-            stderr.starts_with(
-                "remuda: gave up waiting: the next check (Sep 25 05:00) would \
-                 come after --max-wait"
-            ),
-            "{max_wait}: {stderr}"
-        );
-        assert!(took < Duration::from_secs(30), "{max_wait}: {took:?}");
-    }
-    // A `min_headroom` of 0 leaves nothing used up: done.
-    sb.write_config(&format!("{}[pick]\nmin_headroom = 0\n", sb.read_config()));
-    let (code, stdout, _, _) = timed(&sb, &["usage", "max", "--wait", "--max-wait", "0"]);
-    assert_eq!((code, stdout), (Some(0), plain));
-    assert!(sb.invocations().is_empty());
-}
-
-/// R10 `usage --wait --live`: each attempt asks the agent; a query that failed is nothing to
-/// wait for (exit 1, as `usage --live` exits), one whose answer has nothing used up is done.
-#[test]
-fn usage_wait_live_asks_the_agent() {
-    let Setup { sb, max, .. } = setup();
-    // No fixture: the fake claude exits 1.
-    let (code, stdout, stderr, _) = timed(&sb, &["usage", "max", "--wait", "--live"]);
-    assert_eq!(code, Some(1), "{stderr}");
-    assert!(stdout.starts_with("claude:max  error: "), "{stdout}");
-    assert_eq!(
-        stderr,
-        "remuda: nothing to wait for: the live query failed\n"
-    );
-    sb.set_live_usage(Some(&max), LIVE_SAMPLE);
-    let (code, stdout, stderr, _) = timed(&sb, &["usage", "max", "--wait", "--live"]);
-    assert_eq!(code, Some(0), "{stderr}");
-    assert!(stdout.starts_with("claude:max  live\n"), "{stdout}");
-    let invs = sb.invocations_with(Some(&max));
-    assert_eq!(invs.len(), 2);
-    assert!(invs.iter().all(|i| i.args == LIVE_ARGS));
-}
-
-// --- history (R24) with --wait (R10) ------------------------------------------------------
-
-/// R24, R10: `--history` shows what was recorded; it does not combine with `--wait` (nor with
-/// `--max-wait`, which needs `--wait`).
-#[test]
-fn history_does_not_combine_with_wait() {
-    let Setup { sb, .. } = setup();
-    for args in [
-        &["usage", "max", "--history", "--wait"][..],
-        &["usage", "max", "--wait", "--history"],
-        &["usage", "max", "--history", "--wait", "--max-wait", "5"],
-        &["usage", "max", "--history", "--max-wait", "5"],
-    ] {
-        let (code, stdout, stderr, _) = timed(&sb, args);
-        assert_eq!(code, Some(2), "{args:?}: {stderr}");
-        assert_eq!(stdout, "", "{args:?}");
-    }
-    let (_, _, stderr, _) = timed(&sb, &["usage", "max", "--history", "--wait"]);
-    assert!(stderr.contains("cannot be used with"), "{stderr}");
-    assert!(!sb.remuda_home().join("state").exists());
-}
-
-/// R24, R10: `usage --wait` records the reading it prints, as `usage` does: cached at the cache
-/// time, when it is done at once and when it gives up (`--max-wait`) on a window used up; live at
-/// the time the answer arrived. A live query that failed records nothing.
-#[test]
-fn usage_wait_records_the_reading_it_prints() {
-    let Setup { sb, max, team } = setup();
-    // Nothing used up: done at once.
-    let fetched = now_ms() as i64 - 60_000;
-    let free = r#"{"limits": [{"kind": "session", "percent": 34,
-        "resets_at": "2099-09-23T15:39:59Z"}]}"#;
-    sb.write_claude_json(Some(&team), &cache_at(fetched, free));
-    let (code, _, stderr, _) = timed(&sb, &["usage", "team", "--wait"]);
-    assert_eq!(code, Some(0), "{stderr}");
-    let got = history(&sb);
-    let ts = jiff::Timestamp::from_millisecond(fetched)
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        got,
-        [
-            serde_json::json!({"ts": ts, "account": "claude:team", "label": "Session",
-            "model": null, "percent": 34.0, "resets_at": "2099-09-23T15:39:59Z",
-            "source": "cached"})
-        ]
-    );
-
-    // A window used up until 2099: gives up at once, and what it printed is recorded.
-    sb.write_claude_json(Some(&max), &cache_at(fetched, LIMITS));
-    let (code, stdout, _, _) = timed(&sb, &["usage", "max", "--wait", "--max-wait", "0"]);
-    assert_eq!(code, Some(1));
-    assert!(stdout.contains("Week (Fable)"), "{stdout}");
-    let max_points: Vec<_> = history(&sb)
-        .into_iter()
-        .filter(|p| p["account"] == "claude:max")
-        .collect();
-    let labels: Vec<&str> = max_points
-        .iter()
-        .map(|p| p["label"].as_str().unwrap())
-        .collect();
-    assert_eq!(labels, ["Session", "Week (all models)", "Week (Fable)"]);
-    assert!(max_points.iter().all(|p| p["ts"] == ts.as_str()));
-
-    // Live: recorded at the answer; a failed query (no fixture for the default) records nothing.
-    let before = history(&sb).len();
-    let (code, _, _, _) = timed(&sb, &["usage", "default", "--wait", "--live"]);
-    assert_eq!(code, Some(1));
-    assert_eq!(history(&sb).len(), before);
-    let mut free_live = LIVE_SAMPLE.replace("85% used", "15% used");
-    free_live = free_live.replace("74% used", "14% used");
-    sb.set_live_usage(Some(&team), &free_live);
-    let start = jiff::Timestamp::now();
-    let (code, stdout, stderr, _) = timed(&sb, &["usage", "team", "--wait", "--live"]);
-    assert_eq!(code, Some(0), "{stderr}");
-    assert!(stdout.starts_with("claude:team  live\n"), "{stdout}");
-    let live: Vec<_> = history(&sb)
-        .into_iter()
-        .filter(|p| p["source"] == "live")
-        .collect();
-    assert_eq!(live.len(), 3, "{live:?}");
-    for p in &live {
-        assert_eq!(p["account"], "claude:team");
-        let at: jiff::Timestamp = p["ts"].as_str().unwrap().parse().unwrap();
-        assert!(at >= start, "{p}");
-    }
-    assert!(!sb.launch_log().exists());
-}
-
-/// R10, R24: a codex window is recorded with the minutes codex told (`window_minutes`), and
-/// `--history` paces it by them, not by its label: 40% used half an hour into a window of 90
-/// minutes (labeled `2h window`) is ahead of an even pace; two hours would be behind it.
+/// R10: a codex window is paced by the minutes codex told, not by its label: 40% used 20
+/// minutes into a window of 90 (labeled `2h window`) is ahead of an even pace, at 100% 40
+/// minutes before its reset; the two hours of its label would put it behind (50 minutes of
+/// 120 elapsed), with no note. The reset is more than an hour away: no reset note.
 #[test]
 fn a_codex_window_is_paced_by_its_minutes() {
     use common::rollouts::{token_count, write_rollout};
@@ -1651,7 +964,7 @@ fn a_codex_window_is_paced_by_its_minutes() {
         work.display()
     ));
     let now = minute();
-    let (read, reset) = (plus(now, -30 * 60), plus(now, 30 * 60));
+    let (read, reset) = (plus(now, -5 * 60), plus(now, 65 * 60));
     let limits = serde_json::json!({"limit_id": "codex", "limit_name": null,
         "primary": {"used_percent": 40.0, "window_minutes": 90, "resets_at": reset.as_second()},
         "secondary": null, "plan_type": "plus"});
@@ -1660,104 +973,192 @@ fn a_codex_window_is_paced_by_its_minutes() {
         "019c1e08-e4f6-7d70-a129-38ec744a3f3c",
         &token_count(limits, &read.to_string()),
     );
-    let out = stdout_of(sb.remuda().args(["usage", "codex:work"]).assert().success());
-    assert!(out.contains("2h window"), "{out}");
-    assert_eq!(
-        history(&sb),
-        [
-            serde_json::json!({"ts": read.to_string(), "account": "codex:work",
-            "label": "2h window", "model": null, "percent": 40.0,
-            "resets_at": reset.to_string(), "source": "cached", "window_minutes": 90})
-        ]
-    );
     let out = stdout_of(
         sb.remuda()
-            .args(["usage", "--history", "codex:work"])
+            .args(["usage", "codex:work"])
             .assert()
             .success()
             .stderr(""),
     );
     assert_eq!(
-        out,
-        format!(
-            "codex:work\n  2h window\n    {}  40%  resets {}\n    \
-             used 40% with 33% of the window elapsed: ahead of an even pace; \
-             at this pace 100% by {} (resets {})\n",
-            utc(read),
-            utc(reset),
-            utc(plus(now, 15 * 60)),
-            utc(reset),
-        )
+        blocks(&out)[0].1,
+        [
+            format!("2h window 40% resets {}", utc(reset)),
+            format!(
+                "note: at this pace 100% by {}, 40m before the reset",
+                utc(plus(now, 25 * 60))
+            ),
+        ],
+        "{out}"
     );
     assert!(sb.codex_invocations().is_empty());
 }
 
-/// R10, R24: `usage --wait` takes a second attempt and records the first one's reading only.
-/// The session is used up and resets in about ten seconds: the first attempt waits, the next
-/// is `MIN_INTERVAL` (60 s) later, when the cached session has reset since: done, exit 0. The
-/// history holds the first attempt's points, once each: the second attempt's week is the same
-/// reading, its session (`reset since cached`) is not recorded. The wait is real, and the
-/// status line is there on a terminal (stderr is a pseudo-terminal here).
+/// R4, R10 (lane review round 1): SIGTERM, which `kill` or a supervisor sends remuda alone, is
+/// passed on like Ctrl-C: the live query under way (in a process group of its own, which no
+/// timeout of remuda's ends once remuda is gone) ends with remuda.
 #[test]
-fn usage_wait_records_the_attempt_before_a_reset_once() {
-    use std::os::fd::FromRawFd;
-    let Setup { sb, max, .. } = setup();
-    let fetched = now_ms() as i64 - 60_000;
-    let reset = jiff::Timestamp::from_millisecond(now_ms() as i64 + 10_000).unwrap();
-    let limits = format!(
-        r#"{{"limits": [
-            {{"kind": "session", "percent": 100, "resets_at": "{reset}"}},
-            {{"kind": "weekly_all", "percent": 20, "resets_at": "2099-09-23T15:39:59Z"}}]}}"#
+fn a_sigterm_reaches_a_running_live_query() {
+    let Setup { sb, .. } = setup();
+    let got = interrupted(
+        &sb,
+        "claude",
+        &["usage", "max", "--live", "--timeout", "60"],
+        libc::SIGTERM,
     );
-    sb.write_claude_json(Some(&max), &cache_at(fetched, &limits));
-    let (master, slave) = pty();
-    let mut cmd = sb.remuda_process();
-    // SAFETY: the descriptor `pty` opened; the command owns it from here, and closes it once
-    // it is dropped.
-    let terminal_end = unsafe { std::fs::File::from_raw_fd(slave) };
-    cmd.args(["usage", "max", "--wait"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(terminal_end);
-    let start = Instant::now();
-    let remuda = cmd.spawn().unwrap();
-    // Only remuda has the terminal's end now: reading ends when it is gone.
-    drop(cmd);
-    let terminal = std::thread::spawn(move || {
-        use std::io::Read;
-        // SAFETY: the descriptor `pty` opened; this file is its only owner.
-        let mut master = unsafe { std::fs::File::from_raw_fd(master) };
-        let mut shown = Vec::new();
-        let _ = master.read_to_end(&mut shown);
-        String::from_utf8_lossy(&shown).into_owned()
-    });
-    let out = remuda.wait_with_output().unwrap();
-    let took = start.elapsed();
-    let shown = terminal.join().unwrap();
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(out.status.success(), "{stdout}{shown}");
-    assert!(
-        took >= Duration::from_secs(60),
-        "took {took:?}: no second attempt"
+    assert_eq!(got, (Some(libc::SIGTERM), true, true));
+    let sb = Sandbox::new();
+    let got = interrupted(
+        &sb,
+        "codex",
+        &["usage", "codex:default", "--live", "--timeout", "60"],
+        libc::SIGTERM,
     );
-    assert!(took < Duration::from_secs(90), "took {took:?}");
-    assert!(
-        shown.contains("remuda: waiting: claude:max Session 100% used"),
-        "{shown:?}"
-    );
-    assert!(stdout.contains("reset since cached"), "{stdout}");
-    let ts = jiff::Timestamp::from_millisecond(fetched)
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        history(&sb),
-        [
-            serde_json::json!({"ts": ts, "account": "claude:max", "label": "Session",
-                "model": null, "percent": 100.0, "resets_at": reset.to_string(),
-                "source": "cached"}),
-            serde_json::json!({"ts": ts, "account": "claude:max",
-                "label": "Week (all models)", "model": null, "percent": 20.0,
-                "resets_at": "2099-09-23T15:39:59Z", "source": "cached"}),
-        ]
-    );
+    assert_eq!(got, (Some(libc::SIGTERM), true, true));
+}
+
+/// R4 (lane review round 1): the same for the queries of `usage --live`, started in parallel:
+/// SIGTERM among the starts reaches every one of them, the ones running and the ones being
+/// started, and so it does once they all run.
+#[test]
+fn a_sigterm_while_queries_are_starting_reaches_them_all() {
+    let args = ["usage", "--live", "--timeout", "60"];
+    // Among the starts, and once they all run.
+    let moments = (0..120)
+        .step_by(12)
+        .chain([1000])
+        .map(Duration::from_millis);
+    for after in moments {
+        assert!(
+            !outlived_by_a_query(after, libc::SIGTERM, &args),
+            "terminated after {after:?}: a query outlived remuda"
+        );
+    }
+}
+
+// --- removed options and the usage history (R5, R10, R24) ---------------------------------
+
+/// R24: the usage history was removed on 2026-10-28, and `remuda usage` records nothing of
+/// what it reads, cached or live: no `state/usage-history.jsonl`, and nothing else written,
+/// no `state/` at all. The windows read have resets ahead, which the history recorded.
+#[test]
+fn usage_records_nothing() {
+    let Setup { sb, max, team } = setup();
+    sb.write_claude_json(Some(&max), &cache_json(60, LIMITS));
+    sb.write_claude_json(None, &cache_json(7200, LIMITS));
+    for home in [None, Some(max.as_path()), Some(team.as_path())] {
+        sb.set_live_usage(home, LIVE_SAMPLE);
+    }
+    for args in [
+        &["usage"][..],
+        &["usage", "max"],
+        &["usage", "--live"],
+        &["usage", "max", "--live"],
+    ] {
+        let out = stdout_of(sb.remuda().args(args).assert().success().stderr(""));
+        assert!(out.contains("claude:max  "), "{args:?}: {out}");
+        let state = sb.remuda_home().join("state");
+        assert!(!state.join("usage-history.jsonl").exists(), "{args:?}");
+        assert!(!state.exists(), "{args:?}: nothing is written");
+    }
+}
+
+/// R24: a usage history that an earlier remuda left in `state/` stays as it is until the user
+/// deletes it: `remuda usage` (cached and `--live`) and `remuda stats` neither remove it nor
+/// write to it or through it. A file of garbage bytes keeps its bytes and its mode 0644; a
+/// symlink to a file elsewhere keeps its target, and the target its bytes and mode.
+/// Nothing else appears in `state/` but the statistics cache.
+#[test]
+fn an_existing_usage_history_is_left_alone() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let Setup { sb, max, team } = setup();
+    sb.write_claude_json(Some(&max), &cache_json(60, LIMITS));
+    sb.write_claude_json(None, &cache_json(7200, LIMITS));
+    for home in [None, Some(max.as_path()), Some(team.as_path())] {
+        sb.set_live_usage(home, LIVE_SAMPLE);
+    }
+    let state = sb.remuda_home().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let path = state.join("usage-history.jsonl");
+    let target = sb.root().join("elsewhere/h.jsonl");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let junk: &[u8] =
+        b"{\"ts\": \"2026-10-01T00:00:00Z\", \"account\": \"claude:max\"}\nnot json\n\xff\xfe\n";
+    for linked in [false, true] {
+        let file = if linked { &target } else { &path };
+        std::fs::write(file, junk).unwrap();
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if linked {
+            std::fs::remove_file(&path).unwrap();
+            symlink(&target, &path).unwrap();
+        }
+        for args in [
+            &["usage"][..],
+            &["usage", "max"],
+            &["usage", "--live"],
+            &["usage", "max", "--live"],
+            &["stats"],
+        ] {
+            sb.remuda().args(args).assert().success();
+            let meta = std::fs::symlink_metadata(&path);
+            assert!(meta.is_ok(), "{args:?}, linked {linked}: removed: {meta:?}");
+            assert_eq!(meta.unwrap().is_symlink(), linked, "{args:?}");
+            if linked {
+                assert_eq!(std::fs::read_link(&path).unwrap(), target, "{args:?}");
+            }
+            let mode = std::fs::metadata(file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o644, "{args:?}, linked {linked}");
+            assert_eq!(
+                std::fs::read(file).unwrap(),
+                junk,
+                "{args:?}, linked {linked}"
+            );
+        }
+        let mut names: Vec<String> = std::fs::read_dir(&state)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["stats.json", "usage-history.jsonl"],
+            "linked {linked}"
+        );
+    }
+}
+
+/// R5, R10, R24: `usage --wait` and `--max-wait` were removed with `remuda pick`, and
+/// `--history` and `--days` with the usage history (2026-10-28): unknown to clap, each is a
+/// usage error (exit 2) that reads no usage, runs no query and records nothing, whatever it is
+/// given with. (No window is used up here, so that a `--wait` that came back would return at
+/// once, failing this test instead of waiting.)
+#[test]
+fn usage_has_no_wait_or_history_options() {
+    let Setup { sb, .. } = setup();
+    for (args, unknown) in [
+        (&["usage", "max", "--wait"][..], "--wait"),
+        (&["usage", "--wait"], "--wait"),
+        (&["usage", "max", "--wait", "--live"], "--wait"),
+        (&["usage", "max", "--live", "--wait"], "--wait"),
+        (&["usage", "max", "--max-wait", "0"], "--max-wait"),
+        (&["usage", "max", "--wait", "--max-wait", "5"], "--wait"),
+        (&["usage", "--history"], "--history"),
+        (&["usage", "max", "--history"], "--history"),
+        (&["usage", "--live", "--history"], "--history"),
+        (&["usage", "--history", "max", "--days", "30"], "--history"),
+        (&["usage", "max", "--history", "--wait"], "--history"),
+        (&["usage", "--days", "3"], "--days"),
+        (&["usage", "max", "--days", "3", "--history"], "--days"),
+    ] {
+        let out = sb.remuda().args(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(
+            stderr.contains(&format!("unexpected argument '{unknown}'")),
+            "{args:?}: {stderr}"
+        );
+    }
+    assert!(sb.invocations().is_empty());
+    assert!(!sb.remuda_home().join("state").exists());
 }

@@ -1332,8 +1332,9 @@ pub struct Request<'a> {
     pub group: usize,
     /// As recorded; `unknown` when the transcript names none.
     pub model: &'a str,
-    /// Whether any copy used fast mode, or US-only inference.
+    /// Whether any copy used fast mode (as priced in `cost`).
     pub fast: bool,
+    /// Whether any copy used US-only inference (as priced in `cost`).
     pub geo_us: bool,
     /// Claude: the largest of each count over the copies; codex: the copy that counts, whole.
     pub tokens: Tokens,
@@ -1732,84 +1733,6 @@ pub fn projects(
         since,
         sections,
         overall: account.is_none().then(|| model_rows(&overall)),
-    }
-}
-
-/// The columns of [`csv`].
-pub const CSV_HEADER: &str = "timestamp,provider,accounts,session_id,project,model,input,\
-cache_read,cache_write_5m,cache_write_1h,output,reasoning,fast,us_only,cost_usd";
-
-/// Every request of `period` as CSV (R20), only of sessions attributed to `account` if given:
-/// [`CSV_HEADER`], then a line per request, by timestamp (those without one last), then by key.
-/// Fields are quoted as RFC 4180 has it; lines end in `\n`.
-pub fn csv(
-    out: &mut impl std::io::Write,
-    counted: &Counted<'_>,
-    period: Period,
-    now: Timestamp,
-    tz: &TimeZone,
-    account: Option<&str>,
-) -> std::io::Result<()> {
-    let start = period.start(now, tz).map(|t| t.as_second());
-    let mut requests: Vec<&Request<'_>> = counted
-        .list
-        .iter()
-        .filter(|r| r.within(start) && counted.includes(r, account))
-        .collect();
-    requests.sort_by_key(|r| (r.ts.is_none(), r.ts, r.key));
-    writeln!(out, "{CSV_HEADER}")?;
-    for r in requests {
-        let file = r.file;
-        let t = &r.tokens;
-        let timestamp =
-            r.ts.and_then(|ts| Timestamp::from_second(ts).ok())
-                .map(|ts| ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string());
-        // Claude records no reasoning apart from output: unknown, not 0 (R20).
-        let reasoning = (file.provider == Provider::Codex).then(|| t.reasoning.to_string());
-        let fields = [
-            timestamp.unwrap_or_default(),
-            file.provider.name().to_string(),
-            counted.groups[r.group].join(" + "),
-            file.session_id.clone(),
-            file.cwd.clone().unwrap_or_default(),
-            r.model.to_string(),
-            t.input.to_string(),
-            t.cache_read.to_string(),
-            t.cache_write_5m.to_string(),
-            t.cache_write_1h.to_string(),
-            t.output.to_string(),
-            reasoning.unwrap_or_default(),
-            r.fast.to_string(),
-            r.geo_us.to_string(),
-            r.cost.map(decimal_usd).unwrap_or_default(),
-        ];
-        let line: Vec<_> = fields.iter().map(|f| csv_field(f)).collect();
-        writeln!(out, "{}", line.join(","))?;
-    }
-    out.flush()
-}
-
-/// `field` as a CSV field (RFC 4180): quoted when it holds `,`, `"`, `\r` or `\n`, with each `"`
-/// doubled.
-fn csv_field(field: &str) -> std::borrow::Cow<'_, str> {
-    if field.contains([',', '"', '\r', '\n']) {
-        format!("\"{}\"", field.replace('"', "\"\"")).into()
-    } else {
-        field.into()
-    }
-}
-
-/// Picodollars as decimal US dollars, exactly: up to 12 decimals, without trailing zeros
-/// (`1_500_000_000_000` is `1.5`).
-fn decimal_usd(pico_usd: u128) -> String {
-    const PER_USD: u128 = 1_000_000_000_000;
-    let (whole, frac) = (pico_usd / PER_USD, pico_usd % PER_USD);
-    match frac {
-        0 => whole.to_string(),
-        _ => {
-            let frac = format!("{frac:012}");
-            format!("{whole}.{}", frac.trim_end_matches('0'))
-        }
     }
 }
 
@@ -2839,26 +2762,6 @@ Not priced: gpt-test (add [prices.\"<model>\"] to config.toml)
                 "cut {cut}"
             );
         }
-    }
-
-    /// R20: CSV fields are quoted as RFC 4180 has it, and costs are exact decimal dollars.
-    #[test]
-    fn csv_fields_and_decimal_dollars() {
-        assert_eq!(csv_field("/w/proj"), "/w/proj");
-        assert_eq!(csv_field(""), "");
-        assert_eq!(csv_field("/w/a,b"), "\"/w/a,b\"");
-        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
-        assert_eq!(csv_field("a\nb"), "\"a\nb\"");
-        assert_eq!(csv_field("a\rb"), "\"a\rb\"");
-        assert_eq!(decimal_usd(0), "0");
-        assert_eq!(decimal_usd(1), "0.000000000001");
-        assert_eq!(decimal_usd(1_500_000_000_000), "1.5");
-        assert_eq!(decimal_usd(123_456_789_012), "0.123456789012");
-        assert_eq!(decimal_usd(12_000_000_000_000), "12");
-        assert_eq!(
-            decimal_usd(u128::MAX),
-            "340282366920938463463374607.431768211455"
-        );
     }
 
     /// R20: a report holds each period by project too, made from the same requests as its

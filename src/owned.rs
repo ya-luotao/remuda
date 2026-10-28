@@ -12,8 +12,7 @@
 //! - exclusive locks, and what happens on a file system that has none;
 //! - the launch log's rules: only a regular file, only one that is the user's alone.
 //!
-//! Reads do not come here: a command that only reads creates nothing. (`remuda usage` and the
-//! TUI's usage readings are not only reads: they record what they read, R24.)
+//! Reads do not come here: a command that only reads creates nothing.
 
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fmt;
@@ -30,7 +29,7 @@ use anyhow::{Context, Result, bail};
 
 /// A directory that is the user's alone: `state/`, a new home (R3, R13).
 const PRIVATE_DIR: u32 = 0o700;
-/// A file that is the user's alone: the caches, the launch log, the usage history (R3).
+/// A file that is the user's alone: the caches and the launch log (R3).
 const PRIVATE_FILE: u32 = 0o600;
 /// Left to the umask: the directories between `$REMUDA_HOME` and what is private.
 const DEFAULT_DIR: u32 = 0o777;
@@ -48,11 +47,6 @@ pub fn state_dir(config: &Path) -> PathBuf {
 /// The launch log of the state directory `state` (R6).
 pub fn launch_log(state: &Path) -> PathBuf {
     state.join("launches.jsonl")
-}
-
-/// The usage history of the state directory `state` (R24).
-pub fn usage_history(state: &Path) -> PathBuf {
-    state.join("usage-history.jsonl")
 }
 
 /// What an entry of a directory is, without following it.
@@ -666,8 +660,7 @@ impl Dir {
 
     /// An exclusive lock on this directory itself, held until the result is dropped; nothing
     /// is created for it. Waits for whoever holds it. On a file system that has no locks it
-    /// is refused: what a lock protects here (the registry, the usage history, R3) is not
-    /// worth losing.
+    /// is refused: what a lock protects here (the registry, R3) is not worth losing.
     pub fn lock(&self, locks: &dyn Locks) -> io::Result<Held> {
         Held::take(self.reopen()?, locks)
     }
@@ -876,180 +869,6 @@ pub fn update_registry(
     };
     replace_keeping_mode(dir, file, text.as_bytes())
         .with_context(|| format!("cannot write {}", config.display()))
-}
-
-/// A file of the state directory, locked for a change that reads it and then appends to it or
-/// replaces it ([`lock_state_file`]). The link to it, if it is reached through one, was resolved
-/// once, when it was locked: what follows is done by the file's name in the directory that is
-/// locked, through that directory's descriptor, and never through the link again, so a link
-/// pointed elsewhere meanwhile redirects nothing.
-#[derive(Debug)]
-pub struct LockedFile {
-    /// Where the file is: its own path in the state directory or, for one that is a symlink,
-    /// the file it points at. For messages.
-    pub target: PathBuf,
-    /// The file in the state directory is a symlink, written through (R3).
-    pub linked: bool,
-    /// The state directory, cleaned by an append as by one to the launch log (R3).
-    state: Dir,
-    /// The directory the file is in, which is locked.
-    dir: Dir,
-    name: OsString,
-    _lock: Held,
-}
-
-impl LockedFile {
-    /// Fails when the file that would be written is one remuda keeps no one else from reading:
-    /// not a regular file (also a symlink put in its place), or, where it is reached through a
-    /// symlink (whose target keeps its mode, R3), one the group or others have any access to.
-    /// A file in the state directory itself is made the user's alone by the write. Looked at in
-    /// the locked directory, without following a link.
-    pub fn check_private(&self) -> Result<()> {
-        let meta = self
-            .dir
-            .meta(&self.name)
-            .with_context(|| format!("cannot read {}", self.target.display()))?;
-        let Some(meta) = meta else {
-            return Ok(());
-        };
-        if meta.kind != Kind::File {
-            bail!("{} is not a regular file", self.target.display());
-        }
-        if self.linked && meta.mode & 0o077 != 0 {
-            bail!(
-                "{} can be accessed by the group or others (mode {:04o}); nothing was written",
-                self.target.display(),
-                meta.mode
-            );
-        }
-        Ok(())
-    }
-
-    /// The file's contents; `None` when there is none. Opened in the locked directory without
-    /// following a link and without blocking: only a regular file is read (a FIFO would hold
-    /// remuda up).
-    pub fn read(&self) -> Result<Option<Vec<u8>>> {
-        let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
-        let mut file = match self.dir.open_at(&entry_name(&self.name)?, flags, 0) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(e).with_context(|| format!("cannot read {}", self.target.display()));
-            }
-        };
-        if !file.metadata()?.file_type().is_file() {
-            bail!("{} is not a regular file", self.target.display());
-        }
-        let mut bytes = Vec::new();
-        io::Read::read_to_end(&mut file, &mut bytes)?;
-        Ok(Some(bytes))
-    }
-
-    /// Appends `bytes` to the file in one write, as [`append_log`] does to the launch log: one in
-    /// the state directory is created with mode 0600 when missing and tightened to it, and
-    /// nothing is written to one that is not a regular file or that the group or others can still
-    /// access. A file reached through a symlink is never created: one that is gone since it was
-    /// locked gets nothing (it would not be the user's file, nor of their mode). A link put at
-    /// the file's name since it was locked is not followed.
-    pub fn append(&self, bytes: &str) -> Result<()> {
-        self.state.sweep();
-        let mut flags = libc::O_WRONLY | libc::O_APPEND | libc::O_NONBLOCK | libc::O_NOFOLLOW;
-        if !self.linked {
-            flags |= libc::O_CREAT;
-        }
-        let mut file = self
-            .dir
-            .open_at(&entry_name(&self.name)?, flags, PRIVATE_FILE)
-            .with_context(|| format!("cannot write {}", self.target.display()))?;
-        if !self.linked {
-            tighten(&file, PRIVATE_FILE);
-        }
-        refuse_shared(&file, &self.target)?;
-        file.write_all(bytes.as_bytes())?;
-        Ok(())
-    }
-
-    /// Replaces the file atomically in the locked directory, as [`save_cache`] does a cache, after
-    /// removing what a killed write left there: one in the state directory with mode 0600; one
-    /// reached through a symlink with the mode it has, and only while it is there and a regular
-    /// file: one that is gone since it was locked is not created again, with any mode.
-    pub fn replace(&self, bytes: &[u8]) -> Result<()> {
-        let failed = || format!("cannot write {}", self.target.display());
-        self.dir.sweep();
-        if !self.linked {
-            return self
-                .dir
-                .put(&self.name, bytes, PRIVATE_FILE, None, true)
-                .with_context(failed);
-        }
-        match self.dir.meta(&self.name).with_context(failed)? {
-            Some(meta) if meta.kind == Kind::File => self
-                .dir
-                .put(&self.name, bytes, PRIVATE_FILE, Some(meta.mode), true)
-                .with_context(failed),
-            Some(_) => bail!("{} is not a regular file", self.target.display()),
-            None => bail!("{} is gone; nothing was written", self.target.display()),
-        }
-    }
-}
-
-/// Locks the file `path` of the state directory ([`state`]) for a change that reads it and then
-/// appends to it or replaces it (R24), creating the state directory as needed. Like the
-/// registry's lock ([`update_registry`]), the lock is on the directory of the file that is
-/// replaced: the state directory's own or, where `path` is a symlink, that of the file it points
-/// at; so every path to one file takes the same lock, two `$REMUDA_HOME`s whose files link to
-/// one included, and a rename in that directory does not leave it behind. The link is looked at
-/// again under the lock: when it was pointed elsewhere meanwhile, that is an error, as is a
-/// file system without locks ([`Dir::lock`]) and a link that leads nowhere. What follows
-/// goes through the [`LockedFile`], to the file that was locked, whatever the link says then.
-pub fn lock_state_file(path: &Path, locks: &dyn Locks) -> Result<LockedFile> {
-    let (above, name) = split(path)?;
-    let state_dir = state(above)?;
-    let linked =
-        through(&state_dir, name).with_context(|| format!("cannot resolve {}", path.display()))?;
-    let lock = {
-        let there = linked.as_ref().map_or(&state_dir, |(there, _)| there);
-        there.lock(locks).with_context(|| {
-            format!(
-                "cannot lock {} to change {}",
-                there.path().display(),
-                path.display()
-            )
-        })?
-    };
-    let now =
-        through(&state_dir, name).with_context(|| format!("cannot resolve {}", path.display()))?;
-    let unchanged = match (&linked, &now) {
-        (None, None) => true,
-        (Some((before, was)), Some((after, is))) => was == is && before.is(after),
-        _ => false,
-    };
-    if !unchanged {
-        bail!(
-            "{} was pointed elsewhere while it was being changed; nothing was written",
-            path.display()
-        );
-    }
-    let is_linked = linked.is_some();
-    let (dir, name) = match linked {
-        Some((there, file)) => (there, file),
-        // The same directory, by the same descriptor: not opened again by its path.
-        None => (
-            Dir {
-                fd: state_dir.fd.try_clone()?,
-                path: state_dir.path.clone(),
-            },
-            name.to_os_string(),
-        ),
-    };
-    Ok(LockedFile {
-        target: dir.path().join(&name),
-        linked: is_linked,
-        state: state_dir,
-        dir,
-        name,
-        _lock: lock,
-    })
 }
 
 /// Replaces the cache `path`, a file of the state directory ([`state`]), atomically (R3): the
@@ -1869,58 +1688,6 @@ mod tests {
         assert_eq!(entries(config.parent().unwrap()), ["config.toml"]);
     }
 
-    /// R24, R3: a file of the state directory is locked where it is replaced: a history that
-    /// is a symlink takes the lock of the directory of the file it points at, the same lock a
-    /// state directory holding that file takes. A link pointed elsewhere while its lock was
-    /// waited for is refused.
-    #[test]
-    fn a_state_file_is_locked_where_it_is_replaced() {
-        use std::sync::mpsc;
-        let dir = tempfile::tempdir().unwrap();
-        let (own, linked) = (dir.path().join("a/state"), dir.path().join("b/state"));
-        fs::create_dir_all(&own).unwrap();
-        fs::create_dir_all(&linked).unwrap();
-        let file = usage_history(&own);
-        fs::write(&file, "").unwrap();
-        symlink(&file, usage_history(&linked)).unwrap();
-
-        let held = lock_state_file(&file, &Flock).unwrap();
-        assert!(!held.linked);
-        let (tx, rx) = mpsc::channel();
-        let through = usage_history(&linked);
-        let waiter = std::thread::spawn(move || {
-            let got = lock_state_file(&through, &Flock).map(|l| (l.linked, l.target.clone()));
-            tx.send(()).unwrap();
-            got
-        });
-        assert!(
-            rx.recv_timeout(Duration::from_millis(500)).is_err(),
-            "the link took a lock of its own"
-        );
-        drop(held);
-        rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        let (is_linked, target) = waiter.join().unwrap().unwrap();
-        assert!(is_linked);
-        assert_eq!(target, fs::canonicalize(&file).unwrap());
-
-        // Pointed elsewhere while it waited: refused.
-        let elsewhere = dir.path().join("c");
-        fs::create_dir(&elsewhere).unwrap();
-        let held = lock_state_file(&file, &Flock).unwrap();
-        let through = usage_history(&linked);
-        let waiter = std::thread::spawn(move || lock_state_file(&through, &Flock).map(drop));
-        // Time for the waiter to resolve the link and wait for its lock, also under load.
-        std::thread::sleep(Duration::from_millis(2000));
-        fs::remove_file(usage_history(&linked)).unwrap();
-        fs::write(elsewhere.join("h.jsonl"), "").unwrap();
-        symlink(elsewhere.join("h.jsonl"), usage_history(&linked)).unwrap();
-        drop(held);
-        let e = waiter.join().unwrap().unwrap_err();
-        assert!(e.to_string().contains("pointed elsewhere"), "{e}");
-        // And on a file system without locks, nothing is locked: an error.
-        assert!(lock_state_file(&file, &NoLocks).is_err());
-    }
-
     /// R3: each write cleans the directory it writes in, and no other. A cache and a launch
     /// log that are symlinks to files in a directory elsewhere: a line appended to the log
     /// cleans `state/`, where the log is named, not where it points; what a cache left there
@@ -2256,10 +2023,6 @@ mod tests {
         assert_eq!(
             launch_log(&state_dir(config)),
             Path::new("/r/state/launches.jsonl")
-        );
-        assert_eq!(
-            usage_history(&state_dir(config)),
-            Path::new("/r/state/usage-history.jsonl")
         );
     }
 }

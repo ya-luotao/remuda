@@ -25,7 +25,6 @@ them. By area:
 | Across accounts | [R18](#r18-shared-configuration) shared configuration |
 | Statistics | [R20](#r20-token-statistics) token statistics and cost |
 | Privacy | [R21](#r21-private-mode-tui) private mode |
-| Recommendation | [R23](#r23-recommendation-pick) `pick` · [R24](#r24-usage-history) usage history |
 
 How the entries map onto the code is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -92,20 +91,6 @@ switching to a different, logged-out account.
   cache_read = 0.50
   cache_write_5m = 6.25
   cache_write_1h = 10
-
-  [pick]                    # optional: what `remuda pick` may recommend (R23)
-  exclude = ["claude:work"] # never recommended; write accounts as provider:name
-  prefer = ["claude:personal"]  # the rules' last tie-break
-  min_headroom = 10         # percent left required on every window that applies
-  stale_after = 120         # minutes after which cached usage is stale
-  affinity_minutes = 60     # minutes the account that ran a session stays preferred for
-                            # resuming it (R23); 0: never
-  strategy = "headroom"     # how the rules rank (R23): "headroom", or "pace" to use first
-                            # what a reset would waste
-
-  [pick.claude]             # also [pick.codex]
-  models = ["claude-opus-5-5", "claude-fable-5-1"]     # in order of preference
-  default_effort = "high"
   ```
 - Homes created by `setup` live at `$REMUDA_HOME/homes/<provider>/<name>`; homes registered with
   `add` stay where they are. `homes` and `homes/<provider>` are real directories: `setup`
@@ -146,21 +131,16 @@ switching to a different, logged-out account.
   account whose `home` is not an absolute path, `share` on a codex account, a `[share.claude] from`
   that names no claude account, a `[prices."<model>"]` that is not a table, has a key other than
   `input`, `output`, `cache_read`, `cache_write_5m`, and `cache_write_1h`, lacks `input` or
-  `output`, or has a price that is not a number from 0 to 1,000,000, a `[pick]` with a key other
-  than those above, an `exclude` or `prefer` entry that does not resolve as in R1, a
-  `min_headroom` that is not an integer from 0 to 100, a `stale_after` that is not a positive
-  integer, an `affinity_minutes` that is not an integer from 0 to 1440, a `strategy` other
-  than `"headroom"` or `"pace"`, a model not matching `[A-Za-z0-9._:-]+` or starting with `-`,
-  a duplicate model, a claude model that is a claude subcommand, or a `default_effort` that
-  is empty, does not match `[a-z]+`, or, for claude, is a claude subcommand, and similar
-  problems are all reported as errors naming the file; remuda neither guesses nor skips. A bare
-  name in `[pick]` resolves as in R1, so it becomes an error once another provider has an account
-  of that name: `add` and `setup` refuse such an account (R14), and `provider:name` avoids it.
-  The removed `[pick] notes` and `[pick.<provider>] efforts` keys are errors too: users must
-  remove them by hand; no configuration is automatically rewritten. `default_effort` is
-  validated independently, without an effort list.
-- Runtime state (index cache, statistics cache, launch log, usage history of R24) lives in
-  `$REMUDA_HOME/state/` and may be deleted and rebuilt at any time.
+  `output`, or has a price that is not a number from 0 to 1,000,000, and similar problems are all
+  reported as errors naming the file; remuda neither guesses nor skips.
+- A top-level `pick` key is an error too, whatever it holds (an empty table included): the
+  `[pick]` and `[pick.<provider>]` tables configured `remuda pick`, which was removed on
+  2026-10-28. The error names the file and tells the user to remove those tables by hand;
+  remuda neither ignores them nor rewrites the file (no configuration is rewritten
+  automatically). While they are there the registry does not load, so `add`, `setup`, and
+  `remove` change nothing.
+- Runtime state (index cache, statistics cache, launch log) lives in `$REMUDA_HOME/state/` and
+  may be deleted and rebuilt at any time.
 - Runtime state is the user's alone: the launch log holds the arguments of every launch, prompts
   among them (R6), and the caches hold titles and directories. `state/` is created with mode
   0700 and its files with mode 0600. A `state/` or a launch log from before that the group or
@@ -261,17 +241,12 @@ the UI, not reported as an error:
 remuda                                             open the TUI
 remuda run [<account>] [args]                      launch the agent under an account (R6); without
                                                    an account, open the TUI picker (R16)
-remuda usage [<account>] [--live] [--timeout S]    per-account usage as plain text (R10); with
-       [--wait [--max-wait S]]                     --wait, one account's once none of its
-                                                   windows is used up
-remuda usage --history [<account>] [--days N]      the usage recorded so far, with each current
-                                                   window's pace (R24)
+remuda usage [<account>] [--live] [--timeout S]    per-account usage as plain text (R10)
 remuda list [--timeout S]                          accounts, login identity, home (R10a)
 remuda sessions [--limit N]                        recent sessions: time, account attribution,
                                                    title, cwd (R8, R9)
 remuda stats [<account>] [--period P]              tokens and estimated cost per account (or
-       [--by account|project | --csv]              project) and model, or each request as
-                                                   CSV (R20)
+       [--by account|project]                      project) and model (R20)
 remuda add [--provider P] <name> <path>            register an existing home directory (R14, R17)
 remuda setup [--provider P] <name> [--email E]     create a new home, link it to the source of
                                                    shared configuration if there is one (R18),
@@ -279,9 +254,6 @@ remuda setup [--provider P] <name> [--email E]     create a new home, link it to
                                                    `codex login`; R17)
 remuda remove <account>                            unregister an account; its home is left in
                                                    place (R14a)
-remuda pick [--provider P] [--live] [--timeout S]  recommend the account, model and effort to
-       [--json]                                  launch now; with --run, launch it; with
-       [--wait [--max-wait S]] [--run [-- <args>]] --wait, once a pair is feasible (R23)
 remuda help [<command>]                            help for remuda or a command
 ```
 
@@ -291,10 +263,8 @@ remuda help [<command>]                            help for remuda or a command
   `-- -x`). Only a `--` before the account is remuda's own (`remuda run -- -x`, for a
   registered account whose name starts with `-`). Because `-h` and `--help` after `run` go to
   the agent too, the help of `run` itself is `remuda help run`.
-- `--provider` is `claude` (the default) or `codex`; for `pick`, a filter without default.
-  `--timeout` is in seconds, per query: `usage --live` and `pick --live` default to 90, `list` to
-  15. `--max-wait` is in seconds too, 0 included, and needs `--wait`; without it there is no
-  limit.
+- `--provider` is `claude` (the default) or `codex`. `--timeout` is in seconds, per query:
+  `usage --live` defaults to 90, `list` to 15.
 
 ## R6. Launch (`run` and launches from the TUI)
 
@@ -364,8 +334,7 @@ remuda help [<command>]                            help for remuda or a command
   classification above: any subcommand name, `--help` / `-h`, or `--version` / `-v` means
   "not a session". New sessions, resumes, continues, forks, and `-p` runs are sessions.
 - Launch log `state/launches.jsonl`: one line per launch, containing time, account, home, cwd,
-  args, and session ID (or unknown). Besides attribution (R9), `pick` reads it to find the
-  account that last ran a session it is asked to resume (R23, **Resuming**). `args` are the user's arguments as the agent got them,
+  args, and session ID (or unknown). `args` are the user's arguments as the agent got them,
   without the `--session-id` remuda adds: a prompt given on the command line is in the log,
   which is why the log is readable by the user alone (R3). Lines from before 2026-10-28 may
   carry a `shared` field (the options of the shared configuration a launch then injected,
@@ -389,8 +358,8 @@ remuda help [<command>]                            help for remuda or a command
   `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE` as off, a launch of an interactive claude session (one
   the classification above calls a new session, a fork, or an existing session, such as a resume
   or a continue, without `-p` / `--print`; like the classification, either counts anywhere in the
-  arguments, also in a combined short flag such as `-pc`) gives one warning: on stderr from `run`
-  and `pick --run`; from the TUI, printed after the line that says what runs, before the terminal
+  arguments, also in a combined short flag such as `-pc`) gives one warning: on stderr from
+  `run`; from the TUI, printed after the line that says what runs, before the terminal
   is handed over (R16), so that the user can still quit and start again with the override, and
   again among the warnings of the launch when it ends. The warning says that claude saves no
   transcript or prompt history for the session, so what is said in it never reaches remuda's
@@ -586,10 +555,10 @@ appeared in no `history.jsonl`.
        `/usage` is a local command that supports non-interactive use and does not call the model
        (0 tokens, no cost); with `--no-session-persistence` it leaves no transcript. It takes
        anywhere from 2 to 20 seconds (it scans the local session history).
-       The query is remuda's probe, not the user's session, and repeated by `--wait` (R23): it
-       loads none of the account's settings files, so none of their hooks run, no plugin is
-       enabled and their `env` is not applied (managed policy settings still are), and it starts
-       none of the account's MCP servers. Basis (verified on 2.1.292, 2026-10-08): in a home with
+       The query is remuda's probe, not the user's session: it loads none of the account's
+       settings files, so none of their hooks run, no plugin is enabled and their `env` is not
+       applied (managed policy settings still are), and it starts none of the account's MCP
+       servers. Basis (verified on 2.1.292, 2026-10-08): in a home with
        SessionStart and SessionEnd hooks and MCP servers of its own (in `.claude.json`, and in a
        `.mcp.json` of the working directory), `--setting-sources ""` alone kept every hook and
        server from running; `--strict-mcp-config` alone kept the servers from starting, not the
@@ -627,8 +596,7 @@ appeared in no `history.jsonl`.
     prints that summary, and writes nothing to stderr. The reason is `not logged in to a Claude
     subscription, or using an API key`: claude prints the same for an API key, so remuda does
     not take it for a login that must be made again. The reason is shown in one line instead of
-    the text (`remuda usage --live`: `live: <reason>`; the TUI: as the live query's reason;
-    `remuda pick`: R23).
+    the text (`remuda usage --live`: `live: <reason>`; the TUI: as the live query's reason).
   - **Not recognized**: anything else, including an answer with a line that starts like a usage
     line and cannot be parsed, whatever else it says. The text is displayed as is: an answer
     read only in part is not used, because the line left out may be the limit that is used up.
@@ -664,8 +632,8 @@ appeared in no `history.jsonl`.
   (`Session (<name>)`). A window without a numeric percentage and a positive duration is dropped.
   Rows: the general limit first, then per-model limits, each by window length. Each row also
   keeps the window's length as codex told it, in minutes (`window_minutes`, `windowDurationMins`),
-  which the label rounds: R24 records it and paces the window by it. Claude's rows have no
-  length (neither its cache nor `/usage` tells one); R24 reads theirs from the label.
+  which the label rounds: the pace note paces the window by it (below). Claude's rows have no
+  length (neither its cache nor `/usage` tells one); the note reads theirs from the label.
 - Codex credits, reset credits, spend control, and upsell data are not shown (R4).
 - A live query does **not** refresh the local cache (verified for claude: `fetchedAtMs` is
   unchanged after consecutive runs); the two sources are displayed separately.
@@ -685,23 +653,41 @@ appeared in no `history.jsonl`.
   `REMINDER_WITHIN` (60 minutes) of the time it is read at, with at least `REMINDER_LEFT` (25%)
   left, is followed by a line saying so, since what is left then goes unused:
   `  note: resets in 42 min with 71% left` (the minutes rounded up). A window whose reset is
-  unknown or has passed since gets none. The note is in `remuda usage` alone: not in the TUI,
-  nor in `remuda pick`. What `remuda usage` reads is also recorded (R24).
-- **`remuda usage --wait <account>`** waits until the account has no window used up, then
-  prints its usage as `remuda usage <account>` does, exit 0. A window is used up when its usage
-  is known and less than `[pick] min_headroom` percent is left (R3: `usage --wait` reads `[pick]`
-  for it); a window that has reset since its usage was recorded is unknown, never used up. Each
-  attempt reads what `remuda usage <account>` reads, the cache or with `--live` a live query:
-  `--wait` never queries live by itself. Attempts follow R23's `--wait`: the earliest reset of a
-  window used up plus `RESET_MARGIN`, at least `MIN_INTERVAL` after the attempt, `UNKNOWN_RETRY`
-  without a reset ahead. So without `--live` the wait ends once the cached window's reset has
-  passed, and the output says `reset since cached`. With nothing to read (no cached usage, a live
-  answer that told none or was not recognized) nothing is used up either: done. A live query
-  that failed is nothing to wait for: its report, `nothing to wait for` on stderr, exit 1.
-  `--max-wait S`: when the next check would come later than S seconds after remuda started,
-  remuda gives up at once with the last reading, `gave up waiting` and the time of that check
-  on stderr, exit 1. The status line and signals are as in R23. Without an account it is a
-  usage error (exit 2) that names `remuda pick --wait`.
+  unknown or has passed since gets none. The note is in `remuda usage` alone, not in the TUI.
+- **Pace note.** In `remuda usage` too, and not in the TUI either, a window on pace to be used
+  up before its reset is followed by a line saying when, under the reset note when it has that
+  one too:
+  `  note: at this pace 100% by Oct 30 10:55, 2h05m before the reset` (the time as `remuda
+  usage` prints times; the margin as `45m`, `3h05m`, or `2d03h`, rounded down, as the TUI
+  says the time to a reset). With `L` the window's length, `R` its reset, `t` the time its usage
+  was read at (the cache time, or the time the live answer arrived) and `u` its percentage
+  used, the window started at `R − L`, and `e = (t − (R − L)) / L` of it had elapsed at `t`.
+  At that pace it reaches 100% at `T = (R − L) + (t − (R − L)) · 100 / u`. The note is shown
+  only when all of these hold:
+  - the window's length is known (**Window length**, below);
+  - its reset is told and ahead, and its usage is known: not `reset since`, and read at a
+    known time (a cache without `fetchedAtMs` gets no note: how much of the window had
+    elapsed is unknown, not what it is now);
+  - at least `PACE_FROM` (25%) of it is used, and less than 100%: earlier in a window the
+    projection is noise (2% used with 1% of it elapsed would say 100% by its middle);
+  - it is ahead of an even pace, `u/100 > e`, with `0 < e < 1`: a reading from before the
+    window's start, which a reset further than `L` ahead or a clock behind makes, gets no
+    note (`e < 1` holds of every reset ahead of its reading);
+  - `T` is after the current time (a cache read long ago may be past it) and at least a
+    minute before `R`. Being ahead of an even pace is what puts `T` before `R`; less than a
+    minute before it says nothing the reset does not.
+
+  The comparisons are exact: in whole seconds (`T` rounded down to one), and with `u` in
+  millionths of a percent.
+- **Window length.** A window that tells its minutes (codex's) is as long as they say, at most
+  ten years: a longer one is of unknown length, whatever its label says. A window without
+  them is read by its label (above): `Session` is 5 hours and `Week …` 7 days (claude's
+  `session`, `weekly_all`, and `weekly_scoped` limits, its older `five_hour` and `seven_day`
+  fields, its live `Current session` and `Current week` lines; codex's windows of 5 and 168
+  hours); codex's `<N>h window`, `<N>d window`, and `<N>m window` are as long as they say (`N`
+  in ASCII digits, the window at most ten years long); a claude limit of unknown kind, labeled
+  by its kind, is 5 hours for `five_hour` and 7 days for `seven_day…`. Others are of unknown
+  length.
 - The live sources provide no severity: 75% is marked as a warning and 90% as critical. Claude's
   live reset times are localized text; the timeline makes a best effort to parse them into instants
   and otherwise (wording it cannot read, or no reset told) uses the cached reset time of the same
@@ -716,13 +702,12 @@ appeared in no `history.jsonl`.
   time, or the time a live query answered (not the time it was started: a query may take as long
   as its timeout; nor the time the answer is first shown: in the TUI it may wait behind a
   foreground agent). Every place that shows or uses it (`remuda usage`, the table and the
-  timeline, `remuda pick`) reads it against the current time in the same way, taken once the
-  usage has been read, not when the command started; a command that waits for an agent takes
-  the current time after the wait (`remuda usage` when it has read each account's cache, and
-  `remuda usage --wait` likewise at each of its attempts; `remuda usage --live` when each answer
-  arrives, `remuda pick` as R23 says). So a reset that falls while `remuda usage` runs, before an
-  account's cache is read, has reset since for that account: its old percentage is not shown,
-  noted, recorded (R24), or waited on:
+  timeline) reads it against the current time in the same way, taken once the usage has been
+  read, not when the command started; a command that waits for an agent takes the current time
+  after the wait (`remuda usage` when it has read each account's cache; `remuda usage --live`
+  when each answer arrives). So a reset that falls while `remuda usage` runs, before an
+  account's cache is read, has reset since for that account: its old percentage is not shown
+  or noted:
   - Reset wording is read as the next such time after it was said, not after now.
   - A window whose reset fell after its usage was recorded and is not after now has **reset
     since**: the percentage recorded is obsolete, and what the window holds now is unknown until
@@ -732,7 +717,7 @@ appeared in no `history.jsonl`.
     next reset is unknown) and says `reset` after the window's letter in the `next` summary,
     for a per-model window too (the legend still names its letter; the axis gives way to a
     longer summary). A live answer that stays on screen past a reset it named is read the same
-    way. R23 says what `pick` makes of it.
+    way.
   - A reset that was already behind when the usage was recorded (live wording read into the
     past, a cache that records one) says nothing: the percentage stands, and no reset instant
     is shown or drawn for it, not the cached one of the same limit either. This is decided
@@ -852,9 +837,8 @@ The complete set of remuda's write operations:
 
 - `$REMUDA_HOME/config.toml` and `$REMUDA_HOME/state/**`.
   Where the user put a symlink: a `config.toml`, a `state`, or a file in `state/` that is a
-  symlink (a cache, the launch log, the usage history of R24) is written through (R3); where it
-  points, remuda touches only its own files (the registry, the caches, the launch log, the usage
-  history). Modes there (R3): the
+  symlink (a cache, the launch log) is written through (R3); where it points, remuda touches
+  only its own files (the registry, the caches, the launch log). Modes there (R3): the
   directory a `state` symlink points at keeps its mode, and so does the file that a
   `config.toml` or a file in `state/` that is itself a symlink points at; a regular file
   remuda owns by name in a directory reached through a `state` symlink is still created with
@@ -894,8 +878,8 @@ status`, `codex login status`, which creates `tmp/`, a launch, a login).
   `.claude.json` nor `projects/` is present), remuda warns but registers it anyway.
 - It is an error if the name is already taken, if the same path is already registered under another
   name, if another spelling of the same directory (trailing `/`, a symlink, etc.) is already
-  registered, or if `config.toml` would no longer load with the account (R3: a bare name in
-  `[pick]` that it would make ambiguous). `setup` refuses the same, before it creates the home.
+  registered, or if `config.toml` would no longer load with the account (R3). `setup` refuses
+  the same, before it creates the home.
 - Registering the native login's directory (equal to `$HOME/.claude` after normalization) is
   refused: that directory is `default`, and giving it another name would create a separate Keychain
   entry and read `.claude.json` from inside the directory, making it appear logged out.
@@ -909,9 +893,8 @@ status`, `codex login status`, which creates `tmp/`, a launch, a login).
 - The account is named as in R1 (`name` or `provider:name`; a bare name that exists under more than
   one provider is an error listing the candidates).
 - `default` (`claude:default`, `codex:default`) is implicit and cannot be removed: error.
-- Refused while `[share.claude] from` or `[pick]` (`exclude`, `prefer`) names the account: the
-  registry would no longer load (R3).
-  `from` must be changed or removed first; remuda does not edit it.
+- Refused while `[share.claude] from` names the account: the registry would no longer load
+  (R3). `from` must be changed or removed first; remuda does not edit it.
 - The removed table's comments go with it: those inside it and the comment lines directly above
   its header. A comment block separated from the header by a blank line is kept (moved before
   the next table, or to the end of the file). Every other line is kept.
@@ -1016,14 +999,6 @@ Fixtures for transcripts, rollouts, `sessions/*.json`, `history.jsonl`, and
   `default` is implicit (R1) and cannot have been removed.
 - **Account card** (`p` or Space in Accounts): what the view knows of the selected account, and
   its configuration (R22).
-- **Usage readings are recorded** (R24): the cached usage the Accounts view reads (when it
-  starts, on a refresh, for an account the registry adds) and every answer of `u`'s live
-  queries, as `remuda usage` records them, once they are shown: the cached usage of every
-  account read at once first. Leaving the TUI (quitting, or choosing the account of
-  `remuda run`) waits for the recordings of the readings it has shown, at most `RECORD_DRAIN`
-  (2 seconds): what is still under way then (held up by a lock another remuda holds) is not
-  recorded, and the TUI ends all the same. The TUI never compacts the history and does not show
-  it, so private mode (R21) has nothing of it to hide.
 - **Session card** (`p` or Space in History / Live): opens a card over the view with what remuda
   knows of the selected session (its id, provider and entry point, its accounts and whether it
   runs, when it started and was last active, its directory, its transcript and store) and the
@@ -1571,23 +1546,6 @@ the prices are built into remuda and can be overridden in `config.toml` (R3).
   section. Reading progress goes to stderr, as for `sessions`. A directory that could not be
   read is named in an `Incomplete:` line on stdout, after the table and the lines that follow
   it, so that a report that is piped does not pass for a complete one.
-- **CSV**: `remuda stats --csv [<account>] [--period today|7d|30d|all]` prints instead every
-  request counted in the period (once, as above), only of the sessions attributed to the
-  account if one is given, as CSV (RFC 4180, with lines ending in LF), for reconciling with a
-  bill; it does not go with `--by`. A header line names the columns:
-  `timestamp,provider,accounts,session_id,project,model,input,cache_read,cache_write_5m,cache_write_1h,output,reasoning,fast,us_only,cost_usd`.
-  `timestamp` is RFC 3339 in UTC to the second (`2026-10-08T03:04:05Z`), empty without one;
-  `accounts` the session's accounts joined by ` + ` as in the section titles, empty when it is
-  unattributed; `project` the directory as recorded, empty without one; the counts are whole
-  numbers, a count the provider does not record empty (claude's reasoning), codex's cache write
-  in `cache_write_5m`; `fast` and `us_only` are `true` or `false`; `cost_usd` is the request's
-  exact cost in US dollars (its picodollars in decimal, up to 12 decimals, no trailing zeros),
-  empty when it cannot be priced, so their sum is the cost the table shows rounded. Lines are in
-  order of timestamp, those without one last, then of the request's key. A field holding `,`,
-  `"`, CR or LF is quoted, each `"` in it doubled. Only CSV goes to stdout: when a directory
-  could not be read, the `Incomplete:` lines go to stderr and the exit status is 1, since a line
-  of prose would break the CSV; the status carries what the line on stdout carries for the text
-  report.
 - **TUI**: view `4`, Stats, with sections by account or by project, as **Shown** above; `b` in
   the view switches between the two, the title says which is shown, and `t` and `r` keep it. It
   is by account when the TUI starts, and is not saved. A project's section is titled by its
@@ -1839,351 +1797,22 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   problems are messages (R21): a path remuda names in one is masked whole, and the system's
   error in it from its first path to the end of its line.
 
-## R23. Recommendation (`pick`)
+## R23. Recommendation (removed)
 
-`remuda pick` recommends which account and model to launch now, and at what effort. Rules decide
-what is feasible and rank it; selection always takes the first ranked feasible candidate and
-its provider's `default_effort`, or no effort when unset or when resuming or forking a session.
-It reads the usage of R10 and `[pick]` (R3), runs only `codex login status` (R4) or, with
-`--live`, R10's live queries, and writes nothing except, with `--run`, the launch log (R6): the
-usage it reads is not recorded in the usage history (R24). Given a session to resume or fork, it
-also reads the launch log and the session index (R8) to prefer the account whose prompt cache
-holds it (**Resuming**, below).
+Removed on 2026-10-28. `remuda pick` recommended which account and model to launch now, and at
+what effort: from each account's usage (R10) and the `[pick]` table of `config.toml`, it ranked
+the pairs with headroom left, preferred the account that had last run a session it was asked to
+resume, waited with `--wait` until a pair was feasible, and launched its choice with `--run` as
+`remuda run` does. `remuda usage --wait`, which waited for one account the same way, went with
+it, and a `[pick]` table left in `config.toml` is an error (R3). The number stays reserved so
+that the entries after it keep theirs.
 
-- **Candidates.** Each account R1 lists (`default` included) with each model of its provider's
-  `models`, or with the agent's default (nothing injected) when there are none; resuming or
-  forking a session, each account once, with the session's model (**Resuming**). Not feasible,
-  each with its reason: excluded; not of `--provider`, or not of the provider whose session is
-  resumed; resuming a session the session index has, an account whose store (R8) does not hold
-  it (`cannot see this session (its store is not this account's)`: it could not resume it);
-  claude with neither `oauthAccount` in its
-  `.claude.json` nor a usage cache; codex without `codex` on PATH, or whose `codex login status`
-  says it is not logged in (a status that cannot be read is noted, not blocking); or a window
-  that applies, of known usage, with less than `min_headroom` percent left (default 10). With
-  `--live`, a codex account's one `codex app-server` run (R10) answers both: its `account/read`
-  says whether the account is logged in, and `codex login status` runs only when that did not
-  say (the run failed, or `account/read` failed or was not recognized).
-- **Windows.** A usage row (R10) without a parenthesized name, or with `(all models)`, applies to
-  every model. `<window> (<name>)` applies to the claude models of that family
-  (`claude-<family>-…`; a bare alias is its own family) and to the codex model with that id,
-  ignoring case; one that matches no configured model is ignored. Without `models`, the agent's
-  default model is unknown: the `default` pair shows its account's per-model windows (in the
-  output and in `--json` as `default_model_windows`) but is never made infeasible by them. A window that has reset
-  since its usage was cached (R10) is of unknown usage: after its reset remuda knows nothing
-  about it, and 0% used is only a lower bound. It is named (`reset since cached`), never counted,
-  and never makes a pair infeasible: `min_headroom` is checked against known percentages only,
-  so a window that is known and exhausted still blocks a pair whose other windows have reset.
-  Headroom is the least percent left over the windows that apply and are known. A pair with no
-  such window, because there is no usage data or because each window that applies has reset
-  since, is feasible, of unknown headroom. Live usage is recorded when its query answers: a
-  reset time it names that reads as behind then (R10) leaves its percentage as told. Cached
-  codex usage has no per-model limits (R10): they are shown as unknown.
-- **The instant.** A recommendation reads every account's usage at one instant: the time once
-  all of it is gathered, logins checked and live queries answered or failed. It is not the time
-  remuda started: a live query may take as long as its timeout, and a window that resets while
-  it runs has reset. Feasibility, headroom, staleness, and every time in the output
-  (the time to a reset, the data's age) count from that instant. A live answer is
-  recorded when it arrives; when another account's slower query outlasts a reset it named, that
-  window has reset since it was asked (`reset since asked`, without the hint to `--live`). The
-  launch comes after that instant and does not move it.
-- **Staleness.** Cached usage older than `stale_after` minutes (default 120), or of unknown age,
-  is stale; it is marked, and breaks ties (below). Staleness never makes a window feasible: a used
-  percentage only grows until its reset. Staleness and a reset since are independent: staleness
-  is the age of all of an account's usage, a reset since is one window's. Usage that is not
-  stale can hold a window that has reset since, and the windows of stale usage whose resets are
-  ahead stay known, at the percentage recorded. `--live` queries every candidate account first
-  (R10; `--timeout` per query, default 90); a failed query falls back to the cache, with a note,
-  and so does an answer that tells no usage (R10), the note giving its reason.
-  remuda never queries live on its own, not before `--run` either (a live query lets the agent
-  reach its provider and write in its home): where the recommended pair has a window that has
-  reset since, the output names it and, for cached usage, says that `--live` asks the agent.
-- **Rules.** Feasible pairs rank by: resuming a session, the account whose prompt cache is warm
-  (**Resuming**) first; known headroom before unknown; the model's position in
-  `models`; headroom in 10-point bands, higher first (90% left and more is one band); fresh before
-  stale; the binding window's reset, sooner first; `prefer` order; registry order. Headroom
-  known from stale usage is still known: such a pair ranks before every pair of unknown
-  headroom, so usage whose resets have all passed never outranks usage that says something.
-  Pairs of unknown headroom, without usage data or past every reset, rank among themselves by
-  the same rules (a pair without usage data is not stale). The rules' effort is
-  `default_effort`, or none (none when resuming).
-  That is `strategy = "headroom"`, the default (R3). With `strategy = "pace"`, the pace takes
-  the headroom's three places: known pace before unknown, the pace band, higher first, and the
-  reset of the window that gives the pace, sooner first; affinity, the model's position,
-  freshness, `prefer`, and registry order keep theirs. A pair's **pace** is the percent left
-  per hour until reset: how much has to be used each hour for nothing to be lost at the reset.
-  It is given for every pair, whatever the strategy, from the windows that apply and are known
-  (**Windows**, the headroom's): of each, the percent left over the hours from the instant to
-  its reset, never fewer than 1 (a window that resets in a minute would outrank everything), or
-  over its whole length when its reset is unknown. A window's length is the length codex tells,
-  to the minute, else read from the label (R24: `Session` five hours, `Week …` seven days,
-  codex's `<N>h window`, rounded to the hour); the same length decides whether it is a budget
-  window. A window of unknown length gives no pace, whatever its reset. The pair's pace is the least of its budget windows' (a
-  day long or longer: what is left of them at their reset is lost). A budget window that has
-  reset since is unknown, never a full one: it gives no pace but is a budget window all the
-  same, so a pair whose budget windows have all reset since has no pace. Only a pair without a
-  budget window takes the least of its shorter windows' (what is left of a five-hour window at
-  its reset is no loss while a longer one holds the budget). A pair with no pace ranks after
-  every known pace, as unknown headroom does. The
-  bands: the feasible pairs of known pace from the highest down, the first opening a band
-  topped by its pace, and each pair whose pace is below 0.9 of the current band's top opening
-  the next, topped by its own (one at exactly 0.9 of it is in the band); so paces within a tenth
-  tie, and `prefer` breaks the tie. Paces are ordered, compared, and banded exactly, on the
-  percent left to a millionth of a percent and the seconds until reset in whole seconds: two
-  paces equal so are equal whatever their reset times. The pace shown (`%/h`, and `pace` in
-  `--json`) is the quotient, for reading only. The
-  pace only orders: feasibility, the binding window, and `--wait` are as above.
-- **Local selection.** No recommendation request is made and no API key or HTTP transport is
-  used. The deterministic rules above decide both the candidate and its configured effort.
-- **Output.** The account, model, and effort; `decided by` as `rules`, or
-  `rules, strategy pace` with `strategy = "pace"`; the binding window and its
-  reset (`unknown` when no window that applies is known); with `strategy = "pace"`, the pace,
-  the window that gives it, and its reset (`unknown` when the pace is unknown); the windows that have reset since,
-  with the hint to `--live` when the usage is cached; the data's age; the exclusions; the
-  `remuda run <account> <options> <args>` command, `<args>` being those after `--`, each word
-  quoted for a POSIX shell where it needs it (so that the line, run by a shell, gives the agent
-  the same words; `--json` has them as an array); resuming,
-  the session's facts (**Resuming**); and every pair that is not feasible,
-  with its reason. `--json` prints `account`, `provider`, `model`, `effort`,
-  `decided_by` (`rules`; null with nothing feasible), `effort_by` (`rules`; null without an
-  effort, including with nothing feasible),
-  `strategy` (`headroom`, `pace`; also with nothing feasible), `command`, `session` (null without a session resumed or forked, nothing feasible included;
-  else `id`, `kind` (`resume`, `fork`), `last_account`, `last_active_at`, `age_seconds`,
-  `affine`, `model`, `indexed`), and `candidates` (`account`, `model`, `feasible`, `why_not`,
-  `headroom`, `binding`, `resets_at`, `pace`, `pace_window`, `reset_passed`,
-  `default_model_windows`, `source`, `fetched_at`, `age_seconds`, `stale`, `rules_rank`,
-  `affine`). There is no top-level `reason` or `jev`, nor candidate `jev_probability`.
-  `headroom` and `binding` are null when the headroom
-  is unknown; `pace` (percent per hour) and `pace_window` (the label of the window that gives
-  it) are null when the pace is unknown, and are given whatever the strategy; `resets_at` is the binding window's reset, null unless it is ahead: never an
-  instant in the past; `reset_passed` is true when a window that applies has reset since.
-  Each of `default_model_windows` has `label`, `percent`, `resets_at`, and `reset_passed`, with
-  `percent` and `resets_at` null when its reset has passed. With nothing feasible: the reasons,
-  exit 1.
-- **`--run`.** Launches the recommendation exactly as `remuda run <account> <options> <args>`
-  (R6, R17, R18), `<args>` being those after `--`: claude gets `--model <m> --effort <e>`, codex
-  `-m <m> -c model_reasoning_effort=<e>` (verified: codex 0.156.1 accepts both before a
-  subcommand), before the user's arguments; the launch log records them among its `args`. An
-  option the user's arguments already set (claude `--model`, `--effort`; codex `-m`, `--model`,
-  `-c`/`--config model_reasoning_effort=…`) is not injected, and remuda says so on stderr. So
-  does it when a window of the launched pair has reset since (with the hint to `--live` when
-  the usage is cached); it launches all the same.
-  Arguments that resume or fork a named session (**Resuming**) are launched as given, nothing
-  injected, exactly as `remuda run <account> <args>`: the same directory (R6), the same log
-  record, codex's `resume <id>` without a `-C` of remuda's; like `run`, `pick --run` does not
-  check that the session is running elsewhere (R16's check is the TUI's). Other arguments that
-  do not start a new session (R6's classification for claude; `resume` or `fork` without an id,
-  or with `--last`, first for codex) are refused before selection or launch, with `--run` or
-  without (the command shown is one remuda would launch), and when no pair is feasible as
-  well as when one is. With a feasible pair they are checked for the providers of the feasible
-  pairs, as the launch would read them; with none, for each provider with an account that
-  nothing permanent blocks (not excluded, of `--provider` or of the session's provider, logged
-  in, `codex` on PATH, able to see the session resumed), before saying that nothing is
-  feasible. Arguments after `--` need no `--run`;
-  without it they are only shown in the command. `--json` does not combine with `--run`.
-- **Resuming.** Prompt caches are per account (verified on claude 2.1.292: a session begun as
-  one account and resumed as another read only the prefix the second had cached itself and
-  wrote the rest of the conversation again, 9,817 tokens; resumed as the first again, it read
-  what the first had written; every write was the 1-hour ephemeral cache). Resuming or forking
-  a session as another account than the one that ran it lately writes the whole conversation
-  into the new account's cache: it takes longer and spends that account's limits. So `pick`
-  prefers the account that ran it, among the feasible pairs only: **affinity orders, it never
-  makes a pair feasible**.
-  - The arguments after `--` name the session: for claude, exactly one `--resume <id>`
-    (`-r <id>`, `--resume=<id>`) with no other resume, continue, or `--session-id` option, alone
-    or with `--fork-session` for a fork (R6's classification; where R6 forks the first of
-    several resumes, `pick` refuses them, as it refuses every other form); for codex,
-    `resume <id>` or `fork <id>` first (R17). Only that provider's accounts are candidates (a conflicting
-    `--provider` is an error, and arguments that name a session for both readings are refused
-    as ambiguous). Each account is one candidate, with nothing injected: neither `models` nor
-    `default_effort` applies.
-  - The account that ran it last: of the launch log's records (R6) whose `session_id` is the id
-    or whose `fork_of` is (a fork reads the whole session it copies, into its account's cache),
-    the latest, with the home it was launched with. That account is the one registered under
-    that name **with that home string, byte for byte** (R2): an account registered again under
-    the name with another home is another login, whose cache never held the session; it is not
-    warm, and the output says so. Its last activity is the later of that launch and the last
-    record of what the launch ran (the session itself, or for a fork the session it made; a
-    codex fork's is unknown), read at the end of **that account's own copy**: the transcript the
-    session index (R8) has in the account's store. Stores that are not shared each hold their
-    own copy of a session; another account's copy, however recent, is that account's activity.
-    One store may hold several copies (one per project directory): the session goes on in the
-    one written to last (by its last record's time); of copies written to last at the same
-    time, the one whose last record is in the launch's directory; when that does not single
-    one out, neither its time nor its model is known. A copy is read only when its file is
-    there and is named by that session, and its last record counts only when it is in the
-    launch's directory. A last record elsewhere was written by a later run the log does not
-    have, maybe another account's: when it cannot be told, remuda takes the account's cache for
-    cold rather than credit it with someone else's activity. Without such a record the launch's time
-    counts. A session remuda never launched has no last account, and nothing is preferred;
-    `history.jsonl` (R9) tells no time and is not used.
-  - Its prompt cache is warm, and the account is preferred, when that last activity is at
-    most `affinity_minutes` (R3; default 60, 0: never) before the instant. 60 follows the
-    1-hour cache writes above; codex's cache lifetime is **[unverified]**, and the same value
-    is used.
-  - The session's model, for each account, is that of the copy it would resume, the one in its
-    own store, chosen as above: the last assistant record of that transcript (claude) or its
-    last `turn_context` (codex), found through the session index; unknown otherwise. The
-    windows of that model apply (**Windows**); unknown, the pair is as `default`'s: its
-    per-model windows are shown, never counted. The model is the transcript's text, unchecked: it is matched
-    against the windows locally and shown on the user's terminal. The text report and
-    `--json` keep the window labels.
-  - Which accounts can see it: those whose store holds the transcript the index has. A session
-    the index does not have holds no account back, and the output says so.
-  - Nothing is read but the launch log, `state/index.json`, and the end of the session's
-    transcripts: no store is scanned, no request is made.
-  - The output names the session's kind and id, the account that ran it last and how long
-    ago, whether its cache is warm (or why not: too long ago, affinity off, no longer
-    registered, registered again with another home, never launched through remuda), and the
-    model of the copy the recommended account would resume (with nothing recommended, the
-    model every copy has, if they agree); when the warm account is not the one recommended, it
-    says why (its reason for not being feasible) and that resuming as another
-    account rewrites its prompt cache. These facts are in the text report whether or not a
-    pair is feasible, and, with `--run`, on stderr before the launch.
-- **`--wait`.** With nothing feasible, remuda does not stop: it tries again until a pair is
-  feasible, then goes on as without `--wait` (the text, `--json`, or `--run`'s launch). With a
-  feasible pair it changes nothing. Each attempt is the whole gathering, at an instant of its
-  own: the cache is read again (an agent may have refreshed it), and with `--live` every account
-  is queried again. `--wait` never implies `--live`: remuda still never queries live on its own.
-  So without `--live`, once the reset of the window that blocked has passed, that cached window
-  has reset since, is of unknown usage and blocks nothing: `pick --wait` returns right after
-  the reset, of unknown headroom, naming the window with the hint to `--live`.
-  - When. A pair that is not feasible by a window (its binding window, below `min_headroom`)
-    waits for that window's reset. The next attempt is at the earliest such reset ahead plus
-    `RESET_MARGIN` (30 s), and never sooner than `MIN_INTERVAL` (60 s) after the attempt's
-    instant: a reset that passed and freed no pair (another window still below) does not make
-    remuda try again at once. Without a known reset ahead for any of them, `UNKNOWN_RETRY` (5
-    minutes) after it. Asleep, remuda reads the clock again at least every `NAP` (60 s), so a
-    computer that slept does not put the attempt off.
-  - Nothing to wait for. When every pair that is not feasible is so for a reason that time does
-    not change (excluded, not of `--provider` or of the provider whose session is resumed, not
-    logged in, `codex` not on PATH, unable to see the session resumed), or there is no account: at once, the reasons as without `--wait`, `nothing to wait for: …` naming them
-    on stderr, exit 1.
-  - `--max-wait S`. No attempt starts later than S seconds after remuda started. When the next
-    would, remuda gives up at once instead of sleeping out time in which it would check
-    nothing: the reasons as without `--wait`, when that next check would have been on stderr,
-    exit 1. The clock is read again on waking, before each attempt: a sleep that ended after
-    the deadline (a computer that slept, a clock set forward) starts none either; the wait ends
-    with the last attempt's reasons, and stderr says that `--max-wait` ran out before the check
-    that was due could be made. An attempt under way is not cut short:
-    with `--live`, a query may run on for its `--timeout`.
-  - While it waits, only when stderr is a terminal, one line there, rewritten in place: the
-    account and window it waits on, the time to its reset, the next check, and that Ctrl-C
-    stops it (`remuda: waiting: claude:max Week (Fable) 100% used, resets in 1h12m; next check
-    Oct 8 21:40 (Ctrl-C stops)`); it is cleared before the result, or an error that ends the
-    wait, is printed. `--json` prints once, at the
-    end. Ctrl-C, Ctrl-\, a hangup, or SIGTERM ends remuda by that signal, whether it sleeps or
-    an attempt is under way: a query under way, or being started, is told first (R4), and
-    none is left running. The arguments after
-    `--` are checked at each attempt as without `--wait` (**`--run`**): when a pair is feasible,
-    for the feasible pairs' providers; when remuda is about to wait, for each provider with an
-    account that nothing permanent blocks, so they are refused before the wait instead of after
-    it.
-  - Resuming (**Resuming**), the session's facts (the launch log, the session index, the ends
-    of its copies) are read once, before the first attempt; whether the account that ran it is
-    warm is judged at each attempt's instant, so a long wait can let its cache go cold.
+## R24. Usage history (removed)
 
-
-## R24. Usage history
-
-Each usage reading `remuda usage` and the TUI take is kept, a point per window, so that the
-usage of a window can be followed to its reset. Nothing else records usage: `remuda pick` writes
-nothing (R23), and `remuda list` reads no usage.
-
-- **The file.** `$REMUDA_HOME/state/usage-history.jsonl`, one JSON object per line, appended:
-  `{"ts", "account", "label", "model", "percent", "resets_at", "source", "window_minutes"}`.
-  `ts` is the time of the reading as R10 has it: the cache time (claude's `fetchedAtMs`, the
-  codex rollout record's `timestamp`) or the time a live answer arrived; never the time remuda
-  ran, so the same cache read again is the same reading. `account` is `provider:name`; `label`
-  the window's label (R10); `model` the name in its parentheses, null for `all models` and for a
-  window without one; `percent` the percentage used; `resets_at` the reset when it was ahead at
-  the reading, else null (none told, wording not read, or already behind when recorded); `source`
-  `cached` or `live`; `window_minutes` the window's length in minutes as codex told it (R10),
-  written only when it is known: a point of claude's has no such key, nor has one recorded before
-  remuda kept the length. It is read when it is a whole number from 1 to 4294967295; null or any
-  other value is no length, and the line is still a point (the key does not tell points apart).
-  Times are RFC 3339. A window is identified by `account`, `label`, and `model`.
-- **What is recorded.** `remuda usage` records what it reads, cached or with `--live`; with
-  `--wait` (R10), every reading it takes, the one printed at the end included, once the wait is
-  over and that reading is printed; `remuda usage --history` records nothing. The TUI records
-  the cached usage it reads for the Accounts view and each answer of `u` (R16). Not recorded: a
-  reading whose time is unknown (a cache without `fetchedAtMs`); a window that has reset since
-  it was read (`reset since cached`, R10, as of the time the cache was read, not when the
-  command started), whose percentage is unknown; a live query that failed, or whose answer told no usage or
-  was not recognized (R10); a point older than the 45 days kept. A point already in the history,
-  of the same window with the same `ts`, `percent`, and `resets_at`, is not recorded again, so
-  a cache read between two live answers adds nothing; `window_minutes` is not compared (a point
-  recorded without it and the same reading with it are one point).
-- **Writing.** The points of one run of `remuda usage` (every account) or of one batch of the
-  TUI (the cached usage of the accounts it reads at once, or one account's live answer) are one
-  write. Every write takes an exclusive lock and holds it while it reads the history, leaves out
-  the points already there, and writes. As for the registry (R3), the lock is on the directory
-  of the file that is replaced, and no lock file is created: the state directory's own or,
-  where `usage-history.jsonl` is a symlink, that of the file it points at. So every path to one
-  history takes the same lock, two `$REMUDA_HOME`s whose histories link to one file included.
-  The link is resolved once, before the lock is taken, and looked at again under the lock: one
-  pointed elsewhere meanwhile gets nothing; nor does a link that leads nowhere (unlike the launch
-  log's, R3, its target is not created). From then on the file is read, checked, appended to, and
-  replaced by its name in the directory that is locked, through that directory's descriptor, never
-  through the link: a link pointed elsewhere after that redirects nothing, and the file it points
-  at then is neither read nor written. A history of the state directory that is replaced by a
-  symlink meanwhile is not written through it. The history is never created with any mode but
-  0600: where `usage-history.jsonl` is a file of `state/` and is missing (also removed after it
-  was read), it is created with mode 0600, as the launch log is (R3); the file a symlink points
-  at is never created, so one removed after it was read gets nothing, neither appended to nor
-  replaced.
-  The write is either one append (one `write` on a file opened with `O_APPEND`, like the launch
-  log; a last line left unfinished is ended first), or, when it compacts, one replacement
-  (temporary file + rename, R3). Readings taken at the same time, also by two `remuda usage` and
-  the TUI, so lose no point, and the same reading taken twice at once is recorded once. Only
-  `remuda usage` compacts: points older than 45 days and lines that are not points are dropped,
-  and of what remains and the new points together, beyond 50,000 lines, the first written (new
-  points too, when they alone are more); the file is replaced only when that drops a line. The
-  history is a file of `state/`, written as R3 says (created with mode 0600, a symlink in its
-  place written through) and, appended to or replaced, under the launch log's rules: nothing is
-  written to it when it is not a regular file, nor when it is a symlink to a file the group or
-  others can access (whose mode remuda leaves as it is); a history that is not a regular file is
-  not read either (a FIFO would hold remuda up). The history is a by-product: on a file system
-  without locks nothing is recorded or compacted (a write without the lock could lose another's
-  point), and a `state/` that cannot be created, written, or locked records nothing; `remuda
-  usage` and the TUI say nothing of it and go on. The TUI records a batch once all of it is on
-  the screen: a lock another remuda holds (one compacting, or one suspended) holds up no
-  account's usage. Leaving the TUI waits for such recordings at most 2 seconds (R16), so a
-  reading shown just before is not lost, and a lock held elsewhere delays the end no longer.
-- **Window length.** The pace, and the grouping of a window's points by reset (below), need the
-  window's length. A point that tells `window_minutes` is as long as that says (at most ten
-  years; a longer one is of unknown length). A point without it is read by its label (R10):
-  `Session` is 5 hours and `Week …` 7 days (claude's `session`, `weekly_all`, and
-  `weekly_scoped` limits, its older `five_hour` and `seven_day` fields, its live `Current session`
-  and `Current week` lines; codex's windows of 5 and 168 hours); codex's `<N>h window`, `<N>d
-  window`, and `<N>m window` are as long as they say (`N` in ASCII digits, the window at most ten
-  years long); a claude limit of unknown kind, labeled by
-  its kind, is 5 hours for `five_hour` and 7 days for `seven_day…`. Others are of unknown length,
-  and a window of unknown length gets no pace.
-  Codex's labels round its windows to whole hours (R10), so a codex window of 90 minutes recorded
-  without `window_minutes` counts as 2 hours. When a window's points disagree (the earlier ones
-  recorded without `window_minutes`), the length is the latest point's, for grouping them and for
-  the pace of the current one.
-- **`remuda usage --history [<account>] [--days N]`** prints, for each account (the one named,
-  else every account R1 lists, in order), each window it has points for since `N` days ago
-  (default 7, at most 3650), in the order first recorded: the label, then its points in time
-  order, grouped by window. A point starts a new window when it was read at or after the reset
-  of the one before, or when its reset is further than the window's half-length, at most an hour,
-  from that one (an hour when the length is unknown): claude's live resets are told to the minute
-  or the hour, its cache's to the second. A point without a reset stays in the window before. The
-  last window, when its reset is ahead or unknown, is the current one, listed a point a line:
-  `<time>  <used>%  resets <reset>` (without `resets` when the point has none). Every other window
-  is one line: `window ended <reset>: peaked NN%` (its highest percentage; `window to <reset>`
-  for one whose reset is still ahead, `earlier window` for one whose reset is unknown). Times are
-  in the local time zone, as `remuda usage` prints them. An account without points then:
-  `<account>  no usage history in the last N days`. Without a history:
-  `no usage history yet (<path>)`. Both exit 0; a history that cannot be read is an error. It
-  does not combine with `--live`, `--wait`, or `--max-wait`.
-- **Pace.** The current window, of known length `L` and with a reset `R` told, gets a line from
-  its latest point, read at `t` with `u`% used: the window started at `R − L`, and
-  `e = (t − (R − L)) / L` of it had elapsed then (`e < 1`, since `t` was before `R`). `used u%
-  with E% of the window elapsed` (`E` is `e` in whole percent, rounded down), then: at 100%,
-  `: limit reached (resets R)`; when `u/100 > e`, `: ahead of an even pace; at this pace 100% by
-  T (resets R)`, `T = (R − L) + (t − (R − L)) · 100 / u`; otherwise `: behind an even pace; at
-  this pace P% at reset`, `P = u / e` rounded. With `e ≤ 0` (a point read before the window's
-  start, which a reset further than `L` ahead or a clock behind would make) the line ends after
-  the elapsed share, with no projection.
+Removed on 2026-10-28. `remuda usage` and the TUI's Accounts view recorded each usage reading,
+a line per window, in `$REMUDA_HOME/state/usage-history.jsonl` (the TUI waited up to 2 seconds
+for its recordings when it ended), and `remuda usage --history [--days N]` listed what was
+recorded, with each current window's pace. Nothing records usage now, and nothing reads that
+file: one left in `state/` stays until the user deletes it; remuda does not. The pace survives
+as the pace note of `remuda usage`, from the current reading alone (R10). The number stays
+reserved so that the entries after it keep theirs.
