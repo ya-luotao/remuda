@@ -88,12 +88,11 @@ before its reset. [Usage limits](docs/GUIDE.md#usage-limits) in the guide has th
 ### Launch, resume and fork as any account
 
 `remuda run <account>` replaces itself with the agent, started in the current directory with that
-account's home selected. New
-Claude sessions get their session ID from Remuda, and every launch is logged, so each session is
-shown under the account that ran it. In the TUI, `n` starts a session as the selected account;
-History resumes or forks any session, and its card (`p`) lets you choose the account with `R` and
-`F`; Live lists running Claude sessions, with attach, logs and stop for background ones. The TUI
-refuses to resume a Claude session that is still running elsewhere.
+account's home selected. New Claude sessions get their session ID from Remuda, and every launch is
+logged, so each session is shown under the account that ran it. In the TUI, `n` starts a session
+as the selected account; History resumes or forks any session, and its card (`p`) lets you choose
+the account with `R` and `F`; Live lists running Claude sessions, with attach, logs and stop for
+background ones. The TUI refuses to resume a Claude session that is still running elsewhere.
 [Launching and sessions](docs/GUIDE.md#launching-and-sessions) has the rest.
 
 ### One setup for every account

@@ -253,10 +253,11 @@ and the rest of [R18's list](../SPEC.md#r18-shared-configuration)), or is not a 
 `setup` leaves it out, names the keys but never their values, and asks you to give the new home a
 `settings.json` of its own; until then, the account has no shared settings. That check happens
 once: such a setting added to a linked file later reaches every account that links it. Remuda then
-warns in the Accounts view and on stderr at each session launch of those accounts
-(`remuda: warning: claude:work reads the authentication settings of claude:default through its
-settings.json link: env.ANTHROPIC_API_KEY`), but does not stop it. Keep one account's settings in its own `settings.json`, or in an account with
-`share = false`. The login itself is no setting: it stays in the Keychain or the home's
+warns in the Accounts view and at each session launch of those accounts, on stderr from
+`remuda run` or among a TUI launch's warnings (`remuda: warning: claude:work reads the
+authentication settings of claude:default through its settings.json link: env.ANTHROPIC_API_KEY`),
+but does not stop it. Keep one account's settings in its own `settings.json`, or in an account
+with `share = false`. The login itself is no setting: it stays in the Keychain or the home's
 `.credentials.json`.
 
 Every account that shares `projects` cleans it up by its own `cleanupPeriodDays`, and Claude's
