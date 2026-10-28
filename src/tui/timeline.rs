@@ -65,21 +65,9 @@ pub fn track(now: Timestamp, marks: &[(char, Timestamp)], width: usize) -> Strin
     line.into_iter().collect()
 }
 
-/// Time until `t`, compact: `45m`, `3h05m`, `2d03h`; `now` once it has passed.
-pub fn until(now: Timestamp, t: Timestamp) -> String {
-    let mins = t.duration_since(now).as_secs() / 60;
-    if mins <= 0 {
-        return "now".to_string();
-    }
-    let (d, h, m) = (mins / 1440, mins / 60 % 24, mins % 60);
-    if d > 0 {
-        format!("{d}d{h:02}h")
-    } else if h > 0 {
-        format!("{h}h{m:02}m")
-    } else {
-        format!("{m}m")
-    }
-}
+/// Time until a reset, compact: `45m`, `3h05m`, `2d03h`; `now` once it has passed. The same
+/// as `remuda usage` says it (R10).
+pub use crate::usage::until;
 
 #[cfg(test)]
 mod tests {

@@ -6,8 +6,8 @@ use std::fs;
 use std::io;
 use std::time::Duration;
 
-use jiff::Timestamp;
 use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 
 use crate::account_command::{Parsed, Runner};
@@ -17,7 +17,6 @@ use crate::provider::{Provider, codex};
 use crate::registry::Account;
 use crate::{Env, text};
 
-pub mod history;
 pub mod snapshot;
 
 pub use snapshot::{Reading, Reset, Snapshot, Source, Window};
@@ -39,7 +38,7 @@ pub struct UsageRow {
     pub resets: Option<Resets>,
     /// How long the window is, in minutes, as codex tells it (R10; its label rounds it to whole
     /// hours). `None` for claude's rows: neither its cache nor `/usage` says, and the length is
-    /// not guessed from the label here (R24 reads it from the label when it needs one).
+    /// not guessed from the label here (the pace note reads it from the label, [`window_length`]).
     pub window_minutes: Option<u32>,
 }
 
@@ -298,6 +297,23 @@ pub fn format_ago(secs: i64) -> String {
     }
 }
 
+/// Time until `t`, compact: `45m`, `3h05m`, `2d03h`; `now` once it has passed. The TUI's time
+/// to a reset, and the margin of the pace note (R10).
+pub fn until(now: Timestamp, t: Timestamp) -> String {
+    let mins = t.duration_since(now).as_secs() / 60;
+    if mins <= 0 {
+        return "now".to_string();
+    }
+    let (d, h, m) = (mins / 1440, mins / 60 % 24, mins % 60);
+    if d > 0 {
+        format!("{d}d{h:02}h")
+    } else if h > 0 {
+        format!("{h}h{m:02}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
 /// Live rows carry no severity: from this percentage on they are marked warning (R10).
 pub const WARN_AT: f64 = 75.0;
 /// ... and from this one critical (R10).
@@ -308,13 +324,71 @@ pub const REMINDER_WITHIN: i64 = 60 * 60;
 /// ... with at least this percentage left gets a note in `remuda usage` (R10).
 pub const REMINDER_LEFT: f64 = 25.0;
 
+/// A window used less than this percentage gets no pace note (R10): early in a window the
+/// projection is noise (2% used with 1% of the window elapsed would say 100% by its middle).
+pub const PACE_FROM: f64 = 25.0;
+
+/// The pace note compares a percentage in millionths of a percent, and times in whole
+/// seconds: exactly, in whole numbers (R10).
+const MICRO_PERCENT: f64 = 1_000_000.0;
+
+/// The longest window there is a length for: ten years (R10). A window that tells more minutes,
+/// or whose label says more, is of unknown length.
+const MAX_WINDOW_MINUTES: i64 = 10 * 366 * 24 * 60;
+
+/// How long `w` is (R10): the minutes codex told for it, from 1 to [`MAX_WINDOW_MINUTES`] (more
+/// is unknown, whatever the label says), else what its label says ([`label_length`]). `None`:
+/// unknown.
+fn window_length(w: &Window) -> Option<SignedDuration> {
+    match w.window_minutes {
+        Some(minutes) => (1..=MAX_WINDOW_MINUTES)
+            .contains(&i64::from(minutes))
+            .then(|| SignedDuration::from_mins(i64::from(minutes))),
+        None => label_length(&w.label),
+    }
+}
+
+/// How long the window labeled `label` is, from its label (R10): `Session` five hours, `Week …`
+/// seven days (claude's `session`, `weekly_all` and `weekly_scoped` limits, its older
+/// `five_hour` and `seven_day` fields, its live `Current session` and `Current week` lines;
+/// codex's windows of 5 and 168 hours), codex's `<N>h window`, `<N>d window` and `<N>m window` as
+/// they say, and a claude limit of unknown kind labeled `five_hour` or `seven_day…` by that
+/// kind. Codex's labels give its windows' minutes rounded to whole hours: a row that tells its
+/// window's minutes is as long as they say instead ([`window_length`]). `None`: unknown.
+fn label_length(label: &str) -> Option<SignedDuration> {
+    let base = match label.strip_suffix(')').and_then(|l| l.rsplit_once(" (")) {
+        Some((base, _)) => base,
+        None => label,
+    };
+    if base == "Session" || base == "five_hour" {
+        return Some(SignedDuration::from_hours(5));
+    }
+    if base == "Week" || base.starts_with("seven_day") {
+        return Some(SignedDuration::from_hours(7 * 24));
+    }
+    let count = base.strip_suffix(" window")?;
+    // Only the ASCII units, stripped as such: a label is any text a cache gives (R10).
+    let (number, per) = [('m', 1), ('h', 60), ('d', 24 * 60)]
+        .into_iter()
+        .find_map(|(unit, per)| Some((count.strip_suffix(unit)?, per)))?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let minutes = number.parse::<i64>().ok()?.checked_mul(per)?;
+    // No longer than a window can be and still be counted in seconds and placed in time.
+    (1..=MAX_WINDOW_MINUTES)
+        .contains(&minutes)
+        .then(|| SignedDuration::from_mins(minutes))
+}
+
 /// Indented, aligned rows of `reading`'s windows: label, percent, `!`/`!!` for warning/critical
 /// ([`Window::severity`]), reset time. A window whose reset has passed since the usage was
-/// recorded has `-` for its percent and says so (R10). A window that resets within
-/// [`REMINDER_WITHIN`] of `now` with at least [`REMINDER_LEFT`] percent left is followed by a
-/// note saying so: what is left then goes unused (R10).
+/// recorded has `-` for its percent and says so (R10). A row is followed by its notes (R10),
+/// a line each: that the window resets within [`REMINDER_WITHIN`] of `now` with at least
+/// [`REMINDER_LEFT`] percent left, which then goes unused ([`reminder`]); then that it is on
+/// pace to be used up before its reset ([`pace_note`]).
 pub fn format_rows(reading: &Reading, tz: &TimeZone, now: Timestamp) -> String {
-    let cells: Vec<(&str, String, &str, String, Option<String>)> = reading
+    let cells: Vec<(&str, String, &str, String, Vec<String>)> = reading
         .windows
         .iter()
         .map(|w| {
@@ -336,21 +410,23 @@ pub fn format_rows(reading: &Reading, tz: &TimeZone, now: Timestamp) -> String {
                 ),
                 (Some(used), _, None) => (format_percent(used), String::new()),
             };
-            (w.label.as_str(), percent, mark, resets, reminder(w, now))
+            let notes = [reminder(w, now), pace_note(w, reading.fetched_at, now, tz)];
+            let notes = notes.into_iter().flatten().collect();
+            (w.label.as_str(), percent, mark, resets, notes)
         })
         .collect();
     let label_w = cells.iter().map(|c| text::width(c.0)).max().unwrap_or(0);
     let pct_w = cells.iter().map(|c| c.1.len()).max().unwrap_or(0);
     cells
         .iter()
-        .map(|(label, pct, mark, resets, note)| {
+        .map(|(label, pct, mark, resets, notes)| {
             let label = text::pad(label, label_w);
             let line = format!("  {label}  {pct:>pct_w$} {mark:<2}  {resets}");
-            let note = note
-                .as_ref()
+            let notes: String = notes
+                .iter()
                 .map(|note| format!("  note: {note}\n"))
-                .unwrap_or_default();
-            format!("{}\n{note}", line.trim_end())
+                .collect();
+            format!("{}\n{notes}", line.trim_end())
         })
         .collect()
 }
@@ -371,6 +447,56 @@ fn reminder(w: &Window, now: Timestamp) -> Option<String> {
     Some(format!(
         "resets in {minutes} min with {} left",
         format_percent(left)
+    ))
+}
+
+/// `at this pace 100% by Oct 30 10:55, 2h05m before the reset`, for a window on pace to be used
+/// up before its reset (R10), read at `read_at` (the cache time, or when a live answer arrived)
+/// and seen at `now`. With `L` its length ([`window_length`]), `R` its reset, `t` = `read_at` and
+/// `u` its percentage used, the window started at `R − L`, and `e = (t − (R − L)) / L` of it had
+/// elapsed at `t`. A note only when all of these hold: `L` is known; `R` is told and ahead, and
+/// the usage is known, read at a known time; [`PACE_FROM`] ≤ `u` < 100; `e > 0` (`e < 1`
+/// follows: the reset is ahead of the reading); and `T = (R − L) + (t − (R − L)) · 100 / u`, when
+/// it reaches 100% at that pace, is after `now` and at least a minute before `R`. `T` is before
+/// `R` exactly when the window is ahead of an even pace (`u/100 > e`), so that is the test of
+/// it; less than a minute before says nothing the reset does not. Every comparison is exact, in
+/// whole numbers: seconds, and `u` in millionths of a percent.
+fn pace_note(
+    w: &Window,
+    read_at: Option<Timestamp>,
+    now: Timestamp,
+    tz: &TimeZone,
+) -> Option<String> {
+    let Reset::Ahead(reset) = w.reset else {
+        return None;
+    };
+    // An unknown time is not now: a cache without one is paced from nowhere.
+    let read_at = read_at?;
+    let length = i128::from(window_length(w)?.as_secs());
+    let used = (w.used()? * MICRO_PERCENT).round() as i128;
+    let hundred = (100.0 * MICRO_PERCENT) as i128;
+    if used < (PACE_FROM * MICRO_PERCENT) as i128 || used >= hundred {
+        return None;
+    }
+    let reset_at = i128::from(reset.as_second());
+    let start = reset_at - length;
+    let elapsed = i128::from(read_at.as_second()) - start;
+    // Read after the window's start: a reset further than its length ahead, or a clock behind,
+    // puts the reading before it.
+    if elapsed <= 0 {
+        return None;
+    }
+    // T, floored to the second: before R exactly when u · L > 100 · elapsed, ahead of an even
+    // pace.
+    let full = start + elapsed * hundred / used;
+    if full <= i128::from(now.as_second()) || reset_at - full < 60 {
+        return None;
+    }
+    let full = Timestamp::from_second(i64::try_from(full).ok()?).ok()?;
+    Some(format!(
+        "at this pace 100% by {}, {} before the reset",
+        format_time(full, tz),
+        until(full, reset)
     ))
 }
 
@@ -420,50 +546,37 @@ fn cached_claude(account: &Account, env: &Env) -> Result<CachedUsage, String> {
     parse_cached(&text)
 }
 
-/// `remuda usage` block for one account from its cached usage (R10), read as of `clock` once
-/// the cache has been read ([`cached_attempt`]).
+/// `remuda usage` block for one account from its cached usage (R10). The cache is read first
+/// and `clock` asked after that: usage is read against the time it was read at, so a reset
+/// that falls while the cache is read (or while the command ran before) has passed since.
 pub fn cached_report(
     account: &Account,
     env: &Env,
     tz: &TimeZone,
     clock: impl Fn() -> Timestamp,
 ) -> String {
-    cached_attempt(account, env, tz, clock).0
-}
-
-/// [`cached_report`], and the reading it shows (`None` without cached usage): for the usage
-/// history (R24), which records it. The cache is read first and `clock` asked after that: usage
-/// is read against the time it was read at (R10), so a reset that falls while the cache is read
-/// (or while the command ran before) has passed since.
-pub fn cached_attempt(
-    account: &Account,
-    env: &Env,
-    tz: &TimeZone,
-    clock: impl Fn() -> Timestamp,
-) -> (String, Option<Reading>) {
     let cached = cached_usage(account, env);
     cached_text(account, &cached, tz, clock())
 }
 
-/// [`cached_attempt`] of the cached usage `cached` already read, as of `now`: a time taken
+/// [`cached_report`] of the cached usage `cached` already read, as of `now`: a time taken
 /// after it was read.
 fn cached_text(
     account: &Account,
     cached: &Result<CachedUsage, String>,
     tz: &TimeZone,
     now: Timestamp,
-) -> (String, Option<Reading>) {
+) -> String {
     let name = account.qualified();
     match cached {
-        Err(notice) => (format!("{name}  no cached usage ({notice})\n"), None),
+        Err(notice) => format!("{name}  no cached usage ({notice})\n"),
         Ok(cached) => {
             let reading = Snapshot::cached(cached).at(now);
             let when = match (reading.age_text(), reading.fetched_at) {
                 (Some(age), Some(at)) => format!("cached {age} ({})", format_time(at, tz)),
                 _ => "cached (time unknown)".to_string(),
             };
-            let text = format!("{name}  {when}\n{}", format_rows(&reading, tz, now));
-            (text, Some(reading))
+            format!("{name}  {when}\n{}", format_rows(&reading, tz, now))
         }
     }
 }
@@ -658,8 +771,8 @@ pub fn live_codex(
 
 /// `remuda usage --live` block for one account; `false` when the query failed (R10), which an
 /// agent that is not on PATH is too. The header names the identity the query told (codex: email
-/// and plan). The rows are read when they are answered, by `clock`: the query may take as long
-/// as `timeout`.
+/// and plan). The rows are read when they are answered, by `clock` after the query: it may take
+/// as long as `timeout`.
 pub fn live_report(
     account: &Account,
     agents: &dyn Runner,
@@ -667,39 +780,24 @@ pub fn live_report(
     clock: fn() -> Timestamp,
     timeout: Duration,
 ) -> (String, bool) {
-    let (text, ok, _) = live_attempt(account, agents, tz, clock, timeout);
-    (text, ok)
-}
-
-/// [`live_report`], and the reading it shows (`None` when the answer gave no usage rows): for
-/// the usage history (R24). The answer is read when it arrived, by `clock` after the query.
-pub fn live_attempt(
-    account: &Account,
-    agents: &dyn Runner,
-    tz: &TimeZone,
-    clock: fn() -> Timestamp,
-    timeout: Duration,
-) -> (String, bool, Option<Reading>) {
     let result = live_usage(account, agents, timeout);
     live_text(account, &result, tz, clock())
 }
 
-/// [`live_attempt`] of the answer `result`, read at `answered_at`: when it arrived.
-pub fn live_text(
+/// [`live_report`] of the answer `result`, read at `answered_at`: when it arrived.
+fn live_text(
     account: &Account,
     result: &Result<LiveResult, String>,
     tz: &TimeZone,
     answered_at: Timestamp,
-) -> (String, bool, Option<Reading>) {
+) -> (String, bool) {
     let name = account.qualified();
     match result {
-        Err(e) => (format!("{name}  error: {e}\n"), false, None),
+        Err(e) => (format!("{name}  error: {e}\n"), false),
         Ok(LiveResult { usage, identity }) => {
             let who = identity.as_ref().map(who_and_plan).unwrap_or_default();
             match usage {
-                LiveUsage::Untold(untold) => {
-                    (format!("{name}  live: {}\n", untold.reason()), true, None)
-                }
+                LiveUsage::Untold(untold) => (format!("{name}  live: {}\n", untold.reason()), true),
                 LiveUsage::Unrecognized(stdout) => {
                     let raw: String = stdout
                         .lines()
@@ -708,7 +806,6 @@ pub fn live_text(
                     (
                         format!("{name}  live (output not recognized; shown as is){who}\n{raw}"),
                         true,
-                        None,
                     )
                 }
                 LiveUsage::Rows(rows) => {
@@ -719,7 +816,6 @@ pub fn live_text(
                             format_rows(&reading, tz, answered_at)
                         ),
                         true,
-                        Some(reading),
                     )
                 }
             }
@@ -1587,9 +1683,9 @@ mod tests {
         );
     }
 
-    /// R10, R24: cached usage is read against a time taken after the cache was read, never
-    /// before: here asking the clock changes the cache, and what is shown is what was there
-    /// before it was asked. So a reset that falls while the cache is read has passed since.
+    /// R10: cached usage is read against a time taken after the cache was read, never before:
+    /// here asking the clock changes the cache, and what is shown is what was there before it
+    /// was asked. So a reset that falls while the cache is read has passed since.
     #[test]
     fn cached_usage_takes_the_time_after_reading_the_cache() {
         let dir = tempfile::tempdir().unwrap();
@@ -1615,21 +1711,16 @@ mod tests {
             fs::write(home.join(".claude.json"), cache(99)).unwrap();
             ts("2026-10-08T10:30:00Z")
         };
-        let (text, reading) = cached_attempt(&max, &env, &TimeZone::UTC, clock);
+        let text = cached_report(&max, &env, &TimeZone::UTC, clock);
         assert_eq!(asked.get(), 1);
         assert!(text.contains("Session  34%"), "{text}");
-        assert_eq!(reading.unwrap().windows[0].used(), Some(34.0));
+        assert!(!text.contains("99%"), "{text}");
         // Read at a time after its reset: reset since, whatever the command's start was.
         fs::write(home.join(".claude.json"), cache(34)).unwrap();
         let after = || ts("2026-10-08T11:00:30Z");
-        let (text, reading) = cached_attempt(&max, &env, &TimeZone::UTC, after);
+        let text = cached_report(&max, &env, &TimeZone::UTC, after);
         assert!(text.contains("reset since cached (Oct 8 11:00)"), "{text}");
-        assert_eq!(reading.unwrap().windows[0].used(), None);
-        assert_eq!(
-            cached_report(&max, &env, &TimeZone::UTC, after),
-            text,
-            "the report is the attempt's text"
-        );
+        assert!(!text.contains("34%"), "{text}");
     }
 
     /// R10: a window that resets within an hour with at least 25% left is followed by a note;
@@ -1671,6 +1762,299 @@ mod tests {
         };
         let out = format_rows(&Snapshot::cached(&cached).at(now), &TimeZone::UTC, now);
         assert!(!out.contains("note"), "{out}");
+    }
+
+    /// R10: window lengths from R10's labels; codex's to the hour its label is rounded to.
+    #[test]
+    fn window_lengths_come_from_the_labels() {
+        let h = |n: i64| Some(SignedDuration::from_hours(n));
+        let cases = [
+            ("Session", h(5)),
+            ("Session (GPT-5.3-Codex-Spark)", h(5)),
+            ("Week (all models)", h(168)),
+            ("Week (Fable)", h(168)),
+            ("five_hour", h(5)),
+            ("seven_day_opus", h(168)),
+            ("2h window", h(2)),
+            ("3d window (Spark)", h(72)),
+            ("45m window", Some(SignedDuration::from_mins(45))),
+            ("weekly_other", None),
+            ("0h window", None),
+            ("h window", None),
+            ("Weekly", None),
+            ("", None),
+            // Any text a cache gives is a label (R10): never cut inside a character, nor a
+            // count out of range.
+            ("额度 window", None),
+            ("度m window", None),
+            ("1度 window", None),
+            ("５h window", None),
+            ("+5h window", None),
+            ("153722867280912931m window", None),
+            ("9223372036854775807d window", None),
+            (
+                "5270400m window",
+                Some(SignedDuration::from_mins(5_270_400)),
+            ),
+            ("5270401m window", None),
+        ];
+        for (label, want) in cases {
+            assert_eq!(label_length(label), want, "{label:?}");
+        }
+        // A codex window of 90 minutes is labeled `2h window` (R10): two hours, then.
+        assert_eq!(codex_label(90, None), "2h window");
+        assert_eq!(label_length(&codex_label(299, None)), h(5));
+        assert_eq!(label_length(&codex_label(10079, None)), h(168));
+    }
+
+    /// The pace note of the window `row`, cached at `read` (`None`: a cache that does not say
+    /// when) and read at `now`.
+    fn pace_of(row: UsageRow, read: Option<&str>, now: &str) -> Option<String> {
+        let cached = CachedUsage {
+            fetched_at: read.map(ts),
+            rows: vec![row],
+        };
+        let reading = Snapshot::cached(&cached).at(ts(now));
+        pace_note(
+            &reading.windows[0],
+            reading.fetched_at,
+            ts(now),
+            &TimeZone::UTC,
+        )
+    }
+
+    /// A session that resets at 14:00, started at 09:00, with `percent` used.
+    fn session(percent: f64) -> UsageRow {
+        row("Session", percent, None, at("2026-10-08T14:00:00Z"))
+    }
+
+    /// R10: a window on pace to be used up before its reset is followed by a note saying when it
+    /// reaches 100% at that pace, and how long before the reset: a session read at 11:50, 2 h 50
+    /// min into its 5 h with 85% used, reaches it at 12:20, 1 h 40 min before its reset. Under
+    /// the reset note when both are due; a live answer is paced from when it arrived; a margin
+    /// of days says days; a codex window is as long as its minutes say.
+    #[test]
+    fn a_window_on_pace_to_be_used_up_gets_a_note() {
+        let cached = CachedUsage {
+            fetched_at: Some(ts("2026-10-08T11:50:00Z")),
+            rows: vec![session(85.0)],
+        };
+        let now = ts("2026-10-08T12:00:00Z");
+        let out = format_rows(&Snapshot::cached(&cached).at(now), &TimeZone::UTC, now);
+        assert_eq!(
+            normalized(&out),
+            [
+                "Session 85% ! resets Oct 8 14:00",
+                "note: at this pace 100% by Oct 8 12:20, 1h40m before the reset",
+            ]
+        );
+        assert!(out.contains("\n  note: at this pace 100% by"), "{out}");
+
+        // Both notes: two hours that reset in 50 minutes with 40% left, 60% used 70 minutes in.
+        let rows = [lasting(
+            120,
+            row("2h window", 60.0, None, at("2026-10-08T12:50:00Z")),
+        )];
+        let out = format_rows(&Snapshot::live(&rows, now).at(now), &TimeZone::UTC, now);
+        assert_eq!(
+            normalized(&out),
+            [
+                "2h window 60% resets Oct 8 12:50",
+                "note: resets in 50 min with 40% left",
+                "note: at this pace 100% by Oct 8 12:46, 3m before the reset",
+            ]
+        );
+
+        // A live answer, as claude words its reset: 2 of 5 hours gone, 60% used.
+        let rows = [row("Session", 60.0, None, text("Oct 8 at 3pm (UTC)"))];
+        let out = format_rows(&Snapshot::live(&rows, now).at(now), &TimeZone::UTC, now);
+        assert_eq!(
+            normalized(&out),
+            [
+                "Session 60% resets Oct 8 at 3pm (UTC)",
+                "note: at this pace 100% by Oct 8 13:20, 1h40m before the reset",
+            ]
+        );
+
+        // A week, two days in with half of it used: three days early.
+        let read = ts("2026-10-05T12:00:00Z");
+        let rows = [row(
+            "Week (all models)",
+            50.0,
+            None,
+            at("2026-10-10T12:00:00Z"),
+        )];
+        let out = format_rows(&Snapshot::live(&rows, read).at(read), &TimeZone::UTC, read);
+        assert_eq!(
+            normalized(&out)[1],
+            "note: at this pace 100% by Oct 7 12:00, 3d00h before the reset"
+        );
+
+        // A codex window of 90 minutes, labeled `2h window`: 40% used 30 minutes in is ahead;
+        // by the two hours of its label it would be behind (half of it gone).
+        let window = row("2h window", 40.0, None, at("2026-10-08T13:00:00Z"));
+        let rows = [lasting(90, window.clone())];
+        let out = format_rows(&Snapshot::live(&rows, now).at(now), &TimeZone::UTC, now);
+        assert_eq!(
+            normalized(&out),
+            [
+                "2h window 40% resets Oct 8 13:00",
+                "note: resets in 60 min with 60% left",
+                "note: at this pace 100% by Oct 8 12:45, 15m before the reset",
+            ]
+        );
+        let out = format_rows(&Snapshot::live(&[window], now).at(now), &TimeZone::UTC, now);
+        assert_eq!(
+            normalized(&out),
+            [
+                "2h window 40% resets Oct 8 13:00",
+                "note: resets in 60 min with 60% left",
+            ]
+        );
+    }
+
+    /// R10: a window of unknown length gets no pace note, however fast it goes: a claude limit
+    /// of a kind remuda does not know, labels that tell no length, and a codex window telling
+    /// more minutes than ten years, whose label does not stand in for them. Minutes told stand
+    /// in for a label that tells nothing.
+    #[test]
+    fn no_pace_note_for_a_window_of_unknown_length() {
+        let (read, now) = (Some("2026-10-08T11:50:00Z"), "2026-10-08T12:00:00Z");
+        let ahead = |label: &str| UsageRow {
+            label: label.into(),
+            ..session(85.0)
+        };
+        assert!(pace_of(ahead("Session"), read, now).is_some());
+        for label in [
+            "monthly_thing",
+            "Weekly",
+            "额度 window",
+            "153722867280912931m window",
+        ] {
+            assert_eq!(pace_of(ahead(label), read, now), None, "{label}");
+        }
+        for minutes in [5_270_401, u32::MAX] {
+            assert_eq!(
+                pace_of(lasting(minutes, ahead("Session")), read, now),
+                None,
+                "{minutes}"
+            );
+        }
+        assert!(pace_of(lasting(300, ahead("monthly_thing")), read, now).is_some());
+    }
+
+    /// R10: a window gets no pace note without a reset told and ahead, and its usage known: no
+    /// reset told, wording not read (and no cached reset to stand in), a reset passed since the
+    /// usage was read, or one already behind when it was.
+    #[test]
+    fn no_pace_note_without_a_reset_ahead() {
+        let (read, now) = (Some("2026-10-08T11:50:00Z"), "2026-10-08T12:00:00Z");
+        assert!(pace_of(session(85.0), read, now).is_some());
+        for (resets, why) in [
+            (None, "none told"),
+            (text("soon"), "wording not read"),
+            (at("2026-10-08T11:55:00Z"), "reset since"),
+            (at("2026-10-08T11:00:00Z"), "behind the reading"),
+        ] {
+            let window = row("Session", 85.0, None, resets);
+            assert_eq!(pace_of(window, read, now), None, "{why}");
+        }
+    }
+
+    /// R10: a cache that does not say when it was written gets no pace note: how much of the
+    /// window had elapsed is unknown, not what it is now.
+    #[test]
+    fn no_pace_note_for_a_reading_of_unknown_time() {
+        let now = "2026-10-08T12:00:00Z";
+        assert!(pace_of(session(85.0), Some(now), now).is_some());
+        assert_eq!(pace_of(session(85.0), None, now), None);
+    }
+
+    /// R10: a window used less than 25% gets no pace note, however early in it (3 minutes into
+    /// the session, 2% used would say 100% by 11:30, 24% by 09:12); 25% is enough. A window
+    /// used up gets none either: here read a minute after now, as by a clock behind, where only
+    /// the percentage keeps it quiet.
+    #[test]
+    fn no_pace_note_below_a_quarter_used_or_at_100() {
+        let early = Some("2026-10-08T09:03:00Z");
+        for percent in [2.0, 24.0] {
+            assert_eq!(
+                pace_of(session(percent), early, "2026-10-08T09:03:00Z"),
+                None,
+                "{percent}"
+            );
+        }
+        assert_eq!(
+            pace_of(session(25.0), early, "2026-10-08T09:03:00Z").as_deref(),
+            Some("at this pace 100% by Oct 8 09:12, 4h48m before the reset")
+        );
+        let read = Some("2026-10-08T12:00:00Z");
+        assert_eq!(pace_of(session(100.0), read, "2026-10-08T11:59:00Z"), None);
+        assert!(pace_of(session(99.0), read, "2026-10-08T11:59:00Z").is_some());
+    }
+
+    /// R10: a reading from before its window started gets no pace note: a cache of 10:00, an
+    /// hour before a session that resets at 16:00 began, read at 08:30 by a clock behind, would
+    /// be at 100% by 09:00 "at that pace", before the window even starts; so would one of
+    /// 11:00, its very start. A minute into it, it is ahead.
+    #[test]
+    fn no_pace_note_before_the_window_starts() {
+        let late = || row("Session", 50.0, None, at("2026-10-08T16:00:00Z"));
+        let behind = "2026-10-08T08:30:00Z";
+        assert_eq!(pace_of(late(), Some("2026-10-08T10:00:00Z"), behind), None);
+        assert_eq!(pace_of(late(), Some("2026-10-08T11:00:00Z"), behind), None);
+        let in_it = "2026-10-08T11:01:00Z";
+        assert_eq!(
+            pace_of(late(), Some(in_it), in_it).as_deref(),
+            Some("at this pace 100% by Oct 8 11:02, 4h58m before the reset")
+        );
+    }
+
+    /// R10: a window at or behind an even pace gets no pace note: 2 hours into a session of 5
+    /// (40% of it), 40% used is even, 39% behind; 41% is ahead, at 100% by 13:52, 7 minutes
+    /// before its reset.
+    #[test]
+    fn no_pace_note_at_or_behind_an_even_pace() {
+        let read = Some("2026-10-08T11:00:00Z");
+        for percent in [39.0, 40.0] {
+            assert_eq!(
+                pace_of(session(percent), read, "2026-10-08T11:00:00Z"),
+                None,
+                "{percent}"
+            );
+        }
+        assert_eq!(
+            pace_of(session(41.0), read, "2026-10-08T11:00:00Z").as_deref(),
+            Some("at this pace 100% by Oct 8 13:52, 7m before the reset")
+        );
+    }
+
+    /// R10: a projection whose time has passed gets no pace note: a session read at 10:00, 3
+    /// hours into its 5 with 80% used, was on pace for 100% by 10:45; at 11:00 that has passed,
+    /// at 10:45 it is now, and at 10:30 it is still ahead.
+    #[test]
+    fn no_pace_note_once_its_time_has_passed() {
+        let read = Some("2026-10-08T10:00:00Z");
+        let early = || row("Session", 80.0, None, at("2026-10-08T12:00:00Z"));
+        assert_eq!(pace_of(early(), read, "2026-10-08T11:00:00Z"), None);
+        assert_eq!(pace_of(early(), read, "2026-10-08T10:45:00Z"), None);
+        assert_eq!(
+            pace_of(early(), read, "2026-10-08T10:30:00Z").as_deref(),
+            Some("at this pace 100% by Oct 8 10:45, 1h15m before the reset")
+        );
+    }
+
+    /// R10: a window that reaches 100% less than a minute before its reset gets no pace note:
+    /// as far as a minute tells, that is the reset. 4 hours into a session of 5, 80.2% used
+    /// reaches it 45 seconds before the reset, 80.3% a minute and 8 seconds before.
+    #[test]
+    fn no_pace_note_less_than_a_minute_before_the_reset() {
+        let read = Some("2026-10-08T13:00:00Z");
+        assert_eq!(pace_of(session(80.2), read, "2026-10-08T13:00:00Z"), None);
+        assert_eq!(
+            pace_of(session(80.3), read, "2026-10-08T13:00:00Z").as_deref(),
+            Some("at this pace 100% by Oct 8 13:58, 1m before the reset")
+        );
     }
 
     #[test]
