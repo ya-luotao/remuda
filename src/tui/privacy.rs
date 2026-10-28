@@ -550,9 +550,14 @@ impl Redactor<'_> {
     }
 
     fn check(&self, check: &Check) -> Check {
-        let Check { account, message } = check;
+        let Check {
+            account,
+            level,
+            message,
+        } = check;
         Check {
             account: account.as_deref().map(|q| self.alias(q)),
+            level: *level,
             message: self.scrub.marked(message),
         }
     }
@@ -913,6 +918,7 @@ impl Redactor<'_> {
     fn config_view(&self, view: &ConfigView) -> ConfigView {
         let ConfigView {
             role,
+            plugins_link,
             instructions,
             synced,
             stale_overrides,
@@ -948,6 +954,8 @@ impl Redactor<'_> {
                     source: self.alias(source),
                 },
             },
+            // Masked as a check's message was (R21): the link whole, the source by its alias.
+            plugins_link: plugins_link.as_ref().map(|m| self.scrub.marked(m)),
             instructions: instructions.iter().map(|i| self.config_item(i)).collect(),
             synced: match synced {
                 Synced::None => Synced::None,

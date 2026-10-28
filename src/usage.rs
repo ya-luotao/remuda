@@ -93,7 +93,7 @@ fn cached_limits(utilization: &Value) -> Parsed<UsageRow> {
 /// The rows of the older `five_hour` / `seven_day` fields: one that is there (not null) is a
 /// window, read or not.
 fn cached_windows(utilization: &Value) -> Parsed<UsageRow> {
-    let windows = [("five_hour", "Session"), ("seven_day", "Week (all models)")];
+    let windows = [("five_hour", "5h"), ("seven_day", "Week (all models)")];
     Parsed::of(windows.into_iter().filter_map(|(key, label)| {
         let window = utilization.get(key).filter(|w| !w.is_null())?;
         Some(
@@ -114,7 +114,7 @@ fn cached_windows(utilization: &Value) -> Parsed<UsageRow> {
 fn limit_row(limit: &Value) -> Option<UsageRow> {
     let kind = limit.get("kind")?.as_str()?;
     let label = match kind {
-        "session" => "Session".to_string(),
+        "session" => "5h".to_string(),
         "weekly_all" => "Week (all models)".to_string(),
         "weekly_scoped" => {
             let model = limit
@@ -143,14 +143,14 @@ fn resets_at(v: &Value) -> Option<Resets> {
 }
 
 /// The label of a codex window (R10), by its duration rather than its position (a Pro plan's
-/// `primary` window is weekly): minutes rounded to whole hours; 5 hours is `Session`, 168 hours
+/// `primary` window is weekly): minutes rounded to whole hours; 5 hours is `5h`, 168 hours
 /// `Week (all models)`, anything else `<N>h window` (`<N>d window` for whole days). A per-model
 /// limit's `name` replaces `all models` in the week and is appended to the others.
 pub fn codex_label(minutes: i64, name: Option<&str>) -> String {
     let hours = (minutes + 30) / 60;
     match (hours, name) {
-        (5, None) => "Session".to_string(),
-        (5, Some(name)) => format!("Session ({name})"),
+        (5, None) => "5h".to_string(),
+        (5, Some(name)) => format!("5h ({name})"),
         (168, None) => "Week (all models)".to_string(),
         (168, Some(name)) => format!("Week ({name})"),
         _ => {
@@ -240,9 +240,9 @@ pub fn codex_live_rows(result: &Value) -> Vec<UsageRow> {
 /// The start of each line of `claude -p /usage` that is a usage window.
 const LIVE_LINES: [&str; 2] = ["Current session", "Current week"];
 
-/// Parses the `Current session` / `Current week (...)` lines of `claude -p /usage`. A line that
-/// starts like one and cannot be read is counted, not dropped: the caller must not take the
-/// rest for the account's usage (R10).
+/// Parses the `Current session` / `Current week (...)` lines of `claude -p /usage` (the first
+/// labeled `5h`). A line that starts like one and cannot be read is counted, not dropped: the
+/// caller must not take the rest for the account's usage (R10).
 pub fn parse_live(stdout: &str) -> Parsed<UsageRow> {
     let lines = stdout.lines().filter(|line| {
         LIVE_LINES
@@ -255,7 +255,7 @@ pub fn parse_live(stdout: &str) -> Parsed<UsageRow> {
 fn live_row(line: &str) -> Option<UsageRow> {
     let line = line.trim();
     let (label, rest) = if let Some(rest) = line.strip_prefix("Current session:") {
-        ("Session".to_string(), rest)
+        ("5h".to_string(), rest)
     } else {
         let (inner, rest) = line.strip_prefix("Current week (")?.split_once("):")?;
         (format!("Week ({inner})"), rest)
@@ -348,7 +348,7 @@ fn window_length(w: &Window) -> Option<SignedDuration> {
     }
 }
 
-/// How long the window labeled `label` is, from its label (R10): `Session` five hours, `Week …`
+/// How long the window labeled `label` is, from its label (R10): `5h` five hours, `Week …`
 /// seven days (claude's `session`, `weekly_all` and `weekly_scoped` limits, its older
 /// `five_hour` and `seven_day` fields, its live `Current session` and `Current week` lines;
 /// codex's windows of 5 and 168 hours), codex's `<N>h window`, `<N>d window` and `<N>m window` as
@@ -360,7 +360,7 @@ fn label_length(label: &str) -> Option<SignedDuration> {
         Some((base, _)) => base,
         None => label,
     };
-    if base == "Session" || base == "five_hour" {
+    if base == "5h" || base == "five_hour" {
         return Some(SignedDuration::from_hours(5));
     }
     if base == "Week" || base.starts_with("seven_day") {
@@ -899,7 +899,7 @@ mod tests {
             cached.rows,
             [
                 row(
-                    "Session",
+                    "5h",
                     34.0,
                     Some("normal"),
                     at("2026-09-23T15:39:59.632347Z")
@@ -933,7 +933,7 @@ mod tests {
         assert_eq!(
             cached.rows,
             [
-                row("Session", 12.5, Some("normal"), None),
+                row("5h", 12.5, Some("normal"), None),
                 row("monthly_thing", 3.0, Some("novel"), None),
                 row("Week (scoped)", 50.0, None, None),
                 row("Week (all models)", 40.0, None, None),
@@ -960,7 +960,7 @@ mod tests {
             assert_eq!(
                 cached_limits(&utilization),
                 Parsed {
-                    items: vec![row("Session", 12.0, None, None)],
+                    items: vec![row("5h", 12.0, None, None)],
                     unrecognized: 1
                 },
                 "{unread}"
@@ -996,7 +996,7 @@ mod tests {
         let old = r#"{"five_hour": {"utilization": 34, "resets_at": "2026-09-23T15:40:00+00:00"},
                       "seven_day": {"utilization": 76, "resets_at": null}, "seven_day_opus": null}"#;
         let expected = [
-            row("Session", 34.0, None, at("2026-09-23T15:40:00Z")),
+            row("5h", 34.0, None, at("2026-09-23T15:40:00Z")),
             row("Week (all models)", 76.0, None, None),
         ];
         assert_eq!(parse_cached(&cache_with(old)).unwrap().rows, expected);
@@ -1059,7 +1059,7 @@ mod tests {
         let plus = json!({"primary": window(10.0, 300, json!(1)),
                           "secondary": window(20.0, 10080, json!(2))});
         let expected = [
-            lasting(300, row("Session", 10.0, None, at_second(1))),
+            lasting(300, row("5h", 10.0, None, at_second(1))),
             lasting(10080, row("Week (all models)", 20.0, None, at_second(2))),
         ];
         assert_eq!(rows(plus), expected);
@@ -1072,7 +1072,7 @@ mod tests {
         assert_eq!(
             rows(legacy),
             [
-                lasting(299, row("Session", 1.5, None, None)),
+                lasting(299, row("5h", 1.5, None, None)),
                 lasting(10079, row("Week (all models)", 2.0, None, None))
             ]
         );
@@ -1089,7 +1089,7 @@ mod tests {
             [
                 lasting(
                     300,
-                    row("Session (GPT-5.3-Codex-Spark)", 5.0, None, at_second(1))
+                    row("5h (GPT-5.3-Codex-Spark)", 5.0, None, at_second(1))
                 ),
                 lasting(
                     10080,
@@ -1163,7 +1163,7 @@ mod tests {
             labels(&result),
             owned(&[
                 ("Week (all models)", 99.0),
-                ("Session (GPT-5.3-Codex-Spark)", 5.0),
+                ("5h (GPT-5.3-Codex-Spark)", 5.0),
                 ("Week (GPT-5.3-Codex-Spark)", 7.0),
                 ("1h window (codex_other)", 1.0),
             ])
@@ -1190,7 +1190,7 @@ mod tests {
         assert_eq!(
             labels(&json!({"rateLimits": spark,
                            "rateLimitsByLimitId": {"codex_bengalfox": spark}})),
-            owned(&[("Session", 5.0)])
+            owned(&[("5h", 5.0)])
         );
         for empty in [
             json!({}),
@@ -1208,12 +1208,7 @@ mod tests {
             parse_live(LIVE),
             Parsed {
                 items: vec![
-                    row(
-                        "Session",
-                        9.0,
-                        None,
-                        text("Sep 24 at 3:19am (Asia/Shanghai)")
-                    ),
+                    row("5h", 9.0, None, text("Sep 24 at 3:19am (Asia/Shanghai)")),
                     row(
                         "Week (all models)",
                         74.0,
@@ -1232,7 +1227,7 @@ mod tests {
         );
         assert_eq!(
             parse_live("  Current session: 0% used\n").items,
-            [row("Session", 0.0, None, None)]
+            [row("5h", 0.0, None, None)]
         );
         // Neither a usage line nor like one.
         for other in ["", "hello\n", "Currently: 5% used\n", "session: 5% used\n"] {
@@ -1271,7 +1266,7 @@ mod tests {
         );
         let parsed = parse_live(&drifted);
         let labels: Vec<&str> = parsed.items.iter().map(|r| r.label.as_str()).collect();
-        assert_eq!(labels, ["Session", "Week (Fable)"]);
+        assert_eq!(labels, ["5h", "Week (Fable)"]);
         assert_eq!(parsed.unrecognized, 1);
         assert_eq!(parsed.complete(), Err(1));
     }
@@ -1480,7 +1475,7 @@ mod tests {
             json!({"rateLimits": {"primary": {"usedPercent": 4, "windowDurationMins": 300}}});
         let read =
             json!({"account": {"type": "chatgpt", "email": "c@example.com", "planType": "plus"}});
-        let session = vec![lasting(300, row("Session", 4.0, None, None))];
+        let session = vec![lasting(300, row("5h", 4.0, None, None))];
         let agents =
             Scripted::new().app_server_says("codex:work", Ok(vec![Ok(limits.clone()), Ok(read)]));
         let result = live_usage(&work, &agents, T).unwrap();
@@ -1593,7 +1588,7 @@ mod tests {
         assert_eq!(
             normalized(&out),
             [
-                "Session 34% resets Sep 23 15:39",
+                "5h 34% resets Sep 23 15:39",
                 "note: resets in 21 min with 66% left",
                 "Week (all models) 77% ! resets Sep 25 04:59",
                 "Week (Fable) 100% !! resets Sep 25 04:59",
@@ -1616,7 +1611,7 @@ mod tests {
         // Labels align by display width (a double-width model name).
         let wide = live_text(&[
             row("Week (模型)", 5.0, None, None),
-            row("Session", 7.0, None, None),
+            row("5h", 7.0, None, None),
         ]);
         let pct_col: Vec<usize> = wide
             .lines()
@@ -1638,7 +1633,7 @@ mod tests {
         assert_eq!(
             normalized(&out),
             [
-                "Session - reset since cached (Sep 23 15:39)",
+                "5h - reset since cached (Sep 23 15:39)",
                 "Week (all models) 77% ! resets Sep 25 04:59",
                 "Week (Fable) 100% !! resets Sep 25 04:59",
             ]
@@ -1661,26 +1656,20 @@ mod tests {
                 ts("2026-10-01T00:00:00Z")
             )),
             [
-                "Session - reset since cached (Sep 23 15:39)",
+                "5h - reset since cached (Sep 23 15:39)",
                 "Week (all models) - reset since cached (Sep 25 04:59)",
                 "Week (Fable) - reset since cached (Sep 25 04:59)",
             ]
         );
         // A live answer naming a reset already behind keeps its percentage, and its wording.
         let now = ts("2026-09-24T00:00:00Z");
-        let rows = [row("Session", 95.0, None, text("Sep 23 at 11pm (UTC)"))];
+        let rows = [row("5h", 95.0, None, text("Sep 23 at 11pm (UTC)"))];
         let live = format_rows(&Snapshot::live(&rows, now).at(now), &TimeZone::UTC, now);
-        assert_eq!(
-            normalized(&live),
-            ["Session 95% !! resets Sep 23 at 11pm (UTC)"]
-        );
+        assert_eq!(normalized(&live), ["5h 95% !! resets Sep 23 at 11pm (UTC)"]);
         // The same answer, asked before that reset and read after it.
         let asked = ts("2026-09-23T20:00:00Z");
         let aged = format_rows(&Snapshot::live(&rows, asked).at(now), &TimeZone::UTC, now);
-        assert_eq!(
-            normalized(&aged),
-            ["Session - reset since asked (Sep 23 23:00)"]
-        );
+        assert_eq!(normalized(&aged), ["5h - reset since asked (Sep 23 23:00)"]);
     }
 
     /// R10: cached usage is read against a time taken after the cache was read, never before:
@@ -1713,7 +1702,7 @@ mod tests {
         };
         let text = cached_report(&max, &env, &TimeZone::UTC, clock);
         assert_eq!(asked.get(), 1);
-        assert!(text.contains("Session  34%"), "{text}");
+        assert!(text.contains("5h  34%"), "{text}");
         assert!(!text.contains("99%"), "{text}");
         // Read at a time after its reset: reset since, whatever the command's start was.
         fs::write(home.join(".claude.json"), cache(34)).unwrap();
@@ -1769,8 +1758,10 @@ mod tests {
     fn window_lengths_come_from_the_labels() {
         let h = |n: i64| Some(SignedDuration::from_hours(n));
         let cases = [
-            ("Session", h(5)),
-            ("Session (GPT-5.3-Codex-Spark)", h(5)),
+            ("5h", h(5)),
+            ("5h (GPT-5.3-Codex-Spark)", h(5)),
+            // The label remuda gave the 5-hour window until 2026-10-28: it gives none such now.
+            ("Session", None),
             ("Week (all models)", h(168)),
             ("Week (Fable)", h(168)),
             ("five_hour", h(5)),
@@ -1825,7 +1816,7 @@ mod tests {
 
     /// A session that resets at 14:00, started at 09:00, with `percent` used.
     fn session(percent: f64) -> UsageRow {
-        row("Session", percent, None, at("2026-10-08T14:00:00Z"))
+        row("5h", percent, None, at("2026-10-08T14:00:00Z"))
     }
 
     /// R10: a window on pace to be used up before its reset is followed by a note saying when it
@@ -1844,7 +1835,7 @@ mod tests {
         assert_eq!(
             normalized(&out),
             [
-                "Session 85% ! resets Oct 8 14:00",
+                "5h 85% ! resets Oct 8 14:00",
                 "note: at this pace 100% by Oct 8 12:20, 1h40m before the reset",
             ]
         );
@@ -1866,12 +1857,12 @@ mod tests {
         );
 
         // A live answer, as claude words its reset: 2 of 5 hours gone, 60% used.
-        let rows = [row("Session", 60.0, None, text("Oct 8 at 3pm (UTC)"))];
+        let rows = [row("5h", 60.0, None, text("Oct 8 at 3pm (UTC)"))];
         let out = format_rows(&Snapshot::live(&rows, now).at(now), &TimeZone::UTC, now);
         assert_eq!(
             normalized(&out),
             [
-                "Session 60% resets Oct 8 at 3pm (UTC)",
+                "5h 60% resets Oct 8 at 3pm (UTC)",
                 "note: at this pace 100% by Oct 8 13:20, 1h40m before the reset",
             ]
         );
@@ -1924,7 +1915,7 @@ mod tests {
             label: label.into(),
             ..session(85.0)
         };
-        assert!(pace_of(ahead("Session"), read, now).is_some());
+        assert!(pace_of(ahead("5h"), read, now).is_some());
         for label in [
             "monthly_thing",
             "Weekly",
@@ -1935,7 +1926,7 @@ mod tests {
         }
         for minutes in [5_270_401, u32::MAX] {
             assert_eq!(
-                pace_of(lasting(minutes, ahead("Session")), read, now),
+                pace_of(lasting(minutes, ahead("5h")), read, now),
                 None,
                 "{minutes}"
             );
@@ -1956,7 +1947,7 @@ mod tests {
             (at("2026-10-08T11:55:00Z"), "reset since"),
             (at("2026-10-08T11:00:00Z"), "behind the reading"),
         ] {
-            let window = row("Session", 85.0, None, resets);
+            let window = row("5h", 85.0, None, resets);
             assert_eq!(pace_of(window, read, now), None, "{why}");
         }
     }
@@ -1999,7 +1990,7 @@ mod tests {
     /// 11:00, its very start. A minute into it, it is ahead.
     #[test]
     fn no_pace_note_before_the_window_starts() {
-        let late = || row("Session", 50.0, None, at("2026-10-08T16:00:00Z"));
+        let late = || row("5h", 50.0, None, at("2026-10-08T16:00:00Z"));
         let behind = "2026-10-08T08:30:00Z";
         assert_eq!(pace_of(late(), Some("2026-10-08T10:00:00Z"), behind), None);
         assert_eq!(pace_of(late(), Some("2026-10-08T11:00:00Z"), behind), None);
@@ -2035,7 +2026,7 @@ mod tests {
     #[test]
     fn no_pace_note_once_its_time_has_passed() {
         let read = Some("2026-10-08T10:00:00Z");
-        let early = || row("Session", 80.0, None, at("2026-10-08T12:00:00Z"));
+        let early = || row("5h", 80.0, None, at("2026-10-08T12:00:00Z"));
         assert_eq!(pace_of(early(), read, "2026-10-08T11:00:00Z"), None);
         assert_eq!(pace_of(early(), read, "2026-10-08T10:45:00Z"), None);
         assert_eq!(
@@ -2066,17 +2057,13 @@ mod tests {
     #[test]
     fn live_rows_get_the_same_markers_in_text() {
         let out = live_text(&[
-            row("Session", 74.0, None, None),
+            row("5h", 74.0, None, None),
             row("Week (all models)", 75.0, None, None),
             row("Week (Fable)", 90.0, None, None),
         ]);
         assert_eq!(
             normalized(&out),
-            [
-                "Session 74%",
-                "Week (all models) 75% !",
-                "Week (Fable) 90% !!"
-            ]
+            ["5h 74%", "Week (all models) 75% !", "Week (Fable) 90% !!"]
         );
     }
 }

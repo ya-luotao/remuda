@@ -169,7 +169,7 @@ pub enum Reset {
 /// One usage window of a [`Reading`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Window {
-    /// As R10 labels it: `Session`, `Week (all models)`, `Week (Fable)`.
+    /// As R10 labels it: `5h`, `Week (all models)`, `Week (Fable)`.
     pub label: String,
     /// The name in the label's trailing parentheses; `None` for a general window.
     pub model: Option<String>,
@@ -232,7 +232,8 @@ impl Window {
     }
 }
 
-/// `Week (Fable)` → `Fable`; `Week (all models)`, `Session`, `5h window` → `None`.
+/// `Week (Fable)` → `Fable`, `5h (Spark)` → `Spark`; `Week (all models)`, `5h`, `3h window` →
+/// `None`.
 fn window_model(label: &str) -> Option<String> {
     let inner = label.strip_suffix(')')?.rsplit_once(" (")?.1;
     (inner != "all models").then(|| inner.to_string())
@@ -476,7 +477,7 @@ mod tests {
             vec![
                 UsageRow {
                     severity: Some("critical".into()),
-                    ..row("Session", 100.0, at("2026-09-27T09:00:00Z"))
+                    ..row("5h", 100.0, at("2026-09-27T09:00:00Z"))
                 },
                 row("Week (all models)", 100.0, at("2026-09-28T09:00:00Z")),
             ],
@@ -521,7 +522,7 @@ mod tests {
         let now = ts(NOW);
         let rows = [
             // Wording read into the past: at most a day back (`parse_reset_text`).
-            row("Session", 60.0, text("Sep 27 at 9am (UTC)")),
+            row("5h", 60.0, text("Sep 27 at 9am (UTC)")),
             row("Week (all models)", 95.0, at("2026-09-26T00:00:00Z")),
             row("Week (Fable)", 20.0, text("soon")),
         ];
@@ -541,7 +542,7 @@ mod tests {
         // A cache that records a reset already behind it: the same.
         let cache = cached(
             Some("2026-09-27T09:30:00Z"),
-            vec![row("Session", 34.0, at("2026-09-27T09:00:00Z"))],
+            vec![row("5h", 34.0, at("2026-09-27T09:00:00Z"))],
         );
         let odd = &Snapshot::cached(&cache).at(now).windows[0];
         assert_eq!((odd.used(), odd.reset), (Some(34.0), Reset::Unknown));
@@ -555,7 +556,7 @@ mod tests {
         // One the cache did record ahead of itself is ahead for that clock too.
         let cache = cached(
             Some("2026-09-27T09:30:00Z"),
-            vec![row("Session", 34.0, at("2026-09-27T09:45:00Z"))],
+            vec![row("5h", 34.0, at("2026-09-27T09:45:00Z"))],
         );
         let ahead = &Snapshot::cached(&cache)
             .at(ts("2026-09-27T08:30:00Z"))
@@ -569,7 +570,7 @@ mod tests {
     fn a_live_answer_ages() {
         let asked = ts("2026-09-27T05:00:00Z");
         let rows = [
-            row("Session", 88.0, text("7am (UTC)")),
+            row("5h", 88.0, text("7am (UTC)")),
             row("Week (all models)", 40.0, text("Sep 30 at 12pm (UTC)")),
         ];
         let then = Snapshot::live(&rows, asked).at(asked);
@@ -621,7 +622,7 @@ mod tests {
     fn untold_resets_fall_back_to_the_cache_while_it_is_ahead() {
         let now = ts(NOW);
         let rows = [
-            row("Session", 12.0, text("soon")),
+            row("5h", 12.0, text("soon")),
             row("Week (all models)", 91.0, None),
             row("Week (Fable)", 5.0, text("Sep 30 at 12pm (UTC)")),
             row("Week (Sonnet)", 7.0, text("whenever")),
@@ -629,7 +630,7 @@ mod tests {
         let cache = cached(
             Some("2026-09-27T06:00:00Z"),
             vec![
-                row("Session", 5.0, at("2026-09-27T12:30:00Z")),
+                row("5h", 5.0, at("2026-09-27T12:30:00Z")),
                 row("Week (all models)", 80.0, at("2026-09-27T09:00:00Z")),
                 row("Week (Fable)", 1.0, at("2026-10-02T00:00:00Z")),
             ],
@@ -660,13 +661,13 @@ mod tests {
         // remuda could not read: the cache's later reset for that limit does not replace it,
         // or the timeline would draw a reset the agent did not tell.
         let rows = [
-            row("Session", 60.0, text("Sep 27 at 9am (UTC)")),
+            row("5h", 60.0, text("Sep 27 at 9am (UTC)")),
             row("Week (all models)", 91.0, at("2026-09-26T00:00:00Z")),
         ];
         let cache = cached(
             Some("2026-09-27T08:00:00Z"),
             vec![
-                row("Session", 20.0, at("2026-09-27T12:00:00Z")),
+                row("5h", 20.0, at("2026-09-27T12:00:00Z")),
                 row("Week (all models)", 80.0, at("2026-09-30T00:00:00Z")),
             ],
         );
@@ -680,7 +681,7 @@ mod tests {
             );
         }
         // The same answer, kept until after a reset it told: passed, and it stays so.
-        let rows = [row("Session", 60.0, text("Sep 27 at 11am (UTC)"))];
+        let rows = [row("5h", 60.0, text("Sep 27 at 11am (UTC)"))];
         let later = ts("2026-09-27T11:30:00Z");
         let reading = Snapshot::live(&rows, now).with_resets_of(&cache).at(later);
         assert_eq!(
@@ -688,10 +689,10 @@ mod tests {
             Reset::Passed(ts("2026-09-27T11:00:00Z"))
         );
         // A cached reset that the cache itself had already passed is no reset to borrow.
-        let rows = [row("Session", 60.0, None)];
+        let rows = [row("5h", 60.0, None)];
         let cache = cached(
             Some("2026-09-27T12:30:00Z"),
-            vec![row("Session", 20.0, at("2026-09-27T12:00:00Z"))],
+            vec![row("5h", 20.0, at("2026-09-27T12:00:00Z"))],
         );
         let reading = Snapshot::live(&rows, now).with_resets_of(&cache).at(now);
         assert_eq!(reading.windows[0].reset, Reset::Unknown);
@@ -701,9 +702,9 @@ mod tests {
     fn a_per_model_window_names_its_model() {
         assert_eq!(window_model("Week (Fable)").as_deref(), Some("Fable"));
         assert_eq!(window_model("Week (all models)"), None);
-        assert_eq!(window_model("Session"), None);
+        assert_eq!(window_model("5h"), None);
         let rows = [
-            row("Session (GPT-5.3-Codex-Spark)", 1.0, None),
+            row("5h (GPT-5.3-Codex-Spark)", 1.0, None),
             row("5h window", 1.0, None),
         ];
         let reading = Snapshot::live(&rows, ts(NOW)).at(ts(NOW));
@@ -732,12 +733,12 @@ mod tests {
             (90.0, "critical"),
             (100.0, "critical"),
         ] {
-            assert_eq!(severity(row("Session", percent, None)), want, "{percent}%");
+            assert_eq!(severity(row("5h", percent, None)), want, "{percent}%");
         }
         // A reported severity (cached rows) wins over the percentage.
         let reported = UsageRow {
             severity: Some("normal".into()),
-            ..row("Session", 95.0, None)
+            ..row("5h", 95.0, None)
         };
         assert_eq!(severity(reported), "normal");
     }

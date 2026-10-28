@@ -39,8 +39,8 @@ with one of those directories selected. By design ([SPEC.md](SPEC.md), R2, R13 a
   session store and configuration, never at credentials, and nothing is replaced or removed.
   `remuda setup` creates that home below real directories only: it refuses a `homes` or
   `homes/<provider>` that is a symlink;
-- adds no option and none of another account's settings to a launch: shared configuration is
-  what a home links (R18), and the one thing a launch sets for it is
+- adds no option for sharing, and none of another account's settings, to a launch: shared
+  configuration is what a home links (R18), and the one thing a launch sets for it is
   `CLAUDE_CODE_REMOTE_MEMORY_DIR`, the source's home, for a member whose `projects` is linked;
   and does not link a `settings.json` that sets authentication settings (credential helpers,
   provider, endpoint or organization settings, and secret-like `env` entries) at the moment

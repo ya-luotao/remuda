@@ -292,13 +292,116 @@ fn checks_keep_what_they_say_around_their_paths_in_private_mode() {
     for said in [
         "! ANTHROPIC_API_KEY is set: it overrides every account's /login",
         "! account-2: home ~/••• does not exist",
-        // Wrapped at this width.
-        "! account-1: does not share projects with claude:default: it does not see the \
+        // A note (R11), after the warnings; wrapped at this width.
+        "· account-1: does not share projects with claude:default: it does not see the \
          sessions in ~/•••/••• and cannot resume them",
         "~/•••/•••/•••",
     ] {
         assert!(private.contains(said), "{said}:\n{private}");
     }
+    let at = |said: &str| private.find(said).unwrap();
+    assert!(at("! account-2: home") < at("· account-1: does not share"));
+    leaks_nothing(&private);
+}
+
+/// R11, R21, R22: a member's `plugins` link that the source's installs go through, from the
+/// files to the screen. It is no check: the accounts view says nothing of it. The member's
+/// account card says that the link must stay, with the number of plugins, under the card's
+/// part in sharing; in private mode the link is masked whole, the source shown by its alias,
+/// and what the line says around them stays.
+#[test]
+fn a_plugins_link_that_must_stay_is_said_in_the_card_not_among_the_checks() {
+    use std::os::unix::fs::symlink;
+
+    let h = Homes::new();
+    let source_home = h.home.join("zq src (old)").join("zqsrc, a: b");
+    fs::create_dir_all(source_home.join("plugins/cache/m")).unwrap();
+    let source = Account {
+        provider: CLAUDE,
+        name: "zqsrc".into(),
+        home: Home::Path(source_home.display().to_string()),
+    };
+    let through = h.member_home().join("plugins");
+    symlink(source_home.join("plugins"), &through).unwrap();
+    write(
+        &source_home.join("plugins/installed_plugins.json"),
+        &serde_json::json!({
+            "version": 2,
+            "plugins": {
+                "a@m": [{"scope": "user", "installPath": through.join("cache/m/a")}],
+                "b@m": [{"scope": "user", "installPath": through.join("cache/m/b")}],
+                "c@m": [{"scope": "user", "installPath": source_home.join("plugins/cache/m/c")}],
+            },
+        })
+        .to_string(),
+    );
+    let sharing = Sharing {
+        source: Some(source.clone()),
+        ..Sharing::default()
+    };
+    let accounts = vec![source, h.member.clone()];
+
+    let found = checks::sharing(&accounts, &h.env, &sharing);
+    assert!(
+        !found
+            .iter()
+            .any(|c| c.message.contains("must stay a symlink")),
+        "{found:?}"
+    );
+    let view = account_config::read(&h.member, &sharing, None, &h.env);
+    assert_eq!(
+        view.plugins_link.as_ref().map(|m| m.to_string()),
+        Some(format!(
+            "{} must stay a symlink: 2 plugins of claude:zqsrc are installed through it and \
+             stop loading for every account without it",
+            through.display()
+        ))
+    );
+
+    let mut app = h.app(accounts);
+    update(&mut app, Event::Checks(found));
+    assert!(!screen(&app).contains("must stay a symlink"));
+    update(&mut app, Event::Key(Key::Char('p')));
+    let request = app.config.work.round();
+    update(
+        &mut app,
+        Event::Config {
+            request,
+            account: h.member.clone(),
+            result: Ok(Box::new(view)),
+        },
+    );
+    app.private = true;
+    let copy = privacy::redacted(&app);
+    let Some(Ok(masked)) = &copy.config.loaded else {
+        panic!("no configuration loaded: {:?}", copy.config.loaded)
+    };
+    assert_eq!(
+        masked
+            .plugins_link
+            .as_ref()
+            .map(|m| m.to_string())
+            .as_deref(),
+        Some(
+            "~/•••/•••/••• must stay a symlink: 2 plugins of claude:account-1 are installed \
+             through it and stop loading for every account without it"
+        )
+    );
+    let private = screen(&app);
+    let (shares, link) = {
+        let lines: Vec<&str> = private.lines().collect();
+        let at = |said: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(said))
+                .unwrap_or_else(|| panic!("{said}:\n{private}"))
+        };
+        (
+            at("member of account-1: shares what its home links to it"),
+            at("~/•••/•••/••• must stay a symlink: 2 plugins of claude:account-1"),
+        )
+    };
+    assert_eq!(link, shares + 1, "{private}");
     leaks_nothing(&private);
 }
 

@@ -1349,7 +1349,7 @@ mod tests {
                 account: work,
                 result: Ok(usage::LiveResult {
                     usage: usage::LiveUsage::Rows(vec![usage::UsageRow {
-                        label: "Session".into(),
+                        label: "5h".into(),
                         percent: 4.0,
                         severity: None,
                         resets: None,

@@ -540,6 +540,10 @@ appeared in no `history.jsonl`.
 
 - For each account, show its usage windows with utilization and reset time: claude's 5-hour
   window, weekly window, and per-model weekly limits; codex's windows under the same labels (below).
+  The 5-hour window is labeled `5h`: claude's `session` limit, its older `five_hour` field, and
+  its live `Current session` line (claude's words, read as they are); not `Session`, which is
+  what Live and History list (R7, R8). The weekly window is `Week (all models)`, and a per-model
+  weekly limit `Week (<model>)`.
 - The reset times of all accounts are drawn on a single timeline, so that the account with the most
   headroom right now is easy to pick.
 - Two data sources:
@@ -626,10 +630,10 @@ appeared in no `history.jsonl`.
   shown as is. `account/read` is extra: if it fails, is not recognized, or names no logged-in
   account, the usage is still shown, without an email or plan.
 - **Codex windows** are labeled by duration, not position (a Pro plan's `primary` window is weekly,
-  with no `secondary`): minutes rounded to whole hours; 5 hours is `Session`, 168 hours is
+  with no `secondary`): minutes rounded to whole hours; 5 hours is `5h`, 168 hours is
   `Week (all models)`, any other duration `<N>h window` (`<N>d window` for whole days). A
   per-model limit's name replaces `all models` in `Week (<name>)` and is appended to the others
-  (`Session (<name>)`). A window without a numeric percentage and a positive duration is dropped.
+  (`5h (<name>)`). A window without a numeric percentage and a positive duration is dropped.
   Rows: the general limit first, then per-model limits, each by window length. Each row also
   keeps the window's length as codex told it, in minutes (`window_minutes`, `windowDurationMins`),
   which the label rounds: the pace note paces the window by it (below). Claude's rows have no
@@ -681,7 +685,7 @@ appeared in no `history.jsonl`.
   millionths of a percent.
 - **Window length.** A window that tells its minutes (codex's) is as long as they say, at most
   ten years: a longer one is of unknown length, whatever its label says. A window without
-  them is read by its label (above): `Session` is 5 hours and `Week …` 7 days (claude's
+  them is read by its label (above): `5h` is 5 hours and `Week …` 7 days (claude's
   `session`, `weekly_all`, and `weekly_scoped` limits, its older `five_hour` and `seven_day`
   fields, its live `Current session` and `Current week` lines; codex's windows of 5 and 168
   hours); codex's `<N>h window`, `<N>d window`, and `<N>m window` are as long as they say (`N`
@@ -744,6 +748,14 @@ appeared in no `history.jsonl`.
 
 ## R11. Checks in the accounts view
 
+- **Two levels.** A check is a **warning** (something broken or overridden) or a **note** (a fact
+  of the layout, true of a healthy setup too). The one note is the notice of what a member does
+  not share (below), whichever of its parts it says; every other check is a warning. The
+  accounts view lists the warnings first, each after `!` in the warning color, with those the
+  view adds among them (an account not logged in, a failed live query, R10); then the notes,
+  each after a `·`, all of it dim, without `!`, whatever order the checks were found in.
+  `✓ no problems found` means no warning: notes may follow it. The account card lists the
+  checks of its account the same way (R22), and private mode masks both levels alike (R21).
 - Variables of the environment that change what claude does for every account, one warning each,
   in this order, never with the value (the tokens are secrets); remuda counts an empty value as
   not set:
@@ -807,16 +819,14 @@ appeared in no `history.jsonl`.
     and why, whether or not the home has a `settings.json` of its own, and asks nothing of
     the account: the file is the source's to fix, and the source's account card shows the
     problem (R22). This is a notice that the account does not share those items, not an
-    error.
-  - The source's `installed_plugins.json` records an `installPath` under `<home>/plugins/` (the
-    home's path as registered) while the home's `plugins` resolves to the source's: that link
-    cannot be removed without breaking those plugins for every account. The message gives
-    their number. Nothing is reported when the file is not recognized.
+    error: a note, also when it says only that `settings.json` is not shared.
   - The home's `settings.json` resolves to the source's, and the source's settings have
     authentication settings (R18): warning that this account reads them through the link,
     naming the keys, never their values (each session launch says it too, R18). The message
     says to give the account a `settings.json` of its own instead of the link, or to move
     those settings out of the source's `settings.json`.
+  - A `plugins` link that the source's installs go through is not a check: it is how a healthy
+    shared layout looks, and the member's account card says it (R22).
 
 ## R12. Symlinks in homes
 
@@ -1591,8 +1601,9 @@ status and hint lines, notices, the help box) shows:
 - **Session content**: titles, first messages, session names, preview messages, background
   session logs, search text, and the descriptions in the account card (R22) are shown as
   `•••`.
-- **Messages and free text** (notices, errors, check messages, the problems of the account
-  card's configuration, the description of a pending launch): account names are replaced by their aliases, as
+- **Messages and free text** (notices, errors, check messages, warnings and notes alike, the
+  problems of the account card's configuration, the card's line about a `plugins` link, the
+  description of a pending launch): account names are replaced by their aliases, as
   whole words (ASCII letters, digits, `_`, and `-` make a word, so a name right next to CJK text
   or full-width punctuation is replaced too); emails, organization names, live session names,
   the search text, and the values typed in the open form (as typed, without the blanks around
@@ -1602,7 +1613,8 @@ status and hint lines, notices, the help box) shows:
     and which came from elsewhere. So it is with a notice and a form's error (a launch
     directory, a store, a home), a check message (R11: a home, a link and its target, a store,
     a file), a problem of the account card's configuration (R22: a home, a file, the registry, a
-    settings file that cannot be read or is not a JSON object), the status line's notice of a
+    settings file that cannot be read or is not a JSON object), the card's line about a
+    `plugins` link (R22: the link), the status line's notice of a
     refresh that is incomplete (R8, R20: the directory that could not be read, with the
     system's error after it as text from elsewhere), and the reason a launch is refused before
     it starts (R16: that its account is no longer registered, or is registered with another
@@ -1661,11 +1673,20 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   `live…` beside them while a live query is out; a failed one is among its checks), its
   sessions (how many History lists as its, under R8's noise filter as toggled, R17, and how
   many run, R7), its checks (R11: those naming it and the machine-wide ones, which concern
-  every account; and not logged in or a failed live query as the view lists them, shown with
-  the last run's under `checking…` while the checks run: the first time, on `r`, and after
-  the account list changed, when an account added since was never checked), and its part in
-  sharing (R18: alone, the source, a member of which source, opted out, or a source whose home
-  is missing). What is not read yet says so and is never shown as none or zero: the login,
+  every account; and not logged in or a failed live query; as the view lists them, the
+  warnings first, then the notes; shown with the last run's under `checking…` while the
+  checks run: the first time, on `r`, and after the account list changed, when an account
+  added since was never checked), and its part in sharing (R18: alone, the source, a member
+  of which source, opted out, or a source whose home is missing). Under its part in sharing,
+  for a member whose `plugins` resolves to the source's while the source's
+  `installed_plugins.json` records an `installPath` under `<home>/plugins/` (the home's path
+  as registered), a line of its own says that the link cannot be removed without breaking
+  those plugins for every account, with their number (of plugins, not of installs), for
+  example `<home>/plugins must stay a symlink: 2 plugins of <source> are installed through it
+  and stop loading for every account without it`. It is a fact of a healthy layout, not a
+  check (R11): drawn as the card's other facts, without `!`. Nothing is said when the file is
+  not recognized, nor of the source or an account with `share = false`. What is not read yet
+  says so and is never shown as none or zero: the login,
   the usage, the sessions (until the index, the attribution and the running sessions are
   loaded, and again after the account list changed, until they are read once more: of an
   account added since, they knew nothing), the checks, the configuration. Then the
@@ -1794,8 +1815,9 @@ part comes from. It only reads: nothing is written (R13), no agent command runs,
   settings keys, `env` variables, MCP servers, and an agent's model, effort, and tools);
   descriptions are masked as `•••`; paths (link targets, install and memory directories, the
   directory in the title) are masked as in R21; the source account is shown by its alias;
-  problems are messages (R21): a path remuda names in one is masked whole, and the system's
-  error in it from its first path to the end of its line.
+  problems, and the line about a `plugins` link, are messages (R21): a path remuda names in
+  one is masked whole, and the system's error in it from its first path to the end of its
+  line.
 
 ## R23. Recommendation (removed)
 
