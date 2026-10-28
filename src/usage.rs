@@ -2046,7 +2046,8 @@ mod tests {
 
     /// R10: a window that reaches 100% less than a minute before its reset gets no pace note:
     /// as far as a minute tells, that is the reset. 4 hours into a session of 5, 80.2% used
-    /// reaches it 45 seconds before the reset, 80.3% a minute and 8 seconds before.
+    /// reaches it 45 seconds before the reset, 80.3% a minute and 8 seconds before. A minute
+    /// exactly is enough: 80% used 3 h 59 min 12 s in reaches it at 13:59:00.
     #[test]
     fn no_pace_note_less_than_a_minute_before_the_reset() {
         let read = Some("2026-10-08T13:00:00Z");
@@ -2054,6 +2055,11 @@ mod tests {
         assert_eq!(
             pace_of(session(80.3), read, "2026-10-08T13:00:00Z").as_deref(),
             Some("at this pace 100% by Oct 8 13:58, 1m before the reset")
+        );
+        let read = Some("2026-10-08T12:59:12Z");
+        assert_eq!(
+            pace_of(session(80.0), read, "2026-10-08T12:59:12Z").as_deref(),
+            Some("at this pace 100% by Oct 8 13:59, 1m before the reset")
         );
     }
 

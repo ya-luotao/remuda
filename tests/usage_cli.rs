@@ -1063,6 +1063,70 @@ fn usage_records_nothing() {
     }
 }
 
+/// R24: a usage history that an earlier remuda left in `state/` stays as it is until the user
+/// deletes it: `remuda usage` (cached and `--live`) and `remuda stats` neither remove it nor
+/// write to it or through it. A file of garbage bytes keeps its bytes and its mode 0644; a
+/// symlink to a file elsewhere keeps its target, and the target its bytes and mode.
+/// Nothing else appears in `state/` but the statistics cache.
+#[test]
+fn an_existing_usage_history_is_left_alone() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let Setup { sb, max, team } = setup();
+    sb.write_claude_json(Some(&max), &cache_json(60, LIMITS));
+    sb.write_claude_json(None, &cache_json(7200, LIMITS));
+    for home in [None, Some(max.as_path()), Some(team.as_path())] {
+        sb.set_live_usage(home, LIVE_SAMPLE);
+    }
+    let state = sb.remuda_home().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let path = state.join("usage-history.jsonl");
+    let target = sb.root().join("elsewhere/h.jsonl");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    let junk: &[u8] =
+        b"{\"ts\": \"2026-10-01T00:00:00Z\", \"account\": \"claude:max\"}\nnot json\n\xff\xfe\n";
+    for linked in [false, true] {
+        let file = if linked { &target } else { &path };
+        std::fs::write(file, junk).unwrap();
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if linked {
+            std::fs::remove_file(&path).unwrap();
+            symlink(&target, &path).unwrap();
+        }
+        for args in [
+            &["usage"][..],
+            &["usage", "max"],
+            &["usage", "--live"],
+            &["usage", "max", "--live"],
+            &["stats"],
+        ] {
+            sb.remuda().args(args).assert().success();
+            let meta = std::fs::symlink_metadata(&path);
+            assert!(meta.is_ok(), "{args:?}, linked {linked}: removed: {meta:?}");
+            assert_eq!(meta.unwrap().is_symlink(), linked, "{args:?}");
+            if linked {
+                assert_eq!(std::fs::read_link(&path).unwrap(), target, "{args:?}");
+            }
+            let mode = std::fs::metadata(file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o644, "{args:?}, linked {linked}");
+            assert_eq!(
+                std::fs::read(file).unwrap(),
+                junk,
+                "{args:?}, linked {linked}"
+            );
+        }
+        let mut names: Vec<String> = std::fs::read_dir(&state)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["stats.json", "usage-history.jsonl"],
+            "linked {linked}"
+        );
+    }
+}
+
 /// R5, R10, R24: `usage --wait` and `--max-wait` were removed with `remuda pick`, and
 /// `--history` and `--days` with the usage history (2026-10-28): unknown to clap, each is a
 /// usage error (exit 2) that reads no usage, runs no query and records nothing, whatever it is

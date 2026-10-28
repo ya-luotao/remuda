@@ -82,7 +82,7 @@ may contain breaking changes; they are listed under **Changed** or **Removed** w
   for example from `remuda usage`. `TYPESAFE_API_KEY` is unused and can be removed from your
   setup.
 - **Breaking:** the usage history, `remuda usage --history` and `--days`, and
-  `remuda stats --csv` (SPEC R3, R5, R10, R16, R20, R24). `remuda usage` and the TUI no longer
+  `remuda stats --csv` (SPEC R3, R5, R10, R13, R16, R20, R24). `remuda usage` and the TUI no longer
   record what they read in `state/usage-history.jsonl`, nothing reads that file any more, and
   leaving the TUI no longer waits up to 2 seconds for recordings. `--history`, `--days` and
   `--csv` are now unexpected arguments (exit 2). Remuda does not delete an existing history:

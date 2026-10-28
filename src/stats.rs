@@ -1332,8 +1332,9 @@ pub struct Request<'a> {
     pub group: usize,
     /// As recorded; `unknown` when the transcript names none.
     pub model: &'a str,
-    /// Whether any copy used fast mode, or US-only inference.
+    /// Whether any copy used fast mode (as priced in `cost`).
     pub fast: bool,
+    /// Whether any copy used US-only inference (as priced in `cost`).
     pub geo_us: bool,
     /// Claude: the largest of each count over the copies; codex: the copy that counts, whole.
     pub tokens: Tokens,

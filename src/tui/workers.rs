@@ -1428,6 +1428,87 @@ mod tests {
         assert!(!deps.state_dir.exists(), "nothing is written in state/");
     }
 
+    /// R24: a usage history that an earlier remuda left in `state/` stays as it is until the
+    /// user deletes it: the TUI's cached and live usage workers neither remove it nor write to
+    /// it or through it. A file of garbage bytes keeps its bytes and its mode 0644; a symlink to
+    /// a file elsewhere keeps its target, and the target its bytes and mode. Nothing else
+    /// appears in `state/`.
+    #[test]
+    fn an_existing_usage_history_is_left_alone_by_the_tui() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let work = Account {
+            provider: Provider::Codex,
+            name: "work".into(),
+            home: Home::Path(dir.path().join("work").display().to_string()),
+        };
+        let registered = format!(
+            "[[account]]\nprovider = \"codex\"\nname = \"work\"\nhome = \"{}\"\n",
+            work.home
+        );
+        let codex = crate::probe::script(
+            dir.path(),
+            "codex",
+            "read a; read b; read c; read d; \
+             echo '{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":4,\
+             \"windowDurationMins\":300,\"resetsAt\":1790262000}}}}'; \
+             echo '{\"id\":3,\"result\":{}}'; cat >/dev/null",
+        );
+        let deps = Arc::new(Deps {
+            codex: Some(codex),
+            ..Deps::clone(&deps_with(dir.path(), &registered))
+        });
+        let max = max(&deps);
+        fs::write(
+            dir.path().join("max/.claude.json"),
+            r#"{"cachedUsageUtilization": {"fetchedAtMs": 1790247600000,
+              "utilization": {"limits": [{"kind": "session", "percent": 34,
+              "resets_at": "2026-09-24T15:00:00Z"}]}}}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(&deps.state_dir).unwrap();
+        let path = deps.state_dir.join("usage-history.jsonl");
+        let target = dir.path().join("elsewhere/h.jsonl");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let junk: &[u8] = b"{\"ts\": \"2026-10-01T00:00:00Z\"}\nnot json\n\xff\xfe\n";
+        for linked in [false, true] {
+            let file = if linked { &target } else { &path };
+            fs::write(file, junk).unwrap();
+            fs::set_permissions(file, fs::Permissions::from_mode(0o644)).unwrap();
+            if linked {
+                fs::remove_file(&path).unwrap();
+                symlink(&target, &path).unwrap();
+            }
+            let events = finished(Effect::CachedUsage(vec![max.clone()]), &deps);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [Event::CachedUsage { result: Ok(_), .. }]
+                ),
+                "{events:?}"
+            );
+            let events = finished(Effect::LiveUsage(vec![work.clone()]), &deps);
+            assert!(
+                matches!(events.as_slice(), [Event::LiveUsage { result: Ok(_), .. }]),
+                "{events:?}"
+            );
+            let meta = fs::symlink_metadata(&path);
+            assert!(meta.is_ok(), "linked {linked}: removed: {meta:?}");
+            assert_eq!(meta.unwrap().is_symlink(), linked);
+            if linked {
+                assert_eq!(fs::read_link(&path).unwrap(), target);
+            }
+            let mode = fs::metadata(file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o644, "linked {linked}");
+            assert_eq!(fs::read(file).unwrap(), junk, "linked {linked}");
+            let names: Vec<_> = fs::read_dir(&deps.state_dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, ["usage-history.jsonl"], "linked {linked}");
+        }
+    }
+
     /// R16: reading the registry again is work of its own, so a refresh can ask for it while
     /// everything else is still running; a list that changed is the answer.
     #[test]
